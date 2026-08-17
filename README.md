@@ -9,6 +9,7 @@ O código pode ficar no GitHub, mas extratos, faturas, holerites, banco de dados
 Esta primeira versão entrega:
 
 - configuração segura do primeiro administrador;
+- acessos individuais para membros da mesma família, com gestão restrita ao administrador;
 - cadastro de contas, cartões, investimentos e titulares;
 - importação de CSV, OFX/QFX e PDF com texto selecionável;
 - parsers validados para extrato Itaú, fatura Itaú em duas colunas, CSV Nubank e holerite;
@@ -25,8 +26,11 @@ Esta primeira versão entrega:
 - rendimento do investimento sobre o saldo inicial de cada mês;
 - teto de gastos, benefícios VA/VR e saldo mínimo de segurança;
 - visão mensal navegável, com totais e categorias separados por competência;
+- entradas, saídas, gastos e aplicações apresentados separadamente;
+- lançamento manual de despesa, receita, aplicação, resgate e reembolso;
+- exclusão auditada de registros manuais e desativação segura de acessos;
 - consolidação automática de lançamentos repetidos entre a planilha e importações históricas;
-- plano de cortes por categoria, com média observada, novo teto e economia mensal possível;
+- plano de cortes por categoria com metas iniciais conservadoras, sem prometer corte integral;
 - backup diário do PostgreSQL com retenção configurável;
 - trilha de auditoria das alterações.
 
@@ -111,7 +115,10 @@ Depois do primeiro acesso, siga esta ordem:
 3. importe primeiro os holerites, depois extratos e faturas;
 4. resolva a fila de revisão antes de confiar nos totais;
 5. cadastre comissões e compromissos futuros;
-6. confira o plano de cortes e os três cenários da projeção.
+6. em **Acessos**, crie o usuário individual de cada membro da família;
+7. confira o plano de cortes e os três cenários da projeção.
+
+Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo investido e o fluxo de caixa, mas não são tratados como consumo. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
 
 ## Carga da planilha consolidada
 
