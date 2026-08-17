@@ -69,6 +69,15 @@
       </header>
 
       <section id="view-dashboard" class="view active">
+        <div class="period-toolbar">
+          <div><span class="step-label">PERÍODO ANALISADO</span><strong id="dashboard-period-label">Mês atual</strong></div>
+          <div class="month-navigation">
+            <button id="dashboard-prev-month" class="secondary month-arrow" type="button" aria-label="Mês anterior">‹</button>
+            <input type="month" id="dashboard-month" aria-label="Mês analisado">
+            <button id="dashboard-next-month" class="secondary month-arrow" type="button" aria-label="Próximo mês">›</button>
+            <button id="dashboard-current-month" class="secondary" type="button">Mês atual</button>
+          </div>
+        </div>
         <div class="kpi-grid">
           <article class="kpi highlight"><span>Saldo investido</span><strong id="kpi-investment">R$ 0,00</strong><small>Aplicação informada no perfil</small></article>
           <article class="kpi"><span>Gasto no mês</span><strong id="kpi-spending">R$ 0,00</strong><small id="kpi-cap-caption">de R$ 0,00</small></article>
@@ -87,6 +96,10 @@
             <div id="quality-list" class="quality-list"></div>
           </article>
         </div>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">DETALHAMENTO MENSAL</span><h2 id="monthly-categories-title">Gastos por categoria</h2><small id="monthly-duplicates-note" class="hidden"></small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Categoria</th><th class="right">Participação</th><th class="right">Total no mês</th></tr></thead><tbody id="monthly-categories-table"></tbody></table></div>
+        </article>
         <article class="panel cut-plan-panel">
           <div class="panel-heading"><div><span class="step-label">AÇÃO RECOMENDADA</span><h2>Plano objetivo de cortes</h2><small id="cut-plan-period">Baseado nos últimos meses importados</small></div><div class="savings-callout"><span>Economia mensal possível</span><strong id="cut-plan-savings">R$ 0,00</strong></div></div>
           <div class="table-wrap"><table><thead><tr><th>Prioridade</th><th>Categoria</th><th class="right">Média mensal</th><th class="right">Novo teto</th><th class="right">Cortar por mês</th><th>Como agir</th></tr></thead><tbody id="cut-plan-table"></tbody></table></div>

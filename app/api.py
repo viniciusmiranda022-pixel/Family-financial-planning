@@ -92,6 +92,65 @@ def decimal_value(value: Decimal | None) -> float:
     return float(value or 0)
 
 
+def _month_start(value: str | None) -> date:
+    if not value:
+        return date.today().replace(day=1)
+    try:
+        return datetime.strptime(value, "%Y-%m").date().replace(day=1)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from exc
+
+
+def _expense_signature(transaction: Transaction, account_type: str | None) -> tuple[object, ...]:
+    period: object = transaction.booked_at
+    if account_type == "credit_card":
+        period = (transaction.booked_at.year, transaction.booked_at.month)
+    return (
+        period,
+        normalize_description(transaction.description),
+        money(transaction.amount),
+        transaction.installment_current,
+        transaction.installment_total,
+    )
+
+
+def _consolidated_expenses(
+    db: Session,
+    household_id: str,
+    start: date,
+    end: date,
+) -> tuple[list[tuple[Transaction, str]], int]:
+    """Prefer the consolidated workbook when the same expense exists in another import."""
+    raw_rows = db.execute(
+        select(Transaction, Category.name, Account.account_type, Document.document_type)
+        .outerjoin(Category, Category.id == Transaction.category_id)
+        .outerjoin(Account, Account.id == Transaction.account_id)
+        .outerjoin(Document, Document.id == Transaction.document_id)
+        .where(
+            Transaction.household_id == household_id,
+            Transaction.booked_at >= start,
+            Transaction.booked_at < end,
+            Transaction.transaction_type.in_(("expense", "refund")),
+            Transaction.excluded.is_(False),
+        )
+        .order_by(Transaction.booked_at, Transaction.created_at, Transaction.id)
+    ).all()
+    workbook_signatures = {
+        _expense_signature(transaction, account_type)
+        for transaction, _category, account_type, document_type in raw_rows
+        if document_type == "financial_plan_workbook"
+    }
+    result: list[tuple[Transaction, str]] = []
+    duplicates_ignored = 0
+    for transaction, category_name, account_type, document_type in raw_rows:
+        signature = _expense_signature(transaction, account_type)
+        if document_type != "financial_plan_workbook" and signature in workbook_signatures:
+            duplicates_ignored += 1
+            continue
+        result.append((transaction, str(category_name or "Revisar")))
+    return result, duplicates_ignored
+
+
 def audit(
     db: Session,
     user: User,
@@ -452,10 +511,7 @@ def transactions(
 ) -> list[dict]:
     query = select(Transaction).where(Transaction.household_id == user.household_id)
     if month:
-        try:
-            start = datetime.strptime(month, "%Y-%m").date().replace(day=1)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from exc
+        start = _month_start(month)
         query = query.where(Transaction.booked_at >= start, Transaction.booked_at < add_months(start, 1))
     if review_only:
         query = query.where(Transaction.reviewed.is_(False))
@@ -815,25 +871,19 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
 
 
 @router.get("/cut-plan")
-def cut_plan(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
-    end = add_months(date.today().replace(day=1), 1)
+def cut_plan(
+    month: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    end = add_months(_month_start(month), 1)
     start = add_months(end, -6)
-    rows = db.execute(
-        select(Transaction.booked_at, Transaction.amount, Category.name)
-        .join(Category, Category.id == Transaction.category_id)
-        .where(
-            Transaction.household_id == user.household_id,
-            Transaction.booked_at >= start,
-            Transaction.booked_at < end,
-            Transaction.transaction_type.in_(("expense", "refund")),
-            Transaction.excluded.is_(False),
-        )
-    ).all()
-    covered = {(item.booked_at.year, item.booked_at.month) for item in rows}
+    rows, duplicates_ignored = _consolidated_expenses(db, user.household_id, start, end)
+    covered = {(transaction.booked_at.year, transaction.booked_at.month) for transaction, _ in rows}
     month_count = max(1, len(covered))
     totals: dict[str, Decimal] = {}
-    for item in rows:
-        totals[item.name] = totals.get(item.name, Decimal("0")) - Decimal(item.amount)
+    for transaction, category_name in rows:
+        totals[category_name] = totals.get(category_name, Decimal("0")) - Decimal(transaction.amount)
     categories_rows = db.scalars(
         select(Category).where(Category.household_id == user.household_id, Category.cash_cap.is_not(None))
     ).all()
@@ -866,26 +916,36 @@ def cut_plan(user: User = Depends(get_current_user), db: Session = Depends(get_d
         "window_start": start,
         "window_end": end,
         "covered_months": len(covered),
+        "duplicates_ignored": duplicates_ignored,
         "potential_monthly_savings": decimal_value(potential),
         "recommendations": recommendations,
     }
 
 
 @router.get("/dashboard")
-def dashboard(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+def dashboard(
+    month: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
     profile = profile_for(db, user.household_id)
-    start = date.today().replace(day=1)
+    start = _month_start(month)
     end = add_months(start, 1)
-    spending = db.scalar(
-        select(func.coalesce(func.sum(-Transaction.amount), 0)).where(
-            Transaction.household_id == user.household_id,
-            Transaction.booked_at >= start,
-            Transaction.booked_at < end,
-            Transaction.transaction_type.in_(("expense", "refund")),
-            Transaction.excluded.is_(False),
-        )
+    expense_rows, duplicates_ignored = _consolidated_expenses(
+        db,
+        user.household_id,
+        start,
+        end,
     )
-    spending = max(Decimal("0"), Decimal(spending or 0))
+    spending = max(
+        Decimal("0"),
+        sum((-Decimal(transaction.amount) for transaction, _ in expense_rows), Decimal("0")),
+    )
+    category_totals: dict[str, Decimal] = {}
+    for transaction, category_name in expense_rows:
+        category_totals[category_name] = category_totals.get(category_name, Decimal("0")) - Decimal(
+            transaction.amount
+        )
     review_count = db.scalar(
         select(func.count(ReviewItem.id)).where(
             ReviewItem.household_id == user.household_id, ReviewItem.status == "open"
@@ -908,5 +968,11 @@ def dashboard(user: User = Depends(get_current_user), db: Session = Depends(get_
         "emergency_floor": decimal_value(profile.emergency_floor),
         "food_benefits": decimal_value(benefit),
         "review_count": int(review_count or 0),
+        "duplicates_ignored": duplicates_ignored,
+        "category_spending": [
+            {"category": name, "amount": decimal_value(max(Decimal("0"), amount))}
+            for name, amount in sorted(category_totals.items(), key=lambda item: item[1], reverse=True)
+            if amount > 0
+        ],
         "future_commissions_gross": decimal_value(future_commission),
     }

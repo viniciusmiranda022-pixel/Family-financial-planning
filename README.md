@@ -24,6 +24,8 @@ Esta primeira versão entrega:
 - projeção sem comissão, no mês esperado e com atraso conservador;
 - rendimento do investimento sobre o saldo inicial de cada mês;
 - teto de gastos, benefícios VA/VR e saldo mínimo de segurança;
+- visão mensal navegável, com totais e categorias separados por competência;
+- consolidação automática de lançamentos repetidos entre a planilha e importações históricas;
 - plano de cortes por categoria, com média observada, novo teto e economia mensal possível;
 - backup diário do PostgreSQL com retenção configurável;
 - trilha de auditoria das alterações.

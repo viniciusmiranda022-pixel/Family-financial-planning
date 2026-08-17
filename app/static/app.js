@@ -1,6 +1,7 @@
 const state = { user: null, accounts: [], categories: [], forecast: [], forecastFloor: 0 };
 const money = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
 const dateFormat = new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" });
+const monthFormat = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
 const pageNames = {
   dashboard: "Visão geral",
   imports: "Importações",
@@ -115,11 +116,38 @@ function emptyRow(columns, text = "Nenhum registro encontrado") {
   return `<tr><td colspan="${columns}" class="empty">${escapeHtml(text)}</td></tr>`;
 }
 
+function currentMonthKey() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function shiftMonth(month, offset) {
+  const [year, value] = month.split("-").map(Number);
+  const shifted = new Date(Date.UTC(year, value - 1 + offset, 1));
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function monthLabel(month) {
+  const label = monthFormat.format(new Date(`${month}-01T00:00:00Z`));
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
 async function loadDashboard() {
-  const [summary, transactions, cutPlan] = await Promise.all([api("/dashboard"), api("/transactions?limit=8"), api("/cut-plan")]);
+  const monthControl = document.querySelector("#dashboard-month");
+  if (!monthControl.value) monthControl.value = currentMonthKey();
+  const selectedMonth = monthControl.value;
+  const [summary, transactions, cutPlan] = await Promise.all([
+    api(`/dashboard?month=${encodeURIComponent(selectedMonth)}`),
+    api(`/transactions?limit=8&month=${encodeURIComponent(selectedMonth)}`),
+    api(`/cut-plan?month=${encodeURIComponent(selectedMonth)}`),
+  ]);
+  const selectedLabel = monthLabel(summary.month);
+  monthControl.value = summary.month;
+  document.querySelector("#dashboard-period-label").textContent = selectedLabel;
+  document.querySelector("#monthly-categories-title").textContent = `Gastos de ${selectedLabel} por categoria`;
   document.querySelector("#kpi-investment").textContent = money.format(summary.investment_balance);
   document.querySelector("#kpi-spending").textContent = money.format(summary.spending);
-  document.querySelector("#kpi-cap-caption").textContent = `de ${money.format(summary.cash_cap)} no mês`;
+  document.querySelector("#kpi-cap-caption").textContent = `de ${money.format(summary.cash_cap)} em ${selectedLabel}`;
   document.querySelector("#kpi-remaining").textContent = money.format(summary.remaining_cap);
   document.querySelector("#kpi-reviews").textContent = summary.review_count;
   document.querySelector("#nav-review-count").textContent = summary.review_count;
@@ -132,11 +160,24 @@ async function loadDashboard() {
   document.querySelector("#budget-percent").textContent = `${percent}%`;
   document.querySelector("#budget-used").textContent = `${money.format(summary.spending)} usados`;
   document.querySelector("#budget-total").textContent = `${money.format(summary.cash_cap)} de teto`;
-  document.querySelector("#quality-list").innerHTML = [
+  const qualityItems = [
     [summary.review_count === 0, "Fila de revisão", summary.review_count === 0 ? "Sem pendências" : `${summary.review_count} itens`],
     [state.accounts.length > 0, "Contas cadastradas", state.accounts.length ? `${state.accounts.length} fontes` : "Cadastre a primeira"],
     [summary.cash_cap > 0, "Perfil financeiro", summary.cash_cap > 0 ? "Premissas configuradas" : "Configuração pendente"],
-  ].map(([ok, title, detail]) => `<div class="quality-item"><div><span class="quality-dot${ok ? "" : " warn"}"></span><strong>${escapeHtml(title)}</strong></div><small>${escapeHtml(detail)}</small></div>`).join("");
+  ];
+  if (summary.duplicates_ignored > 0) qualityItems.unshift([true, "Consolidação automática", `${summary.duplicates_ignored} cópia(s) ignorada(s) no mês`]);
+  document.querySelector("#quality-list").innerHTML = qualityItems.map(([ok, title, detail]) => `<div class="quality-item"><div><span class="quality-dot${ok ? "" : " warn"}"></span><strong>${escapeHtml(title)}</strong></div><small>${escapeHtml(detail)}</small></div>`).join("");
+  const duplicateNote = document.querySelector("#monthly-duplicates-note");
+  duplicateNote.classList.toggle("hidden", summary.duplicates_ignored === 0);
+  duplicateNote.textContent = summary.duplicates_ignored > 0
+    ? `${summary.duplicates_ignored} lançamento(s) repetido(s) entre a planilha consolidada e importações anteriores foram desconsiderados.`
+    : "";
+  document.querySelector("#monthly-categories-table").innerHTML = summary.category_spending.length
+    ? summary.category_spending.map((item) => {
+      const share = summary.spending > 0 ? Math.round((item.amount / summary.spending) * 100) : 0;
+      return `<tr><td><strong>${escapeHtml(item.category)}</strong></td><td class="right">${share}%</td><td class="right amount-expense">${money.format(item.amount)}</td></tr>`;
+    }).join("")
+    : emptyRow(3, `Nenhum gasto considerado em ${selectedLabel}`);
   document.querySelector("#cut-plan-savings").textContent = money.format(cutPlan.potential_monthly_savings);
   document.querySelector("#cut-plan-period").textContent = cutPlan.covered_months
     ? `${cutPlan.covered_months} mês(es) com dados entre ${dateFormat.format(new Date(`${cutPlan.window_start}T00:00:00Z`))} e ${dateFormat.format(new Date(`${cutPlan.window_end}T00:00:00Z`))}`
@@ -276,7 +317,25 @@ document.querySelector("#login-form").addEventListener("submit", async (event) =
 });
 document.querySelector("#logout-button").addEventListener("click", async () => { await api("/auth/logout", { method: "POST" }); state.user = null; showAuth(true); });
 document.querySelectorAll("#main-nav button").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
-document.querySelectorAll("[data-go]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.go)));
+document.querySelectorAll("[data-go]").forEach((button) => button.addEventListener("click", () => {
+  if (button.dataset.go === "transactions") document.querySelector("#transaction-month").value = document.querySelector("#dashboard-month").value;
+  navigate(button.dataset.go);
+}));
+document.querySelector("#dashboard-month").addEventListener("change", loadDashboard);
+document.querySelector("#dashboard-prev-month").addEventListener("click", () => {
+  const control = document.querySelector("#dashboard-month");
+  control.value = shiftMonth(control.value || currentMonthKey(), -1);
+  loadDashboard();
+});
+document.querySelector("#dashboard-next-month").addEventListener("click", () => {
+  const control = document.querySelector("#dashboard-month");
+  control.value = shiftMonth(control.value || currentMonthKey(), 1);
+  loadDashboard();
+});
+document.querySelector("#dashboard-current-month").addEventListener("click", () => {
+  document.querySelector("#dashboard-month").value = currentMonthKey();
+  loadDashboard();
+});
 document.querySelector("#refresh-transactions").addEventListener("click", loadTransactions);
 document.querySelector("#refresh-forecast").addEventListener("click", loadForecast);
 
