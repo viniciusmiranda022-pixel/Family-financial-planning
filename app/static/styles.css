@@ -77,12 +77,14 @@ input:focus, select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgb
 .month-navigation input { width: 165px; padding: 9px 11px; }
 .month-navigation button { padding: 10px 13px; }
 .month-navigation .month-arrow { width: 40px; padding: 10px 0; font-size: 20px; line-height: 1; }
-.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 17px; margin-bottom: 17px; }
+.kpi-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 17px; margin-bottom: 17px; }
 .kpi { min-height: 145px; padding: 23px; border: 1px solid var(--line); border-radius: 15px; background: var(--surface); box-shadow: var(--shadow); }
 .kpi.highlight { background: var(--soft-green); border-color: #cbe9d8; }
 .kpi.warning { background: var(--soft-amber); border-color: #f3dfaa; }
 .kpi span, .kpi small { display: block; color: var(--muted); font-size: 12px; font-weight: 700; }
 .kpi strong { display: block; margin: 15px 0 7px; color: var(--navy); font-size: 29px; letter-spacing: -.04em; }
+.kpi.cash-in strong { color: var(--green); }
+.kpi.cash-out strong { color: var(--red); }
 .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; margin-bottom: 17px; }
 .two-column.form-layout { grid-template-columns: 1.3fr .7fr; align-items: start; }
 .panel { margin-bottom: 17px; padding: 22px; border: 1px solid var(--line); border-radius: 15px; background: var(--surface); box-shadow: var(--shadow); }
@@ -90,6 +92,7 @@ input:focus, select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgb
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
 .panel-heading h2 { margin: 2px 0 0; font-size: 18px; letter-spacing: -.02em; }
 .metric-pill { padding: 7px 10px; border-radius: 999px; background: var(--soft-green); color: var(--green); font-size: 12px; font-weight: 900; }
+.metric-pill.over { color: var(--red); background: #fee2e2; }
 .budget-track { height: 13px; overflow: hidden; border-radius: 999px; background: #e8eef2; }
 .budget-track div { width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #0f766e, #22a67f); transition: width .5s; }
 .budget-track div.over { background: linear-gradient(90deg, #b42318, #ef4444); }
@@ -109,7 +112,9 @@ input:focus, select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgb
 .savings-callout { min-width: 210px; padding: 12px 15px; border-radius: 11px; background: var(--soft-green); text-align: right; }
 .savings-callout span { display: block; color: var(--muted); font-size: 10px; font-weight: 700; }
 .savings-callout strong { display: block; margin-top: 3px; color: var(--green); font-size: 21px; }
+.savings-callout small { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; }
 .muted-field { opacity: .48; }
+.muted-copy { color: var(--muted); line-height: 1.65; }
 
 .table-wrap { overflow: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -123,6 +128,10 @@ tr:last-child td { border-bottom: 0; }
 .status-chip.warn { color: #8a5a10; background: var(--soft-amber); }
 .status-chip.ok { color: var(--green); background: var(--soft-green); }
 .status-chip.muted { color: var(--muted); background: #eef2f4; }
+.danger-button, .text-action { border: 0; border-radius: 8px; padding: 7px 9px; font-size: 10px; font-weight: 800; white-space: nowrap; }
+.danger-button { color: var(--red); background: #feeceb; }
+.text-action { color: var(--navy-2); background: var(--soft-blue); }
+.danger-button:hover, .text-action:hover { filter: brightness(.96); }
 .empty { color: var(--muted); text-align: center; padding: 32px !important; }
 
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
@@ -173,6 +182,7 @@ tr:last-child td { border-bottom: 0; }
   .month-navigation { flex-wrap: wrap; }
   .month-navigation input { flex: 1; min-width: 150px; }
   .kpi-grid, .form-grid, .form-grid.three { grid-template-columns: 1fr; }
+  .full-on-mobile { grid-column: 1 / -1; }
   .projection-kpis { grid-template-columns: 1fr; }
   .privacy-chip { display: none; }
 }
