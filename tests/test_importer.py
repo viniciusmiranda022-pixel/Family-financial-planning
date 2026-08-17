@@ -26,6 +26,6 @@ def test_exact_overlap_has_same_fingerprint() -> None:
 
 
 def test_internal_transfer_requires_review_and_is_excluded() -> None:
-    result = classify("PIX TRANSF KELLY", -100)
+    result = classify("PIX TRANSF PESSOA A", -100, ("Pessoa A", "Pessoa B"))
     assert result.excluded is True
     assert result.review_reason is not None

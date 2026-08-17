@@ -344,6 +344,12 @@ async def import_document(
 
     imported = 0
     review_count = 0
+    internal_aliases = tuple(
+        {
+            *db.scalars(select(User.name).where(User.household_id == user.household_id)).all(),
+            *db.scalars(select(Account.owner_label).where(Account.household_id == user.household_id)).all(),
+        }
+    )
     for item in parsed:
         fingerprint = transaction_fingerprint(account.id, item, account.owner_label)
         duplicate = bool(
@@ -354,7 +360,7 @@ async def import_document(
                 )
             )
         )
-        classification = classify(item.description, float(item.amount))
+        classification = classify(item.description, float(item.amount), internal_aliases)
         category = category_for(db, user.household_id, classification.category)
         transaction = Transaction(
             household_id=user.household_id,

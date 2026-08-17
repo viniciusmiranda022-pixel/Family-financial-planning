@@ -74,7 +74,7 @@ RULES: tuple[tuple[re.Pattern[str], Classification], ...] = (
 )
 
 
-def classify(description: str, amount: float) -> Classification:
+def classify(description: str, amount: float, internal_aliases: tuple[str, ...] = ()) -> Classification:
     normalized = normalize_description(description)
     if "MERCADO PAG" in normalized:
         return Classification(
@@ -84,11 +84,14 @@ def classify(description: str, amount: float) -> Classification:
             0.45,
             "Mercado Pago é intermediador; confirmar a finalidade real",
         )
-    if re.search(r"RODRIGO", normalized):
+    if re.search(r"REPASSE|REEMBOLSO", normalized):
         return Classification(
             "Repasses a confirmar", "transfer", True, 0.65, "Confirmar se é repasse ou reembolso"
         )
-    if re.search(r"VINICIUS|KELLY", normalized) and re.search(r"PIX|TED|TRANSF", normalized):
+    normalized_aliases = tuple(
+        alias for raw_alias in internal_aliases if len(alias := normalize_description(raw_alias)) >= 3
+    )
+    if any(alias in normalized for alias in normalized_aliases) and re.search(r"PIX|TED|TRANSF", normalized):
         return Classification(
             "Transferência interna", "transfer", True, 0.8, "Confirmar transferência entre o casal"
         )
