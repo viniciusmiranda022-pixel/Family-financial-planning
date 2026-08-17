@@ -9,6 +9,7 @@ const pageNames = {
   reviews: "Revisar",
   income: "Rendas",
   planning: "Planejamento",
+  users: "Acessos",
   settings: "Configurações",
 };
 
@@ -68,6 +69,7 @@ async function showApp() {
   document.querySelector("#auth-shell").classList.add("hidden");
   document.querySelector("#app-shell").classList.remove("hidden");
   document.querySelector("#current-user").textContent = state.user.name;
+  document.querySelector("#nav-users").classList.toggle("hidden", !state.user.is_admin);
   await Promise.all([loadAccounts(), loadCategories()]);
   await navigate("dashboard");
 }
@@ -95,6 +97,7 @@ async function navigate(view) {
     reviews: loadReviews,
     income: loadIncome,
     planning: loadForecast,
+    users: loadUsers,
     settings: loadProfile,
   };
   try { await loaders[view]?.(); } catch (error) { toast(error.message, true); }
@@ -106,10 +109,15 @@ async function loadAccounts() {
   select.innerHTML = state.accounts.length
     ? state.accounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("")
     : '<option value="">Cadastre uma conta primeiro</option>';
+  const transactionSelect = document.querySelector("#transaction-account");
+  transactionSelect.innerHTML = state.accounts.length
+    ? state.accounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("")
+    : '<option value="">Cadastre uma conta primeiro</option>';
 }
 
 async function loadCategories() {
   state.categories = await api("/categories");
+  document.querySelector("#transaction-category").innerHTML = categoryOptions();
 }
 
 function emptyRow(columns, text = "Nenhum registro encontrado") {
@@ -119,6 +127,11 @@ function emptyRow(columns, text = "Nenhum registro encontrado") {
 function currentMonthKey() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function currentDateKey() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 }
 
 function shiftMonth(month, offset) {
@@ -146,6 +159,8 @@ async function loadDashboard() {
   document.querySelector("#dashboard-period-label").textContent = selectedLabel;
   document.querySelector("#monthly-categories-title").textContent = `Gastos de ${selectedLabel} por categoria`;
   document.querySelector("#kpi-investment").textContent = money.format(summary.investment_balance);
+  document.querySelector("#kpi-cash-in").textContent = money.format(summary.cash_in);
+  document.querySelector("#kpi-cash-out").textContent = money.format(summary.cash_out);
   document.querySelector("#kpi-spending").textContent = money.format(summary.spending);
   document.querySelector("#kpi-cap-caption").textContent = `de ${money.format(summary.cash_cap)} em ${selectedLabel}`;
   document.querySelector("#kpi-remaining").textContent = money.format(summary.remaining_cap);
@@ -157,7 +172,9 @@ async function loadDashboard() {
   const bar = document.querySelector("#budget-progress");
   bar.style.width = `${width}%`;
   bar.classList.toggle("over", percent > 100);
-  document.querySelector("#budget-percent").textContent = `${percent}%`;
+  const percentPill = document.querySelector("#budget-percent");
+  percentPill.textContent = `${percent}%`;
+  percentPill.classList.toggle("over", percent > 100);
   document.querySelector("#budget-used").textContent = `${money.format(summary.spending)} usados`;
   document.querySelector("#budget-total").textContent = `${money.format(summary.cash_cap)} de teto`;
   const qualityItems = [
@@ -165,12 +182,12 @@ async function loadDashboard() {
     [state.accounts.length > 0, "Contas cadastradas", state.accounts.length ? `${state.accounts.length} fontes` : "Cadastre a primeira"],
     [summary.cash_cap > 0, "Perfil financeiro", summary.cash_cap > 0 ? "Premissas configuradas" : "Configuração pendente"],
   ];
-  if (summary.duplicates_ignored > 0) qualityItems.unshift([true, "Consolidação automática", `${summary.duplicates_ignored} cópia(s) ignorada(s) no mês`]);
+  if (summary.duplicates_ignored > 0) qualityItems.unshift([true, "Duplicidades evitadas", `${summary.duplicates_ignored} registros repetidos foram contados apenas uma vez`]);
   document.querySelector("#quality-list").innerHTML = qualityItems.map(([ok, title, detail]) => `<div class="quality-item"><div><span class="quality-dot${ok ? "" : " warn"}"></span><strong>${escapeHtml(title)}</strong></div><small>${escapeHtml(detail)}</small></div>`).join("");
   const duplicateNote = document.querySelector("#monthly-duplicates-note");
   duplicateNote.classList.toggle("hidden", summary.duplicates_ignored === 0);
   duplicateNote.textContent = summary.duplicates_ignored > 0
-    ? `${summary.duplicates_ignored} lançamento(s) repetido(s) entre a planilha consolidada e importações anteriores foram desconsiderados.`
+    ? `${summary.duplicates_ignored} registros apareceram tanto na planilha quanto em arquivos importados. O sistema preservou as duas fontes para auditoria, mas contou cada movimentação apenas uma vez.`
     : "";
   document.querySelector("#monthly-categories-table").innerHTML = summary.category_spending.length
     ? summary.category_spending.map((item) => {
@@ -180,7 +197,7 @@ async function loadDashboard() {
     : emptyRow(3, `Nenhum gasto considerado em ${selectedLabel}`);
   document.querySelector("#cut-plan-savings").textContent = money.format(cutPlan.potential_monthly_savings);
   document.querySelector("#cut-plan-period").textContent = cutPlan.covered_months
-    ? `${cutPlan.covered_months} mês(es) com dados entre ${dateFormat.format(new Date(`${cutPlan.window_start}T00:00:00Z`))} e ${dateFormat.format(new Date(`${cutPlan.window_end}T00:00:00Z`))}`
+    ? `Histórico de ${monthLabel(cutPlan.analysis_start_month)} a ${monthLabel(cutPlan.analysis_end_month)} • ${cutPlan.covered_months} meses com dados • média de ${money.format(cutPlan.monthly_average)}`
     : "Importe os extratos e cartões para receber recomendações específicas";
   document.querySelector("#cut-plan-table").innerHTML = cutPlan.recommendations.length ? cutPlan.recommendations.slice(0, 8).map((item) => `
     <tr><td><span class="status-chip ${item.priority === "alta" ? "warn" : "muted"}">${escapeHtml(item.priority)}</span></td><td><strong>${escapeHtml(item.category)}</strong></td><td class="right">${money.format(item.average)}</td><td class="right">${money.format(item.target)}</td><td class="right amount-expense"><strong>${money.format(item.suggested_cut)}</strong></td><td><small>${escapeHtml(item.rationale)}</small></td></tr>
@@ -203,6 +220,16 @@ function categoryOptions(selected) {
   return state.categories.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === selected ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
 }
 
+function updateManualTransactionFields() {
+  const movementType = document.querySelector("#transaction-movement-type").value;
+  const category = document.querySelector("#transaction-category");
+  const categoryField = document.querySelector("#transaction-category-field");
+  const needsCategory = movementType === "expense";
+  category.disabled = !needsCategory;
+  category.required = needsCategory;
+  categoryField.classList.toggle("muted-field", !needsCategory);
+}
+
 async function loadTransactions() {
   const month = document.querySelector("#transaction-month").value;
   const items = await api(`/transactions?limit=500${month ? `&month=${month}` : ""}`);
@@ -212,14 +239,28 @@ async function loadTransactions() {
       <td><strong>${escapeHtml(item.description)}</strong>${item.installment ? `<br><small>Parcela ${escapeHtml(item.installment)}</small>` : ""}</td>
       <td><select class="category-select" data-id="${escapeHtml(item.id)}">${categoryOptions(item.category_id)}</select></td>
       <td>${escapeHtml(item.owner)}</td><td>${escapeHtml(item.account)}</td>
-      <td>${item.possible_duplicate ? '<span class="status-chip warn">Possível duplicidade</span>' : item.excluded ? '<span class="status-chip muted">Excluído do cálculo</span>' : '<span class="status-chip ok">Considerado</span>'}</td>
+      <td>${item.possible_duplicate ? '<span class="status-chip warn">Possível duplicidade</span>' : item.excluded ? `<span class="status-chip muted">${item.manual ? "Fora do teto" : "Ignorado no cálculo"}</span>` : '<span class="status-chip ok">Considerado</span>'}</td>
       <td class="right ${item.amount < 0 ? "amount-expense" : "amount-income"}">${money.format(item.amount)}</td>
+      <td class="right">${item.manual
+        ? `<button class="danger-button delete-transaction" data-id="${escapeHtml(item.id)}">Excluir</button>`
+        : `<button class="text-action toggle-transaction" data-id="${escapeHtml(item.id)}" data-excluded="${item.excluded}">${item.excluded ? "Reconsiderar" : "Ignorar"}</button>`}</td>
     </tr>
-  `).join("") : emptyRow(7);
+  `).join("") : emptyRow(8);
   document.querySelectorAll(".category-select").forEach((select) => select.addEventListener("change", async (event) => {
     try {
       await api(`/transactions/${event.target.dataset.id}`, { method: "PATCH", body: JSON.stringify({ category_id: event.target.value, reviewed: true }) });
       toast("Categoria atualizada e item revisado");
+    } catch (error) { toast(error.message, true); }
+  }));
+  document.querySelectorAll(".delete-transaction").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("Excluir definitivamente este lançamento manual?")) return;
+    try { await api(`/transactions/${button.dataset.id}`, { method: "DELETE" }); await loadTransactions(); await loadDashboard(); toast("Lançamento excluído"); }
+    catch (error) { toast(error.message, true); }
+  }));
+  document.querySelectorAll(".toggle-transaction").forEach((button) => button.addEventListener("click", async () => {
+    try {
+      await api(`/transactions/${button.dataset.id}`, { method: "PATCH", body: JSON.stringify({ excluded: button.dataset.excluded !== "true", reviewed: true }) });
+      await loadTransactions(); await loadDashboard(); toast("Cálculo atualizado");
     } catch (error) { toast(error.message, true); }
   }));
 }
@@ -239,12 +280,22 @@ async function loadReviews() {
 async function loadIncome() {
   const [commissions, payroll] = await Promise.all([api("/commissions"), api("/payroll")]);
   document.querySelector("#commissions-table").innerHTML = commissions.length ? commissions.map((item) => `
-    <tr><td>${dateFormat.format(new Date(`${item.expected_date}T00:00:00Z`))}</td><td>${escapeHtml(item.description)}</td><td class="right">${money.format(item.gross)}</td><td class="right amount-expense">${money.format(item.tax)}</td><td class="right amount-income">${money.format(item.net)}</td></tr>
-  `).join("") : emptyRow(5, "Nenhuma comissão cadastrada");
+    <tr><td>${dateFormat.format(new Date(`${item.expected_date}T00:00:00Z`))}</td><td>${escapeHtml(item.description)}</td><td class="right">${money.format(item.gross)}</td><td class="right amount-expense">${money.format(item.tax)}</td><td class="right amount-income">${money.format(item.net)}</td><td class="right"><button class="danger-button delete-commission" data-id="${escapeHtml(item.id)}">Excluir</button></td></tr>
+  `).join("") : emptyRow(6, "Nenhuma comissão cadastrada");
   const kindLabels = { regular: "Salário", "13_first": "1ª do 13º", "13_second": "2ª do 13º", vacation_extra: "Férias adicionais", other: "Outro" };
   document.querySelector("#payroll-table").innerHTML = payroll.length ? payroll.map((item) => `
-    <tr><td>${dateFormat.format(new Date(`${item.payment_date}T00:00:00Z`))}</td><td>${escapeHtml(item.person_name)}</td><td>${kindLabels[item.kind] || escapeHtml(item.kind)}</td><td class="right amount-income">${money.format(item.net)}</td></tr>
-  `).join("") : emptyRow(4, "Nenhum holerite cadastrado");
+    <tr><td>${dateFormat.format(new Date(`${item.payment_date}T00:00:00Z`))}</td><td>${escapeHtml(item.person_name)}</td><td>${kindLabels[item.kind] || escapeHtml(item.kind)}</td><td class="right amount-income">${money.format(item.net)}</td><td class="right">${item.manual ? `<button class="danger-button delete-payroll" data-id="${escapeHtml(item.id)}">Excluir</button>` : '<span class="status-chip muted">Importado</span>'}</td></tr>
+  `).join("") : emptyRow(5, "Nenhum holerite cadastrado");
+  document.querySelectorAll(".delete-commission").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("Excluir esta comissão da projeção?")) return;
+    try { await api(`/commissions/${button.dataset.id}`, { method: "DELETE" }); await loadIncome(); toast("Comissão excluída"); }
+    catch (error) { toast(error.message, true); }
+  }));
+  document.querySelectorAll(".delete-payroll").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("Excluir este registro manual de folha?")) return;
+    try { await api(`/payroll/${button.dataset.id}`, { method: "DELETE" }); await loadIncome(); toast("Registro de folha excluído"); }
+    catch (error) { toast(error.message, true); }
+  }));
 }
 
 async function loadProfile() {
@@ -254,7 +305,7 @@ async function loadProfile() {
 }
 
 async function loadForecast() {
-  const data = await api("/forecast");
+  const [data, obligations] = await Promise.all([api("/forecast"), api("/obligations")]);
   state.forecast = data.rows;
   state.forecastFloor = data.summary.emergency_floor;
   document.querySelector("#forecast-final").textContent = money.format(data.summary.final_delayed);
@@ -265,7 +316,28 @@ async function loadForecast() {
   document.querySelector("#forecast-table").innerHTML = data.rows.length ? data.rows.map((item) => `
     <tr><td>${escapeHtml(item.month)}</td><td class="right">${money.format(item.salary)}</td><td class="right">${money.format(item.payroll_extras)}</td><td class="right amount-income">${money.format(item.commission_delayed)}</td><td class="right amount-expense">${money.format(item.obligations)}</td><td class="right amount-expense">${money.format(item.installments)}</td><td class="right amount-income">${money.format(item.investment_return_delayed)}</td><td class="right ${item.balance_delayed < data.summary.emergency_floor ? "amount-expense" : "amount-income"}">${money.format(item.balance_delayed)}</td></tr>
   `).join("") : emptyRow(8, "Configure as premissas financeiras");
+  document.querySelector("#obligations-table").innerHTML = obligations.length ? obligations.map((item) => `
+    <tr><td>${dateFormat.format(new Date(`${item.due_date}T00:00:00Z`))}</td><td><strong>${escapeHtml(item.name)}</strong></td><td>${escapeHtml(item.category)}</td><td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td><td class="right amount-expense">${money.format(item.amount)}</td><td class="right"><button class="danger-button delete-obligation" data-id="${escapeHtml(item.id)}">Excluir</button></td></tr>
+  `).join("") : emptyRow(6, "Nenhum compromisso ativo");
+  document.querySelectorAll(".delete-obligation").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("Excluir este compromisso das projeções futuras?")) return;
+    try { await api(`/obligations/${button.dataset.id}`, { method: "DELETE" }); await loadForecast(); toast("Compromisso excluído"); }
+    catch (error) { toast(error.message, true); }
+  }));
   drawForecast(data.rows, data.summary.emergency_floor);
+}
+
+async function loadUsers() {
+  if (!state.user.is_admin) return navigate("dashboard");
+  const items = await api("/users");
+  document.querySelector("#users-table").innerHTML = items.length ? items.map((item) => `
+    <tr><td><strong>${escapeHtml(item.name)}</strong>${item.is_current ? " <small>(você)</small>" : ""}</td><td>${escapeHtml(item.username)}</td><td>${item.is_admin ? "Administrador" : "Usuário da família"}</td><td><span class="status-chip ${item.active ? "ok" : "muted"}">${item.active ? "Ativo" : "Desativado"}</span></td><td class="right">${item.active && !item.is_current ? `<button class="danger-button deactivate-user" data-id="${escapeHtml(item.id)}">Desativar</button>` : ""}</td></tr>
+  `).join("") : emptyRow(5, "Nenhum usuário cadastrado");
+  document.querySelectorAll(".deactivate-user").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("Desativar este acesso? O histórico financeiro será preservado.")) return;
+    try { await api(`/users/${button.dataset.id}`, { method: "DELETE" }); await loadUsers(); toast("Acesso desativado"); }
+    catch (error) { toast(error.message, true); }
+  }));
 }
 
 function drawForecast(rows, floor) {
@@ -338,6 +410,22 @@ document.querySelector("#dashboard-current-month").addEventListener("click", () 
 });
 document.querySelector("#refresh-transactions").addEventListener("click", loadTransactions);
 document.querySelector("#refresh-forecast").addEventListener("click", loadForecast);
+document.querySelector("#transaction-movement-type").addEventListener("change", updateManualTransactionFields);
+
+document.querySelector("#transaction-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const payload = formJson(event.target, ["amount"]);
+    await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
+    const month = payload.booked_at.slice(0, 7);
+    event.target.reset();
+    event.target.elements.booked_at.value = currentDateKey();
+    document.querySelector("#transaction-month").value = month;
+    updateManualTransactionFields();
+    await loadTransactions();
+    toast("Lançamento registrado");
+  } catch (error) { toast(error.message, true); }
+});
 
 document.querySelector("#account-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -376,6 +464,13 @@ document.querySelector("#obligation-form").addEventListener("submit", async (eve
   try { await api("/obligations", { method: "POST", body: JSON.stringify(formJson(event.target, ["amount", "recurrence_months", "occurrence_count"])) }); event.target.reset(); event.target.elements.recurrence_months.value = "0"; event.target.elements.occurrence_count.value = "1"; await loadForecast(); toast("Compromisso incluído na projeção"); }
   catch (error) { toast(error.message, true); }
 });
+document.querySelector("#user-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = formJson(event.target);
+  payload.is_admin = payload.is_admin === "true";
+  try { await api("/users", { method: "POST", body: JSON.stringify(payload) }); event.target.reset(); await loadUsers(); toast("Acesso criado com sucesso"); }
+  catch (error) { toast(error.message, true); }
+});
 document.querySelector("#profile-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const numeric = ["monthly_salary_net", "monthly_cash_cap", "emergency_floor", "food_allowance", "meal_allowance_daily", "workdays_month", "investment_balance", "investment_gross_annual_rate", "investment_income_tax_rate"];
@@ -384,4 +479,6 @@ document.querySelector("#profile-form").addEventListener("submit", async (event)
 });
 
 window.addEventListener("resize", () => { if (state.forecast.length) drawForecast(state.forecast, state.forecastFloor); });
+document.querySelector("#transaction-form").elements.booked_at.value = currentDateKey();
+updateManualTransactionFields();
 bootstrap();
