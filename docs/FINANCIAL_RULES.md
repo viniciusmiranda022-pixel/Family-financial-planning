@@ -20,6 +20,8 @@
 - Reimportação exata é bloqueada pelo hash do arquivo.
 - Lançamento com fingerprint já existente é marcado como possível duplicidade e excluído provisoriamente.
 - O usuário decide se mantém excluído ou confirma como lançamento legítimo.
+- Quando a planilha consolidada e um documento histórico contêm o mesmo lançamento, a planilha é a fonte canônica nos totais mensais; a cópia não é apagada e permanece auditável.
+- Cartões são conciliados pela competência da fatura; contas correntes usam a data exata do lançamento.
 
 ## Renda PJ e comissões
 
