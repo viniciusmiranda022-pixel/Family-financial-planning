@@ -1,0 +1,61 @@
+# Arquitetura
+
+## Princípios
+
+1. **Dados locais:** o Git contém somente código, documentação e testes.
+2. **Cálculo determinístico:** imposto, projeção, deduplicação e conciliação não dependem de resposta probabilística.
+3. **IA assistiva:** classificadores ou modelos futuros sugerem; não alteram o livro financeiro silenciosamente.
+4. **Rastreabilidade:** todo lançamento importado mantém documento, linha, conta, titular e nível de confiança.
+5. **Correção sem apagamento:** revisão altera status e classificação, preservando o evento original e a trilha de auditoria.
+
+## Componentes
+
+### Aplicação
+
+FastAPI serve a interface web e a API. Para o MVP, o processamento ocorre no próprio serviço porque o volume é familiar. Um worker separado poderá ser adicionado quando OCR ou modelos locais exigirem filas demoradas.
+
+### PostgreSQL
+
+Armazena usuários, contas, categorias, documentos, lançamentos, pendências, comissões, holerites, compromissos, perfil financeiro e auditoria.
+
+### Documentos
+
+O arquivo original é criptografado com Fernet antes de ser persistido no volume. O banco guarda SHA-256, nome original, tipo, status e caminho criptografado.
+
+### Backup
+
+Um contêiner isolado executa `pg_dump` diariamente. A retenção local padrão é de 30 dias. A cópia externa deve ser implementada na operação do servidor.
+
+## Fluxo de importação
+
+```text
+Upload
+  -> valida tamanho e extensão
+  -> calcula SHA-256
+  -> bloqueia arquivo idêntico
+  -> criptografa original
+  -> escolhe parser CSV / OFX / PDF
+  -> separa as duas colunas de faturas Itaú quando aplicável
+  -> extrai totais e consignado de holerites compatíveis
+  -> normaliza sinais e valores
+  -> classifica
+  -> calcula fingerprint de transação
+  -> marca possíveis duplicidades
+  -> cria fila de revisão
+  -> registra auditoria
+```
+
+Um documento inválido ou incompatível não interrompe o sistema: o original permanece criptografado e uma pendência é criada para revisão.
+
+## Modelo de deduplicação
+
+Existem dois níveis:
+
+- **arquivo idêntico:** SHA-256 igual; importação bloqueada;
+- **lançamento possivelmente repetido:** conta, data, valor, descrição normalizada, titular e parcela iguais; registro preservado, excluído provisoriamente dos totais e encaminhado para revisão.
+
+Essa estratégia evita dupla contagem sem apagar duas compras legítimas que eventualmente tenham o mesmo valor.
+
+## Evolução
+
+Quando OCR e IA local forem adicionados, a topologia passa a incluir Redis e um worker dedicado. A API e o modelo de dados permanecem compatíveis.
