@@ -17,7 +17,7 @@ os.environ["SESSION_SECURE"] = "false"
 
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Account, Category, Document, Household, Transaction  # noqa: E402
+from app.models import Account, Category, Document, Household, ReviewItem, Transaction  # noqa: E402
 
 Base.metadata.create_all(bind=engine)
 
@@ -137,12 +137,41 @@ def test_complete_local_financial_flow() -> None:
                     confidence=Decimal("1"),
                 )
             )
+            august_transaction = db.scalar(
+                select(Transaction).where(
+                    Transaction.booked_at == date(2026, 8, 4),
+                    Transaction.description == "iFood - NuPay",
+                )
+            )
+            july_transaction = db.scalar(
+                select(Transaction).where(
+                    Transaction.booked_at == date(2026, 7, 31),
+                    Transaction.description == "iFood - NuPay",
+                )
+            )
+            assert august_transaction is not None
+            assert july_transaction is not None
+            db.add_all(
+                (
+                    ReviewItem(
+                        household_id=household.id,
+                        transaction_id=august_transaction.id,
+                        reason="test_august_review",
+                    ),
+                    ReviewItem(
+                        household_id=household.id,
+                        transaction_id=july_transaction.id,
+                        reason="test_july_review",
+                    ),
+                )
+            )
             db.commit()
 
         dashboard = client.get("/api/dashboard").json()
         assert dashboard["spending"] == 76.78
         assert dashboard["food_benefits"] == 1630.0
         assert dashboard["duplicates_ignored"] == 1
+        assert dashboard["review_count"] == 1
         assert dashboard["category_spending"][0] == {
             "category": "Restaurantes e delivery",
             "amount": 44.88,
@@ -152,6 +181,7 @@ def test_complete_local_financial_flow() -> None:
         assert july_dashboard.status_code == 200
         assert july_dashboard.json()["month"] == "2026-07"
         assert july_dashboard.json()["spending"] == 33.4
+        assert july_dashboard.json()["review_count"] == 1
         assert client.get("/api/dashboard?month=07-2026").status_code == 422
         july_cuts = client.get("/api/cut-plan?month=2026-07").json()
         assert july_cuts["covered_months"] == 1
