@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Planejamento Financeiro Familiar</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body data-configured="{{ 'true' if configured else 'false' }}">
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <main id="auth-shell" class="auth-shell">
+    <section class="auth-brand">
+      <div class="brand-mark">FF</div>
+      <p class="eyebrow">ON-PREMISES • DADOS LOCAIS</p>
+      <h1>Planejamento financeiro com rastreabilidade.</h1>
+      <p>Importe documentos, revise o que for ambíguo e projete cada compromisso sem depender de uma planilha manual.</p>
+      <ul>
+        <li>Documentos criptografados no servidor</li>
+        <li>Deduplicação de arquivos e lançamentos</li>
+        <li>Cálculos auditáveis e cenários conservadores</li>
+      </ul>
+    </section>
+    <section class="auth-panel">
+      <form id="setup-form" class="auth-form hidden">
+        <span class="step-label">PRIMEIRO ACESSO</span>
+        <h2>Configurar sua família</h2>
+        <p>Crie o administrador local. Nenhuma informação será enviada para fora do servidor.</p>
+        <label>Nome da família<input name="household_name" value="Família" required minlength="2"></label>
+        <label>Seu nome<input name="name" required minlength="2" autocomplete="name"></label>
+        <label>Usuário<input name="username" required minlength="3" autocomplete="username"></label>
+        <label>Senha<input type="password" name="password" required minlength="10" autocomplete="new-password"></label>
+        <button class="primary full" type="submit">Criar ambiente local</button>
+      </form>
+      <form id="login-form" class="auth-form hidden">
+        <span class="step-label">ACESSO LOCAL</span>
+        <h2>Entrar no sistema</h2>
+        <p>Use o usuário criado no primeiro acesso.</p>
+        <label>Usuário<input name="username" required autocomplete="username"></label>
+        <label>Senha<input type="password" name="password" required autocomplete="current-password"></label>
+        <button class="primary full" type="submit">Entrar</button>
+      </form>
+    </section>
+  </main>
+
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand"><span class="brand-mark small">FF</span><strong>Family Finance</strong></div>
+      <nav id="main-nav">
+        <button data-view="dashboard" class="active"><span>⌂</span>Visão geral</button>
+        <button data-view="imports"><span>⇧</span>Importações</button>
+        <button data-view="transactions"><span>≡</span>Lançamentos</button>
+        <button data-view="reviews"><span>!</span>Revisar <b id="nav-review-count" class="badge">0</b></button>
+        <button data-view="income"><span>+</span>Rendas</button>
+        <button data-view="planning"><span>↗</span>Planejamento</button>
+        <button data-view="settings"><span>⚙</span>Configurações</button>
+      </nav>
+      <div class="sidebar-footer">
+        <span id="current-user">Usuário local</span>
+        <button id="logout-button" class="text-button">Sair</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div><p class="eyebrow">PLANEJAMENTO FINANCEIRO FAMILIAR</p><h1 id="page-title">Visão geral</h1></div>
+        <div class="privacy-chip"><span></span> Dados no servidor local</div>
+      </header>
+
+      <section id="view-dashboard" class="view active">
+        <div class="kpi-grid">
+          <article class="kpi highlight"><span>Saldo investido</span><strong id="kpi-investment">R$ 0,00</strong><small>Aplicação informada no perfil</small></article>
+          <article class="kpi"><span>Gasto no mês</span><strong id="kpi-spending">R$ 0,00</strong><small id="kpi-cap-caption">de R$ 0,00</small></article>
+          <article class="kpi"><span>Disponível no teto</span><strong id="kpi-remaining">R$ 0,00</strong><small>Sem contar parcelas antigas</small></article>
+          <article class="kpi warning"><span>Pendências</span><strong id="kpi-reviews">0</strong><small>Itens aguardando confirmação</small></article>
+        </div>
+        <div class="two-column">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">CONTROLE MENSAL</span><h2>Consumo do teto</h2></div><span id="budget-percent" class="metric-pill">0%</span></div>
+            <div class="budget-track"><div id="budget-progress"></div></div>
+            <div class="budget-legend"><span id="budget-used">R$ 0 usados</span><span id="budget-total">R$ 0 de teto</span></div>
+            <div class="callout"><strong>Benefícios de alimentação</strong><span id="food-benefits">R$ 0,00</span><small>VA + VR ficam separados do dinheiro livre.</small></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">PRÓXIMOS PASSOS</span><h2>Qualidade dos dados</h2></div></div>
+            <div id="quality-list" class="quality-list"></div>
+          </article>
+        </div>
+        <article class="panel cut-plan-panel">
+          <div class="panel-heading"><div><span class="step-label">AÇÃO RECOMENDADA</span><h2>Plano objetivo de cortes</h2><small id="cut-plan-period">Baseado nos últimos meses importados</small></div><div class="savings-callout"><span>Economia mensal possível</span><strong id="cut-plan-savings">R$ 0,00</strong></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Prioridade</th><th>Categoria</th><th class="right">Média mensal</th><th class="right">Novo teto</th><th class="right">Cortar por mês</th><th>Como agir</th></tr></thead><tbody id="cut-plan-table"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">ÚLTIMOS LANÇAMENTOS</span><h2>Movimentações recentes</h2></div><button data-go="transactions" class="secondary">Ver todos</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Conta</th><th class="right">Valor</th></tr></thead><tbody id="recent-transactions"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-imports" class="view">
+        <div class="two-column form-layout">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">NOVO ARQUIVO</span><h2>Importar documento</h2></div></div>
+            <form id="import-form" class="form-grid">
+              <label id="import-account-field">Conta ou cartão<select name="account_id" id="import-account" required></select></label>
+              <label>Tipo de documento<select name="document_type" id="import-document-type"><option value="bank_statement">Extrato bancário</option><option value="credit_card">Fatura/cartão de crédito</option><option value="payroll">Holerite</option></select></label>
+              <label class="file-field full"><input type="file" name="file" accept=".pdf,.csv,.txt,.ofx,.qfx" required><span><strong>Selecionar PDF, CSV ou OFX</strong><small>Máximo de 25 MB. Holerites devem ser enviados em PDF.</small></span></label>
+              <button class="primary" type="submit">Importar e verificar</button>
+            </form>
+          </article>
+          <article class="panel compact">
+            <div class="panel-heading"><div><span class="step-label">CADASTRO</span><h2>Nova conta</h2></div></div>
+            <form id="account-form" class="form-grid">
+              <label>Nome<input name="name" placeholder="Itaú conta corrente" required></label>
+              <label>Instituição<input name="institution" placeholder="Itaú"></label>
+              <label>Tipo<select name="account_type"><option value="checking">Conta corrente</option><option value="credit_card">Cartão</option><option value="investment">Investimento</option><option value="cash">Dinheiro</option></select></label>
+              <label>Titular<input name="owner_label" value="Família"></label>
+              <label>Últimos 4 dígitos<input name="last_four" pattern="\d{4}" maxlength="4"></label>
+              <button class="secondary" type="submit">Cadastrar conta</button>
+            </form>
+          </article>
+        </div>
+        <article class="panel"><div class="panel-heading"><div><span class="step-label">HISTÓRICO</span><h2>Arquivos processados</h2></div></div><div class="table-wrap"><table><thead><tr><th>Arquivo</th><th>Tipo</th><th>Status</th><th>Registros</th><th>Data</th></tr></thead><tbody id="imports-table"></tbody></table></div></article>
+      </section>
+
+      <section id="view-transactions" class="view">
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">LIVRO-RAZÃO</span><h2>Lançamentos consolidados</h2></div><div class="filters"><input type="month" id="transaction-month"><button id="refresh-transactions" class="secondary">Atualizar</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Titular</th><th>Conta</th><th>Status</th><th class="right">Valor</th></tr></thead><tbody id="transactions-table"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-reviews" class="view">
+        <article class="panel"><div class="panel-heading"><div><span class="step-label">FILA DE CONTROLE</span><h2>Itens que exigem confirmação</h2></div></div><div id="reviews-list" class="review-list"></div></article>
+      </section>
+
+      <section id="view-income" class="view">
+        <div class="two-column form-layout">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">RENDA VARIÁVEL</span><h2>Adicionar comissão</h2></div></div>
+            <form id="commission-form" class="form-grid">
+              <label class="full">Descrição<input name="description" required placeholder="Projeto / recebível"></label>
+              <label>Previsão<input type="date" name="expected_date" required></label>
+              <label>Valor bruto<input type="number" name="gross_amount" min="0.01" step="0.01" required></label>
+              <label>Imposto<input type="number" name="tax_rate" min="0" max="1" step="0.01" value="0.06" required><small>0,06 corresponde a 6%</small></label>
+              <label>Atraso conservador<input type="number" name="delay_days" min="0" max="365" value="60"></label>
+              <button class="primary" type="submit">Adicionar comissão</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">FOLHA</span><h2>Adicionar holerite ou extra</h2></div></div>
+            <form id="payroll-form" class="form-grid">
+              <label>Nome<input name="person_name" required></label>
+              <label>Tipo<select name="payroll_kind"><option value="regular">Salário regular</option><option value="13_first">1ª parcela do 13º</option><option value="13_second">2ª parcela do 13º</option><option value="vacation_extra">Adicional líquido de férias</option><option value="other">Outro</option></select></label>
+              <label>Competência<input type="date" name="competence" required></label>
+              <label>Pagamento<input type="date" name="payment_date" required></label>
+              <label>Bruto<input type="number" name="gross_amount" step="0.01" value="0"></label>
+              <label>Descontos<input type="number" name="deductions" step="0.01" value="0"></label>
+              <label>Líquido<input type="number" name="net_amount" step="0.01" required></label>
+              <label>Consignado já descontado<input type="number" name="payroll_loan" step="0.01" value="0"></label>
+              <button class="primary" type="submit">Adicionar folha</button>
+            </form>
+          </article>
+        </div>
+        <div class="two-column">
+          <article class="panel"><div class="panel-heading"><h2>Comissões</h2></div><div class="table-wrap"><table><thead><tr><th>Previsão</th><th>Descrição</th><th class="right">Bruto</th><th class="right">Imposto</th><th class="right">Líquido</th></tr></thead><tbody id="commissions-table"></tbody></table></div></article>
+          <article class="panel"><div class="panel-heading"><h2>Holerites e adicionais</h2></div><div class="table-wrap"><table><thead><tr><th>Pagamento</th><th>Pessoa</th><th>Tipo</th><th class="right">Líquido</th></tr></thead><tbody id="payroll-table"></tbody></table></div></article>
+        </div>
+      </section>
+
+      <section id="view-planning" class="view">
+        <div class="two-column form-layout">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">COMPROMISSOS</span><h2>Adicionar obrigação</h2></div></div>
+            <form id="obligation-form" class="form-grid">
+              <label class="full">Nome<input name="name" required placeholder="Parcela ou reforço"></label>
+              <label>Primeiro vencimento<input type="date" name="due_date" required></label>
+              <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
+              <label>Repetir a cada (meses)<input type="number" name="recurrence_months" min="0" value="0"><small>Use 0 para pagamento único</small></label>
+              <label>Quantidade<input type="number" name="occurrence_count" min="1" value="1"></label>
+              <label>Grupo<select name="category"><option value="chacara">Chácara</option><option value="loan">Empréstimo</option><option value="general">Geral</option></select></label>
+              <button class="primary" type="submit">Adicionar compromisso</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">CENÁRIO CONSERVADOR</span><h2>Resultado projetado</h2></div><button id="refresh-forecast" class="secondary">Recalcular</button></div>
+            <div class="projection-kpis"><div><span>Saldo final + atraso</span><strong id="forecast-final">R$ 0,00</strong></div><div><span>Menor saldo</span><strong id="forecast-min">R$ 0,00</strong></div><div><span>Decisão</span><strong id="forecast-status">Configure o perfil</strong></div></div>
+            <canvas id="forecast-chart" width="900" height="320" aria-label="Gráfico da projeção financeira"></canvas>
+          </article>
+        </div>
+        <article class="panel"><div class="panel-heading"><h2>Calendário consolidado</h2></div><div class="table-wrap wide"><table><thead><tr><th>Mês</th><th class="right">Salário</th><th class="right">Extras</th><th class="right">Comissão + atraso</th><th class="right">Compromissos</th><th class="right">Parcelas</th><th class="right">Rendimento</th><th class="right">Saldo + atraso</th></tr></thead><tbody id="forecast-table"></tbody></table></div></article>
+      </section>
+
+      <section id="view-settings" class="view">
+        <article class="panel settings-panel">
+          <div class="panel-heading"><div><span class="step-label">PREMISSAS EDITÁVEIS</span><h2>Perfil financeiro</h2></div></div>
+          <form id="profile-form" class="form-grid three">
+            <label>Salário líquido mensal<input type="number" name="monthly_salary_net" step="0.01" min="0" required></label>
+            <label>Teto mensal em dinheiro<input type="number" name="monthly_cash_cap" step="0.01" min="0" required></label>
+            <label>Saldo mínimo de segurança<input type="number" name="emergency_floor" step="0.01" min="0" required></label>
+            <label>Vale-alimentação<input type="number" name="food_allowance" step="0.01" min="0" required></label>
+            <label>Vale-refeição por dia<input type="number" name="meal_allowance_daily" step="0.01" min="0" required></label>
+            <label>Dias trabalhados/mês<input type="number" name="workdays_month" min="0" max="31" required></label>
+            <label>Nome do investimento<input name="investment_name" required></label>
+            <label>Saldo investido<input type="number" name="investment_balance" step="0.01" min="0" required></label>
+            <label>Retorno bruto anual<input type="number" name="investment_gross_annual_rate" step="0.0001" min="0" max="1" required><small>0,14 corresponde a 14% a.a.</small></label>
+            <label>IR conservador dos ganhos<input type="number" name="investment_income_tax_rate" step="0.001" min="0" max="1" required><small>0,225 corresponde a 22,5%</small></label>
+            <label>Projetar até<input type="date" name="projection_end" required></label>
+            <div class="form-action"><button class="primary" type="submit">Salvar premissas</button></div>
+          </form>
+          <div class="security-note"><strong>Importante</strong><p>O saldo mínimo é apenas uma referência de segurança. O sistema não separa fisicamente nenhum valor da aplicação.</p></div>
+        </article>
+      </section>
+    </main>
+  </div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
