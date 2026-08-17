@@ -16,6 +16,13 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class UserCreateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    username: str = Field(min_length=3, max_length=80, pattern=r"^[a-zA-Z0-9._-]+$")
+    password: str = Field(min_length=10, max_length=200)
+    is_admin: bool = False
+
+
 class AccountRequest(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     institution: str = Field(default="", max_length=80)
@@ -29,6 +36,17 @@ class TransactionUpdate(BaseModel):
     excluded: bool | None = None
     reviewed: bool | None = None
     owner_label: str | None = Field(default=None, max_length=80)
+
+
+class ManualTransactionRequest(BaseModel):
+    booked_at: date
+    description: str = Field(min_length=2, max_length=500)
+    amount: Decimal = Field(gt=0)
+    movement_type: str = Field(
+        pattern="^(expense|income|investment|redemption|refund)$"
+    )
+    account_id: str
+    category_id: str | None = None
 
 
 class CommissionRequest(BaseModel):
