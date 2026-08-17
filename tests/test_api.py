@@ -35,6 +35,22 @@ def test_complete_local_financial_flow() -> None:
         )
         assert setup.status_code == 201
 
+        family_user = client.post(
+            "/api/users",
+            json={
+                "name": "Kelly",
+                "username": "kelly",
+                "password": "senha-kelly-segura",
+                "is_admin": False,
+            },
+        )
+        assert family_user.status_code == 201
+        users = client.get("/api/users").json()
+        assert {(item["username"], item["is_admin"]) for item in users} == {
+            ("admin", True),
+            ("kelly", False),
+        }
+
         account = client.post(
             "/api/accounts",
             json={
@@ -185,16 +201,108 @@ def test_complete_local_financial_flow() -> None:
         assert client.get("/api/dashboard?month=07-2026").status_code == 422
         july_cuts = client.get("/api/cut-plan?month=2026-07").json()
         assert july_cuts["covered_months"] == 1
-        assert july_cuts["potential_monthly_savings"] == 33.4
+        assert july_cuts["potential_monthly_savings"] == 8.35
 
         cuts = client.get("/api/cut-plan").json()
         assert cuts["covered_months"] == 2
         assert cuts["duplicates_ignored"] == 1
-        assert cuts["potential_monthly_savings"] == 39.14
+        assert cuts["potential_monthly_savings"] == 9.79
         assert cuts["recommendations"][0]["category"] == "Restaurantes e delivery"
 
         forecast = client.get("/api/forecast").json()
         by_month = {row["month"]: row for row in forecast["rows"]}
         assert by_month["2027-03"]["commission_delayed"] == 9400.0
+
+        restaurant_category = next(
+            item for item in client.get("/api/categories").json()
+            if item["name"] == "Restaurantes e delivery"
+        )
+        manual_expense = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-17",
+                "description": "Abastecimento manual",
+                "amount": 100,
+                "movement_type": "expense",
+                "account_id": account.json()["id"],
+                "category_id": restaurant_category["id"],
+            },
+        )
+        assert manual_expense.status_code == 201
+        manual_investment = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-17",
+                "description": "Aplicação no Privilege DI",
+                "amount": 500,
+                "movement_type": "investment",
+                "account_id": account.json()["id"],
+            },
+        )
+        assert manual_investment.status_code == 201
+        dashboard_with_manual = client.get("/api/dashboard?month=2026-08").json()
+        assert dashboard_with_manual["spending"] == 176.78
+        assert dashboard_with_manual["cash_in"] == 0
+        assert dashboard_with_manual["cash_out"] == 676.78
+        assert dashboard_with_manual["investment_balance"] == 20500
+
+        transaction_rows = client.get("/api/transactions?month=2026-08").json()
+        assert sum(item["manual"] for item in transaction_rows) == 2
+        imported = next(item for item in transaction_rows if not item["manual"])
+        assert client.delete(f"/api/transactions/{imported['id']}").status_code == 409
+        assert client.delete(
+            f"/api/transactions/{manual_expense.json()['id']}"
+        ).status_code == 200
+        assert client.delete(
+            f"/api/transactions/{manual_investment.json()['id']}"
+        ).status_code == 200
+        dashboard_after_delete = client.get("/api/dashboard?month=2026-08").json()
+        assert dashboard_after_delete["spending"] == 76.78
+        assert dashboard_after_delete["cash_out"] == 76.78
+        assert dashboard_after_delete["investment_balance"] == 20000
+
+        obligation = client.post(
+            "/api/obligations",
+            json={
+                "name": "Compromisso temporário",
+                "due_date": "2026-12-10",
+                "amount": 1000,
+                "recurrence_months": 0,
+                "occurrence_count": 1,
+                "category": "general",
+            },
+        )
+        assert obligation.status_code == 201
+        assert client.delete(f"/api/obligations/{obligation.json()['id']}").status_code == 200
+
+        payroll = client.post(
+            "/api/payroll",
+            json={
+                "person_name": "Kelly",
+                "competence": "2026-08-01",
+                "payment_date": "2026-09-05",
+                "payroll_kind": "other",
+                "gross_amount": 100,
+                "deductions": 0,
+                "net_amount": 100,
+                "payroll_loan": 0,
+            },
+        )
+        assert payroll.status_code == 201
+        assert client.delete(f"/api/payroll/{payroll.json()['id']}").status_code == 200
+        assert client.delete(f"/api/commissions/{commission.json()['id']}").status_code == 200
+        with TestClient(app) as family_client:
+            family_login = family_client.post(
+                "/api/auth/login",
+                json={"username": "kelly", "password": "senha-kelly-segura"},
+            )
+            assert family_login.status_code == 200
+            assert family_login.json()["is_admin"] is False
+            assert family_client.get("/api/dashboard?month=2026-08").json()["spending"] == 76.78
+            assert family_client.get("/api/users").status_code == 403
+        assert client.delete(f"/api/users/{family_user.json()['id']}").status_code == 200
+        assert next(item for item in client.get("/api/users").json() if item["username"] == "kelly")[
+            "active"
+        ] is False
 
     assert list(Path(os.environ["DATA_DIR"]).glob("documents/*.bin"))
