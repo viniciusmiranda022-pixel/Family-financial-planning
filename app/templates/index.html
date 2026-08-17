@@ -54,6 +54,7 @@
         <button data-view="reviews"><span>!</span>Revisar <b id="nav-review-count" class="badge">0</b></button>
         <button data-view="income"><span>+</span>Rendas</button>
         <button data-view="planning"><span>↗</span>Planejamento</button>
+        <button data-view="users" id="nav-users" class="hidden"><span>♙</span>Acessos</button>
         <button data-view="settings"><span>⚙</span>Configurações</button>
       </nav>
       <div class="sidebar-footer">
@@ -80,6 +81,8 @@
         </div>
         <div class="kpi-grid">
           <article class="kpi highlight"><span>Saldo investido</span><strong id="kpi-investment">R$ 0,00</strong><small>Aplicação informada no perfil</small></article>
+          <article class="kpi cash-in"><span>Entrou no mês</span><strong id="kpi-cash-in">R$ 0,00</strong><small>Receitas e resgates identificados</small></article>
+          <article class="kpi cash-out"><span>Saiu no mês</span><strong id="kpi-cash-out">R$ 0,00</strong><small>Inclui gastos, aplicações e pagamentos patrimoniais</small></article>
           <article class="kpi"><span>Gasto no mês</span><strong id="kpi-spending">R$ 0,00</strong><small id="kpi-cap-caption">de R$ 0,00</small></article>
           <article class="kpi"><span>Disponível no teto</span><strong id="kpi-remaining">R$ 0,00</strong><small>Sem contar parcelas antigas</small></article>
           <article class="kpi warning"><span>Pendências</span><strong id="kpi-reviews">0</strong><small>Itens aguardando confirmação</small></article>
@@ -101,8 +104,8 @@
           <div class="table-wrap"><table><thead><tr><th>Categoria</th><th class="right">Participação</th><th class="right">Total no mês</th></tr></thead><tbody id="monthly-categories-table"></tbody></table></div>
         </article>
         <article class="panel cut-plan-panel">
-          <div class="panel-heading"><div><span class="step-label">AÇÃO RECOMENDADA</span><h2>Plano objetivo de cortes</h2><small id="cut-plan-period">Baseado nos últimos meses importados</small></div><div class="savings-callout"><span>Economia mensal possível</span><strong id="cut-plan-savings">R$ 0,00</strong></div></div>
-          <div class="table-wrap"><table><thead><tr><th>Prioridade</th><th>Categoria</th><th class="right">Média mensal</th><th class="right">Novo teto</th><th class="right">Cortar por mês</th><th>Como agir</th></tr></thead><tbody id="cut-plan-table"></tbody></table></div>
+          <div class="panel-heading"><div><span class="step-label">AÇÃO RECOMENDADA</span><h2>Plano objetivo de cortes</h2><small id="cut-plan-period">Baseado nos últimos meses importados</small></div><div class="savings-callout"><span>Meta inicial de economia</span><strong id="cut-plan-savings">R$ 0,00</strong><small>Estimativa conservadora, não garantia</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Prioridade</th><th>Categoria</th><th class="right">Média mensal</th><th class="right">Meta inicial</th><th class="right">Reduzir por mês</th><th>Como agir</th></tr></thead><tbody id="cut-plan-table"></tbody></table></div>
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">ÚLTIMOS LANÇAMENTOS</span><h2>Movimentações recentes</h2></div><button data-go="transactions" class="secondary">Ver todos</button></div>
@@ -138,8 +141,20 @@
 
       <section id="view-transactions" class="view">
         <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">LANÇAMENTO RÁPIDO</span><h2>Registrar movimentação</h2><small>Despesas entram no teto; aplicações e resgates também atualizam o saldo investido.</small></div></div>
+          <form id="transaction-form" class="form-grid three">
+            <label>Data<input type="date" name="booked_at" required></label>
+            <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Abastecimento no posto"></label>
+            <label>Natureza<select name="movement_type" id="transaction-movement-type"><option value="expense">Despesa</option><option value="income">Receita</option><option value="investment">Aplicação/investimento</option><option value="redemption">Resgate de investimento</option><option value="refund">Reembolso/estorno</option></select></label>
+            <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
+            <label>Conta<select name="account_id" id="transaction-account" required></select></label>
+            <label id="transaction-category-field">Categoria<select name="category_id" id="transaction-category" required></select></label>
+            <button class="primary" type="submit">Adicionar lançamento</button>
+          </form>
+        </article>
+        <article class="panel">
           <div class="panel-heading"><div><span class="step-label">LIVRO-RAZÃO</span><h2>Lançamentos consolidados</h2></div><div class="filters"><input type="month" id="transaction-month"><button id="refresh-transactions" class="secondary">Atualizar</button></div></div>
-          <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Titular</th><th>Conta</th><th>Status</th><th class="right">Valor</th></tr></thead><tbody id="transactions-table"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Titular</th><th>Conta</th><th>Status</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="transactions-table"></tbody></table></div>
         </article>
       </section>
 
@@ -176,8 +191,8 @@
           </article>
         </div>
         <div class="two-column">
-          <article class="panel"><div class="panel-heading"><h2>Comissões</h2></div><div class="table-wrap"><table><thead><tr><th>Previsão</th><th>Descrição</th><th class="right">Bruto</th><th class="right">Imposto</th><th class="right">Líquido</th></tr></thead><tbody id="commissions-table"></tbody></table></div></article>
-          <article class="panel"><div class="panel-heading"><h2>Holerites e adicionais</h2></div><div class="table-wrap"><table><thead><tr><th>Pagamento</th><th>Pessoa</th><th>Tipo</th><th class="right">Líquido</th></tr></thead><tbody id="payroll-table"></tbody></table></div></article>
+          <article class="panel"><div class="panel-heading"><h2>Comissões</h2></div><div class="table-wrap"><table><thead><tr><th>Previsão</th><th>Descrição</th><th class="right">Bruto</th><th class="right">Imposto</th><th class="right">Líquido</th><th class="right">Ações</th></tr></thead><tbody id="commissions-table"></tbody></table></div></article>
+          <article class="panel"><div class="panel-heading"><h2>Holerites e adicionais</h2></div><div class="table-wrap"><table><thead><tr><th>Pagamento</th><th>Pessoa</th><th>Tipo</th><th class="right">Líquido</th><th class="right">Ações</th></tr></thead><tbody id="payroll-table"></tbody></table></div></article>
         </div>
       </section>
 
@@ -201,7 +216,25 @@
             <canvas id="forecast-chart" width="900" height="320" aria-label="Gráfico da projeção financeira"></canvas>
           </article>
         </div>
+        <article class="panel"><div class="panel-heading"><div><span class="step-label">COMPROMISSOS ATIVOS</span><h2>Obrigações cadastradas</h2></div></div><div class="table-wrap"><table><thead><tr><th>Primeiro vencimento</th><th>Nome</th><th>Grupo</th><th>Repetição</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="obligations-table"></tbody></table></div></article>
         <article class="panel"><div class="panel-heading"><h2>Calendário consolidado</h2></div><div class="table-wrap wide"><table><thead><tr><th>Mês</th><th class="right">Salário</th><th class="right">Extras</th><th class="right">Comissão + atraso</th><th class="right">Compromissos</th><th class="right">Parcelas</th><th class="right">Rendimento</th><th class="right">Saldo + atraso</th></tr></thead><tbody id="forecast-table"></tbody></table></div></article>
+      </section>
+
+      <section id="view-users" class="view">
+        <div class="two-column form-layout">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">NOVO ACESSO</span><h2>Criar usuário da família</h2></div></div>
+            <form id="user-form" class="form-grid">
+              <label>Nome<input name="name" required placeholder="Kelly Miranda"></label>
+              <label>Usuário<input name="username" required minlength="3" pattern="[a-zA-Z0-9._-]+" placeholder="kelly"></label>
+              <label>Senha inicial<input type="password" name="password" required minlength="10" autocomplete="new-password"></label>
+              <label>Perfil<select name="is_admin"><option value="false">Usuário da família</option><option value="true">Administrador</option></select><small>O administrador também pode criar e desativar acessos.</small></label>
+              <button class="primary" type="submit">Criar acesso</button>
+            </form>
+          </article>
+          <article class="panel compact"><div class="panel-heading"><div><span class="step-label">MESMA BASE LOCAL</span><h2>Como funciona</h2></div></div><p class="muted-copy">Todos os usuários desta família visualizam a mesma base financeira. Senhas são individuais e não ficam visíveis depois do cadastro.</p></article>
+        </div>
+        <article class="panel"><div class="panel-heading"><h2>Usuários cadastrados</h2></div><div class="table-wrap"><table><thead><tr><th>Nome</th><th>Usuário</th><th>Perfil</th><th>Status</th><th class="right">Ações</th></tr></thead><tbody id="users-table"></tbody></table></div></article>
       </section>
 
       <section id="view-settings" class="view">
