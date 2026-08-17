@@ -192,8 +192,12 @@ def parse_credit_card_pdf(payload: bytes) -> list[ParsedTransaction]:
                 split = page.width * 0.60
                 for x0, x1 in ((0, split), (split, page.width)):
                     column = page.crop((x0, 0, x1, page.height)).extract_text() or ""
+                    card_last_four = None
                     for raw_line in column.splitlines():
                         line_number += 1
+                        card_match = re.search(r"final\s*(\d{4})", raw_line, re.IGNORECASE)
+                        if card_match:
+                            card_last_four = card_match.group(1)
                         match = line_pattern.match(raw_line)
                         if not match:
                             continue
@@ -202,11 +206,11 @@ def parse_credit_card_pdf(payload: bytes) -> list[ParsedTransaction]:
                         current, total = _installment(description)
                         parsed.append(
                             ParsedTransaction(
-                                _card_date(raw_date, reference),
+                                reference.replace(day=1),
                                 description.strip(),
                                 amount,
                                 line_number,
-                                None,
+                                card_last_four,
                                 current,
                                 total,
                             )

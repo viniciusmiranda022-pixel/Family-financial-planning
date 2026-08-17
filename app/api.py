@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -723,7 +724,32 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
             Transaction.installment_total.is_not(None),
         )
     ).all()
+    latest_by_series: dict[tuple, Transaction] = {}
     for item in rows:
+        current = item.installment_current or 0
+        total = item.installment_total or 0
+        description = re.sub(
+            r"(?:PARCELA\s*)?\d{1,2}\s*/\s*\d{1,2}",
+            " ",
+            item.description,
+            flags=re.IGNORECASE,
+        )
+        origin = add_months(item.booked_at.replace(day=1), -(max(1, current) - 1))
+        series = (
+            item.account_id,
+            item.card_last_four or "",
+            normalize_description(description),
+            money(abs(item.amount)),
+            total,
+            month_key(origin),
+        )
+        previous = latest_by_series.get(series)
+        if previous is None or (item.booked_at, current) > (
+            previous.booked_at,
+            previous.installment_current or 0,
+        ):
+            latest_by_series[series] = item
+    for item in latest_by_series.values():
         remaining = max(0, (item.installment_total or 0) - (item.installment_current or 0))
         for offset in range(1, remaining + 1):
             key = month_key(add_months(item.booked_at.replace(day=1), offset))
@@ -759,7 +785,7 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
     rate = monthly_net_rate(profile.investment_gross_annual_rate, profile.investment_income_tax_rate)
     rows = build_forecast(
         ForecastInput(
-            start_month=date.today().replace(day=1),
+            start_month=add_months(date.today().replace(day=1), 1),
             end_month=end,
             starting_balance=profile.investment_balance,
             monthly_salary=profile.monthly_salary_net,

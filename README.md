@@ -111,6 +111,34 @@ Depois do primeiro acesso, siga esta ordem:
 5. cadastre comissões e compromissos futuros;
 6. confira o plano de cortes e os três cenários da projeção.
 
+## Carga da planilha consolidada
+
+Para preencher o sistema com o plano já consolidado, mantenha a planilha fora do Git e execute a carga pelo Ubuntu/WSL. O comando lê o arquivo diretamente no computador, grava a cópia criptografada no volume local e não envia os dados financeiros para o GitHub.
+
+Primeiro gere uma prévia, sem alterar o banco:
+
+```bash
+./scripts/import-plan.sh "/mnt/c/Users/ViniciusMiranda/Downloads/Plano_Financeiro_Chacara_Vinicius_v3.xlsx"
+```
+
+Confira os totais exibidos e confirme a gravação:
+
+```bash
+./scripts/import-plan.sh "/mnt/c/Users/ViniciusMiranda/Downloads/Plano_Financeiro_Chacara_Vinicius_v3.xlsx" --apply
+```
+
+A carga inclui:
+
+- perfil financeiro, saldo do Privilège DI, VA, VR, teto e reserva-alvo;
+- contas Itaú, cartão Itaú familiar, Nubank e investimento;
+- três holerites reais da Kelly e três eventos estimados de 13º/férias, devidamente identificados;
+- quatro comissões, cada uma com imposto de 6% e cenário de atraso de 60 dias;
+- dez parcelas mensais e três reforços da chácara;
+- lançamentos consolidados das abas `Cartão - Dados`, `Nubank - Dados` e `Banco - Dados`;
+- envelopes de corte e pendências selecionadas da aba `Revisar`.
+
+O importador é idempotente: executar novamente atualiza registros reconhecidos e não duplica a carga. Depois dela, não reimporte os mesmos documentos históricos já cobertos pela planilha; use a tela **Importações** apenas para arquivos novos posteriores a 17/08/2026.
+
 ## Atualização
 
 ```bash
