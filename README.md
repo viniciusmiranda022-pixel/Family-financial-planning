@@ -141,6 +141,16 @@ A carga inclui:
 
 O importador é idempotente: executar novamente atualiza registros reconhecidos e não duplica a carga. Depois dela, não reimporte os mesmos documentos históricos já cobertos pela planilha; use a tela **Importações** apenas para arquivos novos posteriores a 17/08/2026.
 
+## Diagnóstico mensal para conferência
+
+Para investigar um total mensal sem expor credenciais ou os documentos brutos, gere um pacote de diagnóstico somente de leitura:
+
+```bash
+./scripts/export-diagnostics.sh 2026-08
+```
+
+O ZIP será criado na pasta `diagnostics` e conterá resumo, lançamentos, documentos de origem, contas, revisões abertas e possíveis sobreposições. Ele inclui descrições e valores financeiros; compartilhe somente por um canal privado.
+
 ## Atualização
 
 ```bash
