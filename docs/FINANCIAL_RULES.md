@@ -8,7 +8,8 @@
 
 ## Cartões
 
-- Compras entram como despesa na data importada.
+- Compras de faturas entram no mês de referência da fatura; a carga da planilha usa o mês de vencimento.
+- A data original da compra continua preservada na própria planilha consolidada.
 - Pagamento da fatura é conciliação e não é contado novamente.
 - Estorno é crédito.
 - Parcelas futuras são projetadas pelo valor observado e pelas marcações `atual/total`.
