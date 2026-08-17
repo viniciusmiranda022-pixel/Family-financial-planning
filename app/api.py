@@ -120,7 +120,27 @@ def _consolidated_expenses(
     start: date,
     end: date,
 ) -> tuple[list[tuple[Transaction, str]], int]:
-    """Prefer the consolidated workbook when the same expense exists in another import."""
+    """Prefer every matching workbook row over copies from individual imports.
+
+    The workbook is the authoritative ledger even when its copy is excluded from
+    spending or classified as a transfer/reconciliation.  Otherwise a later PDF
+    import can reintroduce that same cash movement as an ordinary expense.
+    """
+    workbook_rows = db.execute(
+        select(Transaction, Account.account_type)
+        .outerjoin(Account, Account.id == Transaction.account_id)
+        .join(Document, Document.id == Transaction.document_id)
+        .where(
+            Transaction.household_id == household_id,
+            Transaction.booked_at >= start,
+            Transaction.booked_at < end,
+            Document.document_type == "financial_plan_workbook",
+        )
+    ).all()
+    workbook_signatures = {
+        _expense_signature(transaction, account_type)
+        for transaction, account_type in workbook_rows
+    }
     raw_rows = db.execute(
         select(Transaction, Category.name, Account.account_type, Document.document_type)
         .outerjoin(Category, Category.id == Transaction.category_id)
@@ -135,11 +155,6 @@ def _consolidated_expenses(
         )
         .order_by(Transaction.booked_at, Transaction.created_at, Transaction.id)
     ).all()
-    workbook_signatures = {
-        _expense_signature(transaction, account_type)
-        for transaction, _category, account_type, document_type in raw_rows
-        if document_type == "financial_plan_workbook"
-    }
     result: list[tuple[Transaction, str]] = []
     duplicates_ignored = 0
     for transaction, category_name, account_type, document_type in raw_rows:
@@ -947,8 +962,13 @@ def dashboard(
             transaction.amount
         )
     review_count = db.scalar(
-        select(func.count(ReviewItem.id)).where(
-            ReviewItem.household_id == user.household_id, ReviewItem.status == "open"
+        select(func.count(ReviewItem.id))
+        .join(Transaction, Transaction.id == ReviewItem.transaction_id)
+        .where(
+            ReviewItem.household_id == user.household_id,
+            ReviewItem.status == "open",
+            Transaction.booked_at >= start,
+            Transaction.booked_at < end,
         )
     )
     future_commission = db.scalar(

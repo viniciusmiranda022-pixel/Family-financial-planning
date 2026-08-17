@@ -179,7 +179,7 @@ def export_diagnostic(
             ),
         }
         transaction_rows.append(transaction_row)
-        if is_expense and not transaction.excluded:
+        if document_type == "financial_plan_workbook" or (is_expense and not transaction.excluded):
             signature = _expense_signature(transaction, str(account_type or ""))
             signature_groups[signature].append(
                 {
