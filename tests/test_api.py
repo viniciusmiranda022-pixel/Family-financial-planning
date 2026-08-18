@@ -283,9 +283,14 @@ def test_complete_local_financial_flow() -> None:
         assert dashboard_with_manual["cash_in"] == 1000
         assert dashboard_with_manual["cash_out"] == 176.78
         assert dashboard_with_manual["investment_balance"] == 20300
-        assert dashboard_with_manual["cash_flow_by_account"][0]["account_type"] == "credit_card"
-        assert dashboard_with_manual["cash_flow_by_account"][0]["cash_in"] == 1000
-        assert dashboard_with_manual["cash_flow_by_account"][0]["cash_out"] == 176.78
+        nubank_flow = next(
+            item
+            for item in dashboard_with_manual["cash_flow_by_account"]
+            if item["account_id"] == account.json()["id"]
+        )
+        assert nubank_flow["account_type"] == "credit_card"
+        assert nubank_flow["cash_in"] == 1000
+        assert nubank_flow["cash_out"] == 131.9
 
         transaction_rows = client.get("/api/transactions?month=2026-08").json()
         assert sum(item["manual"] for item in transaction_rows) == 4
