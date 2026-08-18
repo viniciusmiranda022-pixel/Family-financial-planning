@@ -26,9 +26,14 @@ Esta primeira versão entrega:
 - rendimento do investimento sobre o saldo inicial de cada mês;
 - teto de gastos, benefícios VA/VR e saldo mínimo de segurança;
 - visão mensal navegável, com totais e categorias separados por competência;
-- entradas, saídas, gastos e aplicações apresentados separadamente;
+- entradas e saídas operacionais separadas de aplicações, resgates e estornos;
+- detalhamento mensal por banco, conta corrente e cartão, sem duplicar o pagamento da fatura;
 - lançamento manual de despesa, receita, aplicação, resgate e reembolso;
+- criação automática de uma nova categoria ao usar “Outra categoria” no lançamento manual;
 - exclusão auditada de registros manuais e desativação segura de acessos;
+- revisão assistida com correção de categoria e decisão de considerar ou ignorar cada item;
+- alertas de obrigações com 30 dias de antecedência e destaque nos últimos 7 dias;
+- consultor conversacional local para compras, fluxo mensal, vencimentos e cortes;
 - consolidação automática de lançamentos repetidos entre a planilha e importações históricas;
 - plano de cortes por categoria com metas iniciais conservadoras, sem prometer corte integral;
 - backup diário do PostgreSQL com retenção configurável;
@@ -118,7 +123,9 @@ Depois do primeiro acesso, siga esta ordem:
 6. em **Acessos**, crie o usuário individual de cada membro da família;
 7. confira o plano de cortes e os três cenários da projeção.
 
-Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo investido e o fluxo de caixa, mas não são tratados como consumo. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
+Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo investido, mas não entram nas receitas ou saídas operacionais. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
+
+O **Consultor** funciona localmente e usa regras financeiras auditáveis sobre os dados cadastrados. Ele não envia extratos para uma API externa e não substitui uma análise profissional. Compras são avaliadas à vista; juros de parcelamento e gastos ainda não lançados não entram na resposta.
 
 ## Carga da planilha consolidada
 
@@ -218,6 +225,7 @@ ruff check .
 
 - PDFs escaneados sem camada de texto são encaminhados para revisão; OCR entra na próxima fase.
 - PDFs bancários podem mudar de layout; arquivos inválidos, incompletos ou não reconhecidos vão para revisão.
+- O consultor entende perguntas financeiras objetivas e valores em reais, mas não é um modelo de linguagem de uso geral.
 - possíveis duplicidades são excluídas provisoriamente do cálculo, mas nunca apagadas.
 - o sistema não acessa internet banking e não armazena credenciais bancárias.
 - nenhuma classificação automática substitui a revisão do usuário quando a confiança é baixa.
