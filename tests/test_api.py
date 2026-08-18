@@ -1,6 +1,6 @@
 import os
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -192,6 +192,22 @@ def test_complete_local_financial_flow() -> None:
             "category": "Restaurantes e delivery",
             "amount": 44.88,
         }
+        review_rows = client.get("/api/reviews").json()
+        august_review = next(item for item in review_rows if item["reason"] == "test_august_review")
+        assert august_review["transaction_id"]
+        assert august_review["category"] == "Restaurantes e delivery"
+        assert august_review["account"]
+        reviewed = client.patch(
+            f"/api/transactions/{august_review['transaction_id']}",
+            json={
+                "category_id": august_review["category_id"],
+                "excluded": False,
+                "possible_duplicate": False,
+                "reviewed": True,
+            },
+        )
+        assert reviewed.status_code == 200
+        assert august_review["id"] not in {item["id"] for item in client.get("/api/reviews").json()}
 
         july_dashboard = client.get("/api/dashboard?month=2026-07")
         assert july_dashboard.status_code == 200
@@ -240,14 +256,39 @@ def test_complete_local_financial_flow() -> None:
             },
         )
         assert manual_investment.status_code == 201
+        manual_income = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-17",
+                "description": "Receita manual",
+                "amount": 1000,
+                "movement_type": "income",
+                "account_id": account.json()["id"],
+            },
+        )
+        assert manual_income.status_code == 201
+        manual_redemption = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-17",
+                "description": "Resgate do Privilege DI",
+                "amount": 200,
+                "movement_type": "redemption",
+                "account_id": account.json()["id"],
+            },
+        )
+        assert manual_redemption.status_code == 201
         dashboard_with_manual = client.get("/api/dashboard?month=2026-08").json()
         assert dashboard_with_manual["spending"] == 176.78
-        assert dashboard_with_manual["cash_in"] == 0
-        assert dashboard_with_manual["cash_out"] == 676.78
-        assert dashboard_with_manual["investment_balance"] == 20500
+        assert dashboard_with_manual["cash_in"] == 1000
+        assert dashboard_with_manual["cash_out"] == 176.78
+        assert dashboard_with_manual["investment_balance"] == 20300
+        assert dashboard_with_manual["cash_flow_by_account"][0]["account_type"] == "credit_card"
+        assert dashboard_with_manual["cash_flow_by_account"][0]["cash_in"] == 1000
+        assert dashboard_with_manual["cash_flow_by_account"][0]["cash_out"] == 176.78
 
         transaction_rows = client.get("/api/transactions?month=2026-08").json()
-        assert sum(item["manual"] for item in transaction_rows) == 2
+        assert sum(item["manual"] for item in transaction_rows) == 4
         imported = next(item for item in transaction_rows if not item["manual"])
         assert client.delete(f"/api/transactions/{imported['id']}").status_code == 409
         assert client.delete(
@@ -256,10 +297,43 @@ def test_complete_local_financial_flow() -> None:
         assert client.delete(
             f"/api/transactions/{manual_investment.json()['id']}"
         ).status_code == 200
+        assert client.delete(
+            f"/api/transactions/{manual_income.json()['id']}"
+        ).status_code == 200
+        assert client.delete(
+            f"/api/transactions/{manual_redemption.json()['id']}"
+        ).status_code == 200
         dashboard_after_delete = client.get("/api/dashboard?month=2026-08").json()
         assert dashboard_after_delete["spending"] == 76.78
+        assert dashboard_after_delete["cash_in"] == 0
         assert dashboard_after_delete["cash_out"] == 76.78
         assert dashboard_after_delete["investment_balance"] == 20000
+
+        custom_expense = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-17",
+                "description": "Paisagismo da chácara",
+                "amount": 3100,
+                "movement_type": "expense",
+                "account_id": account.json()["id"],
+                "category_name": "Paisagismo",
+            },
+        )
+        assert custom_expense.status_code == 201
+        assert "Paisagismo" in {item["name"] for item in client.get("/api/categories").json()}
+        over_budget = client.get("/api/dashboard?month=2026-08").json()
+        assert over_budget["remaining_cap"] == -176.78
+        advisor = client.post(
+            "/api/advisor/chat",
+            json={"message": "Em agosto de 2026 quero fazer uma compra que custa R$ 2.000, posso fazer?"},
+        )
+        assert advisor.status_code == 200
+        assert advisor.json()["status"] == "not_recommended"
+        assert "não fazer" in advisor.json()["answer"]
+        assert client.delete(
+            f"/api/transactions/{custom_expense.json()['id']}"
+        ).status_code == 200
 
         obligation = client.post(
             "/api/obligations",
@@ -273,7 +347,35 @@ def test_complete_local_financial_flow() -> None:
             },
         )
         assert obligation.status_code == 201
+        due_soon = date.today() + timedelta(days=5)
+        alert_obligation = client.post(
+            "/api/obligations",
+            json={
+                "name": "Conta próxima",
+                "due_date": due_soon.isoformat(),
+                "amount": 250,
+                "recurrence_months": 0,
+                "occurrence_count": 1,
+                "category": "general",
+            },
+        )
+        assert alert_obligation.status_code == 201
+        obligation_rows = client.get("/api/obligations").json()
+        near = next(item for item in obligation_rows if item["name"] == "Conta próxima")
+        assert near["days_until_due"] == 5
+        assert near["alert_level"] == "urgent"
+        alerts = client.get("/api/dashboard?month=2026-08").json()["obligation_alerts"]
+        assert any(item["name"] == "Conta próxima" for item in alerts)
+        advisor_obligations = client.post(
+            "/api/advisor/chat",
+            json={"message": "Quais obrigações estão próximas?"},
+        ).json()
+        assert advisor_obligations["intent"] == "obligations"
+        assert "Conta próxima" in advisor_obligations["answer"]
         assert client.delete(f"/api/obligations/{obligation.json()['id']}").status_code == 200
+        assert client.delete(
+            f"/api/obligations/{alert_obligation.json()['id']}"
+        ).status_code == 200
 
         payroll = client.post(
             "/api/payroll",
