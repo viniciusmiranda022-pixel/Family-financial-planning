@@ -2,6 +2,8 @@ const state = { user: null, accounts: [], categories: [], forecast: [], forecast
 const money = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
 const dateFormat = new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" });
 const monthFormat = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
+const accountTypeLabels = { checking: "Conta corrente", credit_card: "Cartão de crédito", investment: "Investimento", cash: "Dinheiro", other: "Outros" };
+const systemCategories = new Set(["Conciliação", "Transferência patrimonial", "Transferência interna", "Repasses a confirmar", "Reembolsos e estornos", "Receitas", "Revisar"]);
 const pageNames = {
   dashboard: "Visão geral",
   imports: "Importações",
@@ -9,6 +11,7 @@ const pageNames = {
   reviews: "Revisar",
   income: "Rendas",
   planning: "Planejamento",
+  advisor: "Consultor financeiro",
   users: "Acessos",
   settings: "Configurações",
 };
@@ -97,6 +100,7 @@ async function navigate(view) {
     reviews: loadReviews,
     income: loadIncome,
     planning: loadForecast,
+    advisor: loadAdvisor,
     users: loadUsers,
     settings: loadProfile,
   };
@@ -117,7 +121,7 @@ async function loadAccounts() {
 
 async function loadCategories() {
   state.categories = await api("/categories");
-  document.querySelector("#transaction-category").innerHTML = categoryOptions();
+  document.querySelector("#transaction-category").innerHTML = manualCategoryOptions();
 }
 
 function emptyRow(columns, text = "Nenhum registro encontrado") {
@@ -163,7 +167,13 @@ async function loadDashboard() {
   document.querySelector("#kpi-cash-out").textContent = money.format(summary.cash_out);
   document.querySelector("#kpi-spending").textContent = money.format(summary.spending);
   document.querySelector("#kpi-cap-caption").textContent = `de ${money.format(summary.cash_cap)} em ${selectedLabel}`;
-  document.querySelector("#kpi-remaining").textContent = money.format(summary.remaining_cap);
+  const remainingValue = document.querySelector("#kpi-remaining");
+  remainingValue.textContent = money.format(summary.remaining_cap);
+  remainingValue.classList.toggle("amount-expense", summary.remaining_cap < 0);
+  document.querySelector("#remaining-cap-card").classList.toggle("over-budget", summary.remaining_cap < 0);
+  document.querySelector("#kpi-remaining-caption").textContent = summary.remaining_cap < 0
+    ? `Teto ultrapassado em ${money.format(Math.abs(summary.remaining_cap))}`
+    : "Valor ainda disponível no limite mensal";
   document.querySelector("#kpi-reviews").textContent = summary.review_count;
   document.querySelector("#nav-review-count").textContent = summary.review_count;
   document.querySelector("#food-benefits").textContent = money.format(summary.food_benefits);
@@ -182,13 +192,23 @@ async function loadDashboard() {
     [state.accounts.length > 0, "Contas cadastradas", state.accounts.length ? `${state.accounts.length} fontes` : "Cadastre a primeira"],
     [summary.cash_cap > 0, "Perfil financeiro", summary.cash_cap > 0 ? "Premissas configuradas" : "Configuração pendente"],
   ];
-  if (summary.duplicates_ignored > 0) qualityItems.unshift([true, "Duplicidades evitadas", `${summary.duplicates_ignored} registros repetidos foram contados apenas uma vez`]);
+  if (summary.duplicates_ignored > 0) qualityItems.unshift([true, "Cópias de gastos desconsideradas", `${summary.duplicates_ignored} cópias apareceram em mais de uma fonte; uma única versão entrou no total`]);
   document.querySelector("#quality-list").innerHTML = qualityItems.map(([ok, title, detail]) => `<div class="quality-item"><div><span class="quality-dot${ok ? "" : " warn"}"></span><strong>${escapeHtml(title)}</strong></div><small>${escapeHtml(detail)}</small></div>`).join("");
   const duplicateNote = document.querySelector("#monthly-duplicates-note");
   duplicateNote.classList.toggle("hidden", summary.duplicates_ignored === 0);
   duplicateNote.textContent = summary.duplicates_ignored > 0
-    ? `${summary.duplicates_ignored} registros apareceram tanto na planilha quanto em arquivos importados. O sistema preservou as duas fontes para auditoria, mas contou cada movimentação apenas uma vez.`
+    ? `${summary.duplicates_ignored} cópias do mesmo gasto apareceram em mais de uma fonte, por exemplo na planilha e na fatura. As cópias continuam guardadas para conferência, mas somente o registro original compõe os totais.`
     : "";
+  document.querySelector("#cash-flow-accounts-table").innerHTML = summary.cash_flow_by_account.length
+    ? summary.cash_flow_by_account.map((item) => `
+      <tr><td><strong>${escapeHtml(item.account)}</strong></td><td>${escapeHtml(accountTypeLabels[item.account_type] || item.account_type)}</td><td class="right amount-income">${money.format(item.cash_in)}</td><td class="right amount-expense">${money.format(item.cash_out)}</td><td class="right">${money.format(item.refunds)}</td></tr>
+    `).join("")
+    : emptyRow(5, `Nenhuma movimentação operacional identificada em ${selectedLabel}`);
+  document.querySelector("#dashboard-obligation-alerts").innerHTML = summary.obligation_alerts.length
+    ? summary.obligation_alerts.map((item) => `
+      <div class="obligation-alert ${escapeHtml(item.alert_level)}"><div><strong>${escapeHtml(item.name)}</strong><small>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))} • ${escapeHtml(item.alert_label)}</small></div><span>${money.format(item.amount)}</span></div>
+    `).join("")
+    : '<div class="empty compact-empty">Nenhuma obrigação vence nos próximos 30 dias.</div>';
   document.querySelector("#monthly-categories-table").innerHTML = summary.category_spending.length
     ? summary.category_spending.map((item) => {
       const share = summary.spending > 0 ? Math.round((item.amount / summary.spending) * 100) : 0;
@@ -220,6 +240,22 @@ function categoryOptions(selected) {
   return state.categories.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === selected ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
 }
 
+function manualCategoryOptions(selected) {
+  const categories = state.categories.filter((item) => !systemCategories.has(item.name));
+  return categories.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === selected ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")
+    + '<option value="__other__">Outra categoria...</option>';
+}
+
+function updateCustomCategoryField() {
+  const select = document.querySelector("#transaction-category");
+  const field = document.querySelector("#transaction-custom-category-field");
+  const input = document.querySelector("#transaction-custom-category");
+  const custom = select.value === "__other__" && !select.disabled;
+  field.classList.toggle("hidden", !custom);
+  input.disabled = !custom;
+  input.required = custom;
+}
+
 function updateManualTransactionFields() {
   const movementType = document.querySelector("#transaction-movement-type").value;
   const category = document.querySelector("#transaction-category");
@@ -228,6 +264,7 @@ function updateManualTransactionFields() {
   category.disabled = !needsCategory;
   category.required = needsCategory;
   categoryField.classList.toggle("muted-field", !needsCategory);
+  updateCustomCategoryField();
 }
 
 async function loadTransactions() {
@@ -269,10 +306,30 @@ async function loadReviews() {
   const items = await api("/reviews");
   document.querySelector("#nav-review-count").textContent = items.length;
   document.querySelector("#reviews-list").innerHTML = items.length ? items.map((item) => `
-    <article class="review-card"><div class="review-icon">!</div><div><h3>${escapeHtml(item.description)}</h3><p>${escapeHtml(item.details || item.reason)}${item.amount !== null ? ` • ${money.format(item.amount)}` : ""}</p></div><button class="secondary resolve-review" data-id="${escapeHtml(item.id)}">Marcar como resolvido</button></article>
+    <article class="review-card" data-review-id="${escapeHtml(item.id)}">
+      <div class="review-icon">!</div>
+      <div class="review-content"><h3>${escapeHtml(item.description)}</h3><p>${escapeHtml(item.details || item.reason)}${item.amount !== null ? ` • ${money.format(item.amount)}` : ""}${item.date ? ` • ${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}` : ""}${item.account ? ` • ${escapeHtml(item.account)}` : ""}</p>
+        ${item.transaction_id ? `<div class="review-controls"><select class="review-category" aria-label="Categoria">${categoryOptions(item.category_id)}</select><button class="text-action save-review-category" data-transaction-id="${escapeHtml(item.transaction_id)}">Salvar categoria</button><button class="text-action review-decision" data-transaction-id="${escapeHtml(item.transaction_id)}" data-action="consider">Considerar no cálculo</button><button class="text-action review-decision" data-transaction-id="${escapeHtml(item.transaction_id)}" data-action="ignore">Ignorar no cálculo</button></div>` : ""}
+      </div>
+      <button class="secondary resolve-review" data-id="${escapeHtml(item.id)}">Apenas confirmar</button>
+    </article>
   `).join("") : '<div class="empty">Nenhuma pendência. Todos os lançamentos estão conciliados.</div>';
+  document.querySelectorAll(".save-review-category").forEach((button) => button.addEventListener("click", async () => {
+    const select = button.closest(".review-card").querySelector(".review-category");
+    try {
+      await api(`/transactions/${button.dataset.transactionId}`, { method: "PATCH", body: JSON.stringify({ category_id: select.value, reviewed: true }) });
+      await loadReviews(); await loadDashboard(); toast("Categoria corrigida e pendência concluída");
+    } catch (error) { toast(error.message, true); }
+  }));
+  document.querySelectorAll(".review-decision").forEach((button) => button.addEventListener("click", async () => {
+    const consider = button.dataset.action === "consider";
+    try {
+      await api(`/transactions/${button.dataset.transactionId}`, { method: "PATCH", body: JSON.stringify({ excluded: !consider, possible_duplicate: consider ? false : undefined, reviewed: true }) });
+      await loadReviews(); await loadDashboard(); toast(consider ? "Lançamento incluído no cálculo" : "Lançamento ignorado no cálculo");
+    } catch (error) { toast(error.message, true); }
+  }));
   document.querySelectorAll(".resolve-review").forEach((button) => button.addEventListener("click", async () => {
-    try { await api(`/reviews/${button.dataset.id}/resolve`, { method: "POST" }); await loadReviews(); toast("Pendência resolvida"); }
+    try { await api(`/reviews/${button.dataset.id}/resolve`, { method: "POST" }); await loadReviews(); toast("Pendência confirmada"); }
     catch (error) { toast(error.message, true); }
   }));
 }
@@ -317,14 +374,45 @@ async function loadForecast() {
     <tr><td>${escapeHtml(item.month)}</td><td class="right">${money.format(item.salary)}</td><td class="right">${money.format(item.payroll_extras)}</td><td class="right amount-income">${money.format(item.commission_delayed)}</td><td class="right amount-expense">${money.format(item.obligations)}</td><td class="right amount-expense">${money.format(item.installments)}</td><td class="right amount-income">${money.format(item.investment_return_delayed)}</td><td class="right ${item.balance_delayed < data.summary.emergency_floor ? "amount-expense" : "amount-income"}">${money.format(item.balance_delayed)}</td></tr>
   `).join("") : emptyRow(8, "Configure as premissas financeiras");
   document.querySelector("#obligations-table").innerHTML = obligations.length ? obligations.map((item) => `
-    <tr><td>${dateFormat.format(new Date(`${item.due_date}T00:00:00Z`))}</td><td><strong>${escapeHtml(item.name)}</strong></td><td>${escapeHtml(item.category)}</td><td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td><td class="right amount-expense">${money.format(item.amount)}</td><td class="right"><button class="danger-button delete-obligation" data-id="${escapeHtml(item.id)}">Excluir</button></td></tr>
-  `).join("") : emptyRow(6, "Nenhum compromisso ativo");
+    <tr><td>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))}</td><td><strong>${escapeHtml(item.name)}</strong></td><td>${escapeHtml(item.category)}</td><td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td><td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td><td class="right amount-expense">${money.format(item.amount)}</td><td class="right"><button class="danger-button delete-obligation" data-id="${escapeHtml(item.id)}">Excluir</button></td></tr>
+  `).join("") : emptyRow(7, "Nenhum compromisso ativo");
   document.querySelectorAll(".delete-obligation").forEach((button) => button.addEventListener("click", async () => {
     if (!window.confirm("Excluir este compromisso das projeções futuras?")) return;
     try { await api(`/obligations/${button.dataset.id}`, { method: "DELETE" }); await loadForecast(); toast("Compromisso excluído"); }
     catch (error) { toast(error.message, true); }
   }));
   drawForecast(data.rows, data.summary.emergency_floor);
+}
+
+function appendAdvisorMessage(role, text, status = "") {
+  const messages = document.querySelector("#advisor-messages");
+  const bubble = document.createElement("div");
+  bubble.className = `advisor-message ${role}${status ? ` ${status}` : ""}`;
+  bubble.textContent = text;
+  messages.appendChild(bubble);
+  messages.scrollTop = messages.scrollHeight;
+  return bubble;
+}
+
+function loadAdvisor() {
+  const messages = document.querySelector("#advisor-messages");
+  if (!messages.children.length) {
+    appendAdvisorMessage("assistant", "Olá! Posso avaliar uma compra, explicar entradas e saídas, listar vencimentos e sugerir cortes com base na sua base financeira.");
+  }
+}
+
+async function askAdvisor(message) {
+  appendAdvisorMessage("user", message);
+  const loading = appendAdvisorMessage("assistant", "Analisando seus dados...");
+  try {
+    const result = await api("/advisor/chat", { method: "POST", body: JSON.stringify({ message }) });
+    loading.textContent = result.answer;
+    loading.className = `advisor-message assistant ${result.status}`;
+  } catch (error) {
+    loading.textContent = error.message;
+    loading.className = "advisor-message assistant error";
+  }
+  loading.scrollIntoView({ behavior: "smooth", block: "end" });
 }
 
 async function loadUsers() {
@@ -411,16 +499,20 @@ document.querySelector("#dashboard-current-month").addEventListener("click", () 
 document.querySelector("#refresh-transactions").addEventListener("click", loadTransactions);
 document.querySelector("#refresh-forecast").addEventListener("click", loadForecast);
 document.querySelector("#transaction-movement-type").addEventListener("change", updateManualTransactionFields);
+document.querySelector("#transaction-category").addEventListener("change", updateCustomCategoryField);
 
 document.querySelector("#transaction-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
     const payload = formJson(event.target, ["amount"]);
+    if (payload.category_id === "__other__") payload.category_id = null;
+    else payload.category_name = null;
     await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
     const month = payload.booked_at.slice(0, 7);
     event.target.reset();
     event.target.elements.booked_at.value = currentDateKey();
     document.querySelector("#transaction-month").value = month;
+    await loadCategories();
     updateManualTransactionFields();
     await loadTransactions();
     toast("Lançamento registrado");
@@ -471,6 +563,17 @@ document.querySelector("#user-form").addEventListener("submit", async (event) =>
   try { await api("/users", { method: "POST", body: JSON.stringify(payload) }); event.target.reset(); await loadUsers(); toast("Acesso criado com sucesso"); }
   catch (error) { toast(error.message, true); }
 });
+document.querySelector("#advisor-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = event.target.elements.message;
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = "";
+  await askAdvisor(message);
+});
+document.querySelectorAll(".advisor-suggestion").forEach((button) => button.addEventListener("click", async () => {
+  await askAdvisor(button.textContent.trim());
+}));
 document.querySelector("#profile-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const numeric = ["monthly_salary_net", "monthly_cash_cap", "emergency_floor", "food_allowance", "meal_allowance_daily", "workdays_month", "investment_balance", "investment_gross_annual_rate", "investment_income_tax_rate"];
