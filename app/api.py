@@ -1657,7 +1657,7 @@ def advisor_chat(
                     "obligations_next_180_days": decimal_value(upcoming_total),
                 }
             )
-    elif any(word in normalized for word in ("OBRIGACAO", "VENCIMENTO", "VENCE", "PARCELA")):
+    elif any(word in normalized for word in ("OBRIGAC", "VENCIMENTO", "VENCE", "PARCELA")):
         intent = "obligations"
         items = _obligation_rows(db, user.household_id)
         upcoming = [item for item in items if item["days_until_due"] >= 0][:5]
