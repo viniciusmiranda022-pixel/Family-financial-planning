@@ -34,6 +34,7 @@ class AccountRequest(BaseModel):
 class TransactionUpdate(BaseModel):
     category_id: str | None = None
     excluded: bool | None = None
+    possible_duplicate: bool | None = None
     reviewed: bool | None = None
     owner_label: str | None = Field(default=None, max_length=80)
 
@@ -47,6 +48,11 @@ class ManualTransactionRequest(BaseModel):
     )
     account_id: str
     category_id: str | None = None
+    category_name: str | None = Field(default=None, min_length=2, max_length=100)
+
+
+class AdvisorRequest(BaseModel):
+    message: str = Field(min_length=2, max_length=1000)
 
 
 class CommissionRequest(BaseModel):
