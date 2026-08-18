@@ -1,7 +1,8 @@
 import json
 import re
 import uuid
-from datetime import UTC, date, datetime
+from calendar import monthrange
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
@@ -27,6 +28,7 @@ from app.models import (
 )
 from app.schemas import (
     AccountRequest,
+    AdvisorRequest,
     CommissionRequest,
     LoginRequest,
     ManualTransactionRequest,
@@ -175,6 +177,200 @@ def _consolidated_expenses(
         for transaction in ignored
     )
     return result, duplicates_ignored
+
+
+def _account_display(account: Account | None) -> str:
+    if not account:
+        return "Sem conta identificada"
+    parts = [account.institution.strip(), account.name.strip()]
+    label = " • ".join(dict.fromkeys(part for part in parts if part)) or "Conta sem nome"
+    if account.last_four:
+        label += f" • final {account.last_four}"
+    return label
+
+
+def _operational_cash_flow(rows: list[tuple[Transaction, str]]) -> dict:
+    """Separate actual income/outgoings from patrimonial transfers and reconciliations."""
+    accounts: dict[str, dict[str, object]] = {}
+    for transaction, category_name in rows:
+        if transaction.possible_duplicate:
+            continue
+        if transaction.transaction_type in {"transfer", "reconciliation"}:
+            continue
+        if category_name in {"Transferência interna", "Transferência patrimonial", "Conciliação"}:
+            continue
+        account = transaction.account
+        key = account.id if account else "unidentified"
+        item = accounts.setdefault(
+            key,
+            {
+                "account_id": account.id if account else None,
+                "account": _account_display(account),
+                "institution": account.institution if account else "",
+                "account_type": account.account_type if account else "other",
+                "cash_in": Decimal("0"),
+                "gross_out": Decimal("0"),
+                "refunds": Decimal("0"),
+            },
+        )
+        amount = Decimal(transaction.amount)
+        if transaction.transaction_type == "income" and amount > 0:
+            item["cash_in"] += amount
+        elif transaction.transaction_type == "refund" and amount > 0:
+            item["refunds"] += amount
+        elif transaction.transaction_type in {"expense", "refund"} and amount < 0:
+            item["gross_out"] += abs(amount)
+
+    serialized = []
+    for item in accounts.values():
+        cash_in = money(item["cash_in"])
+        refunds = money(item["refunds"])
+        cash_out = money(max(Decimal("0"), item["gross_out"] - refunds))
+        if cash_in == 0 and cash_out == 0 and refunds == 0:
+            continue
+        serialized.append(
+            {
+                "account_id": item["account_id"],
+                "account": item["account"],
+                "institution": item["institution"],
+                "account_type": item["account_type"],
+                "cash_in": decimal_value(cash_in),
+                "cash_out": decimal_value(cash_out),
+                "refunds": decimal_value(refunds),
+                "net": decimal_value(money(cash_in - cash_out)),
+            }
+        )
+    serialized.sort(key=lambda item: (item["account_type"], item["account"]))
+    return {
+        "cash_in": decimal_value(
+            money(sum((Decimal(str(item["cash_in"])) for item in serialized), Decimal("0")))
+        ),
+        "cash_out": decimal_value(
+            money(sum((Decimal(str(item["cash_out"])) for item in serialized), Decimal("0")))
+        ),
+        "accounts": serialized,
+    }
+
+
+def _add_months_preserving_day(value: date, months: int) -> date:
+    target = add_months(value.replace(day=1), months)
+    return target.replace(day=min(value.day, monthrange(target.year, target.month)[1]))
+
+
+def _obligation_dates(item: Obligation) -> list[date]:
+    dates = []
+    for occurrence in range(max(1, item.occurrence_count)):
+        dates.append(_add_months_preserving_day(item.due_date, occurrence * item.recurrence_months))
+        if item.recurrence_months == 0:
+            break
+    return dates
+
+
+def _obligation_timing(item: Obligation, reference: date | None = None) -> dict:
+    reference = reference or date.today()
+    dates = _obligation_dates(item)
+    next_due = next((due for due in dates if due >= reference), dates[-1])
+    days = (next_due - reference).days
+    if days < 0:
+        level = "overdue"
+        label = f"Cronograma venceu há {abs(days)} dia(s)"
+    elif days == 0:
+        level = "urgent"
+        label = "Vence hoje"
+    elif days <= 7:
+        level = "urgent"
+        label = f"Vence em {days} dia(s)"
+    elif days <= 30:
+        level = "soon"
+        label = f"Vence em {days} dias"
+    else:
+        level = "scheduled"
+        label = f"Vence em {days} dias"
+    return {
+        "next_due_date": next_due,
+        "days_until_due": days,
+        "alert_level": level,
+        "alert_label": label,
+    }
+
+
+def _obligation_rows(db: Session, household_id: str, reference: date | None = None) -> list[dict]:
+    rows = db.scalars(
+        select(Obligation)
+        .where(Obligation.household_id == household_id, Obligation.active.is_(True))
+        .order_by(Obligation.due_date)
+    ).all()
+    result = []
+    for item in rows:
+        timing = _obligation_timing(item, reference)
+        result.append(
+            {
+                "id": item.id,
+                "name": item.name,
+                "due_date": item.due_date,
+                "amount": decimal_value(item.amount),
+                "recurrence_months": item.recurrence_months,
+                "occurrence_count": item.occurrence_count,
+                "category": item.category,
+                **timing,
+            }
+        )
+    result.sort(key=lambda item: item["next_due_date"])
+    return result
+
+
+def _brl(value: Decimal | float | int) -> str:
+    formatted = f"{money(value):,.2f}"
+    return "R$ " + formatted.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+MONTHS_PT = {
+    "JANEIRO": 1,
+    "FEVEREIRO": 2,
+    "MARCO": 3,
+    "ABRIL": 4,
+    "MAIO": 5,
+    "JUNHO": 6,
+    "JULHO": 7,
+    "AGOSTO": 8,
+    "SETEMBRO": 9,
+    "OUTUBRO": 10,
+    "NOVEMBRO": 11,
+    "DEZEMBRO": 12,
+}
+
+
+def _advisor_month(message: str) -> date:
+    normalized = normalize_description(message)
+    year_match = re.search(r"\b(20\d{2})\b", normalized)
+    year = int(year_match.group(1)) if year_match else date.today().year
+    for name, number in MONTHS_PT.items():
+        if re.search(rf"\b{name}\b", normalized):
+            return date(year, number, 1)
+    return date.today().replace(day=1)
+
+
+def _advisor_amount(message: str) -> Decimal | None:
+    lowered = message.lower()
+    number = r"(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
+    patterns = (
+        rf"(?:custa|custando|valor(?:\s+de)?|compra(?:\s+de)?|pagar)\s*(?:r\$\s*)?{number}\s*(mil|k)?",
+        rf"r\$\s*{number}\s*(mil|k)?",
+        rf"{number}\s*(mil|k)\b",
+    )
+    match = next((candidate for pattern in patterns if (candidate := re.search(pattern, lowered))), None)
+    if not match:
+        return None
+    raw = match.group(1)
+    suffix = match.group(2)
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", raw):
+        raw = raw.replace(".", "")
+    elif "," in raw:
+        raw = raw.replace(".", "").replace(",", ".")
+    value = Decimal(raw)
+    if suffix:
+        value *= Decimal("1000")
+    return money(value)
 
 
 def _require_admin(user: User) -> None:
@@ -685,16 +881,35 @@ def create_manual_transaction(
     amount = -abs(payload.amount)
     excluded = False
     if payload.movement_type == "expense":
-        if not payload.category_id:
-            raise HTTPException(status_code=422, detail="Escolha uma categoria para a despesa")
-        category = db.scalar(
-            select(Category).where(
-                Category.id == payload.category_id,
-                Category.household_id == user.household_id,
+        if payload.category_id:
+            category = db.scalar(
+                select(Category).where(
+                    Category.id == payload.category_id,
+                    Category.household_id == user.household_id,
+                )
             )
-        )
-        if not category:
-            raise HTTPException(status_code=404, detail="Categoria não encontrada")
+            if not category:
+                raise HTTPException(status_code=404, detail="Categoria não encontrada")
+        elif payload.category_name:
+            custom_name = " ".join(payload.category_name.split())
+            category = db.scalar(
+                select(Category).where(
+                    Category.household_id == user.household_id,
+                    func.lower(Category.name) == custom_name.lower(),
+                )
+            )
+            if not category:
+                category = Category(
+                    household_id=user.household_id,
+                    name=custom_name,
+                    color="#64748B",
+                    cash_cap=Decimal("0"),
+                    essential=False,
+                )
+                db.add(category)
+                db.flush()
+        else:
+            raise HTTPException(status_code=422, detail="Escolha ou crie uma categoria para a despesa")
     elif payload.movement_type == "income":
         transaction_type = "income"
         amount = abs(payload.amount)
@@ -849,6 +1064,21 @@ def reviews(user: User = Depends(get_current_user), db: Session = Depends(get_db
             "transaction_id": item.transaction_id,
             "description": item.transaction.description if item.transaction else "Documento não processado",
             "amount": decimal_value(item.transaction.amount) if item.transaction else None,
+            "date": item.transaction.booked_at if item.transaction else None,
+            "category_id": item.transaction.category_id if item.transaction else None,
+            "category": (
+                item.transaction.category.name
+                if item.transaction and item.transaction.category
+                else "Revisar"
+            ),
+            "account": (
+                _account_display(item.transaction.account) if item.transaction else ""
+            ),
+            "excluded": item.transaction.excluded if item.transaction else None,
+            "possible_duplicate": (
+                item.transaction.possible_duplicate if item.transaction else False
+            ),
+            "manual": item.transaction.document_id is None if item.transaction else False,
             "created_at": item.created_at,
         }
         for item in rows
@@ -992,23 +1222,7 @@ def delete_manual_payroll(
 
 @router.get("/obligations")
 def obligations(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict]:
-    rows = db.scalars(
-        select(Obligation)
-        .where(Obligation.household_id == user.household_id, Obligation.active.is_(True))
-        .order_by(Obligation.due_date)
-    ).all()
-    return [
-        {
-            "id": item.id,
-            "name": item.name,
-            "due_date": item.due_date,
-            "amount": decimal_value(item.amount),
-            "recurrence_months": item.recurrence_months,
-            "occurrence_count": item.occurrence_count,
-            "category": item.category,
-        }
-        for item in rows
-    ]
+    return _obligation_rows(db, user.household_id)
 
 
 @router.post("/obligations", status_code=201)
@@ -1281,17 +1495,7 @@ def dashboard(
         start,
         end,
     )
-    cash_in = Decimal("0")
-    cash_out = Decimal("0")
-    for transaction, category_name in movement_rows:
-        if transaction.possible_duplicate:
-            continue
-        if transaction.transaction_type == "reconciliation" or category_name == "Transferência interna":
-            continue
-        if transaction.amount > 0:
-            cash_in += Decimal(transaction.amount)
-        elif transaction.amount < 0:
-            cash_out -= Decimal(transaction.amount)
+    cash_flow = _operational_cash_flow(movement_rows)
     category_totals: dict[str, Decimal] = {}
     for transaction, category_name in expense_rows:
         category_totals[category_name] = category_totals.get(category_name, Decimal("0")) - Decimal(
@@ -1315,14 +1519,22 @@ def dashboard(
         )
     )
     benefit = profile.food_allowance + profile.meal_allowance_daily * profile.workdays_month
+    obligation_alerts = [
+        item
+        for item in _obligation_rows(db, user.household_id)
+        if item["days_until_due"] <= 30
+    ][:5]
     return {
         "month": month_key(start),
         "spending": decimal_value(spending),
-        "cash_in": decimal_value(money(cash_in)),
-        "cash_out": decimal_value(money(cash_out)),
-        "cash_net": decimal_value(money(cash_in - cash_out)),
+        "cash_in": cash_flow["cash_in"],
+        "cash_out": cash_flow["cash_out"],
+        "cash_net": decimal_value(
+            money(Decimal(str(cash_flow["cash_in"])) - Decimal(str(cash_flow["cash_out"])))
+        ),
+        "cash_flow_by_account": cash_flow["accounts"],
         "cash_cap": decimal_value(profile.monthly_cash_cap),
-        "remaining_cap": decimal_value(max(Decimal("0"), profile.monthly_cash_cap - spending)),
+        "remaining_cap": decimal_value(money(profile.monthly_cash_cap - spending)),
         "investment_balance": decimal_value(profile.investment_balance),
         "emergency_floor": decimal_value(profile.emergency_floor),
         "food_benefits": decimal_value(benefit),
@@ -1334,4 +1546,196 @@ def dashboard(
             if amount > 0
         ],
         "future_commissions_gross": decimal_value(future_commission),
+        "obligation_alerts": obligation_alerts,
+    }
+
+
+@router.post("/advisor/chat")
+def advisor_chat(
+    payload: AdvisorRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    target_month = _advisor_month(payload.message)
+    selected_month = month_key(target_month)
+    normalized = normalize_description(payload.message)
+    summary = dashboard(month=selected_month, user=user, db=db)
+    profile = profile_for(db, user.household_id)
+    intent = "help"
+    status_name = "informative"
+    metrics: dict[str, object] = {"month": selected_month}
+
+    purchase_words = {"COMPRA", "COMPRAR", "CUSTA", "POSSO", "ADQUIRIR"}
+    if any(word in normalized.split() for word in purchase_words):
+        intent = "purchase"
+        purchase_amount = _advisor_amount(payload.message)
+        if purchase_amount is None:
+            answer = (
+                "Informe o valor da compra para eu analisar. Exemplo: "
+                "‘Quero comprar algo de R$ 2.000; posso fazer essa compra?’"
+            )
+            status_name = "insufficient_data"
+        elif Decimal(str(summary["cash_cap"])) <= 0:
+            answer = (
+                f"Ainda não consigo avaliar a compra de {_brl(purchase_amount)} porque o teto "
+                "mensal não está configurado. Preencha o perfil financeiro primeiro."
+            )
+            status_name = "insufficient_data"
+        else:
+            forecast_data = forecast(user=user, db=db)
+            remaining_before = Decimal(str(summary["remaining_cap"]))
+            remaining_after = money(remaining_before - purchase_amount)
+            minimum_projected = Decimal(str(forecast_data["summary"]["minimum_delayed"]))
+            floor = Decimal(str(forecast_data["summary"]["emergency_floor"]))
+            projection_margin = money(minimum_projected - floor)
+
+            today = date.today()
+            horizon = today + timedelta(days=180)
+            obligation_models = db.scalars(
+                select(Obligation).where(
+                    Obligation.household_id == user.household_id,
+                    Obligation.active.is_(True),
+                )
+            ).all()
+            occurrences = sorted(
+                (due, item)
+                for item in obligation_models
+                for due in _obligation_dates(item)
+                if today <= due <= horizon
+            )
+            upcoming_total = money(
+                sum((Decimal(item.amount) for _due, item in occurrences), Decimal("0"))
+            )
+            next_note = ""
+            if occurrences:
+                next_due, next_item = occurrences[0]
+                next_note = (
+                    f" A próxima obrigação cadastrada é {next_item.name}, de "
+                    f"{_brl(next_item.amount)}, em {next_due:%d/%m/%Y}."
+                )
+
+            if remaining_after < 0:
+                status_name = "not_recommended"
+                answer = (
+                    f"Minha recomendação é não fazer essa compra agora. O valor de "
+                    f"{_brl(purchase_amount)} ultrapassaria o teto disponível em "
+                    f"{_brl(abs(remaining_after))}. Neste mês você já gastou "
+                    f"{_brl(summary['spending'])} de um teto de {_brl(summary['cash_cap'])}."
+                    f"{next_note}"
+                )
+            elif not forecast_data["summary"]["viable"]:
+                status_name = "not_recommended"
+                answer = (
+                    f"Embora a compra de {_brl(purchase_amount)} caiba no teto deste mês, "
+                    "eu não a recomendo agora: a projeção conservadora já fica abaixo da "
+                    f"reserva mínima em {_brl(abs(projection_margin))}. Restariam "
+                    f"{_brl(remaining_after)} no teto após a compra.{next_note}"
+                )
+            elif purchase_amount > remaining_before * Decimal("0.50") or projection_margin < purchase_amount:
+                status_name = "caution"
+                answer = (
+                    f"A compra de {_brl(purchase_amount)} cabe matematicamente, mas exige "
+                    f"cautela: restariam {_brl(remaining_after)} no teto do mês e a margem "
+                    f"mínima projetada acima da reserva é {_brl(max(Decimal('0'), projection_margin))}. "
+                    f"Eu só faria se for necessária e sem usar a reserva investida.{next_note}"
+                )
+            else:
+                status_name = "favorable"
+                answer = (
+                    f"Sim, a compra de {_brl(purchase_amount)} cabe no cenário atual, "
+                    f"considerando pagamento à vista: restariam {_brl(remaining_after)} no "
+                    f"teto do mês. A projeção conservadora continua acima da reserva mínima "
+                    f"por {_brl(projection_margin)}.{next_note}"
+                )
+            answer += " A análise não considera juros de parcelamento nem gastos ainda não lançados."
+            metrics.update(
+                {
+                    "purchase_amount": decimal_value(purchase_amount),
+                    "remaining_before": decimal_value(remaining_before),
+                    "remaining_after": decimal_value(remaining_after),
+                    "projection_margin": decimal_value(projection_margin),
+                    "obligations_next_180_days": decimal_value(upcoming_total),
+                }
+            )
+    elif any(word in normalized for word in ("OBRIGAC", "VENCIMENTO", "VENCE", "PARCELA")):
+        intent = "obligations"
+        items = _obligation_rows(db, user.household_id)
+        upcoming = [item for item in items if item["days_until_due"] >= 0][:5]
+        if upcoming:
+            lines = [
+                f"{item['name']}: {_brl(item['amount'])} em {item['next_due_date']:%d/%m/%Y} "
+                f"({item['alert_label'].lower()})"
+                for item in upcoming
+            ]
+            answer = "Próximas obrigações cadastradas:\n- " + "\n- ".join(lines)
+        else:
+            answer = "Não encontrei obrigações futuras ativas cadastradas."
+    elif any(word in normalized for word in ("ECONOMIZAR", "ECONOMIA", "CORTAR", "CORTE")):
+        intent = "cuts"
+        plan = cut_plan(month=selected_month, user=user, db=db)
+        top = plan["recommendations"][:3]
+        if top:
+            lines = [
+                f"{item['category']}: reduzir inicialmente {_brl(item['suggested_cut'])} por mês"
+                for item in top
+            ]
+            answer = (
+                f"A meta inicial conservadora é {_brl(plan['potential_monthly_savings'])} por mês.\n- "
+                + "\n- ".join(lines)
+            )
+        else:
+            answer = "Não há recomendação de corte calculada para o período selecionado."
+    elif any(word in normalized for word in ("ENTROU", "RECEITA", "RECEBI", "ENTRADA")):
+        intent = "cash_in"
+        sources = [item for item in summary["cash_flow_by_account"] if item["cash_in"] > 0]
+        detail = "; ".join(
+            f"{item['account']}: {_brl(item['cash_in'])}" for item in sources
+        ) or "nenhuma conta com receita identificada"
+        answer = (
+            f"Entraram {_brl(summary['cash_in'])} em receitas reais em {selected_month}. "
+            f"Resgates e estornos não entram nesse total. Detalhamento: {detail}."
+        )
+    elif any(word in normalized for word in ("SAIU", "BANCO", "CARTAO", "SAIDA")):
+        intent = "cash_out"
+        sources = [item for item in summary["cash_flow_by_account"] if item["cash_out"] > 0]
+        detail = "; ".join(
+            f"{item['account']}: {_brl(item['cash_out'])}" for item in sources
+        ) or "nenhuma saída identificada"
+        answer = (
+            f"Saíram {_brl(summary['cash_out'])} em despesas e pagamentos em {selected_month}. "
+            f"Aplicações, resgates, transferências internas e pagamento de fatura foram excluídos. "
+            f"Detalhamento: {detail}."
+        )
+    elif any(word in normalized for word in ("GASTEI", "GASTO", "GASTOS")):
+        intent = "spending"
+        answer = (
+            f"O gasto considerado no teto em {selected_month} é {_brl(summary['spending'])}. "
+            f"O saldo do teto é {_brl(summary['remaining_cap'])}."
+        )
+    else:
+        answer = (
+            "Posso analisar uma compra, informar entradas e saídas por conta, listar obrigações "
+            "próximas, mostrar o gasto do mês ou indicar os principais cortes. Por exemplo: "
+            "‘Posso comprar algo de R$ 2.000?’"
+        )
+
+    audit(
+        db,
+        user,
+        "advisor.question",
+        "financial_profile",
+        profile.id,
+        {"intent": intent, "status": status_name, **metrics},
+    )
+    db.commit()
+    return {
+        "answer": answer,
+        "status": status_name,
+        "intent": intent,
+        "metrics": metrics,
+        "assumptions": [
+            "Compras são avaliadas à vista no mês selecionado",
+            "A reserva investida não é tratada como renda disponível",
+            "Dados ainda não lançados não entram na análise",
+        ],
     }

@@ -54,6 +54,7 @@
         <button data-view="reviews"><span>!</span>Revisar <b id="nav-review-count" class="badge">0</b></button>
         <button data-view="income"><span>+</span>Rendas</button>
         <button data-view="planning"><span>↗</span>Planejamento</button>
+        <button data-view="advisor"><span>✦</span>Consultor</button>
         <button data-view="users" id="nav-users" class="hidden"><span>♙</span>Acessos</button>
         <button data-view="settings"><span>⚙</span>Configurações</button>
       </nav>
@@ -81,10 +82,10 @@
         </div>
         <div class="kpi-grid">
           <article class="kpi highlight"><span>Saldo investido</span><strong id="kpi-investment">R$ 0,00</strong><small>Aplicação informada no perfil</small></article>
-          <article class="kpi cash-in"><span>Entrou no mês</span><strong id="kpi-cash-in">R$ 0,00</strong><small>Receitas e resgates identificados</small></article>
-          <article class="kpi cash-out"><span>Saiu no mês</span><strong id="kpi-cash-out">R$ 0,00</strong><small>Inclui gastos, aplicações e pagamentos patrimoniais</small></article>
+          <article class="kpi cash-in"><span>Entrou no mês</span><strong id="kpi-cash-in">R$ 0,00</strong><small>Somente receitas; sem resgates e estornos</small></article>
+          <article class="kpi cash-out"><span>Saiu no mês</span><strong id="kpi-cash-out">R$ 0,00</strong><small>Despesas e pagamentos; sem aplicações</small></article>
           <article class="kpi"><span>Gasto no mês</span><strong id="kpi-spending">R$ 0,00</strong><small id="kpi-cap-caption">de R$ 0,00</small></article>
-          <article class="kpi"><span>Disponível no teto</span><strong id="kpi-remaining">R$ 0,00</strong><small>Sem contar parcelas antigas</small></article>
+          <article class="kpi" id="remaining-cap-card"><span>Disponível no teto</span><strong id="kpi-remaining">R$ 0,00</strong><small id="kpi-remaining-caption">Sem contar parcelas antigas</small></article>
           <article class="kpi warning"><span>Pendências</span><strong id="kpi-reviews">0</strong><small>Itens aguardando confirmação</small></article>
         </div>
         <div class="two-column">
@@ -99,6 +100,14 @@
             <div id="quality-list" class="quality-list"></div>
           </article>
         </div>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">FLUXO POR ORIGEM</span><h2>Entradas e saídas por banco e cartão</h2><small>Valores operacionais líquidos. Aplicações, resgates, transferências internas e pagamento de fatura não são contabilizados.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Banco / cartão</th><th>Tipo</th><th class="right">Entrou</th><th class="right">Saiu</th><th class="right">Estornos</th></tr></thead><tbody id="cash-flow-accounts-table"></tbody></table></div>
+        </article>
+        <article class="panel obligation-alert-panel">
+          <div class="panel-heading"><div><span class="step-label">ALERTAS</span><h2>Obrigações próximas do vencimento</h2><small>O sistema alerta com 30 dias de antecedência e destaca os últimos 7 dias.</small></div><button data-go="planning" class="secondary">Ver planejamento</button></div>
+          <div id="dashboard-obligation-alerts" class="alert-list"></div>
+        </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">DETALHAMENTO MENSAL</span><h2 id="monthly-categories-title">Gastos por categoria</h2><small id="monthly-duplicates-note" class="hidden"></small></div></div>
           <div class="table-wrap"><table><thead><tr><th>Categoria</th><th class="right">Participação</th><th class="right">Total no mês</th></tr></thead><tbody id="monthly-categories-table"></tbody></table></div>
@@ -145,10 +154,11 @@
           <form id="transaction-form" class="form-grid three">
             <label>Data<input type="date" name="booked_at" required></label>
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Abastecimento no posto"></label>
-            <label>Natureza<select name="movement_type" id="transaction-movement-type"><option value="expense">Despesa</option><option value="income">Receita</option><option value="investment">Aplicação/investimento</option><option value="redemption">Resgate de investimento</option><option value="refund">Reembolso/estorno</option></select></label>
+            <label>Tipo de movimentação<select name="movement_type" id="transaction-movement-type"><option value="expense">Despesa</option><option value="income">Receita</option><option value="investment">Aplicação/investimento</option><option value="redemption">Resgate de investimento</option><option value="refund">Reembolso/estorno</option></select></label>
             <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
             <label>Conta<select name="account_id" id="transaction-account" required></select></label>
-            <label id="transaction-category-field">Categoria<select name="category_id" id="transaction-category" required></select></label>
+            <label id="transaction-category-field">Natureza / categoria<select name="category_id" id="transaction-category" required></select></label>
+            <label id="transaction-custom-category-field" class="hidden">Qual é a nova categoria?<input name="category_name" id="transaction-custom-category" maxlength="100" placeholder="Ex.: Jardinagem"></label>
             <button class="primary" type="submit">Adicionar lançamento</button>
           </form>
         </article>
@@ -159,7 +169,7 @@
       </section>
 
       <section id="view-reviews" class="view">
-        <article class="panel"><div class="panel-heading"><div><span class="step-label">FILA DE CONTROLE</span><h2>Itens que exigem confirmação</h2></div></div><div id="reviews-list" class="review-list"></div></article>
+        <article class="panel"><div class="panel-heading"><div><span class="step-label">FILA DE CONTROLE</span><h2>Itens que exigem confirmação</h2><small>Corrija a categoria, decida se entra no cálculo ou apenas confirme que o item já está correto.</small></div></div><div id="reviews-list" class="review-list"></div></article>
       </section>
 
       <section id="view-income" class="view">
@@ -216,8 +226,32 @@
             <canvas id="forecast-chart" width="900" height="320" aria-label="Gráfico da projeção financeira"></canvas>
           </article>
         </div>
-        <article class="panel"><div class="panel-heading"><div><span class="step-label">COMPROMISSOS ATIVOS</span><h2>Obrigações cadastradas</h2></div></div><div class="table-wrap"><table><thead><tr><th>Primeiro vencimento</th><th>Nome</th><th>Grupo</th><th>Repetição</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="obligations-table"></tbody></table></div></article>
+        <article class="panel"><div class="panel-heading"><div><span class="step-label">COMPROMISSOS ATIVOS</span><h2>Obrigações cadastradas</h2><small>Alertas automáticos aparecem 30 dias antes do próximo vencimento.</small></div></div><div class="table-wrap"><table><thead><tr><th>Próximo vencimento</th><th>Nome</th><th>Grupo</th><th>Repetição</th><th>Status</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="obligations-table"></tbody></table></div></article>
         <article class="panel"><div class="panel-heading"><h2>Calendário consolidado</h2></div><div class="table-wrap wide"><table><thead><tr><th>Mês</th><th class="right">Salário</th><th class="right">Extras</th><th class="right">Comissão + atraso</th><th class="right">Compromissos</th><th class="right">Parcelas</th><th class="right">Rendimento</th><th class="right">Saldo + atraso</th></tr></thead><tbody id="forecast-table"></tbody></table></div></article>
+      </section>
+
+      <section id="view-advisor" class="view">
+        <div class="advisor-layout">
+          <article class="panel advisor-intro">
+            <span class="step-label">INTELIGÊNCIA FINANCEIRA LOCAL</span>
+            <h2>Converse com seu consultor</h2>
+            <p>As respostas usam os lançamentos, o teto, a reserva e as obrigações desta família. Nenhum dado é enviado para um serviço externo.</p>
+            <div class="advisor-suggestions">
+              <button class="secondary advisor-suggestion" type="button">Posso comprar algo de R$ 2.000?</button>
+              <button class="secondary advisor-suggestion" type="button">Quanto saiu do banco e dos cartões neste mês?</button>
+              <button class="secondary advisor-suggestion" type="button">Quais obrigações estão próximas?</button>
+              <button class="secondary advisor-suggestion" type="button">Onde posso economizar?</button>
+            </div>
+            <div class="security-note"><strong>Premissa conservadora</strong><p>Compras são avaliadas à vista. A reserva investida não é tratada como renda livre e o sistema não considera gastos que ainda não foram lançados.</p></div>
+          </article>
+          <article class="panel advisor-chat-panel">
+            <div id="advisor-messages" class="advisor-messages" aria-live="polite"></div>
+            <form id="advisor-form" class="advisor-form">
+              <input name="message" id="advisor-input" autocomplete="off" required maxlength="1000" placeholder="Digite sua pergunta financeira...">
+              <button class="primary" type="submit">Analisar</button>
+            </form>
+          </article>
+        </div>
       </section>
 
       <section id="view-users" class="view">
