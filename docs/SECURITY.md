@@ -22,13 +22,17 @@
 - SHA-256 por documento;
 - trilha de auditoria;
 - backup diário do banco.
+- acesso remoto privado por identidade e dispositivo no Tailscale, sem porta pública;
+- serviço Codex isolado, sem credenciais do banco e sem acesso ao volume de documentos;
+- cálculo financeiro determinístico antes de qualquer explicação gerada por IA;
+- OCR e transcrição locais com confirmação humana antes da gravação.
 
 ## Antes da produção
 
 1. Use Ubuntu Server atualizado e aplique atualizações de segurança.
 2. Restrinja SSH por chave e desabilite senha quando possível.
 3. Libere a porta do sistema somente para a VLAN ou rede dos usuários autorizados.
-4. Coloque proxy reverso HTTPS antes de acesso por VPN, Wi-Fi não confiável ou redes distintas.
+4. Para acesso remoto, use Tailscale Serve em HTTPS e mantenha o Funnel desabilitado.
 5. Configure cópia externa criptografada dos backups.
 6. Teste uma restauração completa.
 7. Guarde o `.env` em cofre offline; ele contém a chave dos documentos.
@@ -38,11 +42,17 @@
 
 - não publicar a porta do PostgreSQL;
 - não expor a aplicação diretamente à internet;
+- não compartilhar a conta do Tailscale nem o usuário do sistema entre Vinicius e Kelly;
 - não armazenar senha de internet banking;
+- não configurar `OPENAI_API_KEY` no serviço `advisor`; a API tem cobrança separada e não é necessária;
 - não sincronizar a pasta de dados com serviço público sem criptografia adicional;
 - não enviar `.env`, dump ou documento em chamados ou issues;
 - não considerar um backup no mesmo disco como recuperação de desastre.
 
-## HTTPS
+## HTTPS e acesso remoto
 
-O MVP inicia em HTTP para uma LAN controlada. Para uso real com múltiplos dispositivos, adicione Caddy ou Nginx com certificado interno e altere `COOKIE_SECURE=true`.
+O sistema inicia em HTTP na máquina local. O Tailscale Serve encerra HTTPS e entrega o endereço `.ts.net` somente aos dispositivos autorizados da tailnet. O controle remoto é feito pela identidade e pelo dispositivo cadastrado, não pelo MAC address, que não atravessa a internet.
+
+## Fronteira do Codex
+
+O serviço `advisor` recebe somente JSON sanitizado produzido pela aplicação. Ele não monta `document_data`, não participa da rede interna do PostgreSQL e não possui `DATABASE_URL`. O sandbox do Codex é somente leitura e vazio. Uma resposta gerada só é aceita se preservar exatamente o veredito calculado pelo motor local; caso contrário, o sistema usa a resposta determinística.
