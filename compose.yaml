@@ -36,6 +36,25 @@ services:
       - no-new-privileges:true
     networks: [internal, lan]
 
+  advisor:
+    build: ./advisor
+    restart: unless-stopped
+    environment:
+      ADVISOR_SHARED_SECRET: ${ADVISOR_SHARED_SECRET:-}
+      CODEX_HOME: /codex-auth
+      CODEX_MODEL: ${CODEX_MODEL:-}
+      CODEX_TIMEOUT_MS: ${CODEX_TIMEOUT_MS:-70000}
+    volumes:
+      - codex_auth:/codex-auth
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /sandbox:size=16m,mode=755
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [lan]
+
   backup:
     image: postgres:17-alpine
     restart: unless-stopped
@@ -61,3 +80,4 @@ volumes:
   postgres_data:
   document_data:
   backup_data:
+  codex_auth:
