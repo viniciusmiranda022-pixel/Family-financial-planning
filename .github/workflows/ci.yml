@@ -20,6 +20,29 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: ruff check .
       - run: pytest -q
+      - run: node --check advisor/server.mjs
+      - name: Validate PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in @(
+            "scripts/setup-codex-windows.ps1",
+            "scripts/run-codex-advisor.ps1",
+            "scripts/setup-tailscale.ps1"
+          )) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $file,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "${file}: $_" }
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
       - run: docker build -t family-financial-planning:test .
       - run: docker build -t family-financial-advisor:test advisor
       - run: cp .env.example .env && docker compose config -q

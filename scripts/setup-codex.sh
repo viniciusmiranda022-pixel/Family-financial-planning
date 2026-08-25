@@ -17,7 +17,7 @@ if ! grep -Eq '^ADVISOR_SHARED_SECRET=.{32,}$' .env || grep -q 'CHANGE_ME_ADVISO
 fi
 
 echo "Construindo o serviço isolado do Codex..."
-docker compose build advisor
+docker compose --profile container-advisor build advisor
 
 echo ""
 echo "Antes de continuar, habilite o login por código de dispositivo em:"
@@ -26,17 +26,17 @@ echo "Documentação: https://developers.openai.com/codex/auth"
 echo ""
 echo "Faça login com a mesma conta do ChatGPT quando o código de dispositivo aparecer."
 echo "Nenhuma chave de API será solicitada ou gravada no projeto."
-if ! docker compose run --rm --no-deps advisor codex login --device-auth; then
+if ! docker compose --profile container-advisor run --rm --no-deps advisor codex login --device-auth; then
   echo ""
   echo "A autenticação não foi concluída. Confirme que o login por código de dispositivo"
   echo "está habilitado nas configurações de Segurança do ChatGPT e tente novamente."
   echo "Se continuar falhando, execute este diagnóstico e envie somente a saída do erro:"
-  echo "docker compose run --rm --no-deps advisor node -e \"fetch('https://auth.openai.com').then(r=>console.log('HTTPS',r.status)).catch(e=>console.error(e.cause||e))\""
+  echo "docker compose --profile container-advisor run --rm --no-deps advisor node -e \"fetch('https://auth.openai.com').then(r=>console.log('HTTPS',r.status)).catch(e=>console.error(e.cause||e))\""
   exit 1
 fi
 
-docker compose up -d advisor app
-docker compose exec advisor codex login status
+docker compose --profile container-advisor up -d advisor app
+docker compose --profile container-advisor exec advisor codex login status
 docker compose ps
 
 echo ""

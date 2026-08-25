@@ -37,11 +37,13 @@ services:
     networks: [internal, lan]
 
   advisor:
+    profiles: ["container-advisor"]
     build: ./advisor
     restart: unless-stopped
     environment:
       ADVISOR_SHARED_SECRET: ${ADVISOR_SHARED_SECRET:-}
       CODEX_HOME: /codex-auth
+      ADVISOR_SANDBOX_DIR: /sandbox
       CODEX_MODEL: ${CODEX_MODEL:-}
       CODEX_TIMEOUT_MS: ${CODEX_TIMEOUT_MS:-70000}
     volumes:

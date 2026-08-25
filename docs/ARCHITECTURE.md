@@ -26,9 +26,14 @@ O arquivo original é criptografado com Fernet antes de ser persistido no volume
 
 Texto e documentos entram em `capture_drafts`. Regras locais, Tesseract e Whisper montam propostas editáveis. Somente a confirmação cria lançamentos, obrigações ou registros de folha. O arquivo original permanece criptografado e a captura registra processador, confiança, proposta e resultado.
 
-### Consultor Codex isolado
+### Consultor Codex
 
 O motor financeiro consulta e consolida o banco, calcula o veredito e monta um resumo. O serviço `advisor` recebe esse resumo por uma rede Docker sem PostgreSQL e executa o Codex em sandbox somente leitura. A resposta é descartada se tentar mudar o veredito. A indisponibilidade do Codex aciona o fallback local.
+
+Em redes que bloqueiam a saída HTTPS de WSL/Docker, o mesmo `advisor` pode executar nativamente no
+Windows. Nesse modo, a aplicação o acessa por `host.docker.internal`, enquanto banco e documentos
+permanecem exclusivamente nos contêineres/volumes. O processo recebe somente o segredo interno e o
+JSON sanitizado, trabalha em um diretório vazio e executa o Codex com sandbox somente leitura.
 
 ### Acesso remoto
 

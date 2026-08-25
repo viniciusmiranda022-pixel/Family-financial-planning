@@ -23,30 +23,54 @@ O contêiner `advisor` não possui `DATABASE_URL`, volume do PostgreSQL nem volu
 
 Se o Codex estiver desconectado ou indisponível, a captura e o consultor continuam usando as regras locais.
 
-## Autenticação usando a assinatura do ChatGPT
+## Autenticação usando a assinatura do ChatGPT no Windows
 
-Depois de atualizar e iniciar o sistema, execute no WSL:
+Quando o Windows alcança a OpenAI, mas a rede virtual do Docker/WSL é filtrada, execute somente o
+consultor no host. O aplicativo continua no Docker e chama o serviço pelo endereço especial
+`host.docker.internal`; o PostgreSQL e os documentos não são expostos ao processo nativo.
 
 Antes, abra **ChatGPT > Configurações > Segurança** e habilite o login por código de
 dispositivo para o Codex CLI. A OpenAI exige essa autorização antes de gerar o código.
 
+```powershell
+cd C:\Users\ViniciusMiranda\Family-financial-planning
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-codex-windows.ps1
+```
+
+O instalador usa o Node.js já presente, instala a versão fixada do Codex no diretório `advisor`,
+exibe o código de dispositivo, configura uma tarefa no logon do Windows e valida a comunicação do
+contêiner `app` com o serviço. Credenciais e logs ficam em
+`%LOCALAPPDATA%\FamilyFinancialPlanning`, fora do Git.
+
+Para conferir o serviço:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8081/health
+Get-ScheduledTask FamilyFinancialPlanning-CodexAdvisor
+```
+
+## Autenticação em Docker/Linux
+
+Se o próprio contêiner consegue acessar `https://auth.openai.com`, execute no Linux/WSL:
+
 ```bash
-cd /mnt/c/Users/ViniciusMiranda/Family-financial-planning
 sh ./scripts/setup-codex.sh
 ```
 
-O comando exibe um código para autenticação por dispositivo. Entre com a conta que possui a assinatura do ChatGPT. Não configure `OPENAI_API_KEY`: uso de API possui cobrança separada e não é necessário nesta arquitetura.
+O comando exibe um código para autenticação por dispositivo. Entre com a conta que possui a
+assinatura do ChatGPT. Não configure `OPENAI_API_KEY`: uso de API possui cobrança separada e não é
+necessário nesta arquitetura.
 
 Para conferir o login posteriormente:
 
 ```bash
-docker compose exec advisor codex login status
+docker compose --profile container-advisor exec advisor codex login status
 ```
 
 Para desconectar, use:
 
 ```bash
-docker compose run --rm --no-deps advisor codex logout
+docker compose --profile container-advisor run --rm --no-deps advisor codex logout
 ```
 
 ## Limites e revisão humana

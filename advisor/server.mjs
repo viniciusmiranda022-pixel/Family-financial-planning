@@ -1,12 +1,21 @@
 import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
-import { access } from "node:fs/promises";
+import { access, mkdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = dirname(fileURLToPath(import.meta.url));
+const isWindows = process.platform === "win32";
+const runtimeRoot = isWindows
+  ? join(process.env.LOCALAPPDATA || process.env.USERPROFILE || root, "FamilyFinancialPlanning")
+  : "/";
+const codexHome = process.env.CODEX_HOME || (isWindows ? join(runtimeRoot, "codex") : "/codex-auth");
+const sandboxDir = process.env.ADVISOR_SANDBOX_DIR
+  || (isWindows ? join(runtimeRoot, "sandbox") : "/sandbox");
+const codexEntrypoint = join(root, "node_modules", "@openai", "codex", "bin", "codex.js");
+const host = process.env.ADVISOR_HOST || "0.0.0.0";
 const port = Number(process.env.ADVISOR_PORT || 8081);
 const sharedSecret = process.env.ADVISOR_SHARED_SECRET || "";
 const model = (process.env.CODEX_MODEL || "").trim();
@@ -44,7 +53,7 @@ function authorized(request) {
 
 async function authAvailable() {
   try {
-    await access(join(process.env.CODEX_HOME || "/codex-auth", "auth.json"), constants.R_OK);
+    await access(join(codexHome, "auth.json"), constants.R_OK);
     return true;
   } catch {
     return false;
@@ -62,13 +71,22 @@ function codexEnvironment() {
     "HTTPS_PROXY",
     "ALL_PROXY",
     "NO_PROXY",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
   ];
   const environment = {};
   for (const key of allowed) {
     if (process.env[key]) environment[key] = process.env[key];
   }
-  environment.HOME = "/home/node";
-  environment.CODEX_HOME = process.env.CODEX_HOME || "/codex-auth";
+  environment.HOME = process.env.HOME || process.env.USERPROFILE || (isWindows ? runtimeRoot : "/home/node");
+  environment.CODEX_HOME = codexHome;
   return environment;
 }
 
@@ -97,16 +115,17 @@ function runCodex(prompt, schemaFile) {
       "--ignore-rules",
       "--skip-git-repo-check",
     ];
+    if (isWindows) args.unshift("-c", 'windows.sandbox="unelevated"');
     if (model) args.push("--model", model);
     args.push(
       "--output-schema",
       join(root, schemaFile),
       "-C",
-      "/sandbox",
+      sandboxDir,
       "-",
     );
-    const child = spawn("codex", args, {
-      cwd: "/sandbox",
+    const child = spawn(process.execPath, [codexEntrypoint, ...args], {
+      cwd: sandboxDir,
       env: codexEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -172,11 +191,13 @@ function advisorPrompt(payload) {
 const server = createServer(async (request, response) => {
   try {
     if (request.method === "GET" && request.url === "/health") {
+      const authenticated = await authAvailable();
       send(response, 200, {
         status: "healthy",
-        ready: Boolean(sharedSecret) && (await authAvailable()),
-        authenticated: await authAvailable(),
+        ready: Boolean(sharedSecret) && authenticated,
+        authenticated,
         model: modelLabel,
+        runtime: process.platform,
       });
       return;
     }
@@ -209,6 +230,8 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(port, "0.0.0.0", () => {
-  process.stdout.write(`Codex advisor listening on ${port}\n`);
+await mkdir(sandboxDir, { recursive: true });
+
+server.listen(port, host, () => {
+  process.stdout.write(`Codex advisor listening on ${host}:${port} (${process.platform})\n`);
 });
