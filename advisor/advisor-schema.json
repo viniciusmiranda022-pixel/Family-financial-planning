@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["favorable", "caution", "not_recommended", "insufficient_data", "informative"]
+    },
+    "answer": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 500 },
+      "maxItems": 6
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 500 },
+      "maxItems": 6
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "required": ["verdict", "answer", "evidence", "assumptions", "confidence"],
+  "additionalProperties": false
+}
