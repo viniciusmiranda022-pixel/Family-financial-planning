@@ -2315,10 +2315,17 @@ def advisor_chat(
                     )
                 ).all()
                 occurrences = sorted(
-                    (due, item)
-                    for item in obligation_models
-                    for due in _obligation_dates(item)
-                    if today <= due <= horizon
+                    (
+                        (due, item)
+                        for item in obligation_models
+                        for due in _obligation_dates(item)
+                        if today <= due <= horizon
+                    ),
+                    key=lambda occurrence: (
+                        occurrence[0],
+                        occurrence[1].name.casefold(),
+                        occurrence[1].id,
+                    ),
                 )
                 upcoming_total = money(
                     sum((Decimal(item.amount) for _due, item in occurrences), Decimal("0"))
