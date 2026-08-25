@@ -153,6 +153,35 @@ class ReviewItem(Base, TimestampMixin):
     transaction: Mapped[Transaction | None] = relationship()
 
 
+class CaptureDraft(Base, TimestampMixin):
+    __tablename__ = "capture_drafts"
+    __table_args__ = (
+        Index("ix_capture_household_created", "household_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(ForeignKey("households.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    source_type: Mapped[str] = mapped_column(String(30))
+    detected_type: Mapped[str] = mapped_column(String(40), default="text")
+    status: Mapped[str] = mapped_column(String(30), default="preview")
+    processor: Mapped[str] = mapped_column(String(60), default="local_rules")
+    original_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proposal_json: Mapped[str] = mapped_column(Text, default="[]")
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4), default=Decimal("0"))
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    document: Mapped[Document | None] = relationship()
+
+
 class Commission(Base, TimestampMixin):
     __tablename__ = "commissions"
 
