@@ -396,6 +396,47 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert advisor_bare_amount.json()["status"] == "insufficient_data"
         assert advisor_bare_amount.json()["metrics"]["purchase_amount"] == 250
         assert "à vista ou parcelada" in advisor_bare_amount.json()["answer"]
+
+        shared_due_date = date.today() + timedelta(days=60)
+        same_day_obligations = []
+        for name in ("Parcela mensal da chácara", "Reforço da chácara"):
+            response = client.post(
+                "/api/obligations",
+                json={
+                    "name": name,
+                    "due_date": shared_due_date.isoformat(),
+                    "amount": 1500,
+                    "recurrence_months": 0,
+                    "occurrence_count": 1,
+                    "category": "property",
+                },
+            )
+            assert response.status_code == 201
+            same_day_obligations.append(response.json()["id"])
+
+        advisor_cash_follow_up = client.post(
+            "/api/advisor/chat",
+            json={
+                "message": "será à vista",
+                "history": [
+                    {
+                        "role": "user",
+                        "content": "Comprar um carro de 20 mil, posso?",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Essa compra será à vista ou parcelada?",
+                    },
+                ],
+            },
+        )
+        assert advisor_cash_follow_up.status_code == 200
+        assert advisor_cash_follow_up.json()["intent"] == "purchase"
+        assert advisor_cash_follow_up.json()["metrics"]["purchase_amount"] == 20000
+        assert advisor_cash_follow_up.json()["metrics"]["payment"]["mode"] == "cash"
+        for obligation_id in same_day_obligations:
+            assert client.delete(f"/api/obligations/{obligation_id}").status_code == 200
+
         with monkeypatch.context() as codex_patch:
             codex_patch.setattr(
                 "app.api.CodexAdvisorClient.analyze",
