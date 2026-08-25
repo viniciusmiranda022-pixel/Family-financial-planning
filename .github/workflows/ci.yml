@@ -21,3 +21,5 @@ jobs:
       - run: ruff check .
       - run: pytest -q
       - run: docker build -t family-financial-planning:test .
+      - run: docker build -t family-financial-advisor:test advisor
+      - run: cp .env.example .env && docker compose config -q
