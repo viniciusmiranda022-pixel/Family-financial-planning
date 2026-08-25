@@ -12,6 +12,7 @@ htmlcov/
 data/
 backups/
 uploads/
+diagnostics/
 *.pdf
 *.ofx
 *.xlsx
