@@ -132,7 +132,7 @@ Depois do primeiro acesso, siga esta ordem:
 Para usar o Codex com a assinatura do ChatGPT, sem configurar uma chave de API, execute:
 
 ```bash
-./scripts/setup-codex.sh
+sh ./scripts/setup-codex.sh
 ```
 
 Para acesso privado fora de casa, siga [docs/TAILSCALE.md](docs/TAILSCALE.md). Não abra a porta `8090` no roteador e não habilite o Tailscale Funnel.
