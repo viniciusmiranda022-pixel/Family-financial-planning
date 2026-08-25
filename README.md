@@ -34,6 +34,12 @@ Esta primeira versão entrega:
 - revisão assistida com correção de categoria e decisão de considerar ou ignorar cada item;
 - alertas de obrigações com 30 dias de antecedência e destaque nos últimos 7 dias;
 - consultor conversacional local para compras, fluxo mensal, vencimentos e cortes;
+- central “Lançar agora” com texto, gravação de áudio, foto, PDF, CSV e OFX;
+- OCR local de comprovantes, boletos, faturas, extratos e holerites;
+- transcrição local de áudio e prévia editável antes da gravação;
+- classificação assistida pelo Codex somente quando a regra local estiver ambígua;
+- consultor com cálculo local e explicação opcional pelo Codex, sem acesso direto ao banco;
+- acesso remoto privado para os celulares de Vinicius e Kelly por Tailscale Serve;
 - consolidação automática de lançamentos repetidos entre a planilha e importações históricas;
 - plano de cortes por categoria com metas iniciais conservadoras, sem prometer corte integral;
 - backup diário do PostgreSQL com retenção configurável;
@@ -42,10 +48,10 @@ Esta primeira versão entrega:
 ## Arquitetura
 
 ```text
-Navegador na rede local
+Celular / navegador via LAN ou Tailscale
         |
         v
-FastAPI + interface web
+FastAPI + interface web ---- resumo sanitizado ----> Codex isolado
    |              |
    v              v
 PostgreSQL   Documentos criptografados
@@ -54,7 +60,7 @@ PostgreSQL   Documentos criptografados
 Backup diário local
 ```
 
-O Docker Compose cria três serviços: `app`, `db` e `backup`. O banco e os documentos usam volumes persistentes e não são publicados no Git.
+O Docker Compose cria `app`, `db`, `backup` e o serviço opcional `advisor`. O contêiner do Codex não recebe credenciais do banco nem monta o volume dos documentos. O banco, os arquivos, os modelos locais e os backups usam volumes persistentes e não são publicados no Git.
 
 ## Servidor recomendado
 
@@ -123,9 +129,19 @@ Depois do primeiro acesso, siga esta ordem:
 6. em **Acessos**, crie o usuário individual de cada membro da família;
 7. confira o plano de cortes e os três cenários da projeção.
 
+Para usar o Codex com a assinatura do ChatGPT, sem configurar uma chave de API, execute:
+
+```bash
+./scripts/setup-codex.sh
+```
+
+Para acesso privado fora de casa, siga [docs/TAILSCALE.md](docs/TAILSCALE.md). Não abra a porta `8090` no roteador e não habilite o Tailscale Funnel.
+
 Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo investido, mas não entram nas receitas ou saídas operacionais. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
 
-O **Consultor** funciona localmente e usa regras financeiras auditáveis sobre os dados cadastrados. Ele não envia extratos para uma API externa e não substitui uma análise profissional. Compras são avaliadas à vista; juros de parcelamento e gastos ainda não lançados não entram na resposta.
+O **Consultor** calcula localmente o veredito com regras financeiras auditáveis. Se o Codex estiver autenticado, recebe apenas pergunta, totais agregados, projeções e o veredito para produzir uma explicação; não recebe documentos, credenciais ou conexão com o banco. Para compras, informe pagamento à vista ou quantidade de parcelas e juros. Sem Codex, o consultor continua operando localmente.
+
+Na central **Lançar agora**, toda extração gera uma prévia. Confira data, valor, conta, categoria e tipo antes de confirmar. O primeiro áudio pode demorar mais porque o modelo pequeno de transcrição é baixado para o volume local.
 
 ## Carga da planilha consolidada
 
@@ -206,6 +222,7 @@ set +a
 - restrinja a porta `8080` à rede local no firewall;
 - use HTTPS antes de permitir acesso por Wi-Fi não confiável, VPN ou internet;
 - não encaminhe a porta do sistema diretamente no roteador;
+- use Tailscale Serve, contas individuais e o usuário próprio da Kelly;
 - faça backup também do `.env`: sem a chave, documentos antigos não podem ser descriptografados;
 - não restaure dumps de origem desconhecida.
 
@@ -223,9 +240,9 @@ ruff check .
 
 ## Limitações conscientes do MVP
 
-- PDFs escaneados sem camada de texto são encaminhados para revisão; OCR entra na próxima fase.
+- OCR e transcrição podem errar; nenhum resultado é gravado sem prévia e confirmação.
 - PDFs bancários podem mudar de layout; arquivos inválidos, incompletos ou não reconhecidos vão para revisão.
-- O consultor entende perguntas financeiras objetivas e valores em reais, mas não é um modelo de linguagem de uso geral.
+- o Codex é opcional; quando conectado, seu uso segue os limites da assinatura autenticada do ChatGPT.
 - possíveis duplicidades são excluídas provisoriamente do cálculo, mas nunca apagadas.
 - o sistema não acessa internet banking e não armazena credenciais bancárias.
 - nenhuma classificação automática substitui a revisão do usuário quando a confiança é baixa.
@@ -235,4 +252,6 @@ ruff check .
 - [Arquitetura](docs/ARCHITECTURE.md)
 - [Regras financeiras](docs/FINANCIAL_RULES.md)
 - [Segurança e operação](docs/SECURITY.md)
+- [Acesso remoto com Tailscale](docs/TAILSCALE.md)
+- [Central inteligente e Codex](docs/INTELLIGENCE.md)
 - [Roteiro do produto](docs/ROADMAP.md)
