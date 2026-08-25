@@ -18,11 +18,12 @@ os.environ["SESSION_SECURE"] = "false"
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Account, Category, Document, Household, ReviewItem, Transaction  # noqa: E402
+from app.services.codex_client import CodexResult  # noqa: E402
 
 Base.metadata.create_all(bind=engine)
 
 
-def test_complete_local_financial_flow() -> None:
+def test_complete_local_financial_flow(monkeypatch) -> None:
     with TestClient(app) as client:
         setup = client.post(
             "/api/auth/setup",
@@ -62,6 +63,57 @@ def test_complete_local_financial_flow() -> None:
             },
         )
         assert account.status_code == 201
+
+        capture_preview = client.post(
+            "/api/captures/preview",
+            data={
+                "text": "Gastei R$ 150 com combustível ontem",
+                "account_id": account.json()["id"],
+                "document_type": "auto",
+            },
+        )
+        assert capture_preview.status_code == 201
+        capture_data = capture_preview.json()
+        assert capture_data["status"] == "preview"
+        assert capture_data["detected_type"] == "text"
+        assert capture_data["items"][0]["category_name"] == "Transporte"
+        capture_confirm = client.post(
+            f"/api/captures/{capture_data['id']}/confirm",
+            json={"items": capture_data["items"]},
+        )
+        assert capture_confirm.status_code == 200
+        captured_transaction_id = capture_confirm.json()["result"]["transactions"][0]
+        assert client.post(
+            f"/api/captures/{capture_data['id']}/confirm",
+            json={"items": capture_data["items"]},
+        ).status_code == 409
+        assert client.delete(f"/api/transactions/{captured_transaction_id}").status_code == 200
+
+        boleto_preview = client.post(
+            "/api/captures/preview",
+            data={
+                "text": (
+                    "ENERGIA DA CASA\nVENCIMENTO 30/08/2026\n"
+                    "VALOR DO DOCUMENTO R$ 350,40\nLINHA DIGITÁVEL 00190.00009"
+                ),
+                "document_type": "boleto",
+            },
+        )
+        assert boleto_preview.status_code == 201
+        boleto_data = boleto_preview.json()
+        assert boleto_data["items"][0]["kind"] == "obligation"
+        boleto_confirm = client.post(
+            f"/api/captures/{boleto_data['id']}/confirm",
+            json={"items": boleto_data["items"]},
+        )
+        assert boleto_confirm.status_code == 200
+        captured_obligation_id = boleto_confirm.json()["result"]["obligations"][0]
+        assert client.delete(f"/api/obligations/{captured_obligation_id}").status_code == 200
+        captures = client.get("/api/captures").json()
+        assert {item["status"] for item in captures} == {"confirmed"}
+        advisor_status = client.get("/api/advisor/status")
+        assert advisor_status.status_code == 200
+        assert advisor_status.json()["local_engine"] is True
 
         profile = client.put(
             "/api/profile",
@@ -329,13 +381,81 @@ def test_complete_local_financial_flow() -> None:
         assert "Paisagismo" in {item["name"] for item in client.get("/api/categories").json()}
         over_budget = client.get("/api/dashboard?month=2026-08").json()
         assert over_budget["remaining_cap"] == -176.78
-        advisor = client.post(
+        advisor_missing_payment = client.post(
             "/api/advisor/chat",
-            json={"message": "Em agosto de 2026 quero fazer uma compra que custa R$ 2.000, posso fazer?"},
+            json={"message": "Quero fazer uma compra que custa R$ 2.000, posso fazer?"},
         )
+        assert advisor_missing_payment.status_code == 200
+        assert advisor_missing_payment.json()["status"] == "insufficient_data"
+        assert "à vista ou parcelada" in advisor_missing_payment.json()["answer"]
+        with monkeypatch.context() as codex_patch:
+            codex_patch.setattr(
+                "app.api.CodexAdvisorClient.analyze",
+                lambda _self, _payload: CodexResult(
+                    {
+                        "verdict": "not_recommended",
+                        "answer": "Não recomendo a compra agora, pois o teto mensal já foi ultrapassado.",
+                        "evidence": ["Teto mensal ultrapassado"],
+                        "assumptions": ["Compra à vista"],
+                        "confidence": 0.98,
+                        "provider": "codex",
+                        "model": "modelo-de-teste",
+                    }
+                ),
+            )
+            advisor = client.post(
+                "/api/advisor/chat",
+                json={
+                    "message": (
+                        "Em agosto de 2026 quero fazer uma compra que custa "
+                        "R$ 2.000 à vista, posso fazer?"
+                    )
+                },
+            )
         assert advisor.status_code == 200
         assert advisor.json()["status"] == "not_recommended"
-        assert "não fazer" in advisor.json()["answer"]
+        assert advisor.json()["provider"] == "codex"
+        assert advisor.json()["model"] == "modelo-de-teste"
+        assert "Não recomendo" in advisor.json()["answer"]
+        with monkeypatch.context() as codex_patch:
+            codex_patch.setattr(
+                "app.api.CodexAdvisorClient.analyze",
+                lambda _self, _payload: CodexResult(
+                    {
+                        "verdict": "favorable",
+                        "answer": "Pode comprar.",
+                        "evidence": [],
+                        "assumptions": [],
+                        "confidence": 1,
+                    }
+                ),
+            )
+            guarded_advisor = client.post(
+                "/api/advisor/chat",
+                json={"message": "Posso comprar R$ 2.000 à vista em agosto de 2026?"},
+            )
+        assert guarded_advisor.json()["status"] == "not_recommended"
+        assert guarded_advisor.json()["provider"] == "local"
+        assert guarded_advisor.json()["answer"] != "Pode comprar."
+        advisor_installments = client.post(
+            "/api/advisor/chat",
+            json={
+                "message": "10x sem juros",
+                "history": [
+                    {
+                        "role": "user",
+                        "content": "Quero comprar um videogame que custa R$ 2.000; posso?",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Essa compra será à vista ou parcelada?",
+                    },
+                ],
+            },
+        )
+        assert advisor_installments.status_code == 200
+        assert advisor_installments.json()["intent"] == "purchase"
+        assert advisor_installments.json()["metrics"]["payment"]["installments"] == 10
         assert client.delete(
             f"/api/transactions/{custom_expense.json()['id']}"
         ).status_code == 200
