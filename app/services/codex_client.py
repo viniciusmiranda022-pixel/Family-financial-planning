@@ -1,9 +1,28 @@
 import json
 from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from app.config import get_settings
+
+
+def _json_default(value: object) -> float | str:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
+def _encode_payload(payload: dict) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=_json_default,
+    ).encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -38,7 +57,7 @@ class CodexAdvisorClient:
     ) -> CodexResult:
         if not self.configured:
             return CodexResult(None, "Codex não configurado")
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode() if payload else None
+        body = _encode_payload(payload) if payload else None
         request = Request(
             f"{self.settings.advisor_url.rstrip('/')}{path}",
             data=body,
