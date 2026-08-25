@@ -361,6 +361,7 @@ def _advisor_amount(message: str) -> Decimal | None:
     number = r"(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
     patterns = (
         rf"(?:custa|custando|valor(?:\s+de)?|compra(?:\s+de)?|pagar)\s*(?:r\$\s*)?{number}\s*(mil|k)?",
+        rf"(?:comprar|compra|adquirir).{{0,80}}?\b(?:por|de|custa|custando|valor(?:\s+de)?)\s*(?:r\$\s*)?{number}\s*(mil|k)?",
         rf"r\$\s*{number}\s*(mil|k)?",
         rf"{number}\s*(mil|k)\b",
     )
@@ -2242,7 +2243,9 @@ def advisor_status(user: User = Depends(get_current_user)) -> dict:
         "local_engine": True,
         "codex_configured": client.configured,
         "codex_ready": ready,
+        "codex_authenticated": bool(result.payload and result.payload.get("authenticated")),
         "model": result.payload.get("model") if result.payload else None,
+        "error": result.error,
     }
 
 
@@ -2278,13 +2281,15 @@ def advisor_chat(
                 "‘Quero comprar algo de R$ 2.000 à vista; posso fazer essa compra?’"
             )
             status_name = "insufficient_data"
-        elif Decimal(str(summary["cash_cap"])) <= 0:
+        else:
+            metrics["purchase_amount"] = decimal_value(purchase_amount)
+        if purchase_amount is not None and Decimal(str(summary["cash_cap"])) <= 0:
             answer = (
                 f"Ainda não consigo avaliar a compra de {_brl(purchase_amount)} porque o teto "
                 "mensal não está configurado. Preencha o perfil financeiro primeiro."
             )
             status_name = "insufficient_data"
-        else:
+        elif purchase_amount is not None:
             payment = _advisor_payment(conversation_message, purchase_amount)
             if not payment["complete"]:
                 answer = str(payment["question"])
