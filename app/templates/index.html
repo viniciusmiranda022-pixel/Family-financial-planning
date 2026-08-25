@@ -49,6 +49,7 @@
       <div class="sidebar-brand"><span class="brand-mark small">FF</span><strong>Family Finance</strong></div>
       <nav id="main-nav">
         <button data-view="dashboard" class="active"><span>⌂</span>Visão geral</button>
+        <button data-view="capture"><span>●</span>Lançar agora</button>
         <button data-view="imports"><span>⇧</span>Importações</button>
         <button data-view="transactions"><span>≡</span>Lançamentos</button>
         <button data-view="reviews"><span>!</span>Revisar <b id="nav-review-count" class="badge">0</b></button>
@@ -119,6 +120,43 @@
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">ÚLTIMOS LANÇAMENTOS</span><h2>Movimentações recentes</h2></div><button data-go="transactions" class="secondary">Ver todos</button></div>
           <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Conta</th><th class="right">Valor</th></tr></thead><tbody id="recent-transactions"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-capture" class="view">
+        <div class="capture-layout">
+          <article class="panel capture-composer">
+            <div class="panel-heading"><div><span class="step-label">CENTRAL INTELIGENTE</span><h2>Conte o que aconteceu</h2><small>Escreva, grave um áudio ou envie um documento. Nada será gravado antes da sua confirmação.</small></div></div>
+            <form id="capture-form" class="capture-form">
+              <label class="full">Mensagem
+                <textarea name="text" id="capture-text" rows="4" maxlength="4000" placeholder="Ex.: Gastei R$ 150 com combustível ontem no cartão Itaú"></textarea>
+              </label>
+              <div class="capture-actions full">
+                <button id="capture-record" class="secondary microphone-button" type="button"><span>●</span> Gravar áudio</button>
+                <span id="capture-record-status" class="capture-status">Nenhum áudio gravado</span>
+                <button id="capture-clear-audio" class="text-action hidden" type="button">Remover áudio</button>
+              </div>
+              <label>Conta ou cartão<select name="account_id" id="capture-account"><option value="">Escolher na prévia</option></select></label>
+              <label>Tipo do arquivo<select name="document_type"><option value="auto">Detectar automaticamente</option><option value="receipt">Comprovante ou nota</option><option value="boleto">Boleto</option><option value="credit_card">Fatura de cartão</option><option value="bank_statement">Extrato bancário</option><option value="payroll">Holerite</option></select></label>
+              <label class="file-field full"><input id="capture-file" type="file" name="file" accept="audio/*,image/*,.pdf,.csv,.txt,.ofx,.qfx"><span><strong>Foto, boleto, fatura, extrato ou áudio</strong><small id="capture-file-label">Toque para escolher um arquivo de até 25 MB</small></span></label>
+              <button class="primary" type="submit">Analisar e preparar prévia</button>
+            </form>
+            <div class="security-note"><strong>Controle antes da gravação</strong><p>OCR, transcrição e classificação podem errar. Confira data, valor, conta e categoria na próxima etapa.</p></div>
+          </article>
+
+          <article id="capture-preview-panel" class="panel capture-preview-panel hidden">
+            <div class="panel-heading"><div><span class="step-label">PRÉVIA EDITÁVEL</span><h2>Confira antes de confirmar</h2><small id="capture-preview-summary"></small></div><span id="capture-confidence" class="metric-pill">0%</span></div>
+            <div id="capture-preview-notes" class="capture-notes hidden"></div>
+            <div id="capture-preview-items" class="capture-preview-items"></div>
+            <div class="capture-confirm-actions">
+              <button id="capture-confirm" class="primary" type="button">Confirmar itens selecionados</button>
+              <button id="capture-cancel" class="secondary" type="button">Cancelar captura</button>
+            </div>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">HISTÓRICO</span><h2>Capturas recentes</h2><small>As prévias e confirmações ficam registradas para auditoria.</small></div><button id="capture-refresh" class="secondary" type="button">Atualizar</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Origem</th><th>Tipo detectado</th><th>Status</th><th>Itens</th><th>Processador</th><th>Data</th></tr></thead><tbody id="captures-table"></tbody></table></div>
         </article>
       </section>
 
@@ -233,16 +271,16 @@
       <section id="view-advisor" class="view">
         <div class="advisor-layout">
           <article class="panel advisor-intro">
-            <span class="step-label">INTELIGÊNCIA FINANCEIRA LOCAL</span>
+            <div class="advisor-title-row"><span class="step-label">INTELIGÊNCIA FINANCEIRA</span><span id="advisor-provider-status" class="status-chip muted">Verificando Codex…</span></div>
             <h2>Converse com seu consultor</h2>
-            <p>As respostas usam os lançamentos, o teto, a reserva e as obrigações desta família. Nenhum dado é enviado para um serviço externo.</p>
+            <p>Os cálculos são feitos pelo motor financeiro local. Quando o Codex estiver conectado, ele recebe somente um resumo dos resultados para explicá-los com clareza — nunca credenciais, documentos ou acesso ao banco.</p>
             <div class="advisor-suggestions">
-              <button class="secondary advisor-suggestion" type="button">Posso comprar algo de R$ 2.000?</button>
+              <button class="secondary advisor-suggestion" type="button">Posso comprar algo de R$ 2.000 à vista?</button>
               <button class="secondary advisor-suggestion" type="button">Quanto saiu do banco e dos cartões neste mês?</button>
               <button class="secondary advisor-suggestion" type="button">Quais obrigações estão próximas?</button>
               <button class="secondary advisor-suggestion" type="button">Onde posso economizar?</button>
             </div>
-            <div class="security-note"><strong>Premissa conservadora</strong><p>Compras são avaliadas à vista. A reserva investida não é tratada como renda livre e o sistema não considera gastos que ainda não foram lançados.</p></div>
+            <div class="security-note"><strong>Análise com contexto</strong><p>Informe se é à vista ou parcelado e, no parcelamento, quantidade de parcelas e juros. A reserva investida não é tratada como renda livre.</p></div>
           </article>
           <article class="panel advisor-chat-panel">
             <div id="advisor-messages" class="advisor-messages" aria-live="polite"></div>
