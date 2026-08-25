@@ -1,6 +1,7 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 $ErrorActionPreference = "Stop"
+$env:NO_COLOR = "1"
 $taskName = "FamilyFinancialPlanning-CodexAdvisor"
 
 function Get-DotEnvValue {
@@ -55,6 +56,21 @@ function Wait-AdvisorHealth {
     throw "O consultor não iniciou. Consulte $env:LOCALAPPDATA\FamilyFinancialPlanning\logs\advisor.log"
 }
 
+function Invoke-DockerCommand {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 transforma mensagens normais do Docker em
+        # NativeCommandError quando ErrorActionPreference está em Stop.
+        $ErrorActionPreference = "Continue"
+        & $dockerExecutable @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
+        return [int]$LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $environmentFile = Join-Path $repositoryRoot ".env"
 $advisorDirectory = Join-Path $repositoryRoot "advisor"
@@ -74,6 +90,7 @@ $npm = Join-Path (Split-Path $node.Source) "npm.cmd"
 if (-not (Test-Path $npm)) {
     throw "npm.cmd não foi encontrado ao lado do Node.js."
 }
+$dockerExecutable = (Get-Command docker.exe -ErrorAction Stop).Source
 
 Write-Host "Instalando o Codex para Windows dentro do diretório isolado do consultor..."
 Push-Location $advisorDirectory
@@ -178,16 +195,27 @@ if ($testResult.provider -ne "codex" -or $testResult.verdict -ne "informative") 
 Write-Host "Atualizando somente a aplicação para usar o consultor nativo..."
 Push-Location $repositoryRoot
 try {
-    docker compose stop advisor 2>$null
-    docker compose up -d --force-recreate app
-    if ($LASTEXITCODE -ne 0) {
+    $stopExitCode = Invoke-DockerCommand -Arguments @("compose", "stop", "advisor")
+    if ($stopExitCode -ne 0) {
+        Write-Warning "O contêiner antigo do advisor não pôde ser parado; a configuração continuará."
+    }
+
+    $upExitCode = Invoke-DockerCommand -Arguments @(
+        "compose", "up", "-d", "--force-recreate", "app"
+    )
+    if ($upExitCode -ne 0) {
         throw "Não foi possível recriar o contêiner da aplicação."
     }
-    docker compose exec -T app python -c "from urllib.request import urlopen; print(urlopen('http://host.docker.internal:8081/health', timeout=5).read().decode())"
-    if ($LASTEXITCODE -ne 0) {
+
+    $healthProbe = "from urllib.request import urlopen; print(urlopen('http://host.docker.internal:8081/health', timeout=5).read().decode())"
+    $probeExitCode = Invoke-DockerCommand -Arguments @(
+        "compose", "exec", "-T", "app", "python", "-c", $healthProbe
+    )
+    if ($probeExitCode -ne 0) {
         throw "O aplicativo Docker não alcançou o consultor nativo do Windows."
     }
-    docker compose ps
+
+    $null = Invoke-DockerCommand -Arguments @("compose", "ps")
 } finally {
     Pop-Location
 }
