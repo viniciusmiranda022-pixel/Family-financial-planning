@@ -22,6 +22,15 @@ def test_natural_language_expense_is_classified_before_confirmation() -> None:
     assert item["confidence"] >= 0.9
 
 
+def test_natural_language_purchase_accepts_bare_amount_after_object() -> None:
+    item = parse_text_capture(
+        "Quero comprar uma enxada de 250",
+        reference=date(2026, 8, 25),
+    )
+    assert item["amount"] == 250.0
+    assert item["movement_type"] == "expense"
+
+
 def test_natural_language_investment_is_not_classified_as_spending() -> None:
     item = parse_text_capture(
         "Investi 500 reais no Privilège DI hoje",

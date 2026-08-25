@@ -612,13 +612,25 @@ async function loadAdvisor() {
   const badge = document.querySelector("#advisor-provider-status");
   try {
     const result = await api("/advisor/status");
-    badge.textContent = result.codex_ready ? `Codex conectado • ${result.model}` : "Motor local ativo";
-    badge.className = `status-chip ${result.codex_ready ? "ok" : "warn"}`;
-    badge.title = result.codex_ready
-      ? "O Codex explica os resultados calculados localmente"
-      : "O consultor continua funcionando com as regras financeiras locais";
+    if (result.codex_ready) {
+      badge.textContent = `Codex conectado • ${result.model}`;
+      badge.className = "status-chip ok";
+      badge.title = "O Codex explica os resultados calculados localmente";
+    } else if (result.codex_configured && !result.codex_authenticated && !result.error) {
+      badge.textContent = "Codex aguardando login";
+      badge.className = "status-chip warn";
+      badge.title = "Habilite o login por código de dispositivo no ChatGPT e execute scripts/setup-codex.sh";
+    } else if (result.codex_configured) {
+      badge.textContent = "Codex indisponível";
+      badge.className = "status-chip warn";
+      badge.title = result.error || "O serviço do Codex não está pronto";
+    } else {
+      badge.textContent = "Somente motor local";
+      badge.className = "status-chip muted";
+      badge.title = "O Codex ainda não foi configurado";
+    }
   } catch (_) {
-    badge.textContent = "Motor local ativo";
+    badge.textContent = "Codex indisponível";
     badge.className = "status-chip warn";
   }
 }

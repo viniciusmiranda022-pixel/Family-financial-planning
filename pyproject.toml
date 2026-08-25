@@ -1,6 +1,6 @@
 [project]
 name = "family-financial-planning"
-version = "0.2.0"
+version = "0.2.1"
 description = "Sistema financeiro familiar on-premises, auditável e orientado a documentos"
 requires-python = ">=3.12"
 dependencies = [

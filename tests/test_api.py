@@ -388,6 +388,14 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert advisor_missing_payment.status_code == 200
         assert advisor_missing_payment.json()["status"] == "insufficient_data"
         assert "à vista ou parcelada" in advisor_missing_payment.json()["answer"]
+        advisor_bare_amount = client.post(
+            "/api/advisor/chat",
+            json={"message": "Comprar enxada de 250 posso?"},
+        )
+        assert advisor_bare_amount.status_code == 200
+        assert advisor_bare_amount.json()["status"] == "insufficient_data"
+        assert advisor_bare_amount.json()["metrics"]["purchase_amount"] == 250
+        assert "à vista ou parcelada" in advisor_bare_amount.json()["answer"]
         with monkeypatch.context() as codex_patch:
             codex_patch.setattr(
                 "app.api.CodexAdvisorClient.analyze",

@@ -27,6 +27,9 @@ Se o Codex estiver desconectado ou indisponível, a captura e o consultor contin
 
 Depois de atualizar e iniciar o sistema, execute no WSL:
 
+Antes, abra **ChatGPT > Configurações > Segurança** e habilite o login por código de
+dispositivo para o Codex CLI. A OpenAI exige essa autorização antes de gerar o código.
+
 ```bash
 cd /mnt/c/Users/ViniciusMiranda/Family-financial-planning
 sh ./scripts/setup-codex.sh
