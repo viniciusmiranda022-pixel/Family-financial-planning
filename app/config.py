@@ -16,12 +16,22 @@ class Settings(BaseSettings):
     session_hours: int = 12
     max_upload_mb: int = 25
     default_timezone: str = "America/Sao_Paulo"
+    whisper_model: str = "tiny"
+    whisper_language: str = "pt"
+    advisor_enabled: bool = True
+    advisor_url: str = "http://advisor:8081"
+    advisor_shared_secret: str = ""
+    advisor_timeout_seconds: int = 75
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     @property
     def documents_dir(self) -> Path:
         return self.data_dir / "documents"
+
+    @property
+    def models_dir(self) -> Path:
+        return self.data_dir / "models"
 
 
 @lru_cache
