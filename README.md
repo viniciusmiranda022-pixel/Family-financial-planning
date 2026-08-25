@@ -129,7 +129,17 @@ Depois do primeiro acesso, siga esta ordem:
 6. em **Acessos**, crie o usuário individual de cada membro da família;
 7. confira o plano de cortes e os três cenários da projeção.
 
-Para usar o Codex com a assinatura do ChatGPT, sem configurar uma chave de API, execute:
+Para usar o Codex com a assinatura do ChatGPT no Windows, sem configurar uma chave de API,
+abra um PowerShell normal na pasta do projeto e execute:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-codex-windows.ps1
+```
+
+Esse modo executa somente o consultor no Windows e mantém aplicação, PostgreSQL e documentos no
+Docker. Ele é recomendado quando a rede do Docker/WSL não alcança os serviços da OpenAI.
+
+Em um servidor Linux cujo Docker tenha saída HTTPS normal, use:
 
 ```bash
 sh ./scripts/setup-codex.sh
