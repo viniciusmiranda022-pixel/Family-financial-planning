@@ -21,13 +21,22 @@
 - exportação Excel/PDF;
 - testes com cópias anonimizadas dos documentos reais.
 
-## Fase 3 — Inteligência local
+## Entregue em 25/08/2026 — captura e acesso remoto
 
 - OCR com Tesseract para PDFs escaneados;
-- worker assíncrono;
-- classificação local opcional;
-- explicação local de anomalias e comparação de cenários;
-- aprendizado supervisionado pelas correções do usuário.
+- transcrição local de áudio com Whisper;
+- captura por texto, áudio, foto, boleto, fatura, extrato e holerite;
+- prévia editável e auditável antes da confirmação;
+- classificação ambígua assistida pelo Codex;
+- consultor com cálculo local, parcelamento/juros e explicação do Codex;
+- acesso privado por Tailscale para Vinicius e Kelly.
+
+## Fase 3 — Próximas evoluções
+
+- worker assíncrono para filas de OCR e áudio;
+- regras editáveis e aprendizado pelas correções confirmadas;
+- comparação visual de cenários de compra;
+- notificações de vencimento no navegador;
 
 ## Fase 4 — Operação endurecida
 

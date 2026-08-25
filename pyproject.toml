@@ -1,6 +1,6 @@
 [project]
 name = "family-financial-planning"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sistema financeiro familiar on-premises, auditável e orientado a documentos"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,9 +10,14 @@ dependencies = [
   "itsdangerous>=2.2,<3",
   "jinja2>=3.1,<4",
   "openpyxl>=3.1,<4",
+  "faster-whisper>=1.1,<2",
   "pdfplumber>=0.11,<1",
+  "pillow>=11,<13",
+  "pillow-heif>=0.21,<2",
   "psycopg[binary]>=3.2,<4",
+  "pymupdf>=1.25,<2",
   "pydantic-settings>=2.7,<3",
+  "pytesseract>=0.3.13,<1",
   "python-multipart>=0.0.18,<1",
   "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.34,<1",

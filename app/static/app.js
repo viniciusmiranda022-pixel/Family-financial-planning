@@ -1,4 +1,14 @@
-const state = { user: null, accounts: [], categories: [], forecast: [], forecastFloor: 0 };
+const state = {
+  user: null,
+  accounts: [],
+  categories: [],
+  forecast: [],
+  forecastFloor: 0,
+  captureDraft: null,
+  captureAudio: null,
+  captureRecorder: null,
+  advisorHistory: [],
+};
 const money = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
 const dateFormat = new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" });
 const monthFormat = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
@@ -6,6 +16,7 @@ const accountTypeLabels = { checking: "Conta corrente", credit_card: "Cartão de
 const systemCategories = new Set(["Conciliação", "Transferência patrimonial", "Transferência interna", "Repasses a confirmar", "Reembolsos e estornos", "Receitas", "Revisar"]);
 const pageNames = {
   dashboard: "Visão geral",
+  capture: "Lançar agora",
   imports: "Importações",
   transactions: "Lançamentos",
   reviews: "Revisar",
@@ -95,6 +106,7 @@ async function navigate(view) {
   document.querySelector("#page-title").textContent = pageNames[view];
   const loaders = {
     dashboard: loadDashboard,
+    capture: loadCapture,
     imports: loadImports,
     transactions: loadTransactions,
     reviews: loadReviews,
@@ -117,6 +129,12 @@ async function loadAccounts() {
   transactionSelect.innerHTML = state.accounts.length
     ? state.accounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("")
     : '<option value="">Cadastre uma conta primeiro</option>';
+  const captureSelect = document.querySelector("#capture-account");
+  if (captureSelect) {
+    const selected = captureSelect.value;
+    captureSelect.innerHTML = '<option value="">Escolher na prévia</option>' + state.accounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("");
+    if ([...captureSelect.options].some((option) => option.value === selected)) captureSelect.value = selected;
+  }
 }
 
 async function loadCategories() {
@@ -384,6 +402,198 @@ async function loadForecast() {
   drawForecast(data.rows, data.summary.emergency_floor);
 }
 
+const captureSourceLabels = { text: "Texto", audio: "Áudio", image: "Imagem", document: "Documento" };
+const captureTypeLabels = { text: "Mensagem", receipt: "Comprovante", boleto: "Boleto", credit_card: "Fatura", bank_statement: "Extrato", payroll: "Holerite", auto: "Automático" };
+const captureStatusLabels = { preview: "Aguardando confirmação", needs_input: "Precisa de ajuste", confirmed: "Confirmado", cancelled: "Cancelado" };
+
+function captureAccountOptions(selected) {
+  return '<option value="">Escolha a conta</option>' + state.accounts.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === selected ? "selected" : ""}>${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("");
+}
+
+function captureCategoryOptions(item) {
+  const selected = item.category_id || "";
+  const options = state.categories.filter((category) => !systemCategories.has(category.name) || category.id === selected)
+    .map((category) => `<option value="${escapeHtml(category.id)}" ${category.id === selected ? "selected" : ""}>${escapeHtml(category.name)}</option>`).join("");
+  const otherSelected = item.new_category && !selected;
+  return options + `<option value="__other__" ${otherSelected ? "selected" : ""}>Outra categoria...</option>`;
+}
+
+function captureWarnings(item) {
+  const warnings = item.warnings || [];
+  return warnings.length ? `<ul class="capture-warning-list">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : "";
+}
+
+function renderCaptureTransaction(item, index) {
+  const checked = item.selected !== false ? "checked" : "";
+  const otherVisible = item.new_category && !item.category_id;
+  return `
+    <article class="capture-item ${item.possible_duplicate ? "duplicate" : ""}" data-index="${index}" data-kind="transaction">
+      <label class="capture-item-selector" title="Incluir este item"><input class="capture-selected" type="checkbox" ${checked}></label>
+      <div class="capture-item-fields">
+        <div class="capture-item-heading"><strong>Lançamento ${index + 1}</strong><span class="status-chip ${item.possible_duplicate ? "warn" : "ok"}">${item.possible_duplicate ? "Possível duplicidade" : `${Math.round((item.confidence || 0) * 100)}% de confiança`}</span></div>
+        <label class="wide">Descrição<input data-field="description" value="${escapeHtml(item.description)}" maxlength="500" required></label>
+        <label>Data<input data-field="booked_at" type="date" value="${escapeHtml(item.booked_at)}" required></label>
+        <label>Valor<input data-field="amount" type="number" min="0.01" step="0.01" value="${escapeHtml(item.amount)}" required></label>
+        <label>Tipo<select data-field="movement_type"><option value="expense" ${item.movement_type === "expense" ? "selected" : ""}>Despesa</option><option value="income" ${item.movement_type === "income" ? "selected" : ""}>Receita</option><option value="investment" ${item.movement_type === "investment" ? "selected" : ""}>Aplicação/investimento</option><option value="redemption" ${item.movement_type === "redemption" ? "selected" : ""}>Resgate</option><option value="refund" ${item.movement_type === "refund" ? "selected" : ""}>Reembolso/estorno</option><option value="transfer" ${item.movement_type === "transfer" ? "selected" : ""}>Transferência interna</option><option value="reconciliation" ${item.movement_type === "reconciliation" ? "selected" : ""}>Pagamento/conciliação</option></select></label>
+        <label>Conta ou cartão<select data-field="account_id" required>${captureAccountOptions(item.account_id)}</select></label>
+        <label>Categoria<select data-field="category_id" class="capture-category">${captureCategoryOptions(item)}</select></label>
+        <label class="capture-new-category ${otherVisible ? "" : "hidden"}">Nova categoria<input data-field="category_name" value="${otherVisible ? escapeHtml(item.category_name) : ""}" maxlength="100" placeholder="Ex.: Jardinagem"></label>
+        ${captureWarnings(item)}
+      </div>
+    </article>`;
+}
+
+function renderCaptureObligation(item, index) {
+  return `
+    <article class="capture-item" data-index="${index}" data-kind="obligation">
+      <label class="capture-item-selector"><input class="capture-selected" type="checkbox" ${item.selected !== false ? "checked" : ""}></label>
+      <div class="capture-item-fields">
+        <div class="capture-item-heading"><strong>Boleto ou obrigação</strong><span class="status-chip">${Math.round((item.confidence || 0) * 100)}% de confiança</span></div>
+        <label class="wide">Descrição<input data-field="description" value="${escapeHtml(item.description)}" maxlength="500" required></label>
+        <label>Vencimento<input data-field="due_date" type="date" value="${escapeHtml(item.due_date)}" required></label>
+        <label>Valor<input data-field="amount" type="number" min="0.01" step="0.01" value="${escapeHtml(item.amount)}" required></label>
+        <label>Repetir a cada (meses)<input data-field="recurrence_months" type="number" min="0" max="120" value="${item.recurrence_months || 0}"></label>
+        <label>Quantidade de ocorrências<input data-field="occurrence_count" type="number" min="1" max="240" value="${item.occurrence_count || 1}"></label>
+        ${captureWarnings(item)}
+      </div>
+    </article>`;
+}
+
+function renderCapturePayroll(item, index) {
+  return `
+    <article class="capture-item" data-index="${index}" data-kind="payroll">
+      <label class="capture-item-selector"><input class="capture-selected" type="checkbox" ${item.selected !== false ? "checked" : ""}></label>
+      <div class="capture-item-fields">
+        <div class="capture-item-heading"><strong>Holerite</strong><span class="status-chip">${Math.round((item.confidence || 0) * 100)}% de confiança</span></div>
+        <label class="wide">Pessoa<input data-field="description" value="${escapeHtml(item.description)}" maxlength="120" required></label>
+        <label>Competência<input data-field="competence" type="date" value="${escapeHtml(item.competence)}" required></label>
+        <label>Data do pagamento<input data-field="payment_date" type="date" value="${escapeHtml(item.payment_date)}" required></label>
+        <label>Valor líquido<input data-field="amount" type="number" min="0.01" step="0.01" value="${escapeHtml(item.amount)}" required></label>
+        <label>Tipo<select data-field="payroll_kind"><option value="regular">Salário</option><option value="13_first">1ª parcela do 13º</option><option value="13_second">2ª parcela do 13º</option><option value="vacation_extra">Férias</option><option value="other">Outro</option></select></label>
+        ${captureWarnings(item)}
+      </div>
+    </article>`;
+}
+
+function renderCapturePreview(capture) {
+  state.captureDraft = capture;
+  const panel = document.querySelector("#capture-preview-panel");
+  panel.classList.remove("hidden");
+  panel.classList.toggle("needs-input", capture.status === "needs_input");
+  document.querySelector("#capture-preview-summary").textContent = `${captureSourceLabels[capture.source_type] || capture.source_type} • ${captureTypeLabels[capture.detected_type] || capture.detected_type} • ${capture.items.length} item(ns)`;
+  document.querySelector("#capture-confidence").textContent = `${Math.round((capture.confidence || 0) * 100)}%`;
+  const notes = document.querySelector("#capture-preview-notes");
+  notes.classList.toggle("hidden", !capture.notes);
+  notes.textContent = capture.notes || "";
+  document.querySelector("#capture-preview-items").innerHTML = capture.items.length
+    ? capture.items.map((item, index) => item.kind === "transaction" ? renderCaptureTransaction(item, index) : item.kind === "obligation" ? renderCaptureObligation(item, index) : renderCapturePayroll(item, index)).join("")
+    : '<div class="capture-empty-preview">Não foi possível montar uma prévia automática. Escreva os dados principais no campo de mensagem e tente novamente.</div>';
+  document.querySelector("#capture-confirm").disabled = !capture.items.length;
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function clearCaptureAudio() {
+  state.captureAudio = null;
+  const button = document.querySelector("#capture-record");
+  button.classList.remove("recording");
+  button.innerHTML = "<span>●</span> Gravar áudio";
+  document.querySelector("#capture-record-status").textContent = "Nenhum áudio gravado";
+  document.querySelector("#capture-clear-audio").classList.add("hidden");
+}
+
+function closeCapturePreview() {
+  state.captureDraft = null;
+  document.querySelector("#capture-preview-panel").classList.add("hidden");
+  document.querySelector("#capture-preview-items").innerHTML = "";
+}
+
+async function loadCapture() {
+  await Promise.all([loadAccounts(), loadCategories()]);
+  const captures = await api("/captures");
+  document.querySelector("#captures-table").innerHTML = captures.length ? captures.map((item) => `
+    <tr><td>${escapeHtml(captureSourceLabels[item.source_type] || item.source_type)}${item.file_name ? `<br><small>${escapeHtml(item.file_name)}</small>` : ""}</td><td>${escapeHtml(captureTypeLabels[item.detected_type] || item.detected_type)}</td><td><span class="status-chip ${item.status === "confirmed" ? "ok" : item.status === "needs_input" ? "warn" : "muted"}">${escapeHtml(captureStatusLabels[item.status] || item.status)}</span></td><td>${item.items.length}</td><td>${escapeHtml(item.processor)}</td><td>${new Date(item.created_at).toLocaleString("pt-BR")}</td></tr>
+  `).join("") : emptyRow(6, "Nenhuma captura realizada");
+}
+
+function capturePayload() {
+  return [...document.querySelectorAll("#capture-preview-items .capture-item")].map((card) => {
+    const index = Number(card.dataset.index);
+    const original = state.captureDraft.items[index] || {};
+    const value = (name) => card.querySelector(`[data-field="${name}"]`)?.value || null;
+    const item = {
+      kind: card.dataset.kind,
+      selected: card.querySelector(".capture-selected").checked,
+      description: value("description"),
+      amount: Number(value("amount") || 0),
+    };
+    if (item.kind === "transaction") {
+      Object.assign(item, {
+        booked_at: value("booked_at"),
+        movement_type: value("movement_type"),
+        account_id: value("account_id"),
+        category_id: value("category_id") === "__other__" ? null : value("category_id"),
+        category_name: value("category_id") === "__other__" ? value("category_name") : null,
+        source_line: original.source_line || null,
+        installment_current: original.installment_current || null,
+        installment_total: original.installment_total || null,
+        card_last_four: original.card_last_four || null,
+        signed_amount: original.signed_amount == null
+          ? null
+          : Math.sign(Number(original.signed_amount)) * Number(value("amount") || 0),
+      });
+    } else if (item.kind === "obligation") {
+      Object.assign(item, {
+        due_date: value("due_date"),
+        category_name: original.category_name || "general",
+        recurrence_months: Number(value("recurrence_months") || 0),
+        occurrence_count: Number(value("occurrence_count") || 1),
+      });
+    } else {
+      Object.assign(item, {
+        competence: value("competence"),
+        payment_date: value("payment_date"),
+        payroll_kind: value("payroll_kind") || "regular",
+      });
+    }
+    return item;
+  });
+}
+
+async function toggleAudioRecording() {
+  const button = document.querySelector("#capture-record");
+  const status = document.querySelector("#capture-record-status");
+  if (state.captureRecorder?.state === "recording") {
+    state.captureRecorder.stop();
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+    toast("Este navegador não permite gravação de áudio. Envie um arquivo de áudio.", true);
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const chunks = [];
+    const preferred = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "";
+    const recorder = new MediaRecorder(stream, preferred ? { mimeType: preferred } : undefined);
+    state.captureRecorder = recorder;
+    recorder.addEventListener("dataavailable", (event) => { if (event.data.size) chunks.push(event.data); });
+    recorder.addEventListener("stop", () => {
+      state.captureAudio = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+      stream.getTracks().forEach((track) => track.stop());
+      button.classList.remove("recording");
+      button.innerHTML = "<span>●</span> Gravar novamente";
+      status.textContent = `Áudio pronto • ${Math.max(1, Math.round(state.captureAudio.size / 1024))} KB`;
+      document.querySelector("#capture-clear-audio").classList.remove("hidden");
+    });
+    recorder.start();
+    button.classList.add("recording");
+    button.innerHTML = "<span>■</span> Parar gravação";
+    status.textContent = "Gravando... fale normalmente";
+  } catch (error) {
+    toast(`Não foi possível acessar o microfone: ${error.message}`, true);
+  }
+}
+
 function appendAdvisorMessage(role, text, status = "") {
   const messages = document.querySelector("#advisor-messages");
   const bubble = document.createElement("div");
@@ -394,10 +604,22 @@ function appendAdvisorMessage(role, text, status = "") {
   return bubble;
 }
 
-function loadAdvisor() {
+async function loadAdvisor() {
   const messages = document.querySelector("#advisor-messages");
   if (!messages.children.length) {
     appendAdvisorMessage("assistant", "Olá! Posso avaliar uma compra, explicar entradas e saídas, listar vencimentos e sugerir cortes com base na sua base financeira.");
+  }
+  const badge = document.querySelector("#advisor-provider-status");
+  try {
+    const result = await api("/advisor/status");
+    badge.textContent = result.codex_ready ? `Codex conectado • ${result.model}` : "Motor local ativo";
+    badge.className = `status-chip ${result.codex_ready ? "ok" : "warn"}`;
+    badge.title = result.codex_ready
+      ? "O Codex explica os resultados calculados localmente"
+      : "O consultor continua funcionando com as regras financeiras locais";
+  } catch (_) {
+    badge.textContent = "Motor local ativo";
+    badge.className = "status-chip warn";
   }
 }
 
@@ -405,9 +627,18 @@ async function askAdvisor(message) {
   appendAdvisorMessage("user", message);
   const loading = appendAdvisorMessage("assistant", "Analisando seus dados...");
   try {
-    const result = await api("/advisor/chat", { method: "POST", body: JSON.stringify({ message }) });
+    const result = await api("/advisor/chat", {
+      method: "POST",
+      body: JSON.stringify({ message, history: state.advisorHistory.slice(-8) }),
+    });
     loading.textContent = result.answer;
     loading.className = `advisor-message assistant ${result.status}`;
+    loading.dataset.source = result.provider === "codex" ? "Explicado pelo Codex" : "Motor financeiro local";
+    state.advisorHistory.push(
+      { role: "user", content: message },
+      { role: "assistant", content: result.answer },
+    );
+    state.advisorHistory = state.advisorHistory.slice(-8);
   } catch (error) {
     loading.textContent = error.message;
     loading.className = "advisor-message assistant error";
@@ -500,6 +731,105 @@ document.querySelector("#refresh-transactions").addEventListener("click", loadTr
 document.querySelector("#refresh-forecast").addEventListener("click", loadForecast);
 document.querySelector("#transaction-movement-type").addEventListener("change", updateManualTransactionFields);
 document.querySelector("#transaction-category").addEventListener("change", updateCustomCategoryField);
+
+document.querySelector("#capture-record").addEventListener("click", toggleAudioRecording);
+document.querySelector("#capture-clear-audio").addEventListener("click", clearCaptureAudio);
+document.querySelector("#capture-file").addEventListener("change", (event) => {
+  const file = event.target.files[0];
+  document.querySelector("#capture-file-label").textContent = file
+    ? `${file.name} • ${Math.max(1, Math.round(file.size / 1024))} KB`
+    : "Toque para escolher um arquivo de até 25 MB";
+});
+document.querySelector("#capture-refresh").addEventListener("click", loadCapture);
+document.querySelector("#capture-preview-items").addEventListener("change", (event) => {
+  if (!event.target.classList.contains("capture-category")) return;
+  const custom = event.target.closest(".capture-item").querySelector(".capture-new-category");
+  custom.classList.toggle("hidden", event.target.value !== "__other__");
+  const input = custom.querySelector("input");
+  input.required = event.target.value === "__other__";
+  if (!input.required) input.value = "";
+});
+
+document.querySelector("#capture-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (state.captureRecorder?.state === "recording") {
+    return toast("Pare a gravação antes de analisar", true);
+  }
+  const fileInput = document.querySelector("#capture-file");
+  if (state.captureAudio && fileInput.files.length) {
+    return toast("Envie o áudio ou o documento em uma captura; não os dois ao mesmo tempo", true);
+  }
+  const data = new FormData(event.target);
+  if (state.captureAudio) {
+    data.delete("file");
+    data.append("file", new File([state.captureAudio], "lancamento.webm", { type: state.captureAudio.type || "audio/webm" }));
+  } else if (!fileInput.files.length) {
+    data.delete("file");
+  }
+  if (!String(data.get("text") || "").trim() && !state.captureAudio && !fileInput.files.length) {
+    return toast("Escreva uma mensagem, grave um áudio ou escolha um arquivo", true);
+  }
+  const button = event.target.querySelector('button[type="submit"]');
+  button.disabled = true;
+  button.textContent = "Analisando com segurança...";
+  try {
+    const capture = await api("/captures/preview", { method: "POST", body: data });
+    renderCapturePreview(capture);
+    await loadCapture();
+    toast(capture.items.length ? "Prévia pronta para conferência" : "A captura precisa de mais informações", !capture.items.length);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Analisar e preparar prévia";
+  }
+});
+
+document.querySelector("#capture-confirm").addEventListener("click", async () => {
+  if (!state.captureDraft) return;
+  const items = capturePayload();
+  const selected = items.filter((item) => item.selected);
+  if (!selected.length) return toast("Selecione ao menos um item", true);
+  const invalid = selected.find((item) => !item.description || item.amount <= 0
+    || (item.kind === "transaction" && (!item.booked_at || !item.account_id || !item.movement_type))
+    || (item.kind === "transaction" && !item.category_id && item.movement_type === "expense" && !item.category_name)
+    || (item.kind === "obligation" && !item.due_date)
+    || (item.kind === "payroll" && (!item.competence || !item.payment_date)));
+  if (invalid) return toast("Preencha os campos obrigatórios dos itens selecionados", true);
+  const button = document.querySelector("#capture-confirm");
+  button.disabled = true;
+  button.textContent = "Confirmando...";
+  try {
+    const result = await api(`/captures/${state.captureDraft.id}/confirm`, {
+      method: "POST",
+      body: JSON.stringify({ items }),
+    });
+    closeCapturePreview();
+    document.querySelector("#capture-form").reset();
+    document.querySelector("#capture-file-label").textContent = "Toque para escolher um arquivo de até 25 MB";
+    clearCaptureAudio();
+    await loadCapture();
+    toast(`Captura confirmada${result.review_items ? `; ${result.review_items} item(ns) para revisão` : ""}`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Confirmar itens selecionados";
+  }
+});
+
+document.querySelector("#capture-cancel").addEventListener("click", async () => {
+  if (!state.captureDraft) return closeCapturePreview();
+  if (!window.confirm("Cancelar esta captura sem criar lançamentos?")) return;
+  try {
+    await api(`/captures/${state.captureDraft.id}`, { method: "DELETE" });
+    closeCapturePreview();
+    await loadCapture();
+    toast("Captura cancelada; nenhum lançamento foi criado");
+  } catch (error) {
+    toast(error.message, true);
+  }
+});
 
 document.querySelector("#transaction-form").addEventListener("submit", async (event) => {
   event.preventDefault();

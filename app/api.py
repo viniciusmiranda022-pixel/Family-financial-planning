@@ -9,12 +9,14 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, Upl
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.db import get_db
 from app.models import (
     Account,
     AuditEvent,
+    CaptureDraft,
     Category,
     Commission,
     Document,
@@ -29,6 +31,7 @@ from app.models import (
 from app.schemas import (
     AccountRequest,
     AdvisorRequest,
+    CaptureConfirmRequest,
     CommissionRequest,
     LoginRequest,
     ManualTransactionRequest,
@@ -47,6 +50,7 @@ from app.security import (
     verify_password,
 )
 from app.services.classifier import classify, normalize_description
+from app.services.codex_client import CodexAdvisorClient
 from app.services.crypto import EncryptedDocumentStore
 from app.services.finance import (
     ForecastCommission,
@@ -59,11 +63,13 @@ from app.services.finance import (
     monthly_net_rate,
 )
 from app.services.importer import (
+    ParsedTransaction,
     file_sha256,
     parse_document,
     parse_payroll_pdf,
     transaction_fingerprint,
 )
+from app.services.smart_capture import CaptureParseError, preview_capture
 
 router = APIRouter(prefix="/api")
 settings = get_settings()
@@ -373,6 +379,85 @@ def _advisor_amount(message: str) -> Decimal | None:
     return money(value)
 
 
+def _advisor_payment(message: str, purchase_amount: Decimal) -> dict[str, object]:
+    normalized = normalize_description(message)
+    installment_match = re.search(r"\b(\d{1,3})\s*(?:X|VEZ(?:ES)?|PARCELAS?)\b", normalized)
+    is_cash = bool(re.search(r"\bA\s+VISTA\b", normalized))
+    if not installment_match and not is_cash:
+        return {
+            "complete": False,
+            "question": (
+                "Essa compra será à vista ou parcelada? Se for parcelada, informe a "
+                "quantidade de parcelas e se há juros."
+            ),
+        }
+    installments = int(installment_match.group(1)) if installment_match else 1
+    if installments < 1 or installments > 120:
+        return {
+            "complete": False,
+            "question": "Informe uma quantidade de parcelas entre 1 e 120.",
+        }
+    interest_match = re.search(r"(\d+(?:[.,]\d+)?)\s*%", message)
+    without_interest = "SEM JUROS" in normalized
+    with_interest = "COM JUROS" in normalized or interest_match is not None
+    if installments > 1 and not without_interest and not with_interest:
+        return {
+            "complete": False,
+            "question": (
+                "O parcelamento tem juros? Se tiver, informe a taxa mensal; "
+                "por exemplo, 2% ao mês."
+            ),
+        }
+    if installments > 1 and "COM JUROS" in normalized and interest_match is None:
+        return {
+            "complete": False,
+            "question": "Qual é a taxa de juros mensal do parcelamento?",
+        }
+    monthly_rate = Decimal("0")
+    if interest_match:
+        monthly_rate = Decimal(interest_match.group(1).replace(",", ".")) / Decimal("100")
+        if monthly_rate > Decimal("0.30"):
+            return {
+                "complete": False,
+                "question": "A taxa parece muito alta. Confirme a taxa mensal do parcelamento.",
+            }
+    if installments == 1 or monthly_rate == 0:
+        monthly_payment = money(purchase_amount / installments)
+        total_cost = money(monthly_payment * installments)
+    else:
+        factor = Decimal("1") - (Decimal("1") + monthly_rate) ** (-installments)
+        monthly_payment = money(purchase_amount * monthly_rate / factor)
+        total_cost = money(monthly_payment * installments)
+    return {
+        "complete": True,
+        "mode": "cash" if installments == 1 else "installments",
+        "installments": installments,
+        "monthly_interest_rate": decimal_value(monthly_rate),
+        "monthly_payment": decimal_value(monthly_payment),
+        "total_cost": decimal_value(total_cost),
+    }
+
+
+def _advisor_conversation_message(payload: AdvisorRequest) -> str:
+    current = payload.message
+    normalized = normalize_description(current)
+    has_payment_detail = bool(
+        re.search(r"\b(\d{1,3})\s*(?:X|VEZ(?:ES)?|PARCELAS?)\b", normalized)
+        or "A VISTA" in normalized
+        or "JUROS" in normalized
+    )
+    if _advisor_amount(current) is not None or not has_payment_detail:
+        return current
+    for item in reversed(payload.history):
+        candidate = normalize_description(item.content)
+        if item.role == "user" and any(
+            word in candidate.split()
+            for word in {"COMPRA", "COMPRAR", "CUSTA", "POSSO", "ADQUIRIR"}
+        ):
+            return f"{item.content}. {current}"
+    return current
+
+
 def _require_admin(user: User) -> None:
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Apenas administradores gerenciam acessos")
@@ -399,10 +484,16 @@ def audit(
 
 
 def category_for(db: Session, household_id: str, name: str) -> Category:
-    category = db.scalar(select(Category).where(Category.household_id == household_id, Category.name == name))
+    clean_name = " ".join(name.split())[:100] or "Revisar"
+    category = db.scalar(
+        select(Category).where(
+            Category.household_id == household_id,
+            func.lower(Category.name) == clean_name.lower(),
+        )
+    )
     if category:
         return category
-    category = Category(household_id=household_id, name=name)
+    category = Category(household_id=household_id, name=clean_name)
     db.add(category)
     db.flush()
     return category
@@ -415,6 +506,131 @@ def profile_for(db: Session, household_id: str) -> FinancialProfile:
         db.add(profile)
         db.flush()
     return profile
+
+
+def _capture_response(item: CaptureDraft) -> dict:
+    try:
+        proposals = json.loads(item.proposal_json or "[]")
+    except json.JSONDecodeError:
+        proposals = []
+    try:
+        result = json.loads(item.result_json) if item.result_json else None
+    except json.JSONDecodeError:
+        result = None
+    return {
+        "id": item.id,
+        "source_type": item.source_type,
+        "detected_type": item.detected_type,
+        "status": item.status,
+        "processor": item.processor,
+        "confidence": decimal_value(item.confidence),
+        "notes": item.notes,
+        "items": proposals,
+        "result": result,
+        "file_name": item.document.original_name if item.document else None,
+        "created_at": item.created_at,
+        "confirmed_at": item.confirmed_at,
+    }
+
+
+def _capture_signed_amount(movement_type: str, amount: Decimal) -> Decimal:
+    if movement_type in {"income", "redemption", "refund", "reconciliation"}:
+        return abs(amount)
+    return -abs(amount)
+
+
+def _enrich_capture_items(
+    db: Session,
+    household_id: str,
+    items: list[dict],
+    requested_account_id: str | None,
+) -> list[dict]:
+    accounts = db.scalars(
+        select(Account).where(Account.household_id == household_id, Account.active.is_(True))
+    ).all()
+    accounts_by_id = {item.id: item for item in accounts}
+    default_account = accounts_by_id.get(requested_account_id or "")
+    if requested_account_id and not default_account:
+        raise HTTPException(status_code=404, detail="Conta não encontrada")
+    if not default_account and len(accounts) == 1:
+        default_account = accounts[0]
+    categories = db.scalars(select(Category).where(Category.household_id == household_id)).all()
+    categories_by_name = {item.name.casefold(): item for item in categories}
+
+    enriched: list[dict] = []
+    for original in items:
+        proposal = dict(original)
+        proposal["warnings"] = list(proposal.get("warnings") or [])
+        if proposal.get("kind") != "transaction":
+            enriched.append(proposal)
+            continue
+        account = default_account
+        if not account and proposal.get("card_last_four"):
+            card_matches = [
+                item for item in accounts if item.last_four == proposal.get("card_last_four")
+            ]
+            if len(card_matches) == 1:
+                account = card_matches[0]
+        if not account:
+            description = normalize_description(str(proposal.get("description") or ""))
+            mentioned = [
+                item
+                for item in accounts
+                if any(
+                    len(alias) >= 3 and alias in description
+                    for alias in (
+                        normalize_description(item.name),
+                        normalize_description(item.institution),
+                    )
+                )
+            ]
+            if "CARTAO" in description:
+                mentioned = [item for item in mentioned if item.account_type == "credit_card"]
+            elif "CONTA" in description:
+                mentioned = [item for item in mentioned if item.account_type == "checking"]
+            if len(mentioned) == 1:
+                account = mentioned[0]
+        proposal["account_id"] = account.id if account else None
+        proposal["account_name"] = _account_display(account) if account else None
+        proposal["requires_account"] = account is None
+        category_name = str(proposal.get("category_name") or "Revisar")
+        category = categories_by_name.get(category_name.casefold())
+        proposal["category_id"] = category.id if category else None
+        proposal["new_category"] = category is None
+        movement_type = str(proposal.get("movement_type") or "expense")
+        if account and proposal.get("booked_at") and proposal.get("amount"):
+            try:
+                signed_amount = _capture_signed_amount(
+                    movement_type, Decimal(str(proposal["amount"]))
+                )
+                parsed = ParsedTransaction(
+                    booked_at=date.fromisoformat(str(proposal["booked_at"])),
+                    description=str(proposal.get("description") or "Lançamento inteligente"),
+                    amount=signed_amount,
+                    source_line=int(proposal.get("source_line") or 1),
+                    card_last_four=proposal.get("card_last_four"),
+                    installment_current=proposal.get("installment_current"),
+                    installment_total=proposal.get("installment_total"),
+                )
+                fingerprint = transaction_fingerprint(account.id, parsed, account.owner_label)
+                duplicate = bool(
+                    db.scalar(
+                        select(Transaction.id).where(
+                            Transaction.household_id == household_id,
+                            Transaction.fingerprint == fingerprint,
+                        )
+                    )
+                )
+            except (TypeError, ValueError):
+                duplicate = False
+            proposal["possible_duplicate"] = duplicate
+            if duplicate:
+                proposal["selected"] = False
+                proposal["warnings"].append(
+                    "Possível duplicidade: já existe um lançamento idêntico nessa conta"
+                )
+        enriched.append(proposal)
+    return enriched
 
 
 @router.get("/public/status")
@@ -815,6 +1031,472 @@ def list_imports(user: User = Depends(get_current_user), db: Session = Depends(g
         }
         for item in rows
     ]
+
+
+@router.post("/captures/preview", status_code=201)
+async def create_capture_preview(
+    text: str | None = Form(default=None),
+    account_id: str | None = Form(default=None),
+    document_type: str = Form(
+        default="auto",
+        pattern="^(auto|receipt|boleto|bank_statement|credit_card|payroll)$",
+    ),
+    file: UploadFile | None = File(default=None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not (text and text.strip()) and file is None:
+        raise HTTPException(status_code=422, detail="Escreva uma mensagem ou envie um arquivo")
+    if text and len(text) > 10000:
+        raise HTTPException(status_code=413, detail="Mensagem maior que 10.000 caracteres")
+    account = None
+    if account_id:
+        account = db.scalar(
+            select(Account).where(
+                Account.id == account_id,
+                Account.household_id == user.household_id,
+                Account.active.is_(True),
+            )
+        )
+        if not account:
+            raise HTTPException(status_code=404, detail="Conta não encontrada")
+
+    payload: bytes | None = None
+    document: Document | None = None
+    filename = file.filename if file else None
+    content_type = file.content_type if file else None
+    if file:
+        payload = await file.read(settings.max_upload_mb * 1024 * 1024 + 1)
+        if len(payload) > settings.max_upload_mb * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Arquivo maior que {settings.max_upload_mb} MB")
+        if not payload:
+            raise HTTPException(status_code=422, detail="O arquivo enviado está vazio")
+        digest = file_sha256(payload)
+        if db.scalar(
+            select(Document.id).where(
+                Document.household_id == user.household_id,
+                Document.sha256 == digest,
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Este arquivo já foi enviado anteriormente; abra a captura existente ou escolha outro arquivo",
+            )
+        document = Document(
+            household_id=user.household_id,
+            account_id=account.id if account else None,
+            original_name=(filename or "captura")[:255],
+            document_type="smart_capture",
+            sha256=digest,
+            encrypted_path="pending",
+            status="capture_processing",
+        )
+        db.add(document)
+        db.flush()
+        document.encrypted_path = EncryptedDocumentStore().save(document.id, payload)
+
+    try:
+        analysis = await run_in_threadpool(
+            preview_capture,
+            text=text,
+            filename=filename,
+            content_type=content_type,
+            payload=payload,
+            requested_type=document_type,
+            account_type=account.account_type if account else None,
+        )
+    except CaptureParseError as exc:
+        source_type = "text"
+        if file:
+            if (content_type or "").startswith("audio/"):
+                source_type = "audio"
+            elif (content_type or "").startswith("image/"):
+                source_type = "image"
+            else:
+                source_type = "document"
+        capture = CaptureDraft(
+            household_id=user.household_id,
+            user_id=user.id,
+            document_id=document.id if document else None,
+            source_type=source_type,
+            detected_type=document_type,
+            status="needs_input",
+            processor="local_rules",
+            original_text=(text or "")[:10000] or None,
+            proposal_json="[]",
+            confidence=Decimal("0"),
+            notes=str(exc),
+        )
+        db.add(capture)
+        if document:
+            document.status = "capture_needs_input"
+            document.notes = str(exc)
+        db.flush()
+        audit(
+            db,
+            user,
+            "capture.needs_input",
+            "capture_draft",
+            capture.id,
+            {"source_type": source_type, "reason": str(exc)},
+        )
+        db.commit()
+        return _capture_response(capture)
+
+    category_rows = db.scalars(
+        select(Category).where(Category.household_id == user.household_id)
+    ).all()
+    categories_by_name = {item.name.casefold(): item.name for item in category_rows}
+    if (
+        len(analysis["items"]) == 1
+        and analysis["items"][0].get("kind") == "transaction"
+        and float(analysis["items"][0].get("confidence", 0)) < 0.70
+    ):
+        codex = CodexAdvisorClient()
+        classification = await run_in_threadpool(
+            codex.classify,
+            {
+                "message": (analysis.get("extracted_text") or text or "")[:2000],
+                "local_proposal": analysis["items"][0],
+                "allowed_categories": [item.name for item in category_rows],
+            },
+        )
+        if classification.payload:
+            suggestion = classification.payload
+            allowed_category = categories_by_name.get(
+                str(suggestion.get("category_name") or "").casefold()
+            )
+            if allowed_category:
+                proposal = analysis["items"][0]
+                proposal["category_name"] = allowed_category
+                proposal["movement_type"] = suggestion.get(
+                    "movement_type", proposal.get("movement_type")
+                )
+                proposed_description = " ".join(
+                    str(suggestion.get("description") or proposal.get("description") or "").split()
+                )
+                if 2 <= len(proposed_description) <= 500:
+                    proposal["description"] = proposed_description
+                try:
+                    suggested_confidence = float(suggestion.get("confidence", 0))
+                except (TypeError, ValueError):
+                    suggested_confidence = 0
+                proposal["confidence"] = round(max(0, min(1, suggested_confidence)), 4)
+                if suggestion.get("reason"):
+                    proposal.setdefault("warnings", []).append(str(suggestion["reason"]))
+                analysis["processor"] += "+codex"
+                analysis["confidence"] = proposal["confidence"]
+
+    proposals = _enrich_capture_items(
+        db,
+        user.household_id,
+        analysis["items"],
+        account.id if account else None,
+    )
+    warnings = list(analysis.get("warnings") or [])
+    if any(item.get("requires_account") for item in proposals):
+        warnings.append("Escolha a conta ou o cartão antes de confirmar")
+    capture = CaptureDraft(
+        household_id=user.household_id,
+        user_id=user.id,
+        document_id=document.id if document else None,
+        source_type=analysis["source_type"],
+        detected_type=analysis["detected_type"],
+        status="preview",
+        processor=analysis["processor"],
+        original_text=(text or "")[:10000] or None,
+        extracted_text=analysis.get("extracted_text") or None,
+        proposal_json=json.dumps(proposals, ensure_ascii=False),
+        confidence=Decimal(str(analysis["confidence"])),
+        notes="; ".join(dict.fromkeys(warnings))[:4000] or None,
+    )
+    db.add(capture)
+    if document:
+        document.document_type = (
+            analysis["detected_type"]
+            if analysis["detected_type"] in {"bank_statement", "credit_card", "payroll"}
+            else "smart_capture"
+        )
+        document.status = "capture_preview"
+    db.flush()
+    audit(
+        db,
+        user,
+        "capture.preview",
+        "capture_draft",
+        capture.id,
+        {
+            "source_type": capture.source_type,
+            "detected_type": capture.detected_type,
+            "processor": capture.processor,
+            "items": len(proposals),
+        },
+    )
+    db.commit()
+    return _capture_response(capture)
+
+
+@router.get("/captures")
+def list_captures(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> list[dict]:
+    rows = db.scalars(
+        select(CaptureDraft)
+        .where(CaptureDraft.household_id == user.household_id)
+        .order_by(CaptureDraft.created_at.desc())
+        .limit(50)
+    ).all()
+    return [_capture_response(item) for item in rows]
+
+
+@router.get("/captures/{capture_id}")
+def get_capture(
+    capture_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    item = db.scalar(
+        select(CaptureDraft).where(
+            CaptureDraft.id == capture_id,
+            CaptureDraft.household_id == user.household_id,
+        )
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Captura não encontrada")
+    return _capture_response(item)
+
+
+@router.delete("/captures/{capture_id}")
+def cancel_capture(
+    capture_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    item = db.scalar(
+        select(CaptureDraft).where(
+            CaptureDraft.id == capture_id,
+            CaptureDraft.household_id == user.household_id,
+        )
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Captura não encontrada")
+    if item.status == "confirmed":
+        raise HTTPException(
+            status_code=409,
+            detail="Uma captura confirmada não pode ser cancelada; ajuste os registros criados",
+        )
+    item.status = "cancelled"
+    if item.document:
+        item.document.status = "capture_cancelled"
+    audit(db, user, "capture.cancel", "capture_draft", item.id)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/captures/{capture_id}/confirm")
+def confirm_capture(
+    capture_id: str,
+    payload: CaptureConfirmRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    capture = db.scalar(
+        select(CaptureDraft).where(
+            CaptureDraft.id == capture_id,
+            CaptureDraft.household_id == user.household_id,
+        )
+    )
+    if not capture:
+        raise HTTPException(status_code=404, detail="Captura não encontrada")
+    if capture.status == "confirmed":
+        raise HTTPException(status_code=409, detail="Esta captura já foi confirmada")
+    if capture.status == "cancelled":
+        raise HTTPException(status_code=409, detail="Esta captura foi cancelada")
+    selected = [item for item in payload.items if item.selected]
+    if not selected:
+        raise HTTPException(status_code=422, detail="Selecione ao menos um item para confirmar")
+
+    result: dict[str, list[str]] = {
+        "transactions": [],
+        "obligations": [],
+        "payroll": [],
+    }
+    structured_document = capture.detected_type in {"bank_statement", "credit_card"}
+    review_count = 0
+    for proposal in selected:
+        if proposal.kind == "transaction":
+            account = db.scalar(
+                select(Account).where(
+                    Account.id == proposal.account_id,
+                    Account.household_id == user.household_id,
+                    Account.active.is_(True),
+                )
+            )
+            if not account:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Escolha uma conta válida para ‘{proposal.description}’",
+                )
+            movement_type = proposal.movement_type or "expense"
+            amount = (
+                money(proposal.signed_amount)
+                if movement_type in {"transfer", "reconciliation"}
+                and proposal.signed_amount is not None
+                else _capture_signed_amount(movement_type, proposal.amount)
+            )
+            excluded = False
+            transaction_type = movement_type
+            investment_movement: str | None = None
+            if movement_type == "expense":
+                if proposal.category_id:
+                    category = db.scalar(
+                        select(Category).where(
+                            Category.id == proposal.category_id,
+                            Category.household_id == user.household_id,
+                        )
+                    )
+                    if not category:
+                        raise HTTPException(status_code=422, detail="Categoria inválida")
+                else:
+                    category = category_for(
+                        db, user.household_id, proposal.category_name or "Revisar"
+                    )
+            elif movement_type == "income":
+                category = category_for(db, user.household_id, "Receitas")
+            elif movement_type in {"investment", "redemption"}:
+                transaction_type = "transfer"
+                excluded = True
+                category = category_for(db, user.household_id, "Transferência patrimonial")
+                investment_movement = movement_type
+            elif movement_type == "transfer":
+                transaction_type = "transfer"
+                excluded = True
+                category = category_for(db, user.household_id, "Transferência interna")
+            elif movement_type == "reconciliation":
+                transaction_type = "reconciliation"
+                excluded = True
+                category = category_for(db, user.household_id, "Conciliação")
+            else:
+                transaction_type = "refund"
+                category = category_for(db, user.household_id, "Reembolsos e estornos")
+
+            parsed = ParsedTransaction(
+                booked_at=proposal.booked_at,
+                description=proposal.description,
+                amount=money(amount),
+                source_line=proposal.source_line or 1,
+                card_last_four=proposal.card_last_four,
+                installment_current=proposal.installment_current,
+                installment_total=proposal.installment_total,
+            )
+            fingerprint = transaction_fingerprint(account.id, parsed, account.owner_label)
+            duplicate = bool(
+                db.scalar(
+                    select(Transaction.id).where(
+                        Transaction.household_id == user.household_id,
+                        Transaction.fingerprint == fingerprint,
+                    )
+                )
+            )
+            if investment_movement and not duplicate:
+                profile = profile_for(db, user.household_id)
+                if investment_movement == "investment":
+                    profile.investment_balance += abs(proposal.amount)
+                else:
+                    profile.investment_balance = max(
+                        Decimal("0"), profile.investment_balance - abs(proposal.amount)
+                    )
+            transaction = Transaction(
+                household_id=user.household_id,
+                account_id=account.id,
+                document_id=capture.document_id if structured_document else None,
+                category_id=category.id,
+                booked_at=proposal.booked_at,
+                description=proposal.description,
+                normalized_description=normalize_description(proposal.description),
+                amount=money(amount),
+                transaction_type=transaction_type,
+                owner_label=account.owner_label,
+                card_last_four=proposal.card_last_four or account.last_four,
+                installment_current=proposal.installment_current,
+                installment_total=proposal.installment_total,
+                fingerprint=fingerprint,
+                source_line=proposal.source_line,
+                confidence=Decimal("1"),
+                excluded=excluded or duplicate,
+                possible_duplicate=duplicate,
+                reviewed=not duplicate,
+            )
+            db.add(transaction)
+            db.flush()
+            result["transactions"].append(transaction.id)
+            if duplicate:
+                db.add(
+                    ReviewItem(
+                        household_id=user.household_id,
+                        transaction_id=transaction.id,
+                        document_id=capture.document_id if structured_document else None,
+                        reason="possible_duplicate",
+                        details="Captura confirmada coincide com um lançamento existente",
+                    )
+                )
+                review_count += 1
+        elif proposal.kind == "obligation":
+            obligation = Obligation(
+                household_id=user.household_id,
+                name=proposal.description,
+                due_date=proposal.due_date,
+                amount=money(proposal.amount),
+                recurrence_months=proposal.recurrence_months,
+                occurrence_count=proposal.occurrence_count,
+                category=(proposal.category_name or "general")[:60],
+                active=True,
+            )
+            db.add(obligation)
+            db.flush()
+            result["obligations"].append(obligation.id)
+        else:
+            record = PayrollRecord(
+                household_id=user.household_id,
+                document_id=capture.document_id,
+                person_name=proposal.description,
+                competence=proposal.competence,
+                payment_date=proposal.payment_date,
+                payroll_kind=proposal.payroll_kind,
+                gross_amount=money(proposal.amount),
+                deductions=Decimal("0"),
+                net_amount=money(proposal.amount),
+                payroll_loan=Decimal("0"),
+                notes="Confirmado pela central de captura inteligente",
+            )
+            db.add(record)
+            db.flush()
+            result["payroll"].append(record.id)
+
+    capture.status = "confirmed"
+    capture.proposal_json = json.dumps(
+        [item.model_dump(mode="json") for item in payload.items], ensure_ascii=False
+    )
+    capture.result_json = json.dumps(result)
+    capture.confirmed_at = datetime.now(UTC)
+    if capture.document:
+        capture.document.status = "imported_with_review" if review_count else "imported"
+        capture.document.record_count = len(selected)
+    audit(
+        db,
+        user,
+        "capture.confirm",
+        "capture_draft",
+        capture.id,
+        {
+            "transactions": len(result["transactions"]),
+            "obligations": len(result["obligations"]),
+            "payroll": len(result["payroll"]),
+            "review_items": review_count,
+        },
+    )
+    db.commit()
+    return {"ok": True, "result": result, "review_items": review_count}
 
 
 @router.get("/transactions")
@@ -1550,29 +2232,50 @@ def dashboard(
     }
 
 
+@router.get("/advisor/status")
+def advisor_status(user: User = Depends(get_current_user)) -> dict:
+    del user
+    client = CodexAdvisorClient()
+    result = client.status()
+    ready = bool(result.payload and result.payload.get("ready"))
+    return {
+        "local_engine": True,
+        "codex_configured": client.configured,
+        "codex_ready": ready,
+        "model": result.payload.get("model") if result.payload else None,
+    }
+
+
 @router.post("/advisor/chat")
 def advisor_chat(
     payload: AdvisorRequest,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    target_month = _advisor_month(payload.message)
+    conversation_message = _advisor_conversation_message(payload)
+    target_month = _advisor_month(conversation_message)
     selected_month = month_key(target_month)
-    normalized = normalize_description(payload.message)
+    normalized = normalize_description(conversation_message)
     summary = dashboard(month=selected_month, user=user, db=db)
     profile = profile_for(db, user.household_id)
     intent = "help"
     status_name = "informative"
     metrics: dict[str, object] = {"month": selected_month}
+    evidence: list[str] = []
+    assumptions = [
+        "A reserva investida não é tratada como renda disponível",
+        "Dados ainda não lançados não entram na análise",
+        "O sistema não consulta o saldo atual do internet banking",
+    ]
 
     purchase_words = {"COMPRA", "COMPRAR", "CUSTA", "POSSO", "ADQUIRIR"}
     if any(word in normalized.split() for word in purchase_words):
         intent = "purchase"
-        purchase_amount = _advisor_amount(payload.message)
+        purchase_amount = _advisor_amount(conversation_message)
         if purchase_amount is None:
             answer = (
                 "Informe o valor da compra para eu analisar. Exemplo: "
-                "‘Quero comprar algo de R$ 2.000; posso fazer essa compra?’"
+                "‘Quero comprar algo de R$ 2.000 à vista; posso fazer essa compra?’"
             )
             status_name = "insufficient_data"
         elif Decimal(str(summary["cash_cap"])) <= 0:
@@ -1582,81 +2285,109 @@ def advisor_chat(
             )
             status_name = "insufficient_data"
         else:
-            forecast_data = forecast(user=user, db=db)
-            remaining_before = Decimal(str(summary["remaining_cap"]))
-            remaining_after = money(remaining_before - purchase_amount)
-            minimum_projected = Decimal(str(forecast_data["summary"]["minimum_delayed"]))
-            floor = Decimal(str(forecast_data["summary"]["emergency_floor"]))
-            projection_margin = money(minimum_projected - floor)
-
-            today = date.today()
-            horizon = today + timedelta(days=180)
-            obligation_models = db.scalars(
-                select(Obligation).where(
-                    Obligation.household_id == user.household_id,
-                    Obligation.active.is_(True),
-                )
-            ).all()
-            occurrences = sorted(
-                (due, item)
-                for item in obligation_models
-                for due in _obligation_dates(item)
-                if today <= due <= horizon
-            )
-            upcoming_total = money(
-                sum((Decimal(item.amount) for _due, item in occurrences), Decimal("0"))
-            )
-            next_note = ""
-            if occurrences:
-                next_due, next_item = occurrences[0]
-                next_note = (
-                    f" A próxima obrigação cadastrada é {next_item.name}, de "
-                    f"{_brl(next_item.amount)}, em {next_due:%d/%m/%Y}."
-                )
-
-            if remaining_after < 0:
-                status_name = "not_recommended"
-                answer = (
-                    f"Minha recomendação é não fazer essa compra agora. O valor de "
-                    f"{_brl(purchase_amount)} ultrapassaria o teto disponível em "
-                    f"{_brl(abs(remaining_after))}. Neste mês você já gastou "
-                    f"{_brl(summary['spending'])} de um teto de {_brl(summary['cash_cap'])}."
-                    f"{next_note}"
-                )
-            elif not forecast_data["summary"]["viable"]:
-                status_name = "not_recommended"
-                answer = (
-                    f"Embora a compra de {_brl(purchase_amount)} caiba no teto deste mês, "
-                    "eu não a recomendo agora: a projeção conservadora já fica abaixo da "
-                    f"reserva mínima em {_brl(abs(projection_margin))}. Restariam "
-                    f"{_brl(remaining_after)} no teto após a compra.{next_note}"
-                )
-            elif purchase_amount > remaining_before * Decimal("0.50") or projection_margin < purchase_amount:
-                status_name = "caution"
-                answer = (
-                    f"A compra de {_brl(purchase_amount)} cabe matematicamente, mas exige "
-                    f"cautela: restariam {_brl(remaining_after)} no teto do mês e a margem "
-                    f"mínima projetada acima da reserva é {_brl(max(Decimal('0'), projection_margin))}. "
-                    f"Eu só faria se for necessária e sem usar a reserva investida.{next_note}"
-                )
+            payment = _advisor_payment(conversation_message, purchase_amount)
+            if not payment["complete"]:
+                answer = str(payment["question"])
+                status_name = "insufficient_data"
             else:
-                status_name = "favorable"
-                answer = (
-                    f"Sim, a compra de {_brl(purchase_amount)} cabe no cenário atual, "
-                    f"considerando pagamento à vista: restariam {_brl(remaining_after)} no "
-                    f"teto do mês. A projeção conservadora continua acima da reserva mínima "
-                    f"por {_brl(projection_margin)}.{next_note}"
+                forecast_data = forecast(user=user, db=db)
+                remaining_before = Decimal(str(summary["remaining_cap"]))
+                monthly_impact = Decimal(str(payment["monthly_payment"]))
+                total_cost = Decimal(str(payment["total_cost"]))
+                remaining_after = money(remaining_before - monthly_impact)
+                minimum_projected = Decimal(str(forecast_data["summary"]["minimum_delayed"]))
+                floor = Decimal(str(forecast_data["summary"]["emergency_floor"]))
+                projection_margin = money(minimum_projected - floor)
+                future_commitment = money(max(Decimal("0"), total_cost - monthly_impact))
+                projection_margin_after = money(projection_margin - future_commitment)
+
+                today = date.today()
+                horizon = today + timedelta(days=180)
+                obligation_models = db.scalars(
+                    select(Obligation).where(
+                        Obligation.household_id == user.household_id,
+                        Obligation.active.is_(True),
+                    )
+                ).all()
+                occurrences = sorted(
+                    (due, item)
+                    for item in obligation_models
+                    for due in _obligation_dates(item)
+                    if today <= due <= horizon
                 )
-            answer += " A análise não considera juros de parcelamento nem gastos ainda não lançados."
-            metrics.update(
-                {
-                    "purchase_amount": decimal_value(purchase_amount),
-                    "remaining_before": decimal_value(remaining_before),
-                    "remaining_after": decimal_value(remaining_after),
-                    "projection_margin": decimal_value(projection_margin),
-                    "obligations_next_180_days": decimal_value(upcoming_total),
-                }
-            )
+                upcoming_total = money(
+                    sum((Decimal(item.amount) for _due, item in occurrences), Decimal("0"))
+                )
+                next_note = ""
+                if occurrences:
+                    next_due, next_item = occurrences[0]
+                    next_note = (
+                        f" A próxima obrigação cadastrada é {next_item.name}, de "
+                        f"{_brl(next_item.amount)}, em {next_due:%d/%m/%Y}."
+                    )
+                payment_note = "à vista"
+                if int(payment["installments"]) > 1:
+                    payment_note = (
+                        f"em {payment['installments']} parcelas de {_brl(monthly_impact)}"
+                        + (
+                            f", com custo total estimado de {_brl(total_cost)}"
+                            if Decimal(str(payment["monthly_interest_rate"])) > 0
+                            else ", sem juros"
+                        )
+                    )
+
+                if remaining_after < 0:
+                    status_name = "not_recommended"
+                    answer = (
+                        f"Minha recomendação é não fazer essa compra agora. O impacto de "
+                        f"{_brl(monthly_impact)} {payment_note} ultrapassaria o teto disponível "
+                        f"em {_brl(abs(remaining_after))}. Neste mês você já gastou "
+                        f"{_brl(summary['spending'])} de um teto de {_brl(summary['cash_cap'])}."
+                        f"{next_note}"
+                    )
+                elif not forecast_data["summary"]["viable"] or projection_margin_after < 0:
+                    status_name = "not_recommended"
+                    answer = (
+                        f"Embora a compra de {_brl(purchase_amount)} {payment_note} caiba no teto "
+                        "imediato, eu não a recomendo agora: a projeção conservadora ficaria "
+                        f"abaixo da reserva mínima em {_brl(abs(projection_margin_after))}. "
+                        f"Restariam {_brl(remaining_after)} no teto após o primeiro impacto.{next_note}"
+                    )
+                elif monthly_impact > remaining_before * Decimal("0.50") or projection_margin_after < total_cost:
+                    status_name = "caution"
+                    answer = (
+                        f"A compra de {_brl(purchase_amount)} {payment_note} cabe matematicamente, "
+                        f"mas exige cautela: restariam {_brl(remaining_after)} no teto do mês e "
+                        "a margem conservadora acima da reserva, após as parcelas futuras, seria "
+                        f"{_brl(max(Decimal('0'), projection_margin_after))}.{next_note}"
+                    )
+                else:
+                    status_name = "favorable"
+                    answer = (
+                        f"A compra de {_brl(purchase_amount)} {payment_note} cabe no cenário atual: "
+                        f"restariam {_brl(remaining_after)} no teto do mês. Depois dos compromissos "
+                        "futuros dessa compra, a projeção conservadora ainda ficaria acima da "
+                        f"reserva mínima por {_brl(projection_margin_after)}.{next_note}"
+                    )
+                answer += " A análise não inclui gastos que ainda não foram lançados."
+                metrics.update(
+                    {
+                        "purchase_amount": decimal_value(purchase_amount),
+                        "payment": payment,
+                        "remaining_before": decimal_value(remaining_before),
+                        "remaining_after": decimal_value(remaining_after),
+                        "projection_margin_before": decimal_value(projection_margin),
+                        "projection_margin_after": decimal_value(projection_margin_after),
+                        "obligations_next_180_days": decimal_value(upcoming_total),
+                    }
+                )
+                evidence = [
+                    f"Gasto do mês: {_brl(summary['spending'])}",
+                    f"Teto disponível antes da compra: {_brl(remaining_before)}",
+                    f"Impacto mensal da compra: {_brl(monthly_impact)}",
+                    f"Margem conservadora após compromissos: {_brl(projection_margin_after)}",
+                    f"Obrigações cadastradas nos próximos 180 dias: {_brl(upcoming_total)}",
+                ]
     elif any(word in normalized for word in ("OBRIGAC", "VENCIMENTO", "VENCE", "PARCELA")):
         intent = "obligations"
         items = _obligation_rows(db, user.household_id)
@@ -1668,6 +2399,7 @@ def advisor_chat(
                 for item in upcoming
             ]
             answer = "Próximas obrigações cadastradas:\n- " + "\n- ".join(lines)
+            evidence = lines
         else:
             answer = "Não encontrei obrigações futuras ativas cadastradas."
     elif any(word in normalized for word in ("ECONOMIZAR", "ECONOMIA", "CORTAR", "CORTE")):
@@ -1683,6 +2415,7 @@ def advisor_chat(
                 f"A meta inicial conservadora é {_brl(plan['potential_monthly_savings'])} por mês.\n- "
                 + "\n- ".join(lines)
             )
+            evidence = lines
         else:
             answer = "Não há recomendação de corte calculada para o período selecionado."
     elif any(word in normalized for word in ("ENTROU", "RECEITA", "RECEBI", "ENTRADA")):
@@ -1695,6 +2428,7 @@ def advisor_chat(
             f"Entraram {_brl(summary['cash_in'])} em receitas reais em {selected_month}. "
             f"Resgates e estornos não entram nesse total. Detalhamento: {detail}."
         )
+        evidence = [detail]
     elif any(word in normalized for word in ("SAIU", "BANCO", "CARTAO", "SAIDA")):
         intent = "cash_out"
         sources = [item for item in summary["cash_flow_by_account"] if item["cash_out"] > 0]
@@ -1706,18 +2440,65 @@ def advisor_chat(
             f"Aplicações, resgates, transferências internas e pagamento de fatura foram excluídos. "
             f"Detalhamento: {detail}."
         )
+        evidence = [detail]
     elif any(word in normalized for word in ("GASTEI", "GASTO", "GASTOS")):
         intent = "spending"
         answer = (
             f"O gasto considerado no teto em {selected_month} é {_brl(summary['spending'])}. "
             f"O saldo do teto é {_brl(summary['remaining_cap'])}."
         )
+        evidence = [
+            f"Gasto consolidado: {_brl(summary['spending'])}",
+            f"Teto restante: {_brl(summary['remaining_cap'])}",
+        ]
     else:
         answer = (
             "Posso analisar uma compra, informar entradas e saídas por conta, listar obrigações "
             "próximas, mostrar o gasto do mês ou indicar os principais cortes. Por exemplo: "
-            "‘Posso comprar algo de R$ 2.000?’"
+            "‘Posso comprar algo de R$ 2.000 à vista?’"
         )
+
+    provider = "local"
+    provider_model = None
+    if status_name != "insufficient_data" and intent != "help":
+        codex_payload = {
+            "question": payload.message,
+            "conversation_history": [item.model_dump() for item in payload.history[-8:]],
+            "selected_month": selected_month,
+            "financial_summary": {
+                "spending": summary["spending"],
+                "cash_in": summary["cash_in"],
+                "cash_out": summary["cash_out"],
+                "cash_cap": summary["cash_cap"],
+                "remaining_cap": summary["remaining_cap"],
+                "investment_balance": summary["investment_balance"],
+                "emergency_floor": summary["emergency_floor"],
+                "review_items": summary["review_count"],
+                "duplicates_ignored": summary["duplicates_ignored"],
+                "top_categories": summary["category_spending"][:5],
+                "forecast": forecast(user=user, db=db)["summary"],
+            },
+            "deterministic_result": {
+                "intent": intent,
+                "verdict": status_name,
+                "answer": answer,
+                "metrics": metrics,
+                "evidence": evidence,
+                "assumptions": assumptions,
+            },
+        }
+        candidate = CodexAdvisorClient().analyze(codex_payload).payload
+        if (
+            candidate
+            and candidate.get("verdict") == status_name
+            and isinstance(candidate.get("answer"), str)
+            and candidate["answer"].strip()
+        ):
+            answer = candidate["answer"].strip()
+            evidence = [str(item) for item in candidate.get("evidence", evidence)][:6]
+            assumptions = [str(item) for item in candidate.get("assumptions", assumptions)][:6]
+            provider = "codex"
+            provider_model = candidate.get("model")
 
     audit(
         db,
@@ -1725,7 +2506,7 @@ def advisor_chat(
         "advisor.question",
         "financial_profile",
         profile.id,
-        {"intent": intent, "status": status_name, **metrics},
+        {"intent": intent, "status": status_name, "provider": provider, **metrics},
     )
     db.commit()
     return {
@@ -1733,9 +2514,8 @@ def advisor_chat(
         "status": status_name,
         "intent": intent,
         "metrics": metrics,
-        "assumptions": [
-            "Compras são avaliadas à vista no mês selecionado",
-            "A reserva investida não é tratada como renda disponível",
-            "Dados ainda não lançados não entram na análise",
-        ],
+        "provider": provider,
+        "model": provider_model,
+        "evidence": evidence,
+        "assumptions": assumptions,
     }

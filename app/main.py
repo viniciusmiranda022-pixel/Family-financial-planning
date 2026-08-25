@@ -12,7 +12,7 @@ from app.models import User
 settings = get_settings()
 app = FastAPI(
     title=settings.app_name,
-    version="0.1.0",
+    version="0.2.0",
     docs_url="/api/docs" if settings.environment != "production" else None,
     redoc_url=None,
 )
@@ -23,7 +23,7 @@ templates = Jinja2Templates(directory="app/templates")
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "healthy", "version": "0.1.0"}
+    return {"status": "healthy", "version": "0.2.0"}
 
 
 @app.get("/", response_class=HTMLResponse)
