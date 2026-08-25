@@ -8,6 +8,13 @@ WORKDIR /app
 
 RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --create-home app
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-por \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml ./
 COPY app ./app
 COPY alembic.ini ./
@@ -15,7 +22,7 @@ COPY alembic ./alembic
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN pip install --upgrade pip && pip install . && \
-    mkdir -p /data/documents && chown -R app:app /app /data && \
+    mkdir -p /data/documents /data/models && chown -R app:app /app /data && \
     chmod +x /usr/local/bin/entrypoint.sh
 
 USER app
