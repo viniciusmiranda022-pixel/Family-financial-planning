@@ -1,7 +1,7 @@
 from datetime import date
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SetupRequest(BaseModel):
@@ -51,8 +51,63 @@ class ManualTransactionRequest(BaseModel):
     category_name: str | None = Field(default=None, min_length=2, max_length=100)
 
 
+class AdvisorHistoryItem(BaseModel):
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(min_length=1, max_length=1500)
+
+
 class AdvisorRequest(BaseModel):
     message: str = Field(min_length=2, max_length=1000)
+    history: list[AdvisorHistoryItem] = Field(default_factory=list, max_length=8)
+
+
+class CaptureItemRequest(BaseModel):
+    kind: str = Field(pattern="^(transaction|obligation|payroll)$")
+    selected: bool = True
+    booked_at: date | None = None
+    due_date: date | None = None
+    competence: date | None = None
+    payment_date: date | None = None
+    description: str = Field(min_length=2, max_length=500)
+    amount: Decimal = Field(gt=0)
+    movement_type: str | None = Field(
+        default=None,
+        pattern="^(expense|income|investment|redemption|refund|transfer|reconciliation)$",
+    )
+    signed_amount: Decimal | None = None
+    account_id: str | None = None
+    category_id: str | None = None
+    category_name: str | None = Field(default=None, min_length=2, max_length=100)
+    recurrence_months: int = Field(default=0, ge=0, le=120)
+    occurrence_count: int = Field(default=1, ge=1, le=240)
+    payroll_kind: str = Field(
+        default="regular", pattern="^(regular|13_first|13_second|vacation_extra|other)$"
+    )
+    source_line: int | None = Field(default=None, ge=1)
+    installment_current: int | None = Field(default=None, ge=1, le=999)
+    installment_total: int | None = Field(default=None, ge=1, le=999)
+    card_last_four: str | None = Field(default=None, pattern=r"^\d{4}$")
+
+    @model_validator(mode="after")
+    def validate_kind_fields(self) -> "CaptureItemRequest":
+        if self.kind == "transaction" and (not self.booked_at or not self.movement_type):
+            raise ValueError("Lançamentos precisam de data e tipo de movimentação")
+        if (
+            self.kind == "transaction"
+            and self.movement_type in {"transfer", "reconciliation"}
+            and self.signed_amount is not None
+            and abs(abs(self.signed_amount) - self.amount) > Decimal("0.01")
+        ):
+            raise ValueError("O valor assinado precisa corresponder ao valor do lançamento")
+        if self.kind == "obligation" and not self.due_date:
+            raise ValueError("Boletos e obrigações precisam de vencimento")
+        if self.kind == "payroll" and (not self.competence or not self.payment_date):
+            raise ValueError("Holerites precisam de competência e data de pagamento")
+        return self
+
+
+class CaptureConfirmRequest(BaseModel):
+    items: list[CaptureItemRequest] = Field(min_length=1, max_length=1000)
 
 
 class CommissionRequest(BaseModel):
