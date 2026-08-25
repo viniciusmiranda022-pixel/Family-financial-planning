@@ -56,3 +56,10 @@ O sistema inicia em HTTP na máquina local. O Tailscale Serve encerra HTTPS e en
 ## Fronteira do Codex
 
 O serviço `advisor` recebe somente JSON sanitizado produzido pela aplicação. Ele não monta `document_data`, não participa da rede interna do PostgreSQL e não possui `DATABASE_URL`. O sandbox do Codex é somente leitura e vazio. Uma resposta gerada só é aceita se preservar exatamente o veredito calculado pelo motor local; caso contrário, o sistema usa a resposta determinística.
+
+No modo nativo do Windows, perde-se a fronteira adicional do contêiner, mas permanecem a separação
+de credenciais, o diretório de trabalho vazio, o ambiente mínimo, o segredo compartilhado e o
+sandbox somente leitura. O serviço aceita a interface interna usada por `host.docker.internal`,
+mas toda análise ou classificação exige o segredo aleatório e a porta 8081 não é publicada pelo
+Tailscale Serve. Ele é iniciado por uma tarefa do próprio usuário. Credenciais do Codex ficam fora
+do repositório em `%LOCALAPPDATA%\FamilyFinancialPlanning\codex`.
