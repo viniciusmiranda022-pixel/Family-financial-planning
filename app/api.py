@@ -396,18 +396,128 @@ def _advisor_amount(message: str) -> Decimal | None:
     return money(value)
 
 
-def _advisor_payment(message: str, purchase_amount: Decimal) -> dict[str, object]:
+PURCHASE_KIND_RULES = (
+    (
+        "personal_care",
+        (
+            "ESMALTE",
+            "BATOM",
+            "MAQUIAGEM",
+            "COSMETICO",
+            "PERFUME",
+            "SHAMPOO",
+            "CONDICIONADOR",
+            "MANICURE",
+        ),
+    ),
+    (
+        "equipment",
+        (
+            "ENXADA",
+            "ROCADEIRA",
+            "FURADEIRA",
+            "FERRAMENTA",
+            "EQUIPAMENTO",
+            "MAQUINA",
+            "MOTOSSERRA",
+            "SOPRADOR",
+            "TRATOR",
+            "BETONEIRA",
+        ),
+    ),
+    ("vehicle", ("CARRO", "MOTO", "CAMINHONETE", "VEICULO", "AUTOMOVEL")),
+    ("property", ("IMOVEL", "TERRENO", "CHALE", "CONSTRUCAO", "REFORMA")),
+    (
+        "electronics",
+        (
+            "VIDEOGAME",
+            "VIDEO GAME",
+            "CONSOLE",
+            "CELULAR",
+            "NOTEBOOK",
+            "COMPUTADOR",
+            "TELEVISOR",
+            "TABLET",
+        ),
+    ),
+    ("clothing", ("ROUPA", "TENIS", "SAPATO", "BOLSA", "VESTIDO", "CAMISA")),
+    (
+        "consumable",
+        ("MERCADO", "ALIMENTO", "COMIDA", "BEBIDA", "LIMPEZA", "DESCARTAVEL"),
+    ),
+)
+
+PURCHASE_KIND_DETAILS = {
+    "personal_care": ("item de cuidados pessoais", "Estética e beleza"),
+    "equipment": ("ferramenta ou equipamento", "Operação da chácara"),
+    "vehicle": ("veículo", "Transporte"),
+    "property": ("imóvel ou melhoria estrutural", "Compras, casa e vestuário"),
+    "electronics": ("eletrônico ou bem durável", "Compras, casa e vestuário"),
+    "clothing": ("item pessoal ou de vestuário", "Compras, casa e vestuário"),
+    "consumable": ("item de consumo recorrente", "Mercado e itens domésticos"),
+    "general": ("compra não classificada", "Pix, ajudas e outros"),
+}
+
+
+def _advisor_purchase_kind(message: str) -> str:
+    normalized = normalize_description(message)
+    for kind, keywords in PURCHASE_KIND_RULES:
+        if any(re.search(rf"\b{re.escape(keyword)}\b", normalized) for keyword in keywords):
+            return kind
+    return "general"
+
+
+def _advisor_purchase_context(
+    message: str,
+    purchase_amount: Decimal,
+    cash_cap: Decimal,
+    *,
+    total_cost: Decimal | None = None,
+    installments: int = 1,
+) -> dict[str, object]:
+    kind = _advisor_purchase_kind(message)
+    label, suggested_category = PURCHASE_KIND_DETAILS[kind]
+    analyzed_cost = money(total_cost if total_cost is not None else purchase_amount)
+    cap = max(Decimal("1"), cash_cap)
+    quick_limit = max(Decimal("50"), money(cap * Decimal("0.02")))
+    ratio = analyzed_cost / cap
+    if installments == 1 and analyzed_cost <= quick_limit:
+        depth = "quick"
+    elif ratio >= Decimal("0.20") or installments >= 4:
+        depth = "full"
+    else:
+        depth = "standard"
+    return {
+        "kind": kind,
+        "label": label,
+        "suggested_category": suggested_category,
+        "analysis_depth": depth,
+        "budget_ratio": decimal_value(ratio),
+        "quick_limit": decimal_value(quick_limit),
+        "show_commitment_schedule": depth == "full" or installments > 1,
+    }
+
+
+def _advisor_payment(
+    message: str,
+    purchase_amount: Decimal,
+    *,
+    assume_cash: bool = False,
+) -> dict[str, object]:
     normalized = normalize_description(message)
     installment_match = re.search(r"\b(\d{1,3})\s*(?:X|VEZ(?:ES)?|PARCELAS?)\b", normalized)
     is_cash = bool(re.search(r"\bA\s+VISTA\b", normalized))
     if not installment_match and not is_cash:
-        return {
-            "complete": False,
-            "question": (
-                "Essa compra será à vista ou parcelada? Se for parcelada, informe a "
-                "quantidade de parcelas e se há juros."
-            ),
-        }
+        if assume_cash:
+            is_cash = True
+        else:
+            return {
+                "complete": False,
+                "question": (
+                    "Essa compra será à vista ou parcelada? Se for parcelada, informe a "
+                    "quantidade de parcelas e se há juros."
+                ),
+            }
     installments = int(installment_match.group(1)) if installment_match else 1
     if installments < 1 or installments > 120:
         return {
@@ -448,6 +558,7 @@ def _advisor_payment(message: str, purchase_amount: Decimal) -> dict[str, object
     return {
         "complete": True,
         "mode": "cash" if installments == 1 else "installments",
+        "assumed_cash": bool(assume_cash and not re.search(r"\bA\s+VISTA\b", normalized)),
         "installments": installments,
         "monthly_interest_rate": decimal_value(monthly_rate),
         "monthly_payment": decimal_value(monthly_payment),
@@ -2177,14 +2288,73 @@ def _advisor_commitment_appendix(schedule: list[dict]) -> str:
     return "Cronograma dos próximos meses já considerado no cálculo:\n" + "\n".join(lines)
 
 
-def _advisor_purchase_reflection_appendix(status_name: str, *, answered: bool = False) -> str:
+def _advisor_purchase_reflection_appendix(
+    status_name: str,
+    purchase_context: dict[str, object],
+    *,
+    answered: bool = False,
+) -> str:
+    kind = str(purchase_context["kind"])
+    depth = str(purchase_context["analysis_depth"])
+    category = str(purchase_context["suggested_category"])
+
+    if depth == "quick":
+        if kind == "personal_care":
+            detail = (
+                "É um item de consumo pessoal e de baixo impacto. Aluguel, manutenção e "
+                "análise patrimonial não se aplicam; confira apenas se já existe um produto "
+                f"equivalente e acompanhe a recorrência na categoria {category}."
+            )
+        elif kind in {"consumable", "clothing"}:
+            detail = (
+                "É uma compra de baixo impacto. Basta conferir se ela não duplica algo que já "
+                f"existe e acompanhar a recorrência na categoria {category}."
+            )
+        else:
+            detail = (
+                "O impacto isolado é baixo, portanto não faz sentido aplicar um checklist de "
+                "bem durável. Observe apenas se pequenas compras semelhantes estão se repetindo."
+            )
+        if status_name == "not_recommended":
+            detail = (
+                "O item isoladamente tem baixo impacto, mas o teto do mês já foi ultrapassado. "
+                "O foco deve ser o conjunto das despesas, não uma comparação artificial com "
+                f"aluguel ou manutenção. Registre a compra em {category}."
+            )
+        return f"Compra consciente:\n{detail}"
+
     if answered:
-        return (
-            "Compra consciente:\nO uso e a necessidade informados foram considerados. "
-            "A compra só deve seguir se o custo total de comprar for menor que alugar, "
-            "contratar o serviço ou comprar usado para a frequência real de uso. "
-            "Se essa comparação ainda não foi feita, adie a decisão."
+        answered_guidance = {
+            "equipment": (
+                "Compare o custo por uso de comprar com aluguel, contratação do serviço ou "
+                "compra usada, incluindo manutenção e armazenamento."
+            ),
+            "vehicle": (
+                "Considere o custo total de propriedade: seguro, impostos, manutenção, "
+                "combustível e depreciação, além do preço de compra."
+            ),
+            "electronics": (
+                "Compare o ganho real sobre o equipamento atual, a vida útil esperada, garantia "
+                "e alternativas usadas ou recondicionadas."
+            ),
+            "property": (
+                "Confirme custo total, documentação, manutenção e impacto nos demais projetos "
+                "antes de comprometer o caixa."
+            ),
+            "personal_care": (
+                "Considere se já existe produto equivalente, a frequência real de uso e a "
+                f"recorrência na categoria {category}."
+            ),
+        }
+        guidance = answered_guidance.get(
+            kind,
+            "Compare a necessidade real, a frequência de uso e uma alternativa mais econômica.",
         )
+        return (
+            "Compra consciente:\nAs informações adicionais foram consideradas. "
+            f"{guidance} Se a comparação ainda não estiver clara, adie a decisão."
+        )
+
     if status_name == "not_recommended":
         opening = (
             "Pelo caixa, a resposta já é não por enquanto. Mesmo quando houver folga, "
@@ -2195,16 +2365,80 @@ def _advisor_purchase_reflection_appendix(status_name: str, *, answered: bool = 
             "Caber matematicamente no orçamento não significa que a compra vale a pena. "
             "Antes de decidir, responda com honestidade:"
         )
-    return (
-        f"Compra consciente:\n{opening}\n"
-        "- Necessidade: isso resolve um problema real agora ou é vontade do momento?\n"
-        "- Uso: quantas vezes você realmente usará nos próximos 12 meses?\n"
-        "- Alternativa: quanto custaria alugar, contratar o serviço ou comprar usado?\n"
-        "- Custo total: haverá manutenção, combustível, armazenamento ou perda de valor?\n"
-        "- Impulso: se não for urgente, espere 72 horas e refaça a pergunta.\n"
-        "Se o uso for ocasional ou a alternativa custar menos, a recomendação é não comprar, "
-        "mesmo que o saldo permita."
+
+    questions_by_kind = {
+        "equipment": (
+            "Necessidade: isso resolve um problema real agora ou é vontade do momento?",
+            "Uso: quantas vezes você realmente usará nos próximos 12 meses?",
+            "Alternativa: quanto custaria alugar, contratar o serviço ou comprar usado?",
+            "Custo total: haverá manutenção, combustível, armazenamento ou perda de valor?",
+            "Impulso: se não for urgente, espere 72 horas e refaça a pergunta.",
+        ),
+        "vehicle": (
+            "Necessidade: o veículo resolve uma necessidade real ou apenas um desejo de troca?",
+            "Uso: qual será a frequência e qual problema de mobilidade ele resolve?",
+            "Custo total: quanto somam seguro, impostos, manutenção, combustível e depreciação?",
+            "Alternativa: manter o veículo atual, alugar ou usar transporte por demanda custa menos?",
+            "Impulso: compare propostas e espere 72 horas antes de assumir o compromisso.",
+        ),
+        "electronics": (
+            "Necessidade: o equipamento atual deixou de atender ou a compra é apenas um upgrade?",
+            "Uso: quantas horas por semana o produto realmente será utilizado?",
+            "Alternativa: usado, recondicionado ou reparo do atual resolveria por menos?",
+            "Custo total: há jogos, acessórios, assinaturas, garantia ou perda rápida de valor?",
+            "Impulso: espere 72 horas e compare preços antes de decidir.",
+        ),
+        "property": (
+            "Objetivo: qual problema familiar ou patrimonial essa compra resolve?",
+            "Custo total: documentação, impostos, obra e manutenção estão incluídos?",
+            "Prioridade: ela atrasa a reserva ou outro projeto mais importante?",
+            "Risco: existe margem para imprevistos sem consumir a reserva mínima?",
+            "Decisão: revise documentos e orçamento antes de assumir o compromisso.",
+        ),
+        "personal_care": (
+            "Necessidade: já existe produto equivalente em casa?",
+            "Uso: ele será utilizado antes de vencer ou perder qualidade?",
+            f"Recorrência: a soma dessas compras continua adequada à categoria {category}?",
+            "Alternativa: uma opção mais barata entrega o mesmo resultado?",
+            "Impulso: a compra continuaria fazendo sentido amanhã?",
+        ),
+        "clothing": (
+            "Necessidade: a peça cobre uma necessidade ou repete algo que você já possui?",
+            "Uso: quantas vezes ela será usada no próximo ano?",
+            "Alternativa: uma peça existente ou mais barata atende da mesma forma?",
+            f"Recorrência: o total permanece adequado à categoria {category}?",
+            "Impulso: espere até amanhã se não houver necessidade imediata.",
+        ),
+        "consumable": (
+            "Necessidade: o item está faltando ou será apenas estoque adicional?",
+            "Quantidade: existe risco de desperdício ou vencimento?",
+            f"Recorrência: o total permanece adequado à categoria {category}?",
+            "Alternativa: outra marca ou quantidade oferece melhor custo por uso?",
+        ),
+        "general": (
+            "Necessidade: qual problema concreto essa compra resolve?",
+            "Uso: com que frequência ela será utilizada?",
+            "Alternativa: existe opção mais barata que entrega o mesmo resultado?",
+            "Custo total: haverá outros gastos necessários depois da compra?",
+            "Impulso: se não for urgente, espere 72 horas e refaça a pergunta.",
+        ),
+    }
+    questions = questions_by_kind[kind]
+    if depth == "standard":
+        questions = questions[:3]
+    closing_by_kind = {
+        "equipment": "Se o uso for ocasional e contratar o serviço custar menos, não compre.",
+        "vehicle": "A parcela caber não basta: o custo total mensal precisa caber com folga.",
+        "electronics": "Se o ganho sobre o equipamento atual for pequeno, adie a troca.",
+        "personal_care": "O ponto relevante é a recorrência, não aluguel ou custo patrimonial.",
+        "consumable": "Avalie necessidade, quantidade e recorrência; não trate como bem durável.",
+    }
+    closing = closing_by_kind.get(
+        kind,
+        "Se a necessidade ou o benefício não forem claros, adie a compra.",
     )
+    lines = "\n".join(f"- {question}" for question in questions)
+    return f"Compra consciente:\n{opening}\n{lines}\n{closing}"
 
 
 @router.get("/cut-plan")
@@ -2417,14 +2651,33 @@ def advisor_chat(
             )
             status_name = "insufficient_data"
         elif purchase_amount is not None:
-            payment = _advisor_payment(conversation_message, purchase_amount)
+            cash_cap = Decimal(str(summary["cash_cap"]))
+            provisional_context = _advisor_purchase_context(
+                conversation_message,
+                purchase_amount,
+                cash_cap,
+            )
+            payment = _advisor_payment(
+                conversation_message,
+                purchase_amount,
+                assume_cash=provisional_context["analysis_depth"] == "quick",
+            )
             if not payment["complete"]:
                 answer = str(payment["question"])
                 status_name = "insufficient_data"
             else:
+                total_cost = Decimal(str(payment["total_cost"]))
+                purchase_context = _advisor_purchase_context(
+                    conversation_message,
+                    purchase_amount,
+                    cash_cap,
+                    total_cost=total_cost,
+                    installments=int(payment["installments"]),
+                )
                 forecast_data = forecast(user=user, db=db)
                 commitment_schedule = _advisor_commitment_schedule(forecast_data)
-                schedule_appendix = _advisor_commitment_appendix(commitment_schedule)
+                if purchase_context["show_commitment_schedule"]:
+                    schedule_appendix = _advisor_commitment_appendix(commitment_schedule)
                 card_installments_projected = money(
                     sum(
                         (
@@ -2445,7 +2698,6 @@ def advisor_chat(
                 )
                 remaining_before = Decimal(str(summary["remaining_cap"]))
                 monthly_impact = Decimal(str(payment["monthly_payment"]))
-                total_cost = Decimal(str(payment["total_cost"]))
                 remaining_after = money(remaining_before - monthly_impact)
                 minimum_projected = Decimal(str(forecast_data["summary"]["minimum_delayed"]))
                 floor = Decimal(str(forecast_data["summary"]["emergency_floor"]))
@@ -2495,7 +2747,19 @@ def advisor_chat(
                         )
                     )
 
-                if remaining_after < 0:
+                is_quick_analysis = purchase_context["analysis_depth"] == "quick"
+                context_label = str(purchase_context["label"])
+                context_category = str(purchase_context["suggested_category"])
+                month_label = f"{MONTH_LABELS_PT[target_month.month]} de {target_month.year}"
+                if remaining_after < 0 and is_quick_analysis:
+                    status_name = "not_recommended"
+                    answer = (
+                        f"A compra de {_brl(purchase_amount)} tem impacto baixo isoladamente, "
+                        f"mas o teto de {month_label} já está ultrapassado em "
+                        f"{_brl(abs(remaining_before))}. O problema não é este {context_label} "
+                        "sozinho, e sim o conjunto de despesas do mês."
+                    )
+                elif remaining_after < 0:
                     status_name = "not_recommended"
                     answer = (
                         f"Minha recomendação é não fazer essa compra agora. O impacto de "
@@ -2503,6 +2767,15 @@ def advisor_chat(
                         f"em {_brl(abs(remaining_after))}. Neste mês você já gastou "
                         f"{_brl(summary['spending'])} de um teto de {_brl(summary['cash_cap'])}."
                         f"{next_note}"
+                    )
+                elif (
+                    not forecast_data["summary"]["viable"] or projection_margin_after < 0
+                ) and is_quick_analysis:
+                    status_name = "not_recommended"
+                    answer = (
+                        f"A compra de {_brl(purchase_amount)} é pequena isoladamente, mas a "
+                        "projeção financeira já está abaixo da reserva mínima. Antes de somar "
+                        f"novas despesas, mesmo na categoria {context_category}, recomponha essa margem."
                     )
                 elif not forecast_data["summary"]["viable"] or projection_margin_after < 0:
                     status_name = "not_recommended"
@@ -2512,7 +2785,23 @@ def advisor_chat(
                         f"abaixo da reserva mínima em {_brl(abs(projection_margin_after))}. "
                         f"Restariam {_brl(remaining_after)} no teto após o primeiro impacto.{next_note}"
                     )
-                elif monthly_impact >= remaining_before * Decimal("0.50") or projection_margin_after < total_cost:
+                elif is_quick_analysis:
+                    status_name = "favorable"
+                    assumed_note = (
+                        " Considerei pagamento à vista por ser uma compra de baixo valor."
+                        if payment.get("assumed_cash")
+                        else ""
+                    )
+                    answer = (
+                        f"A compra de {_brl(purchase_amount)} tem impacto baixo no orçamento de "
+                        f"{month_label}: restariam {_brl(remaining_after)} no teto. Por se tratar "
+                        f"de {context_label}, acompanhe a recorrência na categoria "
+                        f"{context_category}.{assumed_note}"
+                    )
+                elif (
+                    monthly_impact >= remaining_before * Decimal("0.50")
+                    or projection_margin_after < total_cost
+                ):
                     status_name = "caution"
                     answer = (
                         f"A compra de {_brl(purchase_amount)} {payment_note} cabe matematicamente, "
@@ -2531,6 +2820,7 @@ def advisor_chat(
                 answer += " A análise não inclui gastos que ainda não foram lançados."
                 reflection_appendix = _advisor_purchase_reflection_appendix(
                     status_name,
+                    purchase_context,
                     answered=reflection_context is not None,
                 )
                 metrics.update(
@@ -2547,6 +2837,10 @@ def advisor_chat(
                         ),
                         "obligations_in_projection": decimal_value(obligations_projected),
                         "commitment_schedule": commitment_schedule,
+                        "purchase_context": purchase_context,
+                        "show_commitment_schedule": purchase_context[
+                            "show_commitment_schedule"
+                        ],
                         "purchase_reflection_answered": reflection_context is not None,
                     }
                 )

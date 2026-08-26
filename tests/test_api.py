@@ -412,6 +412,35 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             advisor_four_digit_amount.json()["answer"]
         )
         assert "quantas vezes você realmente usará" in advisor_four_digit_amount.json()["answer"]
+        advisor_small_cosmetic = client.post(
+            "/api/advisor/chat",
+            json={"message": "Em setembro comprar um esmalte de 2 reais"},
+        )
+        assert advisor_small_cosmetic.status_code == 200
+        cosmetic_result = advisor_small_cosmetic.json()
+        assert cosmetic_result["status"] == "favorable"
+        assert cosmetic_result["metrics"]["payment"]["mode"] == "cash"
+        assert cosmetic_result["metrics"]["payment"]["assumed_cash"] is True
+        assert cosmetic_result["metrics"]["purchase_context"]["kind"] == "personal_care"
+        assert cosmetic_result["metrics"]["purchase_context"]["analysis_depth"] == "quick"
+        assert cosmetic_result["metrics"]["show_commitment_schedule"] is False
+        assert "Estética e beleza" in cosmetic_result["answer"]
+        assert "Cronograma dos próximos meses" not in cosmetic_result["answer"]
+        assert "quanto custaria alugar" not in cosmetic_result["answer"]
+        assert "haverá manutenção" not in cosmetic_result["answer"]
+        advisor_with_long_history = client.post(
+            "/api/advisor/chat",
+            json={
+                "message": "Em setembro comprar um esmalte de 2 reais",
+                "history": [
+                    {
+                        "role": "assistant",
+                        "content": "Compra consciente:\n" + ("contexto financeiro " * 180),
+                    }
+                ],
+            },
+        )
+        assert advisor_with_long_history.status_code == 200
         with monkeypatch.context() as codex_patch:
             codex_patch.setattr(
                 "app.api.CodexAdvisorClient.analyze",
