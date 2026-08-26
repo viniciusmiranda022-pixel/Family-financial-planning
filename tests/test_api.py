@@ -246,6 +246,8 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard["liquidity_available"] == 10000
         assert dashboard["liquidity_flow"] == -76.78
         assert dashboard["liquidity_direction"] == "withdrawal"
+        assert dashboard["bank_cash_out"] == 0
+        assert dashboard["card_spending"] == 76.78
         assert dashboard["duplicates_ignored"] == 1
         assert dashboard["review_count"] == 1
         assert dashboard["category_spending"][0] == {
@@ -286,6 +288,10 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert report_data["monthly"][1]["spending"] == 76.78
         assert report_data["summary"]["total_spending"] == 110.18
         assert report_data["summary"]["average_spending"] == 55.09
+        assert report_data["summary"]["total_bank_cash_out"] == 0
+        assert report_data["summary"]["total_card_spending"] == 110.18
+        assert report_data["monthly"][1]["bank_cash_out"] == 0
+        assert report_data["monthly"][1]["card_spending"] == 76.78
         assert report_data["summary"]["highest_month"] == "2026-08"
         assert report_data["summary"]["liquidity_name"] == "Privilege DI"
         assert report_data["summary"]["liquidity_balance"] == 20000
@@ -363,6 +369,8 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard_with_manual["spending"] == 176.78
         assert dashboard_with_manual["cash_in"] == 1000
         assert dashboard_with_manual["cash_out"] == 176.78
+        assert dashboard_with_manual["bank_cash_out"] == 0
+        assert dashboard_with_manual["card_spending"] == 176.78
         assert dashboard_with_manual["investment_balance"] == 20300
         assert dashboard_with_manual["liquidity_balance"] == 20300
         assert dashboard_with_manual["liquidity_available"] == 10300
@@ -376,6 +384,33 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert nubank_flow["account_type"] == "credit_card"
         assert nubank_flow["cash_in"] == 1000
         assert nubank_flow["cash_out"] == 131.9
+        assert nubank_flow["bank_cash_out"] == 0
+        assert nubank_flow["card_spending"] == 131.9
+
+        excluded_income = client.patch(
+            f"/api/transactions/{manual_income.json()['id']}",
+            json={"excluded": True},
+        )
+        assert excluded_income.status_code == 200
+        assert client.get("/api/dashboard?month=2026-08").json()["cash_in"] == 0
+        assert client.patch(
+            f"/api/transactions/{manual_income.json()['id']}",
+            json={"excluded": False},
+        ).status_code == 200
+
+        unconfirmed_large = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-17",
+                "description": "Simulação de compra grande",
+                "amount": 80000,
+                "movement_type": "expense",
+                "account_id": account.json()["id"],
+                "category_id": restaurant_category["id"],
+            },
+        )
+        assert unconfirmed_large.status_code == 409
+        assert "simulações" in unconfirmed_large.json()["detail"].lower()
 
         transaction_rows = client.get("/api/transactions?month=2026-08").json()
         assert sum(item["manual"] for item in transaction_rows) == 4
@@ -389,6 +424,8 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard_after_delete["spending"] == 76.78
         assert dashboard_after_delete["cash_in"] == 0
         assert dashboard_after_delete["cash_out"] == 76.78
+        assert dashboard_after_delete["bank_cash_out"] == 0
+        assert dashboard_after_delete["card_spending"] == 76.78
         assert dashboard_after_delete["investment_balance"] == 20000
         assert dashboard_after_delete["liquidity_available"] == 10000
 
