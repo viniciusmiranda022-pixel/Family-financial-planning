@@ -604,6 +604,206 @@ function appendAdvisorMessage(role, text, status = "") {
   return bubble;
 }
 
+function advisorElement(tag, className = "", text = "") {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text) element.textContent = text;
+  return element;
+}
+
+function advisorDecisionLabel(intent, status) {
+  if (intent === "purchase") {
+    if (status === "not_recommended") return "Compra não recomendada agora";
+    if (status === "caution") return "Compra possível, mas exige cautela";
+    if (status === "favorable") return "Compra compatível com o cenário";
+    if (status === "insufficient_data") return "Precisamos de mais informações";
+  }
+  const labels = {
+    obligations: "Próximos compromissos",
+    cuts: "Oportunidades de economia",
+    cash_in: "Entradas do mês",
+    cash_out: "Saídas do mês",
+    spending: "Gastos do mês",
+  };
+  return labels[intent] || "Análise financeira";
+}
+
+function advisorAnswerSections(answer) {
+  const text = String(answer || "").trim();
+  const markers = [
+    { key: "reflection", label: "Compra consciente:" },
+    { key: "schedule", label: "Cronograma dos próximos meses já considerado no cálculo:" },
+  ];
+  const found = markers
+    .map((marker) => ({ ...marker, index: text.indexOf(marker.label) }))
+    .filter((marker) => marker.index >= 0)
+    .sort((left, right) => left.index - right.index);
+  if (!found.length) return { main: text, reflection: "", schedule: "" };
+
+  const sections = { main: text.slice(0, found[0].index).trim(), reflection: "", schedule: "" };
+  found.forEach((marker, index) => {
+    const start = marker.index + marker.label.length;
+    const end = found[index + 1]?.index ?? text.length;
+    sections[marker.key] = text.slice(start, end).trim();
+  });
+  return sections;
+}
+
+function appendAdvisorText(parent, text) {
+  const lines = String(text || "").split("\n").map((line) => line.trim()).filter(Boolean);
+  let list = null;
+  lines.forEach((line) => {
+    if (line.startsWith("- ")) {
+      if (!list) {
+        list = advisorElement("ul", "advisor-answer-list");
+        parent.appendChild(list);
+      }
+      list.appendChild(advisorElement("li", "", line.slice(2)));
+      return;
+    }
+    list = null;
+    parent.appendChild(advisorElement("p", "advisor-answer-paragraph", line));
+  });
+}
+
+function appendAdvisorPurchaseMetrics(parent, metrics) {
+  if (!metrics?.purchase_amount || !metrics?.payment) return;
+  const values = [
+    ["Valor da compra", metrics.purchase_amount],
+    [Number(metrics.payment.installments) > 1 ? "Parcela mensal" : "Impacto à vista", metrics.payment.monthly_payment],
+    ["Teto após a compra", metrics.remaining_after],
+    ["Margem sobre a reserva", metrics.projection_margin_after],
+  ];
+  const grid = advisorElement("div", "advisor-metric-grid");
+  values.forEach(([label, value]) => {
+    if (value === undefined || value === null) return;
+    const card = advisorElement("div", `advisor-metric${Number(value) < 0 ? " negative" : ""}`);
+    card.append(
+      advisorElement("span", "", label),
+      advisorElement("strong", "", money.format(Number(value))),
+    );
+    grid.appendChild(card);
+  });
+  if (grid.children.length) parent.appendChild(grid);
+}
+
+function appendAdvisorReflection(parent, reflection) {
+  if (!reflection) return;
+  const section = advisorElement("section", "advisor-reflection");
+  const heading = advisorElement("div", "advisor-section-heading");
+  heading.append(
+    advisorElement("span", "advisor-section-icon", "?"),
+    advisorElement("h4", "", "Antes de decidir"),
+  );
+  section.appendChild(heading);
+
+  const lines = reflection.split("\n").map((line) => line.trim()).filter(Boolean);
+  const opening = [];
+  const closing = [];
+  const questions = [];
+  let foundQuestion = false;
+  lines.forEach((line) => {
+    if (line.startsWith("- ")) {
+      foundQuestion = true;
+      questions.push(line.slice(2));
+    } else if (foundQuestion) {
+      closing.push(line);
+    } else {
+      opening.push(line);
+    }
+  });
+  if (opening.length) section.appendChild(advisorElement("p", "advisor-reflection-intro", opening.join(" ")));
+  if (questions.length) {
+    const list = advisorElement("div", "advisor-question-list");
+    questions.forEach((question) => {
+      const separator = question.indexOf(":");
+      const item = advisorElement("div", "advisor-question");
+      item.appendChild(advisorElement("span", "advisor-question-dot", ""));
+      const content = advisorElement("p");
+      if (separator > 0) {
+        content.append(
+          advisorElement("strong", "", `${question.slice(0, separator)}: `),
+          document.createTextNode(question.slice(separator + 1).trim()),
+        );
+      } else {
+        content.textContent = question;
+      }
+      item.appendChild(content);
+      list.appendChild(item);
+    });
+    section.appendChild(list);
+  }
+  if (closing.length) section.appendChild(advisorElement("p", "advisor-reflection-close", closing.join(" ")));
+  parent.appendChild(section);
+}
+
+function advisorMonthLabel(value) {
+  const match = /^(\d{4})-(\d{2})$/.exec(String(value || ""));
+  if (!match) return String(value || "");
+  const label = monthFormat.format(new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, 1)));
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function appendAdvisorSchedule(parent, schedule) {
+  if (!Array.isArray(schedule) || !schedule.length) return;
+  const section = advisorElement("section", "advisor-schedule");
+  const heading = advisorElement("div", "advisor-section-heading");
+  heading.append(
+    advisorElement("span", "advisor-section-icon calendar", "▦"),
+    advisorElement("div", ""),
+  );
+  heading.lastChild.append(
+    advisorElement("h4", "", "Compromissos dos próximos meses"),
+    advisorElement("small", "", "Parcelas dos cartões e obrigações já consideradas na análise"),
+  );
+  section.appendChild(heading);
+
+  const wrapper = advisorElement("div", "advisor-schedule-scroll");
+  const table = advisorElement("table", "advisor-schedule-table");
+  const head = advisorElement("thead");
+  const headRow = advisorElement("tr");
+  ["Mês", "Cartões", "Obrigações", "Total"].forEach((label) => headRow.appendChild(advisorElement("th", "", label)));
+  head.appendChild(headRow);
+  table.appendChild(head);
+  const body = advisorElement("tbody");
+  schedule.forEach((row) => {
+    const tr = advisorElement("tr");
+    tr.append(
+      advisorElement("td", "advisor-schedule-month", advisorMonthLabel(row.month)),
+      advisorElement("td", "", money.format(Number(row.card_installments || 0))),
+      advisorElement("td", "", money.format(Number(row.obligations || 0))),
+      advisorElement("td", "advisor-schedule-total", money.format(Number(row.total || 0))),
+    );
+    body.appendChild(tr);
+  });
+  table.appendChild(body);
+  wrapper.appendChild(table);
+  section.appendChild(wrapper);
+  parent.appendChild(section);
+}
+
+function renderAdvisorAnswer(bubble, result) {
+  bubble.replaceChildren();
+  bubble.className = `advisor-message assistant ${result.status}`;
+  bubble.dataset.source = result.provider === "codex" ? "Explicado pelo Codex" : "Motor financeiro local";
+
+  const header = advisorElement("div", "advisor-answer-header");
+  const statusIcon = result.status === "not_recommended" ? "!" : result.status === "favorable" ? "✓" : result.status === "caution" ? "!" : "i";
+  header.append(
+    advisorElement("span", "advisor-answer-icon", statusIcon),
+    advisorElement("strong", "", advisorDecisionLabel(result.intent, result.status)),
+  );
+  bubble.appendChild(header);
+
+  const sections = advisorAnswerSections(result.answer);
+  const summary = advisorElement("div", "advisor-answer-summary");
+  appendAdvisorText(summary, sections.main);
+  bubble.appendChild(summary);
+  appendAdvisorPurchaseMetrics(bubble, result.metrics);
+  appendAdvisorReflection(bubble, sections.reflection);
+  appendAdvisorSchedule(bubble, result.metrics?.commitment_schedule);
+}
+
 async function loadAdvisor() {
   const messages = document.querySelector("#advisor-messages");
   if (!messages.children.length) {
@@ -643,9 +843,7 @@ async function askAdvisor(message) {
       method: "POST",
       body: JSON.stringify({ message, history: state.advisorHistory.slice(-8) }),
     });
-    loading.textContent = result.answer;
-    loading.className = `advisor-message assistant ${result.status}`;
-    loading.dataset.source = result.provider === "codex" ? "Explicado pelo Codex" : "Motor financeiro local";
+    renderAdvisorAnswer(loading, result);
     state.advisorHistory.push(
       { role: "user", content: message },
       { role: "assistant", content: result.answer },
