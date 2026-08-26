@@ -76,6 +76,31 @@ function formJson(form, numericFields = []) {
   return data;
 }
 
+function enhanceResponsiveTables(root = document) {
+  root.querySelectorAll("table").forEach((table) => {
+    const labels = [...table.querySelectorAll("thead th")].map((header) => header.textContent.trim());
+    if (!labels.length) return;
+    table.classList.add("responsive-table");
+    table.querySelectorAll("tbody tr").forEach((row) => {
+      [...row.children].forEach((cell, index) => {
+        if (cell.matches("td") && !cell.hasAttribute("colspan")) {
+          cell.dataset.label = labels[index] || "Detalhe";
+        }
+      });
+    });
+  });
+}
+
+function setMobileMenu(open) {
+  const sidebar = document.querySelector(".sidebar");
+  const toggle = document.querySelector("#mobile-menu-toggle");
+  if (!sidebar || !toggle) return;
+  sidebar.classList.toggle("menu-open", open);
+  toggle.setAttribute("aria-expanded", String(open));
+  toggle.setAttribute("aria-label", open ? "Fechar menu" : "Abrir menu");
+  toggle.textContent = open ? "×" : "☰";
+}
+
 function showAuth(configured) {
   document.querySelector("#app-shell").classList.add("hidden");
   document.querySelector("#auth-shell").classList.remove("hidden");
@@ -104,6 +129,7 @@ async function bootstrap() {
 }
 
 async function navigate(view) {
+  setMobileMenu(false);
   document.querySelectorAll(".view").forEach((item) => item.classList.remove("active"));
   document.querySelectorAll("#main-nav button").forEach((item) => item.classList.toggle("active", item.dataset.view === view));
   document.querySelector(`#view-${view}`).classList.add("active");
@@ -931,6 +957,9 @@ document.querySelector("#login-form").addEventListener("submit", async (event) =
 });
 document.querySelector("#logout-button").addEventListener("click", async () => { await api("/auth/logout", { method: "POST" }); state.user = null; showAuth(true); });
 document.querySelectorAll("#main-nav button").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
+document.querySelector("#mobile-menu-toggle").addEventListener("click", () => {
+  setMobileMenu(!document.querySelector(".sidebar").classList.contains("menu-open"));
+});
 document.querySelectorAll("[data-go]").forEach((button) => button.addEventListener("click", () => {
   if (button.dataset.go === "transactions") document.querySelector("#transaction-month").value = document.querySelector("#dashboard-month").value;
   navigate(button.dataset.go);
@@ -1134,7 +1163,19 @@ document.querySelector("#profile-form").addEventListener("submit", async (event)
   catch (error) { toast(error.message, true); }
 });
 
-window.addEventListener("resize", () => { if (state.forecast.length) drawForecast(state.forecast, state.forecastFloor); });
+let responsiveTableFrame = null;
+const responsiveTableObserver = new MutationObserver(() => {
+  cancelAnimationFrame(responsiveTableFrame);
+  responsiveTableFrame = requestAnimationFrame(() => enhanceResponsiveTables());
+});
+responsiveTableObserver.observe(document.querySelector("#app-shell"), { childList: true, subtree: true });
+enhanceResponsiveTables();
+
+window.addEventListener("resize", () => {
+  if (window.innerWidth > 760) setMobileMenu(false);
+  if (state.forecast.length) drawForecast(state.forecast, state.forecastFloor);
+});
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") setMobileMenu(false); });
 document.querySelector("#transaction-form").elements.booked_at.value = currentDateKey();
 updateManualTransactionFields();
 bootstrap();

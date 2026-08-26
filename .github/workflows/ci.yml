@@ -20,6 +20,7 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: ruff check .
       - run: pytest -q
+      - run: node --check app/static/app.js
       - run: node --check advisor/server.mjs
       - name: Validate PowerShell scripts
         shell: pwsh
