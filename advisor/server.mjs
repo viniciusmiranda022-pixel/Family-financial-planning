@@ -181,6 +181,7 @@ function advisorPrompt(payload) {
     "Não use ferramentas, comandos, arquivos ou pesquisa; responda somente com o JSON solicitado.",
     "Os cálculos e o veredito foram produzidos pelo motor financeiro determinístico. Não refaça totais e não altere o veredito.",
     "Não invente movimentações, rendas, saldos, juros ou obrigações. Diferencie fatos, projeções e premissas.",
+    "Quando financial_summary indicar uma conta de liquidez, trate-a como o caixa central da família: sobras mensais podem ser aplicadas nela e déficits podem ser retirados dela. Aplicações e resgates são movimentos patrimoniais, não receita ou consumo; preserve o piso de segurança informado.",
     "Adapte o conselho ao tipo e à materialidade informados em purchase_context. Não aplique perguntas de aluguel, manutenção, armazenamento ou depreciação a consumíveis, cosméticos ou compras triviais.",
     "Para analysis_depth=quick, seja breve, proporcional e trate apenas impacto, categoria e eventual recorrência. Não despeje o cronograma futuro se show_commitment_schedule=false.",
     "Para equipamentos, veículos, imóveis e eletrônicos materiais, use os custos e alternativas próprios daquele tipo; evite checklist genérico.",
