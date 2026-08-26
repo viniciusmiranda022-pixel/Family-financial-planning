@@ -412,6 +412,50 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             advisor_four_digit_amount.json()["answer"]
         )
         assert "quantas vezes você realmente usará" in advisor_four_digit_amount.json()["answer"]
+        with monkeypatch.context() as codex_patch:
+            codex_patch.setattr(
+                "app.api.CodexAdvisorClient.analyze",
+                lambda _self, _payload: CodexResult(
+                    {
+                        "verdict": "not_recommended",
+                        "answer": (
+                            "Como o uso seria ocasional e o aluguel custa menos, "
+                            "não recomendo comprar agora."
+                        ),
+                        "evidence": ["Uso ocasional", "Aluguel mais barato"],
+                        "assumptions": ["Frequência informada pelo usuário"],
+                        "confidence": 0.92,
+                        "provider": "codex",
+                        "model": "modelo-de-teste",
+                    }
+                ),
+            )
+            advisor_reflection = client.post(
+                "/api/advisor/chat",
+                json={
+                    "message": "Vou usar duas vezes por ano e o aluguel custa R$ 200 por dia",
+                    "history": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Em setembro quero comprar uma enxada rotativa "
+                                "de 2000 à vista"
+                            ),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": advisor_four_digit_amount.json()["answer"],
+                        },
+                    ],
+                },
+            )
+        assert advisor_reflection.status_code == 200
+        assert advisor_reflection.json()["intent"] == "purchase"
+        assert advisor_reflection.json()["status"] == "not_recommended"
+        assert advisor_reflection.json()["provider"] == "codex"
+        assert advisor_reflection.json()["metrics"]["purchase_amount"] == 2000
+        assert advisor_reflection.json()["metrics"]["purchase_reflection_answered"] is True
+        assert "uso seria ocasional" in advisor_reflection.json()["answer"]
 
         shared_due_date = date.today() + timedelta(days=60)
         same_day_obligations = []

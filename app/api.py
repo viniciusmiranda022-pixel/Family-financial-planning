@@ -380,9 +380,10 @@ def _advisor_amount(message: str) -> Decimal | None:
         rf"r\$\s*{number}\s*(mil|k)?",
         rf"{number}\s*(mil|k)\b",
     )
-    match = next((candidate for pattern in patterns if (candidate := re.search(pattern, lowered))), None)
-    if not match:
+    matches = [candidate for pattern in patterns if (candidate := re.search(pattern, lowered))]
+    if not matches:
         return None
+    match = min(matches, key=lambda candidate: candidate.start())
     raw = match.group(1)
     suffix = match.group(2)
     if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", raw):
@@ -454,6 +455,33 @@ def _advisor_payment(message: str, purchase_amount: Decimal) -> dict[str, object
     }
 
 
+def _advisor_reflection_context(payload: AdvisorRequest) -> str | None:
+    if not any(
+        item.role == "assistant" and "COMPRA CONSCIENTE" in normalize_description(item.content)
+        for item in payload.history
+    ):
+        return None
+    normalized = normalize_description(payload.message)
+    reflection_signals = (
+        "PRECISO",
+        "USAR",
+        "USO",
+        "VEZ",
+        "ALUGAR",
+        "ALUGUEL",
+        "SERVICO",
+        "TRABALHO",
+        "CHACARA",
+        "MANUTENCAO",
+        "GUARDAR",
+        "URGENTE",
+        "VONTADE",
+        "ANO",
+        "MESES",
+    )
+    return payload.message.strip() if any(word in normalized for word in reflection_signals) else None
+
+
 def _advisor_conversation_message(payload: AdvisorRequest) -> str:
     current = payload.message
     normalized = normalize_description(current)
@@ -462,7 +490,28 @@ def _advisor_conversation_message(payload: AdvisorRequest) -> str:
         or "A VISTA" in normalized
         or "JUROS" in normalized
     )
-    if _advisor_amount(current) is not None or not has_payment_detail:
+    reflection_context = _advisor_reflection_context(payload)
+    starts_new_purchase = any(
+        word in normalized.split() for word in {"COMPRA", "COMPRAR", "ADQUIRIR"}
+    )
+    if reflection_context and not starts_new_purchase:
+        prior_context = []
+        for item in payload.history:
+            candidate = normalize_description(item.content)
+            if item.role != "user":
+                continue
+            if any(
+                word in candidate.split()
+                for word in {"COMPRA", "COMPRAR", "CUSTA", "ADQUIRIR"}
+            ) or re.search(r"\b(\d{1,3})\s*(?:X|VEZ(?:ES)?|PARCELAS?)\b", candidate) or (
+                "A VISTA" in candidate or "JUROS" in candidate
+            ):
+                prior_context.append(item.content)
+        if prior_context:
+            return ". ".join((*prior_context, f"Contexto de necessidade: {reflection_context}"))
+    if _advisor_amount(current) is not None:
+        return current
+    if not has_payment_detail:
         return current
     for item in reversed(payload.history):
         candidate = normalize_description(item.content)
@@ -2128,7 +2177,14 @@ def _advisor_commitment_appendix(schedule: list[dict]) -> str:
     return "Cronograma dos próximos meses já considerado no cálculo:\n" + "\n".join(lines)
 
 
-def _advisor_purchase_reflection_appendix(status_name: str) -> str:
+def _advisor_purchase_reflection_appendix(status_name: str, *, answered: bool = False) -> str:
+    if answered:
+        return (
+            "Compra consciente:\nO uso e a necessidade informados foram considerados. "
+            "A compra só deve seguir se o custo total de comprar for menor que alugar, "
+            "contratar o serviço ou comprar usado para a frequência real de uso. "
+            "Se essa comparação ainda não foi feita, adie a decisão."
+        )
     if status_name == "not_recommended":
         opening = (
             "Pelo caixa, a resposta já é não por enquanto. Mesmo quando houver folga, "
@@ -2335,6 +2391,7 @@ def advisor_chat(
     evidence: list[str] = []
     schedule_appendix = ""
     reflection_appendix = ""
+    reflection_context = _advisor_reflection_context(payload)
     assumptions = [
         "A reserva investida não é tratada como renda disponível",
         "Dados ainda não lançados não entram na análise",
@@ -2472,7 +2529,10 @@ def advisor_chat(
                         f"reserva mínima por {_brl(projection_margin_after)}.{next_note}"
                     )
                 answer += " A análise não inclui gastos que ainda não foram lançados."
-                reflection_appendix = _advisor_purchase_reflection_appendix(status_name)
+                reflection_appendix = _advisor_purchase_reflection_appendix(
+                    status_name,
+                    answered=reflection_context is not None,
+                )
                 metrics.update(
                     {
                         "purchase_amount": decimal_value(purchase_amount),
@@ -2487,6 +2547,7 @@ def advisor_chat(
                         ),
                         "obligations_in_projection": decimal_value(obligations_projected),
                         "commitment_schedule": commitment_schedule,
+                        "purchase_reflection_answered": reflection_context is not None,
                     }
                 )
                 evidence = [
@@ -2627,12 +2688,18 @@ def advisor_chat(
             },
         }
         candidate = CodexAdvisorClient().analyze(codex_payload).payload
+        verdict_order = {"favorable": 0, "caution": 1, "not_recommended": 2}
+        candidate_verdict = candidate.get("verdict") if candidate else None
+        verdict_allowed = candidate_verdict == status_name
+        if status_name in verdict_order and candidate_verdict in verdict_order:
+            verdict_allowed = verdict_order[candidate_verdict] >= verdict_order[status_name]
         if (
             candidate
-            and candidate.get("verdict") == status_name
+            and verdict_allowed
             and isinstance(candidate.get("answer"), str)
             and candidate["answer"].strip()
         ):
+            status_name = str(candidate_verdict)
             answer = candidate["answer"].strip()
             evidence = [str(item) for item in candidate.get("evidence", evidence)][:6]
             assumptions = [str(item) for item in candidate.get("assumptions", assumptions)][:6]
