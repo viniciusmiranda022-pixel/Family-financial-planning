@@ -31,6 +31,17 @@
 - consultor com cálculo local, parcelamento/juros e explicação do Codex;
 - acesso privado por Tailscale para Vinicius e Kelly.
 
+## Entregue em 26/08/2026 — experiência mobile e análises
+
+- identidade visual própria do Family Finance;
+- navegação e tabelas redesenhadas para celular, sem rolagem lateral;
+- leitura rápida da evolução dos últimos seis meses na visão geral;
+- relatórios configuráveis de 1 a 12 meses;
+- relatório anual por ano-calendário;
+- comparação de entradas, saídas, gastos, saldo operacional e teto;
+- ranking de categorias e detalhamento consolidado por banco e cartão;
+- impressão do relatório para PDF pelo navegador.
+
 ## Fase 3 — Próximas evoluções
 
 - worker assíncrono para filas de OCR e áudio;

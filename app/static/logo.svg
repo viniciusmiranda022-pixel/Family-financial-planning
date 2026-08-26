@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">Family Finance</title>
+  <desc id="desc">Casa formada por uma linha de crescimento e três pessoas</desc>
+  <defs>
+    <linearGradient id="background" x1="8" y1="6" x2="58" y2="60" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#25B99A"/>
+      <stop offset="0.52" stop-color="#118A81"/>
+      <stop offset="1" stop-color="#3157C8"/>
+    </linearGradient>
+    <linearGradient id="roof" x1="15" y1="41" x2="51" y2="18" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF1A8"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="url(#background)"/>
+  <path d="M13 34.5 31.8 18 51 34.5" fill="none" stroke="url(#roof)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M17.5 34v15h29V34" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity=".96"/>
+  <circle cx="24" cy="37" r="3.2" fill="#FFF1A8"/>
+  <circle cx="32" cy="33.5" r="3.8" fill="#fff"/>
+  <circle cx="40" cy="37" r="3.2" fill="#FFD47A"/>
+  <path d="M22 46c.8-4 3-6 6-6 1.8 0 3.1.6 4 1.5.9-.9 2.2-1.5 4-1.5 3 0 5.2 2 6 6" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round"/>
+</svg>

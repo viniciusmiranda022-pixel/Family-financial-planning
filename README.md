@@ -26,6 +26,9 @@ Esta primeira versão entrega:
 - rendimento do investimento sobre o saldo inicial de cada mês;
 - teto de gastos, benefícios VA/VR e saldo mínimo de segurança;
 - visão mensal navegável, com totais e categorias separados por competência;
+- identidade visual própria e interface responsiva sem rolagem lateral no celular;
+- relatórios comparativos configuráveis de 1 a 12 meses e visão por ano-calendário;
+- gráficos de evolução, ranking de categorias, médias, variações e destaques do período;
 - entradas e saídas operacionais separadas de aplicações, resgates e estornos;
 - detalhamento mensal por banco, conta corrente e cartão, sem duplicar o pagamento da fatura;
 - lançamento manual de despesa, receita, aplicação, resgate e reembolso;
@@ -127,7 +130,7 @@ Depois do primeiro acesso, siga esta ordem:
 4. resolva a fila de revisão antes de confiar nos totais;
 5. cadastre comissões e compromissos futuros;
 6. em **Acessos**, crie o usuário individual de cada membro da família;
-7. confira o plano de cortes e os três cenários da projeção.
+7. confira os relatórios comparativos, o plano de cortes e os três cenários da projeção.
 
 Para usar o Codex com a assinatura do ChatGPT no Windows, sem configurar uma chave de API,
 abra um PowerShell normal na pasta do projeto e execute:

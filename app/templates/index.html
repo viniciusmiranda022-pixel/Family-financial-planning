@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light">
   <title>Planejamento Financeiro Familiar</title>
+  <link rel="icon" href="/static/logo.svg?v={{ asset_version }}" type="image/svg+xml">
   <link rel="stylesheet" href="/static/styles.css?v={{ asset_version }}">
 </head>
 <body data-configured="{{ 'true' if configured else 'false' }}" data-app-version="{{ asset_version }}">
@@ -12,7 +13,7 @@
 
   <main id="auth-shell" class="auth-shell">
     <section class="auth-brand">
-      <div class="brand-mark">FF</div>
+      <img class="brand-logo auth-logo" src="/static/logo.svg?v={{ asset_version }}" alt="Family Finance">
       <p class="eyebrow">ON-PREMISES • DADOS LOCAIS</p>
       <h1>Planejamento financeiro com rastreabilidade.</h1>
       <p>Importe documentos, revise o que for ambíguo e projete cada compromisso sem depender de uma planilha manual.</p>
@@ -47,12 +48,13 @@
   <div id="app-shell" class="app-shell hidden">
     <aside class="sidebar">
       <div class="sidebar-brand">
-        <span class="brand-mark small">FF</span>
-        <strong>Family Finance</strong>
+        <img class="brand-logo small" src="/static/logo.svg?v={{ asset_version }}" alt="">
+        <div class="brand-wordmark"><strong>Family Finance</strong><small>Seu dinheiro, com clareza</small></div>
         <button id="mobile-menu-toggle" class="mobile-menu-toggle" type="button" aria-label="Abrir menu" aria-expanded="false">☰</button>
       </div>
       <nav id="main-nav">
         <button data-view="dashboard" class="active"><span>⌂</span>Visão geral</button>
+        <button data-view="reports"><span>▥</span>Relatórios</button>
         <button data-view="capture"><span>●</span>Lançar agora</button>
         <button data-view="imports"><span>⇧</span>Importações</button>
         <button data-view="transactions"><span>≡</span>Lançamentos</button>
@@ -93,6 +95,26 @@
           <article class="kpi" id="remaining-cap-card"><span>Disponível no teto</span><strong id="kpi-remaining">R$ 0,00</strong><small id="kpi-remaining-caption">Sem contar parcelas antigas</small></article>
           <article class="kpi warning"><span>Pendências</span><strong id="kpi-reviews">0</strong><small>Itens aguardando confirmação</small></article>
         </div>
+        <article class="panel financial-pulse-panel">
+          <div class="panel-heading">
+            <div><span class="step-label">LEITURA RÁPIDA</span><h2>Seu ritmo financeiro</h2><small>Uma visão objetiva dos últimos seis meses até a competência escolhida.</small></div>
+            <button data-go="reports" class="secondary">Abrir relatórios</button>
+          </div>
+          <div class="financial-pulse-grid">
+            <div class="mini-chart-card">
+              <div class="chart-title"><strong>Evolução dos gastos</strong><span id="dashboard-trend-badge" class="trend-badge neutral">Sem comparação</span></div>
+              <div id="dashboard-trend-chart" class="trend-chart compact" aria-live="polite"></div>
+            </div>
+            <div class="quick-insight-card">
+              <span class="insight-icon">◎</span>
+              <div><small>MAIOR CATEGORIA DO PERÍODO</small><strong id="dashboard-top-category">Sem dados</strong><p id="dashboard-top-category-detail">Importe lançamentos para formar a análise.</p></div>
+            </div>
+            <div class="quick-insight-card accent">
+              <span class="insight-icon">↗</span>
+              <div><small>MÉDIA DE GASTOS</small><strong id="dashboard-average-spending">R$ 0,00</strong><p id="dashboard-average-detail">Média dos meses selecionados.</p></div>
+            </div>
+          </div>
+        </article>
         <div class="two-column">
           <article class="panel">
             <div class="panel-heading"><div><span class="step-label">CONTROLE MENSAL</span><h2>Consumo do teto</h2></div><span id="budget-percent" class="metric-pill">0%</span></div>
@@ -124,6 +146,67 @@
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">ÚLTIMOS LANÇAMENTOS</span><h2>Movimentações recentes</h2></div><button data-go="transactions" class="secondary">Ver todos</button></div>
           <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Conta</th><th class="right">Valor</th></tr></thead><tbody id="recent-transactions"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-reports" class="view">
+        <article class="reports-hero">
+          <div>
+            <span class="step-label">ANÁLISE COMPARATIVA</span>
+            <h2>Entenda o movimento, não só o saldo.</h2>
+            <p>Compare períodos, encontre tendências e descubra onde o orçamento realmente mudou.</p>
+          </div>
+          <div class="reports-hero-mark"><span>12</span><small>meses analisáveis</small></div>
+        </article>
+
+        <div class="period-toolbar report-toolbar">
+          <div><span class="step-label">PERÍODO DO RELATÓRIO</span><strong id="report-period-label">Últimos 6 meses</strong></div>
+          <div class="report-controls">
+            <label>Até o mês<input type="month" id="report-end-month" aria-label="Mês final do relatório"></label>
+            <label>Comparar<select id="report-months" aria-label="Quantidade de meses">
+              <option value="1">1 mês</option><option value="2">2 meses</option><option value="3">3 meses</option><option value="4">4 meses</option>
+              <option value="5">5 meses</option><option value="6" selected>6 meses</option><option value="7">7 meses</option><option value="8">8 meses</option>
+              <option value="9">9 meses</option><option value="10">10 meses</option><option value="11">11 meses</option><option value="12">Ano completo</option>
+            </select></label>
+            <button id="report-refresh" class="primary" type="button">Atualizar análise</button>
+            <button id="report-calendar-year" class="secondary" type="button">Ano calendário</button>
+            <button id="report-print" class="secondary" type="button">Imprimir / PDF</button>
+          </div>
+        </div>
+
+        <div class="report-kpi-grid">
+          <article class="report-kpi coral"><span>Total gasto</span><strong id="report-total-spending">R$ 0,00</strong><small id="report-total-caption">No período escolhido</small></article>
+          <article class="report-kpi violet"><span>Média mensal</span><strong id="report-average-spending">R$ 0,00</strong><small>Média dos meses com dados</small></article>
+          <article class="report-kpi mint"><span>Entradas</span><strong id="report-total-income">R$ 0,00</strong><small>Somente receitas reais</small></article>
+          <article class="report-kpi sky"><span>Saldo operacional</span><strong id="report-net-cash">R$ 0,00</strong><small>Entradas menos saídas</small></article>
+          <article class="report-kpi sunshine"><span>Taxa de folga</span><strong id="report-savings-rate">0%</strong><small>Percentual das receitas não consumido</small></article>
+        </div>
+
+        <div class="report-analysis-grid">
+          <article class="panel report-trend-panel">
+            <div class="panel-heading"><div><span class="step-label">EVOLUÇÃO</span><h2>Gastos mês a mês</h2><small>A linha pontilhada representa o teto mensal configurado.</small></div><span id="report-change-badge" class="trend-badge neutral">Sem comparação</span></div>
+            <div id="report-trend-chart" class="trend-chart" aria-live="polite"></div>
+          </article>
+          <article class="panel report-insights-panel">
+            <div class="panel-heading"><div><span class="step-label">DESTAQUES</span><h2>O que merece atenção</h2></div></div>
+            <div id="report-insights" class="report-insights"></div>
+          </article>
+        </div>
+
+        <div class="report-analysis-grid categories-layout">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">DISTRIBUIÇÃO</span><h2>Para onde o dinheiro foi</h2><small>Participação de cada categoria no período.</small></div></div>
+            <div id="report-category-ranking" class="category-ranking"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">ORIGENS</span><h2>Bancos e cartões</h2><small>Fluxo operacional consolidado, sem transferências patrimoniais.</small></div></div>
+            <div class="table-wrap"><table><thead><tr><th>Conta</th><th>Tipo</th><th class="right">Entrou</th><th class="right">Saiu</th><th class="right">Saldo</th></tr></thead><tbody id="report-accounts-table"></tbody></table></div>
+          </article>
+        </div>
+
+        <article class="panel report-monthly-panel">
+          <div class="panel-heading"><div><span class="step-label">MÊS A MÊS</span><h2>Detalhamento do período</h2><small id="report-data-quality">Os cálculos respeitam as mesmas regras de consolidação da visão geral.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Mês</th><th class="right">Entradas</th><th class="right">Saídas</th><th class="right">Gastos</th><th class="right">Saldo</th><th class="right">Teto disponível</th><th class="right">Variação</th></tr></thead><tbody id="report-monthly-table"></tbody></table></div>
         </article>
       </section>
 
