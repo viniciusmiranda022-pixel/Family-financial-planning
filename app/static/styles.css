@@ -205,10 +205,51 @@ tr:last-child td { border-bottom: 0; }
 .advisor-message { max-width: 84%; padding: 13px 15px; border-radius: 14px; line-height: 1.55; white-space: pre-wrap; font-size: 13px; }
 .advisor-message.user { align-self: flex-end; color: white; background: var(--navy-2); border-bottom-right-radius: 4px; }
 .advisor-message.assistant { align-self: flex-start; color: var(--ink); background: #edf3f6; border-bottom-left-radius: 4px; }
-.advisor-message.assistant[data-source]::after { content: attr(data-source); display: block; margin-top: 9px; color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.advisor-message.assistant[data-source] { width: min(96%, 820px); max-width: 96%; padding: 0; overflow: hidden; white-space: normal; border: 1px solid var(--line); background: white; box-shadow: 0 7px 22px rgba(16, 42, 67, .07); }
+.advisor-message.assistant[data-source]::after { content: attr(data-source); display: block; padding: 11px 18px; border-top: 1px solid var(--line); color: var(--muted); background: #f8fafb; font-size: 9px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
 .advisor-message.assistant.favorable { border-left: 4px solid var(--green); background: var(--soft-green); }
 .advisor-message.assistant.caution { border-left: 4px solid var(--amber); background: var(--soft-amber); }
 .advisor-message.assistant.not_recommended, .advisor-message.assistant.error { border-left: 4px solid var(--red); background: #feeceb; }
+.advisor-message.assistant[data-source].favorable,
+.advisor-message.assistant[data-source].caution,
+.advisor-message.assistant[data-source].not_recommended { background: white; }
+.advisor-answer-header { display: flex; align-items: center; gap: 10px; padding: 15px 18px; border-bottom: 1px solid var(--line); color: var(--navy); background: #f8fafb; font-size: 14px; }
+.advisor-answer-icon { display: grid; place-items: center; width: 25px; height: 25px; flex: 0 0 25px; border-radius: 50%; color: white; background: var(--blue); font-weight: 900; }
+.advisor-message.favorable .advisor-answer-icon { background: var(--green); }
+.advisor-message.caution .advisor-answer-icon { background: var(--amber); }
+.advisor-message.not_recommended .advisor-answer-icon,
+.advisor-message.error .advisor-answer-icon { background: var(--red); }
+.advisor-answer-summary { padding: 17px 18px 5px; }
+.advisor-answer-paragraph { margin: 0 0 12px; color: #304454; line-height: 1.65; }
+.advisor-answer-list { margin: 0 0 12px; padding-left: 20px; color: #304454; }
+.advisor-answer-list li { margin: 6px 0; }
+.advisor-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; padding: 3px 18px 18px; }
+.advisor-metric { min-width: 0; padding: 11px 12px; border: 1px solid #dce6eb; border-radius: 10px; background: #f7fafb; }
+.advisor-metric span { display: block; min-height: 28px; color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; }
+.advisor-metric strong { display: block; margin-top: 5px; color: var(--navy); font-size: 15px; white-space: nowrap; }
+.advisor-metric.negative { border-color: #f0b7b2; background: #fff3f2; }
+.advisor-metric.negative strong { color: var(--red); }
+.advisor-reflection, .advisor-schedule { margin: 0 18px 18px; padding: 15px; border: 1px solid #ead69d; border-radius: 12px; background: #fffbef; }
+.advisor-section-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 11px; }
+.advisor-section-heading h4 { margin: 0; color: var(--navy); font-size: 14px; }
+.advisor-section-heading small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }
+.advisor-section-icon { display: grid; place-items: center; width: 24px; height: 24px; flex: 0 0 24px; border-radius: 7px; color: white; background: var(--amber); font-weight: 900; }
+.advisor-section-icon.calendar { background: var(--teal); }
+.advisor-reflection-intro { margin: 0 0 12px; color: #60420f; line-height: 1.55; }
+.advisor-question-list { display: grid; gap: 7px; }
+.advisor-question { display: grid; grid-template-columns: 8px 1fr; gap: 9px; align-items: start; padding: 8px 10px; border-radius: 8px; background: rgba(255, 255, 255, .72); }
+.advisor-question-dot { width: 7px; height: 7px; margin-top: 6px; border-radius: 50%; background: var(--amber); }
+.advisor-question p { margin: 0; color: #4e3b19; line-height: 1.45; }
+.advisor-reflection-close { margin: 12px 0 0; padding: 10px 11px; border-left: 3px solid var(--amber); color: #60420f; background: rgba(255, 255, 255, .72); line-height: 1.5; font-weight: 650; }
+.advisor-schedule { border-color: #cfe0e5; background: #f7fafb; }
+.advisor-schedule-scroll { overflow-x: auto; }
+.advisor-schedule-table { width: 100%; border-collapse: collapse; white-space: nowrap; }
+.advisor-schedule-table th { padding: 8px 10px; border-bottom: 1px solid #cedce2; color: var(--muted); text-align: right; font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }
+.advisor-schedule-table th:first-child { text-align: left; }
+.advisor-schedule-table td { padding: 9px 10px; border-bottom: 1px solid #e3eaee; color: #425563; text-align: right; }
+.advisor-schedule-table tbody tr:last-child td { border-bottom: 0; }
+.advisor-schedule-table .advisor-schedule-month { color: var(--navy); text-align: left; font-weight: 750; }
+.advisor-schedule-table .advisor-schedule-total { color: var(--navy); font-weight: 900; }
 .advisor-form { display: grid; grid-template-columns: 1fr auto; gap: 10px; border-top: 1px solid var(--line); padding-top: 14px; }
 .projection-kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 15px; }
 .projection-kpis div { padding: 12px; border-radius: 10px; background: #f6f9fa; }
@@ -252,5 +293,14 @@ tr:last-child td { border-bottom: 0; }
   .advisor-chat-panel { grid-template-rows: minmax(360px, 55vh) auto; }
   .advisor-form { grid-template-columns: 1fr; }
   .advisor-message { max-width: 94%; }
+  .advisor-message.assistant[data-source] { width: 100%; max-width: 100%; }
+  .advisor-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .advisor-reflection, .advisor-schedule { margin-right: 13px; margin-left: 13px; }
   .privacy-chip { display: none; }
+}
+@media (max-width: 430px) {
+  .advisor-metric-grid { grid-template-columns: 1fr; }
+  .advisor-metric span { min-height: 0; }
+  .advisor-answer-summary, .advisor-answer-header { padding-right: 14px; padding-left: 14px; }
+  .advisor-metric-grid { padding-right: 14px; padding-left: 14px; }
 }
