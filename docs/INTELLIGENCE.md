@@ -6,7 +6,7 @@
 - OCR de fotos e PDFs com Tesseract;
 - transcrição de áudio com Whisper executado no computador;
 - leitura de CSV, OFX, extratos, faturas, boletos, comprovantes e holerites;
-- cálculo de teto, fluxo de caixa, projeção, reserva e obrigações;
+- cálculo de teto, fluxo de caixa, projeção da conta central de liquidez, piso de segurança e obrigações;
 - prévia editável e confirmação antes de criar qualquer registro;
 - consultor financeiro determinístico como modo de contingência.
 

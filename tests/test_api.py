@@ -83,10 +83,13 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
         assert capture_confirm.status_code == 200
         captured_transaction_id = capture_confirm.json()["result"]["transactions"][0]
-        assert client.post(
-            f"/api/captures/{capture_data['id']}/confirm",
-            json={"items": capture_data["items"]},
-        ).status_code == 409
+        assert (
+            client.post(
+                f"/api/captures/{capture_data['id']}/confirm",
+                json={"items": capture_data["items"]},
+            ).status_code
+            == 409
+        )
         assert client.delete(f"/api/transactions/{captured_transaction_id}").status_code == 200
 
         boleto_preview = client.post(
@@ -238,6 +241,11 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         dashboard = client.get("/api/dashboard").json()
         assert dashboard["spending"] == 76.78
         assert dashboard["food_benefits"] == 1630.0
+        assert dashboard["liquidity_name"] == "Privilege DI"
+        assert dashboard["liquidity_balance"] == 20000
+        assert dashboard["liquidity_available"] == 10000
+        assert dashboard["liquidity_flow"] == -76.78
+        assert dashboard["liquidity_direction"] == "withdrawal"
         assert dashboard["duplicates_ignored"] == 1
         assert dashboard["review_count"] == 1
         assert dashboard["category_spending"][0] == {
@@ -279,6 +287,11 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert report_data["summary"]["total_spending"] == 110.18
         assert report_data["summary"]["average_spending"] == 55.09
         assert report_data["summary"]["highest_month"] == "2026-08"
+        assert report_data["summary"]["liquidity_name"] == "Privilege DI"
+        assert report_data["summary"]["liquidity_balance"] == 20000
+        assert report_data["summary"]["liquidity_available"] == 10000
+        assert report_data["summary"]["liquidity_flow"] == -110.18
+        assert report_data["summary"]["liquidity_direction"] == "withdrawal"
         assert report_data["categories"][0]["amount"] > 0
         assert client.get("/api/reports?months=13").status_code == 422
         july_cuts = client.get("/api/cut-plan?month=2026-07").json()
@@ -299,8 +312,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert by_month["2027-03"]["commission_delayed"] == 9400.0
 
         restaurant_category = next(
-            item for item in client.get("/api/categories").json()
-            if item["name"] == "Restaurantes e delivery"
+            item for item in client.get("/api/categories").json() if item["name"] == "Restaurantes e delivery"
         )
         manual_expense = client.post(
             "/api/transactions",
@@ -352,6 +364,10 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard_with_manual["cash_in"] == 1000
         assert dashboard_with_manual["cash_out"] == 176.78
         assert dashboard_with_manual["investment_balance"] == 20300
+        assert dashboard_with_manual["liquidity_balance"] == 20300
+        assert dashboard_with_manual["liquidity_available"] == 10300
+        assert dashboard_with_manual["liquidity_flow"] == 823.22
+        assert dashboard_with_manual["liquidity_direction"] == "deposit"
         nubank_flow = next(
             item
             for item in dashboard_with_manual["cash_flow_by_account"]
@@ -365,23 +381,28 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert sum(item["manual"] for item in transaction_rows) == 4
         imported = next(item for item in transaction_rows if not item["manual"])
         assert client.delete(f"/api/transactions/{imported['id']}").status_code == 409
-        assert client.delete(
-            f"/api/transactions/{manual_expense.json()['id']}"
-        ).status_code == 200
-        assert client.delete(
-            f"/api/transactions/{manual_investment.json()['id']}"
-        ).status_code == 200
-        assert client.delete(
-            f"/api/transactions/{manual_income.json()['id']}"
-        ).status_code == 200
-        assert client.delete(
-            f"/api/transactions/{manual_redemption.json()['id']}"
-        ).status_code == 200
+        assert client.delete(f"/api/transactions/{manual_expense.json()['id']}").status_code == 200
+        assert client.delete(f"/api/transactions/{manual_investment.json()['id']}").status_code == 200
+        assert client.delete(f"/api/transactions/{manual_income.json()['id']}").status_code == 200
+        assert client.delete(f"/api/transactions/{manual_redemption.json()['id']}").status_code == 200
         dashboard_after_delete = client.get("/api/dashboard?month=2026-08").json()
         assert dashboard_after_delete["spending"] == 76.78
         assert dashboard_after_delete["cash_in"] == 0
         assert dashboard_after_delete["cash_out"] == 76.78
         assert dashboard_after_delete["investment_balance"] == 20000
+        assert dashboard_after_delete["liquidity_available"] == 10000
+
+        liquidity_answer = client.post(
+            "/api/advisor/chat",
+            json={"message": "Quanto tenho disponível no Privilège DI?"},
+        )
+        assert liquidity_answer.status_code == 200
+        liquidity_data = liquidity_answer.json()
+        assert liquidity_data["intent"] == "liquidity"
+        assert liquidity_data["metrics"]["liquidity_balance"] == 20000
+        assert liquidity_data["metrics"]["liquidity_available"] == 10000
+        assert "conta" in liquidity_data["answer"].lower()
+        assert "renda ou gasto" in liquidity_data["answer"]
 
         custom_expense = client.post(
             "/api/transactions",
@@ -415,15 +436,13 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert "à vista ou parcelada" in advisor_bare_amount.json()["answer"]
         advisor_four_digit_amount = client.post(
             "/api/advisor/chat",
-            json={
-                "message": "Em setembro quero comprar uma enxada rotativa de 2000 à vista"
-            },
+            json={"message": "Em setembro quero comprar uma enxada rotativa de 2000 à vista"},
         )
         assert advisor_four_digit_amount.status_code == 200
         assert advisor_four_digit_amount.json()["metrics"]["purchase_amount"] == 2000
         assert "R$ 2.000,00" in advisor_four_digit_amount.json()["answer"]
-        assert "Caber matematicamente no orçamento não significa" in (
-            advisor_four_digit_amount.json()["answer"]
+        assert (
+            "Caber matematicamente no orçamento não significa" in (advisor_four_digit_amount.json()["answer"])
         )
         assert "quantas vezes você realmente usará" in advisor_four_digit_amount.json()["answer"]
         advisor_small_cosmetic = client.post(
@@ -462,8 +481,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                     {
                         "verdict": "not_recommended",
                         "answer": (
-                            "Como o uso seria ocasional e o aluguel custa menos, "
-                            "não recomendo comprar agora."
+                            "Como o uso seria ocasional e o aluguel custa menos, não recomendo comprar agora."
                         ),
                         "evidence": ["Uso ocasional", "Aluguel mais barato"],
                         "assumptions": ["Frequência informada pelo usuário"],
@@ -480,10 +498,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                     "history": [
                         {
                             "role": "user",
-                            "content": (
-                                "Em setembro quero comprar uma enxada rotativa "
-                                "de 2000 à vista"
-                            ),
+                            "content": ("Em setembro quero comprar uma enxada rotativa de 2000 à vista"),
                         },
                         {
                             "role": "assistant",
@@ -559,8 +574,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                 "/api/advisor/chat",
                 json={
                     "message": (
-                        "Em agosto de 2026 quero fazer uma compra que custa "
-                        "R$ 2.000 à vista, posso fazer?"
+                        "Em agosto de 2026 quero fazer uma compra que custa R$ 2.000 à vista, posso fazer?"
                     )
                 },
             )
@@ -616,9 +630,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
         assert advisor_cuts.status_code == 200
         assert advisor_cuts.json()["intent"] == "cuts"
-        assert client.delete(
-            f"/api/transactions/{custom_expense.json()['id']}"
-        ).status_code == 200
+        assert client.delete(f"/api/transactions/{custom_expense.json()['id']}").status_code == 200
 
         obligation = client.post(
             "/api/obligations",
@@ -657,19 +669,12 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         ).json()
         assert advisor_obligations["intent"] == "obligations"
         assert "Conta próxima" in advisor_obligations["answer"]
-        schedule = {
-            item["month"]: item
-            for item in advisor_obligations["metrics"]["commitment_schedule"]
-        }
+        schedule = {item["month"]: item for item in advisor_obligations["metrics"]["commitment_schedule"]}
         assert schedule["2026-10"]["card_installments"] == 31.9
         assert schedule["2026-12"]["obligations"] == 1000
-        assert "Dezembro de 2026: cartões R$ 0,00 + obrigações R$ 1.000,00" in (
-            advisor_obligations["answer"]
-        )
+        assert "Dezembro de 2026: cartões R$ 0,00 + obrigações R$ 1.000,00" in (advisor_obligations["answer"])
         assert client.delete(f"/api/obligations/{obligation.json()['id']}").status_code == 200
-        assert client.delete(
-            f"/api/obligations/{alert_obligation.json()['id']}"
-        ).status_code == 200
+        assert client.delete(f"/api/obligations/{alert_obligation.json()['id']}").status_code == 200
 
         payroll = client.post(
             "/api/payroll",
@@ -697,8 +702,9 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             assert family_client.get("/api/dashboard?month=2026-08").json()["spending"] == 76.78
             assert family_client.get("/api/users").status_code == 403
         assert client.delete(f"/api/users/{family_user.json()['id']}").status_code == 200
-        assert next(item for item in client.get("/api/users").json() if item["username"] == "kelly")[
-            "active"
-        ] is False
+        assert (
+            next(item for item in client.get("/api/users").json() if item["username"] == "kelly")["active"]
+            is False
+        )
 
     assert list(Path(os.environ["DATA_DIR"]).glob("documents/*.bin"))

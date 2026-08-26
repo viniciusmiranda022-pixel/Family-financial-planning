@@ -531,8 +531,7 @@ def _advisor_payment(
         return {
             "complete": False,
             "question": (
-                "O parcelamento tem juros? Se tiver, informe a taxa mensal; "
-                "por exemplo, 2% ao mês."
+                "O parcelamento tem juros? Se tiver, informe a taxa mensal; por exemplo, 2% ao mês."
             ),
         }
     if installments > 1 and "COM JUROS" in normalized and interest_match is None:
@@ -602,20 +601,17 @@ def _advisor_conversation_message(payload: AdvisorRequest) -> str:
         or "JUROS" in normalized
     )
     reflection_context = _advisor_reflection_context(payload)
-    starts_new_purchase = any(
-        word in normalized.split() for word in {"COMPRA", "COMPRAR", "ADQUIRIR"}
-    )
+    starts_new_purchase = any(word in normalized.split() for word in {"COMPRA", "COMPRAR", "ADQUIRIR"})
     if reflection_context and not starts_new_purchase:
         prior_context = []
         for item in payload.history:
             candidate = normalize_description(item.content)
             if item.role != "user":
                 continue
-            if any(
-                word in candidate.split()
-                for word in {"COMPRA", "COMPRAR", "CUSTA", "ADQUIRIR"}
-            ) or re.search(r"\b(\d{1,3})\s*(?:X|VEZ(?:ES)?|PARCELAS?)\b", candidate) or (
-                "A VISTA" in candidate or "JUROS" in candidate
+            if (
+                any(word in candidate.split() for word in {"COMPRA", "COMPRAR", "CUSTA", "ADQUIRIR"})
+                or re.search(r"\b(\d{1,3})\s*(?:X|VEZ(?:ES)?|PARCELAS?)\b", candidate)
+                or ("A VISTA" in candidate or "JUROS" in candidate)
             ):
                 prior_context.append(item.content)
         if prior_context:
@@ -627,8 +623,7 @@ def _advisor_conversation_message(payload: AdvisorRequest) -> str:
     for item in reversed(payload.history):
         candidate = normalize_description(item.content)
         if item.role == "user" and any(
-            word in candidate.split()
-            for word in {"COMPRA", "COMPRAR", "CUSTA", "ADQUIRIR"}
+            word in candidate.split() for word in {"COMPRA", "COMPRAR", "CUSTA", "ADQUIRIR"}
         ):
             return f"{item.content}. {current}"
     return current
@@ -742,9 +737,7 @@ def _enrich_capture_items(
             continue
         account = default_account
         if not account and proposal.get("card_last_four"):
-            card_matches = [
-                item for item in accounts if item.last_four == proposal.get("card_last_four")
-            ]
+            card_matches = [item for item in accounts if item.last_four == proposal.get("card_last_four")]
             if len(card_matches) == 1:
                 account = card_matches[0]
         if not account:
@@ -776,9 +769,7 @@ def _enrich_capture_items(
         movement_type = str(proposal.get("movement_type") or "expense")
         if account and proposal.get("booked_at") and proposal.get("amount"):
             try:
-                signed_amount = _capture_signed_amount(
-                    movement_type, Decimal(str(proposal["amount"]))
-                )
+                signed_amount = _capture_signed_amount(movement_type, Decimal(str(proposal["amount"])))
                 parsed = ParsedTransaction(
                     booked_at=date.fromisoformat(str(proposal["booked_at"])),
                     description=str(proposal.get("description") or "Lançamento inteligente"),
@@ -891,9 +882,7 @@ def me(user: User = Depends(get_current_user)) -> dict:
 @router.get("/users")
 def users(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict]:
     _require_admin(user)
-    rows = db.scalars(
-        select(User).where(User.household_id == user.household_id).order_by(User.name)
-    ).all()
+    rows = db.scalars(select(User).where(User.household_id == user.household_id).order_by(User.name)).all()
     return [
         {
             "id": item.id,
@@ -953,9 +942,7 @@ def deactivate_user(
     _require_admin(user)
     if user_id == user.id:
         raise HTTPException(status_code=409, detail="Você não pode desativar o próprio acesso")
-    item = db.scalar(
-        select(User).where(User.id == user_id, User.household_id == user.household_id)
-    )
+    item = db.scalar(select(User).where(User.id == user_id, User.household_id == user.household_id))
     if not item:
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
     item.active = False
@@ -1319,9 +1306,7 @@ async def create_capture_preview(
         db.commit()
         return _capture_response(capture)
 
-    category_rows = db.scalars(
-        select(Category).where(Category.household_id == user.household_id)
-    ).all()
+    category_rows = db.scalars(select(Category).where(Category.household_id == user.household_id)).all()
     categories_by_name = {item.name.casefold(): item.name for item in category_rows}
     if (
         len(analysis["items"]) == 1
@@ -1339,15 +1324,11 @@ async def create_capture_preview(
         )
         if classification.payload:
             suggestion = classification.payload
-            allowed_category = categories_by_name.get(
-                str(suggestion.get("category_name") or "").casefold()
-            )
+            allowed_category = categories_by_name.get(str(suggestion.get("category_name") or "").casefold())
             if allowed_category:
                 proposal = analysis["items"][0]
                 proposal["category_name"] = allowed_category
-                proposal["movement_type"] = suggestion.get(
-                    "movement_type", proposal.get("movement_type")
-                )
+                proposal["movement_type"] = suggestion.get("movement_type", proposal.get("movement_type"))
                 proposed_description = " ".join(
                     str(suggestion.get("description") or proposal.get("description") or "").split()
                 )
@@ -1413,9 +1394,7 @@ async def create_capture_preview(
 
 
 @router.get("/captures")
-def list_captures(
-    user: User = Depends(get_current_user), db: Session = Depends(get_db)
-) -> list[dict]:
+def list_captures(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict]:
     rows = db.scalars(
         select(CaptureDraft)
         .where(CaptureDraft.household_id == user.household_id)
@@ -1516,8 +1495,7 @@ def confirm_capture(
             movement_type = proposal.movement_type or "expense"
             amount = (
                 money(proposal.signed_amount)
-                if movement_type in {"transfer", "reconciliation"}
-                and proposal.signed_amount is not None
+                if movement_type in {"transfer", "reconciliation"} and proposal.signed_amount is not None
                 else _capture_signed_amount(movement_type, proposal.amount)
             )
             excluded = False
@@ -1534,9 +1512,7 @@ def confirm_capture(
                     if not category:
                         raise HTTPException(status_code=422, detail="Categoria inválida")
                 else:
-                    category = category_for(
-                        db, user.household_id, proposal.category_name or "Revisar"
-                    )
+                    category = category_for(db, user.household_id, proposal.category_name or "Revisar")
             elif movement_type == "income":
                 category = category_for(db, user.household_id, "Receitas")
             elif movement_type in {"investment", "redemption"}:
@@ -1784,9 +1760,7 @@ def create_manual_transaction(
         excluded = True
         category = category_for(db, user.household_id, "Transferência patrimonial")
         profile = profile_for(db, user.household_id)
-        profile.investment_balance = max(
-            Decimal("0"), profile.investment_balance - abs(payload.amount)
-        )
+        profile.investment_balance = max(Decimal("0"), profile.investment_balance - abs(payload.amount))
     elif payload.movement_type == "refund":
         transaction_type = "refund"
         amount = abs(payload.amount)
@@ -1929,13 +1903,9 @@ def reviews(user: User = Depends(get_current_user), db: Session = Depends(get_db
                 if item.transaction and item.transaction.category
                 else "Revisar"
             ),
-            "account": (
-                _account_display(item.transaction.account) if item.transaction else ""
-            ),
+            "account": (_account_display(item.transaction.account) if item.transaction else ""),
             "excluded": item.transaction.excluded if item.transaction else None,
-            "possible_duplicate": (
-                item.transaction.possible_duplicate if item.transaction else False
-            ),
+            "possible_duplicate": (item.transaction.possible_duplicate if item.transaction else False),
             "manual": item.transaction.document_id is None if item.transaction else False,
             "created_at": item.created_at,
         }
@@ -2455,8 +2425,7 @@ def cut_plan(
     monthly_average = money(
         max(
             Decimal("0"),
-            sum((-Decimal(transaction.amount) for transaction, _ in rows), Decimal("0"))
-            / month_count,
+            sum((-Decimal(transaction.amount) for transaction, _ in rows), Decimal("0")) / month_count,
         )
     )
     totals: dict[str, Decimal] = {}
@@ -2561,22 +2530,25 @@ def dashboard(
     )
     benefit = profile.food_allowance + profile.meal_allowance_daily * profile.workdays_month
     obligation_alerts = [
-        item
-        for item in _obligation_rows(db, user.household_id)
-        if item["days_until_due"] <= 30
+        item for item in _obligation_rows(db, user.household_id) if item["days_until_due"] <= 30
     ][:5]
+    cash_net = money(Decimal(str(cash_flow["cash_in"])) - Decimal(str(cash_flow["cash_out"])))
+    liquidity_available = money(profile.investment_balance - profile.emergency_floor)
     return {
         "month": month_key(start),
         "spending": decimal_value(spending),
         "cash_in": cash_flow["cash_in"],
         "cash_out": cash_flow["cash_out"],
-        "cash_net": decimal_value(
-            money(Decimal(str(cash_flow["cash_in"])) - Decimal(str(cash_flow["cash_out"])))
-        ),
+        "cash_net": decimal_value(cash_net),
         "cash_flow_by_account": cash_flow["accounts"],
         "cash_cap": decimal_value(profile.monthly_cash_cap),
         "remaining_cap": decimal_value(money(profile.monthly_cash_cap - spending)),
         "investment_balance": decimal_value(profile.investment_balance),
+        "liquidity_name": profile.investment_name,
+        "liquidity_balance": decimal_value(profile.investment_balance),
+        "liquidity_available": decimal_value(liquidity_available),
+        "liquidity_flow": decimal_value(cash_net),
+        "liquidity_direction": ("deposit" if cash_net > 0 else "withdrawal" if cash_net < 0 else "balanced"),
         "emergency_floor": decimal_value(profile.emergency_floor),
         "food_benefits": decimal_value(benefit),
         "review_count": int(review_count or 0),
@@ -2606,12 +2578,8 @@ def reports(
     last_month = _month_start(end_month)
     start = add_months(last_month, -(months - 1))
     end = add_months(last_month, 1)
-    expense_rows, duplicates_ignored = _consolidated_expenses(
-        db, user.household_id, start, end
-    )
-    movement_rows, _ignored_movements = _consolidated_transactions(
-        db, user.household_id, start, end
-    )
+    expense_rows, duplicates_ignored = _consolidated_expenses(db, user.household_id, start, end)
+    movement_rows, _ignored_movements = _consolidated_transactions(db, user.household_id, start, end)
 
     month_rows: dict[str, dict[str, object]] = {}
     for offset in range(months):
@@ -2635,9 +2603,7 @@ def reports(
         month_rows[key]["spending"] += amount
         category_totals[category_name] = category_totals.get(category_name, Decimal("0")) + amount
 
-    movements_by_month: dict[str, list[tuple[Transaction, str]]] = {
-        key: [] for key in month_rows
-    }
+    movements_by_month: dict[str, list[tuple[Transaction, str]]] = {key: [] for key in month_rows}
     for transaction, category_name in movement_rows:
         key = month_key(transaction.booked_at.replace(day=1))
         if key in movements_by_month:
@@ -2653,12 +2619,13 @@ def reports(
         cash_out = money(flow["cash_out"])
         cash_net = money(cash_in - cash_out)
         change_percentage = None
-        if item["transaction_count"] > 0 and previous_active_spending is not None and previous_active_spending > 0:
+        if (
+            item["transaction_count"] > 0
+            and previous_active_spending is not None
+            and previous_active_spending > 0
+        ):
             change_percentage = float(
-                money(
-                    ((spending - previous_active_spending) / previous_active_spending)
-                    * Decimal("100")
-                )
+                money(((spending - previous_active_spending) / previous_active_spending) * Decimal("100"))
             )
         serialized_months.append(
             {
@@ -2676,15 +2643,9 @@ def reports(
         if item["transaction_count"] > 0:
             previous_active_spending = spending
 
-    total_spending = money(
-        sum((Decimal(str(item["spending"])) for item in serialized_months), Decimal("0"))
-    )
-    total_cash_in = money(
-        sum((Decimal(str(item["cash_in"])) for item in serialized_months), Decimal("0"))
-    )
-    total_cash_out = money(
-        sum((Decimal(str(item["cash_out"])) for item in serialized_months), Decimal("0"))
-    )
+    total_spending = money(sum((Decimal(str(item["spending"])) for item in serialized_months), Decimal("0")))
+    total_cash_in = money(sum((Decimal(str(item["cash_in"])) for item in serialized_months), Decimal("0")))
+    total_cash_out = money(sum((Decimal(str(item["cash_out"])) for item in serialized_months), Decimal("0")))
     covered_months = sum(item["transaction_count"] > 0 for item in serialized_months)
     average_denominator = Decimal(max(1, covered_months))
     average_spending = money(total_spending / average_denominator)
@@ -2694,18 +2655,14 @@ def reports(
     lowest_month = min(comparison_rows, key=lambda item: item["spending"])
     category_colors = {
         item.name: item.color
-        for item in db.scalars(
-            select(Category).where(Category.household_id == user.household_id)
-        ).all()
+        for item in db.scalars(select(Category).where(Category.household_id == user.household_id)).all()
     }
     categories = [
         {
             "category": name,
             "amount": decimal_value(money(amount)),
             "average": decimal_value(money(amount / average_denominator)),
-            "share": float(money((amount / total_spending) * Decimal("100")))
-            if total_spending > 0
-            else 0,
+            "share": float(money((amount / total_spending) * Decimal("100"))) if total_spending > 0 else 0,
             "color": category_colors.get(name, "#64748B"),
         }
         for name, amount in sorted(category_totals.items(), key=lambda item: item[1], reverse=True)
@@ -2730,6 +2687,18 @@ def reports(
             "total_cash_in": decimal_value(total_cash_in),
             "total_cash_out": decimal_value(total_cash_out),
             "cash_net": decimal_value(money(total_cash_in - total_cash_out)),
+            "liquidity_name": profile.investment_name,
+            "liquidity_balance": decimal_value(profile.investment_balance),
+            "emergency_floor": decimal_value(profile.emergency_floor),
+            "liquidity_available": decimal_value(money(profile.investment_balance - profile.emergency_floor)),
+            "liquidity_flow": decimal_value(money(total_cash_in - total_cash_out)),
+            "liquidity_direction": (
+                "deposit"
+                if total_cash_in > total_cash_out
+                else "withdrawal"
+                if total_cash_out > total_cash_in
+                else "balanced"
+            ),
             "savings_rate": decimal_value(savings_rate),
             "highest_month": highest_month["month"],
             "highest_spending": highest_month["spending"],
@@ -2779,7 +2748,9 @@ def advisor_chat(
     reflection_appendix = ""
     reflection_context = _advisor_reflection_context(payload)
     assumptions = [
-        "A reserva investida não é tratada como renda disponível",
+        (f"{profile.investment_name} é a conta central de liquidez: recebe sobras e cobre déficits mensais"),
+        "Aplicações e resgates não são receitas nem despesas de consumo",
+        "O saldo mínimo de segurança deve ser preservado",
         "Dados ainda não lançados não entram na análise",
         "O sistema não consulta o saldo atual do internet banking",
     ]
@@ -2832,19 +2803,13 @@ def advisor_chat(
                     schedule_appendix = _advisor_commitment_appendix(commitment_schedule)
                 card_installments_projected = money(
                     sum(
-                        (
-                            Decimal(str(row["installments"]))
-                            for row in forecast_data["rows"]
-                        ),
+                        (Decimal(str(row["installments"])) for row in forecast_data["rows"]),
                         Decimal("0"),
                     )
                 )
                 obligations_projected = money(
                     sum(
-                        (
-                            Decimal(str(row["obligations"]))
-                            for row in forecast_data["rows"]
-                        ),
+                        (Decimal(str(row["obligations"])) for row in forecast_data["rows"]),
                         Decimal("0"),
                     )
                 )
@@ -2890,13 +2855,10 @@ def advisor_chat(
                     )
                 payment_note = "à vista"
                 if int(payment["installments"]) > 1:
-                    payment_note = (
-                        f"em {payment['installments']} parcelas de {_brl(monthly_impact)}"
-                        + (
-                            f", com custo total estimado de {_brl(total_cost)}"
-                            if Decimal(str(payment["monthly_interest_rate"])) > 0
-                            else ", sem juros"
-                        )
+                    payment_note = f"em {payment['installments']} parcelas de {_brl(monthly_impact)}" + (
+                        f", com custo total estimado de {_brl(total_cost)}"
+                        if Decimal(str(payment["monthly_interest_rate"])) > 0
+                        else ", sem juros"
                     )
 
                 is_quick_analysis = purchase_context["analysis_depth"] == "quick"
@@ -2926,15 +2888,17 @@ def advisor_chat(
                     status_name = "not_recommended"
                     answer = (
                         f"A compra de {_brl(purchase_amount)} é pequena isoladamente, mas a "
-                        "projeção financeira já está abaixo da reserva mínima. Antes de somar "
-                        f"novas despesas, mesmo na categoria {context_category}, recomponha essa margem."
+                        f"projeção do {profile.investment_name} já está abaixo do piso de segurança. "
+                        "Antes de somar novas despesas, mesmo na categoria "
+                        f"{context_category}, recomponha essa margem."
                     )
                 elif not forecast_data["summary"]["viable"] or projection_margin_after < 0:
                     status_name = "not_recommended"
                     answer = (
                         f"Embora a compra de {_brl(purchase_amount)} {payment_note} caiba no teto "
-                        "imediato, eu não a recomendo agora: a projeção conservadora ficaria "
-                        f"abaixo da reserva mínima em {_brl(abs(projection_margin_after))}. "
+                        "imediato, eu não a recomendo agora: o saldo projetado do "
+                        f"{profile.investment_name} ficaria abaixo do piso de segurança em "
+                        f"{_brl(abs(projection_margin_after))}. "
                         f"Restariam {_brl(remaining_after)} no teto após o primeiro impacto.{next_note}"
                     )
                 elif is_quick_analysis:
@@ -2958,7 +2922,8 @@ def advisor_chat(
                     answer = (
                         f"A compra de {_brl(purchase_amount)} {payment_note} cabe matematicamente, "
                         f"mas exige cautela: restariam {_brl(remaining_after)} no teto do mês e "
-                        "a margem conservadora acima da reserva, após as parcelas futuras, seria "
+                        f"a margem conservadora do {profile.investment_name} acima do piso de "
+                        "segurança, após as parcelas futuras, seria "
                         f"{_brl(max(Decimal('0'), projection_margin_after))}.{next_note}"
                     )
                 else:
@@ -2966,8 +2931,9 @@ def advisor_chat(
                     answer = (
                         f"A compra de {_brl(purchase_amount)} {payment_note} cabe no cenário atual: "
                         f"restariam {_brl(remaining_after)} no teto do mês. Depois dos compromissos "
-                        "futuros dessa compra, a projeção conservadora ainda ficaria acima da "
-                        f"reserva mínima por {_brl(projection_margin_after)}.{next_note}"
+                        "futuros dessa compra, a projeção conservadora do "
+                        f"{profile.investment_name} ainda ficaria acima do piso de segurança por "
+                        f"{_brl(projection_margin_after)}.{next_note}"
                     )
                 answer += " A análise não inclui gastos que ainda não foram lançados."
                 reflection_appendix = _advisor_purchase_reflection_appendix(
@@ -2983,16 +2949,15 @@ def advisor_chat(
                         "remaining_after": decimal_value(remaining_after),
                         "projection_margin_before": decimal_value(projection_margin),
                         "projection_margin_after": decimal_value(projection_margin_after),
+                        "liquidity_name": profile.investment_name,
+                        "liquidity_balance": decimal_value(profile.investment_balance),
+                        "liquidity_available": summary["liquidity_available"],
                         "obligations_next_180_days": decimal_value(upcoming_total),
-                        "card_installments_in_projection": decimal_value(
-                            card_installments_projected
-                        ),
+                        "card_installments_in_projection": decimal_value(card_installments_projected),
                         "obligations_in_projection": decimal_value(obligations_projected),
                         "commitment_schedule": commitment_schedule,
                         "purchase_context": purchase_context,
-                        "show_commitment_schedule": purchase_context[
-                            "show_commitment_schedule"
-                        ],
+                        "show_commitment_schedule": purchase_context["show_commitment_schedule"],
                         "purchase_reflection_answered": reflection_context is not None,
                     }
                 )
@@ -3001,6 +2966,7 @@ def advisor_chat(
                     f"Teto disponível antes da compra: {_brl(remaining_before)}",
                     f"Impacto mensal da compra: {_brl(monthly_impact)}",
                     f"Margem conservadora após compromissos: {_brl(projection_margin_after)}",
+                    (f"Saldo líquido atual do {profile.investment_name}: {_brl(profile.investment_balance)}"),
                     f"Obrigações cadastradas nos próximos 180 dias: {_brl(upcoming_total)}",
                     f"Parcelas futuras dos cartões na projeção: {_brl(card_installments_projected)}",
                 ]
@@ -3015,10 +2981,7 @@ def advisor_chat(
                 "card_installments_in_projection": decimal_value(
                     money(
                         sum(
-                            (
-                                Decimal(str(row["installments"]))
-                                for row in forecast_data["rows"]
-                            ),
+                            (Decimal(str(row["installments"])) for row in forecast_data["rows"]),
                             Decimal("0"),
                         )
                     )
@@ -3026,10 +2989,7 @@ def advisor_chat(
                 "obligations_in_projection": decimal_value(
                     money(
                         sum(
-                            (
-                                Decimal(str(row["obligations"]))
-                                for row in forecast_data["rows"]
-                            ),
+                            (Decimal(str(row["obligations"])) for row in forecast_data["rows"]),
                             Decimal("0"),
                         )
                     )
@@ -3064,12 +3024,54 @@ def advisor_chat(
             evidence = lines
         else:
             answer = "Não há recomendação de corte calculada para o período selecionado."
+    elif any(word in normalized for word in ("PRIVILEG", "RESERVA", "LIQUIDEZ", "INVESTIMENTO", "APLICACAO")):
+        intent = "liquidity"
+        available = Decimal(str(summary["liquidity_available"]))
+        flow = Decimal(str(summary["liquidity_flow"]))
+        if flow > 0:
+            month_note = (
+                f"Pelo fluxo operacional registrado, o mês gerou {_brl(flow)} de sobra para "
+                "ser direcionada a essa conta."
+            )
+        elif flow < 0:
+            month_note = (
+                f"Pelo fluxo operacional registrado, o mês precisou de {_brl(abs(flow))} "
+                "dessa conta para cobrir a diferença."
+            )
+        else:
+            month_note = "O fluxo operacional registrado no mês ficou equilibrado."
+        floor_note = (
+            f"há {_brl(available)} de liquidez acima do piso"
+            if available >= 0
+            else f"o saldo está {_brl(abs(available))} abaixo do piso"
+        )
+        answer = (
+            f"O saldo informado do {profile.investment_name} é "
+            f"{_brl(profile.investment_balance)}. Considerando o piso de segurança de "
+            f"{_brl(profile.emergency_floor)}, {floor_note}. {month_note} Aplicações e "
+            "resgates movimentam essa liquidez, mas não são contados como renda ou gasto."
+        )
+        metrics.update(
+            {
+                "liquidity_name": profile.investment_name,
+                "liquidity_balance": decimal_value(profile.investment_balance),
+                "liquidity_available": decimal_value(available),
+                "liquidity_flow": decimal_value(flow),
+            }
+        )
+        evidence = [
+            f"Saldo líquido: {_brl(profile.investment_balance)}",
+            f"Piso de segurança: {_brl(profile.emergency_floor)}",
+            f"Disponível acima do piso: {_brl(available)}",
+            f"Resultado operacional do mês: {_brl(flow)}",
+        ]
     elif any(word in normalized for word in ("ENTROU", "RECEITA", "RECEBI", "ENTRADA")):
         intent = "cash_in"
         sources = [item for item in summary["cash_flow_by_account"] if item["cash_in"] > 0]
-        detail = "; ".join(
-            f"{item['account']}: {_brl(item['cash_in'])}" for item in sources
-        ) or "nenhuma conta com receita identificada"
+        detail = (
+            "; ".join(f"{item['account']}: {_brl(item['cash_in'])}" for item in sources)
+            or "nenhuma conta com receita identificada"
+        )
         answer = (
             f"Entraram {_brl(summary['cash_in'])} em receitas reais em {selected_month}. "
             f"Resgates e estornos não entram nesse total. Detalhamento: {detail}."
@@ -3078,9 +3080,10 @@ def advisor_chat(
     elif any(word in normalized for word in ("SAIU", "BANCO", "CARTAO", "SAIDA")):
         intent = "cash_out"
         sources = [item for item in summary["cash_flow_by_account"] if item["cash_out"] > 0]
-        detail = "; ".join(
-            f"{item['account']}: {_brl(item['cash_out'])}" for item in sources
-        ) or "nenhuma saída identificada"
+        detail = (
+            "; ".join(f"{item['account']}: {_brl(item['cash_out'])}" for item in sources)
+            or "nenhuma saída identificada"
+        )
         answer = (
             f"Saíram {_brl(summary['cash_out'])} em despesas e pagamentos em {selected_month}. "
             f"Aplicações, resgates, transferências internas e pagamento de fatura foram excluídos. "
@@ -3117,7 +3120,10 @@ def advisor_chat(
                 "cash_out": summary["cash_out"],
                 "cash_cap": summary["cash_cap"],
                 "remaining_cap": summary["remaining_cap"],
-                "investment_balance": summary["investment_balance"],
+                "liquidity_name": summary["liquidity_name"],
+                "liquidity_balance": summary["liquidity_balance"],
+                "liquidity_available": summary["liquidity_available"],
+                "liquidity_flow": summary["liquidity_flow"],
                 "emergency_floor": summary["emergency_floor"],
                 "review_items": summary["review_count"],
                 "duplicates_ignored": summary["duplicates_ignored"],

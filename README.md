@@ -10,7 +10,7 @@ Esta primeira versão entrega:
 
 - configuração segura do primeiro administrador;
 - acessos individuais para membros da mesma família, com gestão restrita ao administrador;
-- cadastro de contas, cartões, investimentos e titulares;
+- cadastro de contas, cartões, conta central de liquidez e titulares;
 - importação de CSV, OFX/QFX e PDF com texto selecionável;
 - parsers validados para extrato Itaú, fatura Itaú em duas colunas, CSV Nubank e holerite;
 - criptografia dos documentos armazenados;
@@ -23,7 +23,8 @@ Esta primeira versão entrega:
 - importação automática de holerites e cadastro de 13º/adicional líquido de férias;
 - compromissos únicos ou recorrentes;
 - projeção sem comissão, no mês esperado e com atraso conservador;
-- rendimento do investimento sobre o saldo inicial de cada mês;
+- Privilège DI tratado como conta central de liquidez, recebendo sobras e cobrindo déficits;
+- rendimento do Privilège DI sobre o saldo inicial de cada mês;
 - teto de gastos, benefícios VA/VR e saldo mínimo de segurança;
 - visão mensal navegável, com totais e categorias separados por competência;
 - identidade visual própria e interface responsiva sem rolagem lateral no celular;
@@ -124,7 +125,7 @@ No primeiro acesso será criado o administrador local.
 
 Depois do primeiro acesso, siga esta ordem:
 
-1. configure saldo investido, salário líquido, VA/VR, teto de caixa e taxa estimada do investimento;
+1. configure o saldo do Privilège DI, o piso de segurança, salário líquido, VA/VR, teto de caixa e taxa estimada de rendimento;
 2. cadastre as contas e cartões;
 3. importe primeiro os holerites, depois extratos e faturas;
 4. resolva a fila de revisão antes de confiar nos totais;
@@ -150,7 +151,7 @@ sh ./scripts/setup-codex.sh
 
 Para acesso privado fora de casa, siga [docs/TAILSCALE.md](docs/TAILSCALE.md). Não abra a porta `8090` no roteador e não habilite o Tailscale Funnel.
 
-Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo investido, mas não entram nas receitas ou saídas operacionais. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
+Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo do Privilège DI, mas não entram nas receitas ou saídas operacionais. A visão geral mostra a sobra que deve ir para essa conta ou o déficit que precisa ser coberto por ela. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
 
 O **Consultor** calcula localmente o veredito com regras financeiras auditáveis. Se o Codex estiver autenticado, recebe apenas pergunta, totais agregados, projeções e o veredito para produzir uma explicação; não recebe documentos, credenciais ou conexão com o banco. Para compras, informe pagamento à vista ou quantidade de parcelas e juros. Sem Codex, o consultor continua operando localmente.
 
@@ -174,8 +175,8 @@ Confira os totais exibidos e confirme a gravação:
 
 A carga inclui:
 
-- perfil financeiro, saldo do Privilège DI, VA, VR, teto e reserva-alvo;
-- contas Itaú, cartão Itaú familiar, Nubank e investimento;
+- perfil financeiro, saldo do Privilège DI, VA, VR, teto e piso de segurança;
+- contas Itaú, cartão Itaú familiar, Nubank e Privilège DI;
 - três holerites reais da Kelly e três eventos estimados de 13º/férias, devidamente identificados;
 - quatro comissões, cada uma com imposto de 6% e cenário de atraso de 60 dias;
 - dez parcelas mensais e três reforços da chácara;

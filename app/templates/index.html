@@ -88,13 +88,26 @@
           </div>
         </div>
         <div class="kpi-grid">
-          <article class="kpi highlight"><span>Saldo investido</span><strong id="kpi-investment">R$ 0,00</strong><small>Aplicação informada no perfil</small></article>
+          <article id="liquidity-kpi-card" class="kpi highlight"><span id="kpi-liquidity-name">Liquidez no Privilège DI</span><strong id="kpi-investment">R$ 0,00</strong><small id="kpi-liquidity-caption">Conta central para sobras e déficits mensais</small></article>
           <article class="kpi cash-in"><span>Entrou no mês</span><strong id="kpi-cash-in">R$ 0,00</strong><small>Somente receitas; sem resgates e estornos</small></article>
           <article class="kpi cash-out"><span>Saiu no mês</span><strong id="kpi-cash-out">R$ 0,00</strong><small>Despesas e pagamentos; sem aplicações</small></article>
           <article class="kpi"><span>Gasto no mês</span><strong id="kpi-spending">R$ 0,00</strong><small id="kpi-cap-caption">de R$ 0,00</small></article>
           <article class="kpi" id="remaining-cap-card"><span>Disponível no teto</span><strong id="kpi-remaining">R$ 0,00</strong><small id="kpi-remaining-caption">Sem contar parcelas antigas</small></article>
           <article class="kpi warning"><span>Pendências</span><strong id="kpi-reviews">0</strong><small>Itens aguardando confirmação</small></article>
         </div>
+        <article id="liquidity-bridge" class="liquidity-bridge balanced">
+          <div class="liquidity-bridge-icon" aria-hidden="true">↔</div>
+          <div class="liquidity-bridge-copy">
+            <span class="step-label">FECHAMENTO DO MÊS</span>
+            <h2 id="liquidity-bridge-label">Fluxo equilibrado</h2>
+            <p id="liquidity-bridge-detail">As receitas e saídas operacionais do mês estão equilibradas.</p>
+          </div>
+          <div class="liquidity-bridge-value">
+            <small id="liquidity-bridge-value-label">Movimento esperado</small>
+            <strong id="liquidity-bridge-value">R$ 0,00</strong>
+            <span id="liquidity-bridge-balance">Saldo atual R$ 0,00</span>
+          </div>
+        </article>
         <article class="panel financial-pulse-panel">
           <div class="panel-heading">
             <div><span class="step-label">LEITURA RÁPIDA</span><h2>Seu ritmo financeiro</h2><small>Uma visão objetiva dos últimos seis meses até a competência escolhida.</small></div>
@@ -178,8 +191,9 @@
           <article class="report-kpi coral"><span>Total gasto</span><strong id="report-total-spending">R$ 0,00</strong><small id="report-total-caption">No período escolhido</small></article>
           <article class="report-kpi violet"><span>Média mensal</span><strong id="report-average-spending">R$ 0,00</strong><small>Média dos meses com dados</small></article>
           <article class="report-kpi mint"><span>Entradas</span><strong id="report-total-income">R$ 0,00</strong><small>Somente receitas reais</small></article>
-          <article class="report-kpi sky"><span>Saldo operacional</span><strong id="report-net-cash">R$ 0,00</strong><small>Entradas menos saídas</small></article>
-          <article class="report-kpi sunshine"><span>Taxa de folga</span><strong id="report-savings-rate">0%</strong><small>Percentual das receitas não consumido</small></article>
+          <article class="report-kpi sky"><span>Resultado do período</span><strong id="report-net-cash">R$ 0,00</strong><small>Sobra para aplicar ou déficit para cobrir</small></article>
+          <article class="report-kpi sunshine"><span id="report-liquidity-name">Saldo no Privilège DI</span><strong id="report-liquidity-balance">R$ 0,00</strong><small>Conta central de liquidez</small></article>
+          <article class="report-kpi teal"><span>Livre acima do piso</span><strong id="report-liquidity-available">R$ 0,00</strong><small id="report-liquidity-floor">Após preservar o mínimo de segurança</small></article>
         </div>
 
         <div class="report-analysis-grid">
@@ -206,7 +220,7 @@
 
         <article class="panel report-monthly-panel">
           <div class="panel-heading"><div><span class="step-label">MÊS A MÊS</span><h2>Detalhamento do período</h2><small id="report-data-quality">Os cálculos respeitam as mesmas regras de consolidação da visão geral.</small></div></div>
-          <div class="table-wrap"><table><thead><tr><th>Mês</th><th class="right">Entradas</th><th class="right">Saídas</th><th class="right">Gastos</th><th class="right">Saldo</th><th class="right">Teto disponível</th><th class="right">Variação</th></tr></thead><tbody id="report-monthly-table"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Mês</th><th class="right">Entradas</th><th class="right">Saídas</th><th class="right">Gastos</th><th class="right">Resultado</th><th class="right">Movimento no Privilège DI</th><th class="right">Teto disponível</th><th class="right">Variação</th></tr></thead><tbody id="report-monthly-table"></tbody></table></div>
         </article>
       </section>
 
@@ -275,7 +289,7 @@
 
       <section id="view-transactions" class="view">
         <article class="panel">
-          <div class="panel-heading"><div><span class="step-label">LANÇAMENTO RÁPIDO</span><h2>Registrar movimentação</h2><small>Despesas entram no teto; aplicações e resgates também atualizam o saldo investido.</small></div></div>
+          <div class="panel-heading"><div><span class="step-label">LANÇAMENTO RÁPIDO</span><h2>Registrar movimentação</h2><small>Despesas entram no teto; aplicações e resgates atualizam o saldo da conta central de liquidez sem virar receita ou gasto.</small></div></div>
           <form id="transaction-form" class="form-grid three">
             <label>Data<input type="date" name="booked_at" required></label>
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Abastecimento no posto"></label>
@@ -347,12 +361,12 @@
           </article>
           <article class="panel">
             <div class="panel-heading"><div><span class="step-label">CENÁRIO CONSERVADOR</span><h2>Resultado projetado</h2></div><button id="refresh-forecast" class="secondary">Recalcular</button></div>
-            <div class="projection-kpis"><div><span>Saldo final + atraso</span><strong id="forecast-final">R$ 0,00</strong></div><div><span>Menor saldo</span><strong id="forecast-min">R$ 0,00</strong></div><div><span>Decisão</span><strong id="forecast-status">Configure o perfil</strong></div></div>
+            <div class="projection-kpis"><div><span>Privilège DI no final</span><strong id="forecast-final">R$ 0,00</strong></div><div><span>Menor saldo projetado</span><strong id="forecast-min">R$ 0,00</strong></div><div><span>Decisão</span><strong id="forecast-status">Configure o perfil</strong></div></div>
             <canvas id="forecast-chart" width="900" height="320" aria-label="Gráfico da projeção financeira"></canvas>
           </article>
         </div>
         <article class="panel"><div class="panel-heading"><div><span class="step-label">COMPROMISSOS ATIVOS</span><h2>Obrigações cadastradas</h2><small>Alertas automáticos aparecem 30 dias antes do próximo vencimento.</small></div></div><div class="table-wrap"><table><thead><tr><th>Próximo vencimento</th><th>Nome</th><th>Grupo</th><th>Repetição</th><th>Status</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="obligations-table"></tbody></table></div></article>
-        <article class="panel"><div class="panel-heading"><h2>Calendário consolidado</h2></div><div class="table-wrap wide"><table><thead><tr><th>Mês</th><th class="right">Salário</th><th class="right">Extras</th><th class="right">Comissão + atraso</th><th class="right">Compromissos</th><th class="right">Parcelas</th><th class="right">Rendimento</th><th class="right">Saldo + atraso</th></tr></thead><tbody id="forecast-table"></tbody></table></div></article>
+        <article class="panel"><div class="panel-heading"><h2>Calendário consolidado</h2><small>O saldo representa a projeção mensal da conta central de liquidez.</small></div><div class="table-wrap wide"><table><thead><tr><th>Mês</th><th class="right">Salário</th><th class="right">Extras</th><th class="right">Comissão + atraso</th><th class="right">Compromissos</th><th class="right">Parcelas</th><th class="right">Rendimento</th><th class="right">Saldo da liquidez</th></tr></thead><tbody id="forecast-table"></tbody></table></div></article>
       </section>
 
       <section id="view-advisor" class="view">
@@ -367,7 +381,7 @@
               <button class="secondary advisor-suggestion" type="button">Quais obrigações estão próximas?</button>
               <button class="secondary advisor-suggestion" type="button">Onde posso economizar?</button>
             </div>
-            <div class="security-note"><strong>Análise com contexto</strong><p>Informe se é à vista ou parcelado e, no parcelamento, quantidade de parcelas e juros. A reserva investida não é tratada como renda livre.</p></div>
+            <div class="security-note"><strong>Análise com contexto</strong><p>Informe se é à vista ou parcelado e, no parcelamento, quantidade de parcelas e juros. O Privilège DI é tratado como liquidez da família, mas o piso de segurança continua protegido.</p></div>
           </article>
           <article class="panel advisor-chat-panel">
             <div id="advisor-messages" class="advisor-messages" aria-live="polite"></div>
@@ -406,14 +420,14 @@
             <label>Vale-alimentação<input type="number" name="food_allowance" step="0.01" min="0" required></label>
             <label>Vale-refeição por dia<input type="number" name="meal_allowance_daily" step="0.01" min="0" required></label>
             <label>Dias trabalhados/mês<input type="number" name="workdays_month" min="0" max="31" required></label>
-            <label>Nome do investimento<input name="investment_name" required></label>
-            <label>Saldo investido<input type="number" name="investment_balance" step="0.01" min="0" required></label>
+            <label>Nome da conta central de liquidez<input name="investment_name" required><small>Ex.: Itaú Privilège DI</small></label>
+            <label>Saldo atual da conta<input type="number" name="investment_balance" step="0.01" min="0" required></label>
             <label>Retorno bruto anual<input type="number" name="investment_gross_annual_rate" step="0.0001" min="0" max="1" required><small>0,14 corresponde a 14% a.a.</small></label>
             <label>IR conservador dos ganhos<input type="number" name="investment_income_tax_rate" step="0.001" min="0" max="1" required><small>0,225 corresponde a 22,5%</small></label>
             <label>Projetar até<input type="date" name="projection_end" required></label>
             <div class="form-action"><button class="primary" type="submit">Salvar premissas</button></div>
           </form>
-          <div class="security-note"><strong>Importante</strong><p>O saldo mínimo é apenas uma referência de segurança. O sistema não separa fisicamente nenhum valor da aplicação.</p></div>
+          <div class="security-note"><strong>Como o Privilège DI funciona no sistema</strong><p>Ele é a conta central de liquidez da família: recebe a sobra do mês e cobre o déficit quando salário e outras receitas não bastam. Aplicações e resgates não entram como receita ou despesa; o saldo mínimo continua sendo o piso de segurança.</p></div>
         </article>
       </section>
     </main>

@@ -41,6 +41,8 @@
 - comparação de entradas, saídas, gastos, saldo operacional e teto;
 - ranking de categorias e detalhamento consolidado por banco e cartão;
 - impressão do relatório para PDF pelo navegador.
+- Privilège DI tratado como conta central de liquidez, com sobra para aplicar, déficit para retirar e piso de segurança separado;
+- barra lateral preenchida e rolável em telas com pouca altura.
 
 ## Fase 3 — Próximas evoluções
 
