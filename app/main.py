@@ -10,9 +10,10 @@ from app.db import SessionLocal
 from app.models import User
 
 settings = get_settings()
+APP_VERSION = "0.2.2"
 app = FastAPI(
     title=settings.app_name,
-    version="0.2.1",
+    version=APP_VERSION,
     docs_url="/api/docs" if settings.environment != "production" else None,
     redoc_url=None,
 )
@@ -23,14 +24,20 @@ templates = Jinja2Templates(directory="app/templates")
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "healthy", "version": "0.2.1"}
+    return {"status": "healthy", "version": APP_VERSION}
 
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
     with SessionLocal() as db:
         configured = bool(db.scalar(select(func.count(User.id))))
-    return templates.TemplateResponse(request=request, name="index.html", context={"configured": configured})
+    response = templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={"configured": configured, "asset_version": APP_VERSION},
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/login")
