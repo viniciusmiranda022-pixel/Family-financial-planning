@@ -88,7 +88,7 @@
           </div>
         </div>
         <div class="kpi-grid">
-          <article id="liquidity-kpi-card" class="kpi highlight"><span id="kpi-liquidity-name">Saldo informado no Privilège DI</span><strong id="kpi-investment">R$ 0,00</strong><small id="kpi-liquidity-caption">Saldo cadastrado; não é consulta bancária em tempo real</small></article>
+          <article id="liquidity-kpi-card" class="kpi highlight"><span id="kpi-liquidity-name">Saldo após fechamento no Privilège DI</span><strong id="kpi-investment">R$ 0,00</strong><small id="kpi-liquidity-caption">Saldo informado ajustado pelo resultado do período</small></article>
           <article class="kpi cash-in"><span>Entrou no mês</span><strong id="kpi-cash-in">R$ 0,00</strong><small>Somente receitas; sem resgates e estornos</small></article>
           <article class="kpi cash-out"><span>Saiu das contas</span><strong id="kpi-cash-out">R$ 0,00</strong><small id="kpi-cash-out-caption">Cartões e compromissos aparecem separados</small></article>
           <article class="kpi"><span>Gasto no mês</span><strong id="kpi-spending">R$ 0,00</strong><small id="kpi-cap-caption">de R$ 0,00</small></article>
@@ -192,8 +192,8 @@
           <article class="report-kpi violet"><span>Média mensal</span><strong id="report-average-spending">R$ 0,00</strong><small>Média dos meses com dados</small></article>
           <article class="report-kpi mint"><span>Entradas</span><strong id="report-total-income">R$ 0,00</strong><small>Somente receitas reais</small></article>
           <article class="report-kpi sky"><span>Resultado do período</span><strong id="report-net-cash">R$ 0,00</strong><small>Sobra para aplicar ou déficit para cobrir</small></article>
-          <article class="report-kpi sunshine"><span id="report-liquidity-name">Saldo no Privilège DI</span><strong id="report-liquidity-balance">R$ 0,00</strong><small>Conta central de liquidez</small></article>
-          <article class="report-kpi teal"><span>Livre acima do piso</span><strong id="report-liquidity-available">R$ 0,00</strong><small id="report-liquidity-floor">Após preservar o mínimo de segurança</small></article>
+          <article class="report-kpi sunshine"><span id="report-liquidity-name">Saldo após o período no Privilège DI</span><strong id="report-liquidity-balance">R$ 0,00</strong><small>Saldo informado mais o resultado operacional</small></article>
+          <article class="report-kpi teal"><span>Distância do piso</span><strong id="report-liquidity-available">R$ 0,00</strong><small id="report-liquidity-floor">Meta de segurança, não valor bloqueado</small></article>
         </div>
 
         <div class="report-analysis-grid">
@@ -381,7 +381,7 @@
               <button class="secondary advisor-suggestion" type="button">Quais obrigações estão próximas?</button>
               <button class="secondary advisor-suggestion" type="button">Onde posso economizar?</button>
             </div>
-            <div class="security-note"><strong>Análise com contexto</strong><p>Informe se é à vista ou parcelado e, no parcelamento, quantidade de parcelas e juros. O Privilège DI é tratado como liquidez da família, mas o piso de segurança continua protegido.</p></div>
+            <div class="security-note"><strong>Análise com contexto</strong><p>Informe se é à vista ou parcelado e, no parcelamento, quantidade de parcelas e juros. O Privilège DI é a liquidez da família; o piso é uma meta e pode ser rompido quando o déficit consome o saldo.</p></div>
           </article>
           <article class="panel advisor-chat-panel">
             <div id="advisor-messages" class="advisor-messages" aria-live="polite"></div>
@@ -427,7 +427,7 @@
             <label>Projetar até<input type="date" name="projection_end" required></label>
             <div class="form-action"><button class="primary" type="submit">Salvar premissas</button></div>
           </form>
-          <div class="security-note"><strong>Como o Privilège DI funciona no sistema</strong><p>Ele é a conta central de liquidez da família: recebe a sobra do mês e cobre o déficit quando salário e outras receitas não bastam. Aplicações e resgates não entram como receita ou despesa; o saldo mínimo continua sendo o piso de segurança.</p></div>
+          <div class="security-note"><strong>Como o Privilège DI funciona no sistema</strong><p>Ele é a conta central de liquidez da família: recebe a sobra do mês e cobre o déficit quando salário e outras receitas não bastam. Se o déficit superar o saldo, o Privilège zera e o restante aparece como dívida sem cobertura. O piso é uma meta de alerta, não dinheiro bloqueado.</p></div>
         </article>
       </section>
     </main>

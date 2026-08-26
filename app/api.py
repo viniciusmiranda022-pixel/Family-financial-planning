@@ -280,6 +280,35 @@ def _operational_cash_flow(rows: list[tuple[Transaction, str]]) -> dict:
     }
 
 
+def _liquidity_settlement(
+    starting_balance: Decimal,
+    operational_result: Decimal,
+    emergency_floor: Decimal,
+) -> dict[str, Decimal]:
+    """Apply the household result to the central liquidity account.
+
+    The Privilège balance is operational cash, not a protected pocket. A negative
+    result consumes the whole balance when necessary; the emergency floor is a
+    warning target and never makes unavailable money appear to remain invested.
+    """
+    starting = money(max(Decimal("0"), starting_balance))
+    result = money(operational_result)
+    floor = money(max(Decimal("0"), emergency_floor))
+    deposit = money(max(Decimal("0"), result))
+    deficit = money(max(Decimal("0"), -result))
+    withdrawal = money(min(starting, deficit))
+    closing = money(starting + deposit - withdrawal)
+    uncovered = money(max(Decimal("0"), deficit - withdrawal))
+    return {
+        "starting_balance": starting,
+        "closing_balance": closing,
+        "deposit": deposit,
+        "withdrawal": withdrawal,
+        "uncovered_deficit": uncovered,
+        "floor_gap": money(closing - floor),
+    }
+
+
 def _large_entry_threshold(profile: FinancialProfile) -> Decimal:
     """Require a second acknowledgement for values likely to be tests or simulations."""
     return max(Decimal("5000"), money(profile.monthly_cash_cap * Decimal("2")))
@@ -2224,6 +2253,23 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
 @router.get("/forecast")
 def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     profile = profile_for(db, user.household_id)
+    current_start = date.today().replace(day=1)
+    current_end = add_months(current_start, 1)
+    current_movements, _ignored = _consolidated_transactions(
+        db,
+        user.household_id,
+        current_start,
+        current_end,
+    )
+    current_flow = _operational_cash_flow(current_movements)
+    current_result = money(
+        Decimal(str(current_flow["cash_in"])) - Decimal(str(current_flow["cash_out"]))
+    )
+    current_liquidity = _liquidity_settlement(
+        Decimal(profile.investment_balance),
+        current_result,
+        Decimal(profile.emergency_floor),
+    )
     end = profile.projection_end or date(date.today().year + 1, 12, 1)
     obligations_rows = db.scalars(
         select(Obligation).where(Obligation.household_id == user.household_id, Obligation.active.is_(True))
@@ -2251,7 +2297,7 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
         ForecastInput(
             start_month=add_months(date.today().replace(day=1), 1),
             end_month=end,
-            starting_balance=profile.investment_balance,
+            starting_balance=current_liquidity["closing_balance"],
             monthly_salary=profile.monthly_salary_net,
             monthly_cash_cap=profile.monthly_cash_cap,
             monthly_investment_rate=rate,
@@ -2270,6 +2316,8 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
         "monthly_net_investment_rate": float(rate),
         "rows": serialized,
         "summary": {
+            "starting_balance": decimal_value(current_liquidity["closing_balance"]),
+            "current_uncovered_deficit": decimal_value(current_liquidity["uncovered_deficit"]),
             "final_delayed": delayed_balances[-1],
             "minimum_delayed": min(delayed_balances),
             "emergency_floor": decimal_value(profile.emergency_floor),
@@ -2583,7 +2631,11 @@ def dashboard(
         item for item in _obligation_rows(db, user.household_id) if item["days_until_due"] <= 30
     ][:5]
     cash_net = money(Decimal(str(cash_flow["cash_in"])) - Decimal(str(cash_flow["cash_out"])))
-    liquidity_available = money(profile.investment_balance - profile.emergency_floor)
+    liquidity = _liquidity_settlement(
+        Decimal(profile.investment_balance),
+        cash_net,
+        Decimal(profile.emergency_floor),
+    )
     return {
         "month": month_key(start),
         "spending": decimal_value(spending),
@@ -2597,8 +2649,13 @@ def dashboard(
         "remaining_cap": decimal_value(money(profile.monthly_cash_cap - spending)),
         "investment_balance": decimal_value(profile.investment_balance),
         "liquidity_name": profile.investment_name,
-        "liquidity_balance": decimal_value(profile.investment_balance),
-        "liquidity_available": decimal_value(liquidity_available),
+        "liquidity_starting_balance": decimal_value(liquidity["starting_balance"]),
+        "liquidity_balance": decimal_value(liquidity["closing_balance"]),
+        "liquidity_closing_balance": decimal_value(liquidity["closing_balance"]),
+        "liquidity_available": decimal_value(liquidity["floor_gap"]),
+        "liquidity_deposit": decimal_value(liquidity["deposit"]),
+        "liquidity_withdrawal": decimal_value(liquidity["withdrawal"]),
+        "liquidity_uncovered_deficit": decimal_value(liquidity["uncovered_deficit"]),
         "liquidity_flow": decimal_value(cash_net),
         "liquidity_direction": ("deposit" if cash_net > 0 else "withdrawal" if cash_net < 0 else "balanced"),
         "emergency_floor": decimal_value(profile.emergency_floor),
@@ -2732,6 +2789,12 @@ def reports(
     ]
     last_change = activity_rows[-1]["change_percentage"] if months > 1 and activity_rows else None
     operational = _operational_cash_flow(movement_rows)
+    total_result = money(total_cash_in - total_cash_out)
+    liquidity = _liquidity_settlement(
+        Decimal(profile.investment_balance),
+        total_result,
+        Decimal(profile.emergency_floor),
+    )
     savings_rate = (
         money(((total_cash_in - total_cash_out) / total_cash_in) * Decimal("100"))
         if total_cash_in > 0
@@ -2750,12 +2813,17 @@ def reports(
             "total_cash_out": decimal_value(total_cash_out),
             "total_bank_cash_out": decimal_value(total_bank_cash_out),
             "total_card_spending": decimal_value(total_card_spending),
-            "cash_net": decimal_value(money(total_cash_in - total_cash_out)),
+            "cash_net": decimal_value(total_result),
             "liquidity_name": profile.investment_name,
-            "liquidity_balance": decimal_value(profile.investment_balance),
+            "liquidity_starting_balance": decimal_value(liquidity["starting_balance"]),
+            "liquidity_balance": decimal_value(liquidity["closing_balance"]),
+            "liquidity_closing_balance": decimal_value(liquidity["closing_balance"]),
             "emergency_floor": decimal_value(profile.emergency_floor),
-            "liquidity_available": decimal_value(money(profile.investment_balance - profile.emergency_floor)),
-            "liquidity_flow": decimal_value(money(total_cash_in - total_cash_out)),
+            "liquidity_available": decimal_value(liquidity["floor_gap"]),
+            "liquidity_deposit": decimal_value(liquidity["deposit"]),
+            "liquidity_withdrawal": decimal_value(liquidity["withdrawal"]),
+            "liquidity_uncovered_deficit": decimal_value(liquidity["uncovered_deficit"]),
+            "liquidity_flow": decimal_value(total_result),
             "liquidity_direction": (
                 "deposit"
                 if total_cash_in > total_cash_out
@@ -2814,7 +2882,7 @@ def advisor_chat(
     assumptions = [
         (f"{profile.investment_name} é a conta central de liquidez: recebe sobras e cobre déficits mensais"),
         "Aplicações e resgates não são receitas nem despesas de consumo",
-        "O saldo mínimo de segurança deve ser preservado",
+        "O piso de segurança é uma meta; um déficit real pode consumi-lo e até zerar a liquidez",
         "Dados ainda não lançados não entram na análise",
         "O sistema não consulta o saldo atual do internet banking",
     ]
@@ -3014,7 +3082,9 @@ def advisor_chat(
                         "projection_margin_before": decimal_value(projection_margin),
                         "projection_margin_after": decimal_value(projection_margin_after),
                         "liquidity_name": profile.investment_name,
-                        "liquidity_balance": decimal_value(profile.investment_balance),
+                        "liquidity_balance": summary["liquidity_balance"],
+                        "liquidity_starting_balance": summary["liquidity_starting_balance"],
+                        "liquidity_uncovered_deficit": summary["liquidity_uncovered_deficit"],
                         "liquidity_available": summary["liquidity_available"],
                         "obligations_next_180_days": decimal_value(upcoming_total),
                         "card_installments_in_projection": decimal_value(card_installments_projected),
@@ -3030,7 +3100,11 @@ def advisor_chat(
                     f"Teto disponível antes da compra: {_brl(remaining_before)}",
                     f"Impacto mensal da compra: {_brl(monthly_impact)}",
                     f"Margem conservadora após compromissos: {_brl(projection_margin_after)}",
-                    (f"Saldo líquido atual do {profile.investment_name}: {_brl(profile.investment_balance)}"),
+                    (
+                        f"Saldo do {profile.investment_name} após o fechamento do mês: "
+                        f"{_brl(summary['liquidity_balance'])}"
+                    ),
+                    f"Déficit atual sem cobertura: {_brl(summary['liquidity_uncovered_deficit'])}",
                     f"Obrigações cadastradas nos próximos 180 dias: {_brl(upcoming_total)}",
                     f"Parcelas futuras dos cartões na projeção: {_brl(card_installments_projected)}",
                 ]
@@ -3092,37 +3166,63 @@ def advisor_chat(
         intent = "liquidity"
         available = Decimal(str(summary["liquidity_available"]))
         flow = Decimal(str(summary["liquidity_flow"]))
-        if flow > 0:
-            month_note = f"O resultado operacional registrado no mês foi positivo em {_brl(flow)}."
-        elif flow < 0:
-            month_note = f"O resultado operacional registrado no mês foi negativo em {_brl(abs(flow))}."
+        starting = Decimal(str(summary["liquidity_starting_balance"]))
+        closing = Decimal(str(summary["liquidity_closing_balance"]))
+        withdrawal = Decimal(str(summary["liquidity_withdrawal"]))
+        deposit = Decimal(str(summary["liquidity_deposit"]))
+        uncovered = Decimal(str(summary["liquidity_uncovered_deficit"]))
+        if uncovered > 0:
+            answer = (
+                f"O resultado negativo de {_brl(abs(flow))} consome todo o saldo informado "
+                f"de {_brl(starting)} do {profile.investment_name}. O saldo estimado após o "
+                f"fechamento fica em {_brl(closing)} e ainda restam {_brl(uncovered)} sem "
+                "cobertura. O piso de segurança foi rompido; ele é uma meta de alerta, não "
+                "dinheiro bloqueado."
+            )
+        elif withdrawal > 0:
+            floor_note = (
+                f"ainda {_brl(available)} acima do piso"
+                if available >= 0
+                else f"{_brl(abs(available))} abaixo do piso"
+            )
+            answer = (
+                f"O déficit de {_brl(abs(flow))} é retirado do {profile.investment_name}. "
+                f"Partindo do saldo informado de {_brl(starting)}, o saldo estimado após o "
+                f"fechamento é {_brl(closing)}, ficando {floor_note}."
+            )
+        elif deposit > 0:
+            answer = (
+                f"A sobra de {_brl(deposit)} é destinada ao {profile.investment_name}. "
+                f"Partindo do saldo informado de {_brl(starting)}, o saldo estimado após o "
+                f"fechamento é {_brl(closing)}."
+            )
         else:
-            month_note = "O resultado operacional registrado no mês ficou equilibrado."
-        floor_note = (
-            f"há {_brl(available)} de liquidez acima do piso"
-            if available >= 0
-            else f"o saldo está {_brl(abs(available))} abaixo do piso"
-        )
-        answer = (
-            f"O saldo informado do {profile.investment_name} é "
-            f"{_brl(profile.investment_balance)}. Considerando o piso de segurança de "
-            f"{_brl(profile.emergency_floor)}, {floor_note}. {month_note} Este é um saldo "
-            "informado, não uma consulta ao Itaú nem uma conciliação bancária em tempo real. "
+            answer = (
+                f"O mês está equilibrado e o saldo estimado do {profile.investment_name} "
+                f"permanece em {_brl(closing)}."
+            )
+        answer += (
+            " O cálculo usa o saldo informado no sistema e não consulta o Itaú em tempo real. "
             "Aplicações e resgates não são contados como renda ou gasto."
         )
         metrics.update(
             {
                 "liquidity_name": profile.investment_name,
-                "liquidity_balance": decimal_value(profile.investment_balance),
+                "liquidity_starting_balance": decimal_value(starting),
+                "liquidity_balance": decimal_value(closing),
                 "liquidity_available": decimal_value(available),
                 "liquidity_flow": decimal_value(flow),
+                "liquidity_withdrawal": decimal_value(withdrawal),
+                "liquidity_uncovered_deficit": decimal_value(uncovered),
             }
         )
         evidence = [
-            f"Saldo líquido: {_brl(profile.investment_balance)}",
+            f"Saldo informado inicial: {_brl(starting)}",
+            f"Saldo estimado após fechamento: {_brl(closing)}",
             f"Piso de segurança: {_brl(profile.emergency_floor)}",
-            f"Disponível acima do piso: {_brl(available)}",
             f"Resultado operacional do mês: {_brl(flow)}",
+            f"Retirada do Privilège: {_brl(withdrawal)}",
+            f"Déficit sem cobertura: {_brl(uncovered)}",
         ]
     elif any(word in normalized for word in ("ENTROU", "RECEITA", "RECEBI", "ENTRADA")):
         intent = "cash_in"

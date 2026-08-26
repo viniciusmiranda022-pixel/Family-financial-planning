@@ -306,12 +306,24 @@ async function loadDashboard() {
   document.querySelector("#dashboard-period-label").textContent = selectedLabel;
   document.querySelector("#monthly-categories-title").textContent = `Gastos de ${selectedLabel} por categoria`;
   const liquidityName = summary.liquidity_name || "Privilège DI";
-  document.querySelector("#kpi-liquidity-name").textContent = `Liquidez no ${liquidityName}`;
+  const liquidityStarting = Number(summary.liquidity_starting_balance || 0);
+  const liquidityClosing = Number(summary.liquidity_closing_balance || summary.liquidity_balance || 0);
+  const liquidityWithdrawal = Number(summary.liquidity_withdrawal || 0);
+  const liquidityDeposit = Number(summary.liquidity_deposit || 0);
+  const liquidityUncovered = Number(summary.liquidity_uncovered_deficit || 0);
+  document.querySelector("#kpi-liquidity-name").textContent = `Saldo após fechamento no ${liquidityName}`;
   document.querySelector("#kpi-investment").textContent = money.format(summary.liquidity_balance);
-  document.querySelector("#kpi-liquidity-caption").textContent = summary.liquidity_available >= 0
-    ? `${money.format(summary.liquidity_available)} livres acima do piso • saldo informado, sem consulta ao Itaú`
-    : `${money.format(Math.abs(summary.liquidity_available))} abaixo do piso • saldo informado, sem consulta ao Itaú`;
-  document.querySelector("#liquidity-kpi-card").classList.toggle("under-floor", summary.liquidity_available < 0);
+  document.querySelector("#kpi-liquidity-caption").textContent = liquidityUncovered > 0
+    ? `Saldo informado de ${money.format(liquidityStarting)} totalmente consumido • faltam ${money.format(liquidityUncovered)}`
+    : liquidityWithdrawal > 0
+      ? `Saldo informado ${money.format(liquidityStarting)} • retirada de ${money.format(liquidityWithdrawal)}`
+      : liquidityDeposit > 0
+        ? `Saldo informado ${money.format(liquidityStarting)} + sobra de ${money.format(liquidityDeposit)}`
+        : `Saldo informado ${money.format(liquidityStarting)} • sem movimentação líquida`;
+  document.querySelector("#liquidity-kpi-card").classList.toggle(
+    "under-floor",
+    liquidityClosing < Number(summary.emergency_floor || 0) || liquidityUncovered > 0,
+  );
   document.querySelector("#kpi-cash-in").textContent = money.format(summary.cash_in);
   document.querySelector("#kpi-cash-out").textContent = money.format(summary.bank_cash_out);
   document.querySelector("#kpi-cash-out-caption").textContent = `Cartões: ${money.format(summary.card_spending)} • compromissos totais: ${money.format(summary.cash_out)}`;
@@ -343,17 +355,31 @@ async function loadDashboard() {
   liquidityBridge.classList.remove("deposit", "withdrawal", "balanced");
   liquidityBridge.classList.add(liquidityDirection);
   liquidityBridge.querySelector(".liquidity-bridge-icon").textContent = liquidityDirection === "deposit" ? "↗" : liquidityDirection === "withdrawal" ? "↘" : "↔";
-  document.querySelector("#liquidity-bridge-label").textContent = liquidityDirection === "deposit"
-    ? `Resultado positivo de ${selectedLabel}`
-    : liquidityDirection === "withdrawal"
-      ? `Resultado negativo de ${selectedLabel}`
-      : `Resultado de ${selectedLabel} equilibrado`;
-  document.querySelector("#liquidity-bridge-detail").textContent = "Receitas reais menos saídas bancárias e compras nos cartões registradas. Esse resultado não altera automaticamente o saldo informado do Privilège.";
-  document.querySelector("#liquidity-bridge-value-label").textContent = "Resultado operacional";
-  document.querySelector("#liquidity-bridge-value").textContent = money.format(Math.abs(liquidityFlow));
-  document.querySelector("#liquidity-bridge-balance").textContent = summary.liquidity_available >= 0
-    ? `Saldo informado ${money.format(summary.liquidity_balance)} • livre acima do piso ${money.format(summary.liquidity_available)}`
-    : `Saldo informado ${money.format(summary.liquidity_balance)} • abaixo do piso em ${money.format(Math.abs(summary.liquidity_available))}`;
+  if (liquidityUncovered > 0) {
+    document.querySelector("#liquidity-bridge-label").textContent = `Saldo do ${liquidityName} esgotado`;
+    document.querySelector("#liquidity-bridge-detail").textContent = `O resultado negativo de ${money.format(Math.abs(liquidityFlow))} consome todo o saldo informado. O piso de segurança é uma meta de alerta, não um valor bloqueado.`;
+    document.querySelector("#liquidity-bridge-value-label").textContent = "Déficit sem cobertura";
+    document.querySelector("#liquidity-bridge-value").textContent = money.format(liquidityUncovered);
+    document.querySelector("#liquidity-bridge-balance").textContent = `Retirada de ${money.format(liquidityWithdrawal)} • saldo final ${money.format(liquidityClosing)}`;
+  } else if (liquidityWithdrawal > 0) {
+    document.querySelector("#liquidity-bridge-label").textContent = `Déficit de ${selectedLabel} coberto pelo ${liquidityName}`;
+    document.querySelector("#liquidity-bridge-detail").textContent = "O resultado negativo é retirado da conta central de liquidez; o piso serve para sinalizar a necessidade de recomposição.";
+    document.querySelector("#liquidity-bridge-value-label").textContent = "Retirada necessária";
+    document.querySelector("#liquidity-bridge-value").textContent = money.format(liquidityWithdrawal);
+    document.querySelector("#liquidity-bridge-balance").textContent = `Saldo informado ${money.format(liquidityStarting)} • saldo final ${money.format(liquidityClosing)}`;
+  } else if (liquidityDeposit > 0) {
+    document.querySelector("#liquidity-bridge-label").textContent = `Sobra de ${selectedLabel} destinada ao ${liquidityName}`;
+    document.querySelector("#liquidity-bridge-detail").textContent = "Depois das receitas e compromissos registrados, a sobra aumenta a conta central de liquidez.";
+    document.querySelector("#liquidity-bridge-value-label").textContent = "Valor para aplicar";
+    document.querySelector("#liquidity-bridge-value").textContent = money.format(liquidityDeposit);
+    document.querySelector("#liquidity-bridge-balance").textContent = `Saldo informado ${money.format(liquidityStarting)} • saldo final ${money.format(liquidityClosing)}`;
+  } else {
+    document.querySelector("#liquidity-bridge-label").textContent = `Resultado de ${selectedLabel} equilibrado`;
+    document.querySelector("#liquidity-bridge-detail").textContent = "As receitas reais e os compromissos registrados se compensam no período.";
+    document.querySelector("#liquidity-bridge-value-label").textContent = "Movimento líquido";
+    document.querySelector("#liquidity-bridge-value").textContent = money.format(0);
+    document.querySelector("#liquidity-bridge-balance").textContent = `Saldo final ${money.format(liquidityClosing)}`;
+  }
   renderDashboardPulse(pulse);
   const qualityItems = [
     [summary.review_count === 0, "Fila de revisão", summary.review_count === 0 ? "Sem pendências" : `${summary.review_count} itens`],
@@ -414,13 +440,15 @@ function renderReport(report) {
   net.textContent = money.format(report.summary.cash_net);
   net.classList.toggle("amount-expense", report.summary.cash_net < 0);
   net.classList.toggle("amount-income", report.summary.cash_net >= 0);
-  document.querySelector("#report-liquidity-name").textContent = `Saldo informado no ${report.summary.liquidity_name}`;
+  document.querySelector("#report-liquidity-name").textContent = `Saldo após o período no ${report.summary.liquidity_name}`;
   document.querySelector("#report-liquidity-balance").textContent = money.format(report.summary.liquidity_balance);
   const reportLiquidityAvailable = document.querySelector("#report-liquidity-available");
   reportLiquidityAvailable.textContent = money.format(report.summary.liquidity_available);
   reportLiquidityAvailable.classList.toggle("amount-expense", report.summary.liquidity_available < 0);
   reportLiquidityAvailable.classList.toggle("amount-income", report.summary.liquidity_available >= 0);
-  document.querySelector("#report-liquidity-floor").textContent = `Após preservar ${money.format(report.summary.emergency_floor)}`;
+  document.querySelector("#report-liquidity-floor").textContent = report.summary.liquidity_available >= 0
+    ? `${money.format(report.summary.liquidity_available)} acima do piso de ${money.format(report.summary.emergency_floor)}`
+    : `Faltam ${money.format(Math.abs(report.summary.liquidity_available))} para recompor o piso`;
   renderTrendChart(document.querySelector("#report-trend-chart"), report.monthly);
   setTrendBadge(document.querySelector("#report-change-badge"), report.summary.last_change_percentage);
 
@@ -430,13 +458,11 @@ function renderReport(report) {
     reportInsight("↑", "MÊS DE MAIOR GASTO", monthLabel(report.summary.highest_month), money.format(report.summary.highest_spending), "coral"),
     reportInsight("↓", "MÊS DE MENOR GASTO", monthLabel(report.summary.lowest_month), money.format(report.summary.lowest_spending), "mint"),
     reportInsight("◎", "CATEGORIA PRINCIPAL", top ? top.category : "Sem dados", top ? `${money.format(top.amount)} no período` : "Nenhum gasto classificado", "violet"),
-    reportInsight(
-      report.summary.liquidity_direction === "withdrawal" ? "↘" : report.summary.liquidity_direction === "deposit" ? "↗" : "↔",
-      "RESULTADO OPERACIONAL",
-      money.format(report.summary.liquidity_flow),
-      `Não altera automaticamente o saldo informado de ${money.format(report.summary.liquidity_balance)}`,
-      report.summary.liquidity_direction === "withdrawal" ? "bad" : "mint",
-    ),
+    report.summary.liquidity_uncovered_deficit > 0
+      ? reportInsight("!", "DÉFICIT SEM COBERTURA", money.format(report.summary.liquidity_uncovered_deficit), `Todo o saldo informado de ${money.format(report.summary.liquidity_starting_balance)} foi consumido`, "bad")
+      : report.summary.liquidity_withdrawal > 0
+        ? reportInsight("↘", "RETIRADA DO PRIVILÈGE", money.format(report.summary.liquidity_withdrawal), `Saldo após o período: ${money.format(report.summary.liquidity_balance)}`, "bad")
+        : reportInsight("↗", "SOBRA PARA O PRIVILÈGE", money.format(report.summary.liquidity_deposit), `Saldo após o período: ${money.format(report.summary.liquidity_balance)}`, "mint"),
   ];
   if (!singleMonth) {
     const changeIcon = report.summary.last_change_percentage === null
