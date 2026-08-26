@@ -14,7 +14,7 @@ const money = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL
 const compactMoney = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", notation: "compact", maximumFractionDigits: 1 });
 const dateFormat = new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" });
 const monthFormat = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
-const accountTypeLabels = { checking: "Conta corrente", credit_card: "Cartão de crédito", investment: "Investimento", cash: "Dinheiro", other: "Outros" };
+const accountTypeLabels = { checking: "Conta corrente", credit_card: "Cartão de crédito", investment: "Conta de liquidez / investimento", cash: "Dinheiro", other: "Outros" };
 const systemCategories = new Set(["Conciliação", "Transferência patrimonial", "Transferência interna", "Repasses a confirmar", "Reembolsos e estornos", "Receitas", "Revisar"]);
 const pageNames = {
   dashboard: "Visão geral",
@@ -284,7 +284,13 @@ async function loadDashboard() {
   monthControl.value = summary.month;
   document.querySelector("#dashboard-period-label").textContent = selectedLabel;
   document.querySelector("#monthly-categories-title").textContent = `Gastos de ${selectedLabel} por categoria`;
-  document.querySelector("#kpi-investment").textContent = money.format(summary.investment_balance);
+  const liquidityName = summary.liquidity_name || "Privilège DI";
+  document.querySelector("#kpi-liquidity-name").textContent = `Liquidez no ${liquidityName}`;
+  document.querySelector("#kpi-investment").textContent = money.format(summary.liquidity_balance);
+  document.querySelector("#kpi-liquidity-caption").textContent = summary.liquidity_available >= 0
+    ? `${money.format(summary.liquidity_available)} livres acima do piso de ${money.format(summary.emergency_floor)}`
+    : `${money.format(Math.abs(summary.liquidity_available))} abaixo do piso de ${money.format(summary.emergency_floor)}`;
+  document.querySelector("#liquidity-kpi-card").classList.toggle("under-floor", summary.liquidity_available < 0);
   document.querySelector("#kpi-cash-in").textContent = money.format(summary.cash_in);
   document.querySelector("#kpi-cash-out").textContent = money.format(summary.cash_out);
   document.querySelector("#kpi-spending").textContent = money.format(summary.spending);
@@ -309,6 +315,29 @@ async function loadDashboard() {
   percentPill.classList.toggle("over", percent > 100);
   document.querySelector("#budget-used").textContent = `${money.format(summary.spending)} usados`;
   document.querySelector("#budget-total").textContent = `${money.format(summary.cash_cap)} de teto`;
+  const liquidityBridge = document.querySelector("#liquidity-bridge");
+  const liquidityFlow = Number(summary.liquidity_flow || 0);
+  const liquidityDirection = summary.liquidity_direction || "balanced";
+  liquidityBridge.classList.remove("deposit", "withdrawal", "balanced");
+  liquidityBridge.classList.add(liquidityDirection);
+  liquidityBridge.querySelector(".liquidity-bridge-icon").textContent = liquidityDirection === "deposit" ? "↗" : liquidityDirection === "withdrawal" ? "↘" : "↔";
+  document.querySelector("#liquidity-bridge-label").textContent = liquidityDirection === "deposit"
+    ? `Sobra de ${selectedLabel} para o ${liquidityName}`
+    : liquidityDirection === "withdrawal"
+      ? `Déficit de ${selectedLabel} coberto pelo ${liquidityName}`
+      : `Fluxo de ${selectedLabel} equilibrado`;
+  document.querySelector("#liquidity-bridge-detail").textContent = liquidityDirection === "deposit"
+    ? "Depois das receitas e saídas operacionais registradas, esta é a sobra estimada para aplicar na conta central."
+    : liquidityDirection === "withdrawal"
+      ? "Depois das receitas e saídas operacionais registradas, esta é a retirada estimada para fechar o mês."
+      : "As receitas e saídas operacionais registradas ficaram equilibradas; não há aplicação ou retirada estimada.";
+  document.querySelector("#liquidity-bridge-value-label").textContent = liquidityDirection === "deposit"
+    ? "Aplicação estimada"
+    : liquidityDirection === "withdrawal" ? "Retirada estimada" : "Movimento estimado";
+  document.querySelector("#liquidity-bridge-value").textContent = money.format(Math.abs(liquidityFlow));
+  document.querySelector("#liquidity-bridge-balance").textContent = summary.liquidity_available >= 0
+    ? `Saldo cadastrado ${money.format(summary.liquidity_balance)} • livre acima do piso ${money.format(summary.liquidity_available)}`
+    : `Saldo cadastrado ${money.format(summary.liquidity_balance)} • abaixo do piso em ${money.format(Math.abs(summary.liquidity_available))}`;
   renderDashboardPulse(pulse);
   const qualityItems = [
     [summary.review_count === 0, "Fila de revisão", summary.review_count === 0 ? "Sem pendências" : `${summary.review_count} itens`],
@@ -369,11 +398,13 @@ function renderReport(report) {
   net.textContent = money.format(report.summary.cash_net);
   net.classList.toggle("amount-expense", report.summary.cash_net < 0);
   net.classList.toggle("amount-income", report.summary.cash_net >= 0);
-  const rate = report.summary.savings_rate;
-  const rateElement = document.querySelector("#report-savings-rate");
-  rateElement.textContent = `${rate.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
-  rateElement.classList.toggle("amount-expense", rate < 0);
-  rateElement.classList.toggle("amount-income", rate >= 0);
+  document.querySelector("#report-liquidity-name").textContent = `Saldo no ${report.summary.liquidity_name}`;
+  document.querySelector("#report-liquidity-balance").textContent = money.format(report.summary.liquidity_balance);
+  const reportLiquidityAvailable = document.querySelector("#report-liquidity-available");
+  reportLiquidityAvailable.textContent = money.format(report.summary.liquidity_available);
+  reportLiquidityAvailable.classList.toggle("amount-expense", report.summary.liquidity_available < 0);
+  reportLiquidityAvailable.classList.toggle("amount-income", report.summary.liquidity_available >= 0);
+  document.querySelector("#report-liquidity-floor").textContent = `Após preservar ${money.format(report.summary.emergency_floor)}`;
   renderTrendChart(document.querySelector("#report-trend-chart"), report.monthly);
   setTrendBadge(document.querySelector("#report-change-badge"), report.summary.last_change_percentage);
 
@@ -383,6 +414,17 @@ function renderReport(report) {
     reportInsight("↑", "MÊS DE MAIOR GASTO", monthLabel(report.summary.highest_month), money.format(report.summary.highest_spending), "coral"),
     reportInsight("↓", "MÊS DE MENOR GASTO", monthLabel(report.summary.lowest_month), money.format(report.summary.lowest_spending), "mint"),
     reportInsight("◎", "CATEGORIA PRINCIPAL", top ? top.category : "Sem dados", top ? `${money.format(top.amount)} no período` : "Nenhum gasto classificado", "violet"),
+    reportInsight(
+      report.summary.liquidity_direction === "withdrawal" ? "↘" : report.summary.liquidity_direction === "deposit" ? "↗" : "↔",
+      "EFEITO NA LIQUIDEZ",
+      report.summary.liquidity_direction === "withdrawal"
+        ? `Retirar ${money.format(Math.abs(report.summary.liquidity_flow))}`
+        : report.summary.liquidity_direction === "deposit"
+          ? `Aplicar ${money.format(report.summary.liquidity_flow)}`
+          : "Sem movimento",
+      `${report.summary.liquidity_name}: ${money.format(report.summary.liquidity_balance)} de saldo cadastrado`,
+      report.summary.liquidity_direction === "withdrawal" ? "bad" : "mint",
+    ),
   ];
   if (!singleMonth) {
     const changeIcon = report.summary.last_change_percentage === null
@@ -409,7 +451,10 @@ function renderReport(report) {
     const variation = item.change_percentage === null
       ? "—"
       : `${item.change_percentage > 0 ? "+" : ""}${item.change_percentage.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
-    return `<tr><td><strong>${escapeHtml(monthLabel(item.month))}</strong><br><small>${item.transaction_count} movimentações</small></td><td class="right amount-income">${money.format(item.cash_in)}</td><td class="right amount-expense">${money.format(item.cash_out)}</td><td class="right">${money.format(item.spending)}</td><td class="right ${item.cash_net < 0 ? "amount-expense" : "amount-income"}">${money.format(item.cash_net)}</td><td class="right ${item.remaining_cap < 0 ? "amount-expense" : "amount-income"}">${money.format(item.remaining_cap)}</td><td class="right ${item.change_percentage > 0 ? "amount-expense" : item.change_percentage < 0 ? "amount-income" : ""}">${variation}</td></tr>`;
+    const liquidityMovement = item.cash_net > 0
+      ? `Aplicar ${money.format(item.cash_net)}`
+      : item.cash_net < 0 ? `Retirar ${money.format(Math.abs(item.cash_net))}` : "Equilibrado";
+    return `<tr><td><strong>${escapeHtml(monthLabel(item.month))}</strong><br><small>${item.transaction_count} movimentações</small></td><td class="right amount-income">${money.format(item.cash_in)}</td><td class="right amount-expense">${money.format(item.cash_out)}</td><td class="right">${money.format(item.spending)}</td><td class="right ${item.cash_net < 0 ? "amount-expense" : "amount-income"}">${money.format(item.cash_net)}</td><td class="right ${item.cash_net < 0 ? "amount-expense" : item.cash_net > 0 ? "amount-income" : ""}"><strong>${escapeHtml(liquidityMovement)}</strong></td><td class="right ${item.remaining_cap < 0 ? "amount-expense" : "amount-income"}">${money.format(item.remaining_cap)}</td><td class="right ${item.change_percentage > 0 ? "amount-expense" : item.change_percentage < 0 ? "amount-income" : ""}">${variation}</td></tr>`;
   }).join("");
   document.querySelector("#report-data-quality").textContent = report.duplicates_ignored
     ? `${report.duplicates_ignored} cópia(s) entre fontes foram desconsideradas; os registros permanecem preservados para auditoria.`
@@ -857,7 +902,7 @@ function appendAdvisorPurchaseMetrics(parent, metrics) {
       ["Valor da compra", metrics.purchase_amount],
       [Number(metrics.payment.installments) > 1 ? "Parcela mensal" : "Impacto à vista", metrics.payment.monthly_payment],
       ["Teto após a compra", metrics.remaining_after],
-      ["Margem sobre a reserva", metrics.projection_margin_after],
+      ["Margem acima do piso", metrics.projection_margin_after],
     ];
   const grid = advisorElement("div", "advisor-metric-grid");
   values.forEach(([label, value]) => {
