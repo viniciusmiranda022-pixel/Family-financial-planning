@@ -60,8 +60,11 @@
 - A sobra operacional do mês é destinada a essa conta; quando as receitas não cobrem as saídas, o déficit é retirado dela.
 - Aplicações e resgates são movimentos patrimoniais e não viram receita, despesa ou consumo do teto.
 - Todo o saldo permanece em uma única conta de liquidez.
-- O saldo mínimo é um piso de segurança, não uma separação bancária nem um bloqueio de todo o saldo.
-- A margem livre é o saldo do Privilège DI menos o piso de segurança; se for negativa, o sistema deve mostrar quanto falta recompor.
+- O saldo mínimo é uma meta de segurança e um alerta, não uma separação bancária nem dinheiro bloqueado.
+- Um resultado negativo consome o saldo do Privilège DI até zerá-lo, mesmo que isso rompa o piso.
+- Se o déficit for maior que o saldo informado, o sistema mostra saldo final zero e o valor restante como déficit sem cobertura.
+- Um resultado positivo é somado ao saldo do Privilège DI como sobra destinada à liquidez.
+- A distância do piso é calculada sobre o saldo depois do fechamento; se for negativa, o sistema mostra quanto falta recompor.
 - A taxa líquida mensal estimada é calculada a partir do retorno bruto anual e do IR conservador.
 - O rendimento mensal incide sobre o saldo inicial positivo do mês.
 - Entradas do mês começam a influenciar o rendimento no mês seguinte.

@@ -266,8 +266,11 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard["spending"] == 76.78
         assert dashboard["food_benefits"] == 1630.0
         assert dashboard["liquidity_name"] == "Privilege DI"
-        assert dashboard["liquidity_balance"] == 20000
-        assert dashboard["liquidity_available"] == 10000
+        assert dashboard["liquidity_starting_balance"] == 20000
+        assert dashboard["liquidity_balance"] == 19923.22
+        assert dashboard["liquidity_available"] == 9923.22
+        assert dashboard["liquidity_withdrawal"] == 76.78
+        assert dashboard["liquidity_uncovered_deficit"] == 0
         assert dashboard["liquidity_flow"] == -76.78
         assert dashboard["liquidity_direction"] == "withdrawal"
         assert dashboard["bank_cash_out"] == 0
@@ -318,8 +321,11 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert report_data["monthly"][1]["card_spending"] == 76.78
         assert report_data["summary"]["highest_month"] == "2026-08"
         assert report_data["summary"]["liquidity_name"] == "Privilege DI"
-        assert report_data["summary"]["liquidity_balance"] == 20000
-        assert report_data["summary"]["liquidity_available"] == 10000
+        assert report_data["summary"]["liquidity_starting_balance"] == 20000
+        assert report_data["summary"]["liquidity_balance"] == 19889.82
+        assert report_data["summary"]["liquidity_available"] == 9889.82
+        assert report_data["summary"]["liquidity_withdrawal"] == 110.18
+        assert report_data["summary"]["liquidity_uncovered_deficit"] == 0
         assert report_data["summary"]["liquidity_flow"] == -110.18
         assert report_data["summary"]["liquidity_direction"] == "withdrawal"
         assert report_data["categories"][0]["amount"] > 0
@@ -396,8 +402,10 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard_with_manual["bank_cash_out"] == 0
         assert dashboard_with_manual["card_spending"] == 176.78
         assert dashboard_with_manual["investment_balance"] == 20300
-        assert dashboard_with_manual["liquidity_balance"] == 20300
-        assert dashboard_with_manual["liquidity_available"] == 10300
+        assert dashboard_with_manual["liquidity_starting_balance"] == 20300
+        assert dashboard_with_manual["liquidity_balance"] == 21123.22
+        assert dashboard_with_manual["liquidity_available"] == 11123.22
+        assert dashboard_with_manual["liquidity_deposit"] == 823.22
         assert dashboard_with_manual["liquidity_flow"] == 823.22
         assert dashboard_with_manual["liquidity_direction"] == "deposit"
         nubank_flow = next(
@@ -451,7 +459,30 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard_after_delete["bank_cash_out"] == 0
         assert dashboard_after_delete["card_spending"] == 76.78
         assert dashboard_after_delete["investment_balance"] == 20000
-        assert dashboard_after_delete["liquidity_available"] == 10000
+        assert dashboard_after_delete["liquidity_balance"] == 19923.22
+        assert dashboard_after_delete["liquidity_available"] == 9923.22
+
+        uncovered_expense = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-17",
+                "description": "Teste de déficit maior que a liquidez",
+                "amount": 25000,
+                "movement_type": "expense",
+                "account_id": account.json()["id"],
+                "category_id": restaurant_category["id"],
+                "confirmed_large_amount": True,
+            },
+        )
+        assert uncovered_expense.status_code == 201
+        exhausted = client.get("/api/dashboard?month=2026-08").json()
+        assert exhausted["liquidity_starting_balance"] == 20000
+        assert exhausted["liquidity_flow"] == -25076.78
+        assert exhausted["liquidity_withdrawal"] == 20000
+        assert exhausted["liquidity_balance"] == 0
+        assert exhausted["liquidity_available"] == -10000
+        assert exhausted["liquidity_uncovered_deficit"] == 5076.78
+        assert client.delete(f"/api/transactions/{uncovered_expense.json()['id']}").status_code == 200
 
         liquidity_answer = client.post(
             "/api/advisor/chat",
@@ -460,8 +491,9 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert liquidity_answer.status_code == 200
         liquidity_data = liquidity_answer.json()
         assert liquidity_data["intent"] == "liquidity"
-        assert liquidity_data["metrics"]["liquidity_balance"] == 20000
-        assert liquidity_data["metrics"]["liquidity_available"] == 10000
+        assert liquidity_data["metrics"]["liquidity_starting_balance"] == 20000
+        assert liquidity_data["metrics"]["liquidity_balance"] == 19923.22
+        assert liquidity_data["metrics"]["liquidity_available"] == 9923.22
         assert "conta" in liquidity_data["answer"].lower()
         assert "renda ou gasto" in liquidity_data["answer"]
 
