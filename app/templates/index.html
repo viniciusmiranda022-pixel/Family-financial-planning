@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Planejamento Financeiro Familiar</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v={{ asset_version }}">
 </head>
-<body data-configured="{{ 'true' if configured else 'false' }}">
+<body data-configured="{{ 'true' if configured else 'false' }}" data-app-version="{{ asset_version }}">
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <main id="auth-shell" class="auth-shell">
@@ -331,6 +331,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v={{ asset_version }}" defer></script>
 </body>
 </html>
