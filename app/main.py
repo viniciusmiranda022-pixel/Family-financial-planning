@@ -10,7 +10,7 @@ from app.db import SessionLocal
 from app.models import User
 
 settings = get_settings()
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 app = FastAPI(
     title=settings.app_name,
     version=APP_VERSION,
