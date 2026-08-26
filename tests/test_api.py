@@ -399,6 +399,19 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert advisor_bare_amount.json()["status"] == "insufficient_data"
         assert advisor_bare_amount.json()["metrics"]["purchase_amount"] == 250
         assert "à vista ou parcelada" in advisor_bare_amount.json()["answer"]
+        advisor_four_digit_amount = client.post(
+            "/api/advisor/chat",
+            json={
+                "message": "Em setembro quero comprar uma enxada rotativa de 2000 à vista"
+            },
+        )
+        assert advisor_four_digit_amount.status_code == 200
+        assert advisor_four_digit_amount.json()["metrics"]["purchase_amount"] == 2000
+        assert "R$ 2.000,00" in advisor_four_digit_amount.json()["answer"]
+        assert "Caber matematicamente no orçamento não significa" in (
+            advisor_four_digit_amount.json()["answer"]
+        )
+        assert "quantas vezes você realmente usará" in advisor_four_digit_amount.json()["answer"]
 
         shared_due_date = date.today() + timedelta(days=60)
         same_day_obligations = []
