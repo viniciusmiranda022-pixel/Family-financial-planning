@@ -136,6 +136,30 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
         assert profile.status_code == 200
 
+        large_capture_preview = client.post(
+            "/api/captures/preview",
+            data={
+                "text": "Gastei R$ 80 com combustível hoje",
+                "account_id": account.json()["id"],
+                "document_type": "auto",
+            },
+        )
+        assert large_capture_preview.status_code == 201
+        large_capture_data = large_capture_preview.json()
+        large_capture_items = large_capture_data["items"]
+        large_capture_items[0]["amount"] = 8000
+        assert client.post(
+            f"/api/captures/{large_capture_data['id']}/confirm",
+            json={"items": large_capture_items},
+        ).status_code == 409
+        confirmed_large_capture = client.post(
+            f"/api/captures/{large_capture_data['id']}/confirm",
+            json={"items": large_capture_items, "confirmed_large_amount": True},
+        )
+        assert confirmed_large_capture.status_code == 200
+        large_capture_transaction = confirmed_large_capture.json()["result"]["transactions"][0]
+        assert client.delete(f"/api/transactions/{large_capture_transaction}").status_code == 200
+
         commission = client.post(
             "/api/commissions",
             json={
