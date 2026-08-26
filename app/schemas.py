@@ -49,6 +49,7 @@ class ManualTransactionRequest(BaseModel):
     account_id: str
     category_id: str | None = None
     category_name: str | None = Field(default=None, min_length=2, max_length=100)
+    confirmed_large_amount: bool = False
 
 
 class AdvisorHistoryItem(BaseModel):
@@ -108,6 +109,7 @@ class CaptureItemRequest(BaseModel):
 
 class CaptureConfirmRequest(BaseModel):
     items: list[CaptureItemRequest] = Field(min_length=1, max_length=1000)
+    confirmed_large_amount: bool = False
 
 
 class CommissionRequest(BaseModel):
