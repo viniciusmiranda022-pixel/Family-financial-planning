@@ -57,7 +57,11 @@ async function api(path, options = {}) {
   let payload = null;
   try { payload = await response.json(); } catch (_) { payload = {}; }
   if (!response.ok) {
-    const detail = typeof payload.detail === "string" ? payload.detail : "Não foi possível concluir a operação";
+    const detail = typeof payload.detail === "string"
+      ? payload.detail
+      : Array.isArray(payload.detail)
+        ? payload.detail.map((item) => item.msg).filter(Boolean).join("; ")
+        : "Não foi possível concluir a operação";
     throw new Error(detail);
   }
   return payload;
@@ -668,12 +672,18 @@ function appendAdvisorText(parent, text) {
 
 function appendAdvisorPurchaseMetrics(parent, metrics) {
   if (!metrics?.purchase_amount || !metrics?.payment) return;
-  const values = [
-    ["Valor da compra", metrics.purchase_amount],
-    [Number(metrics.payment.installments) > 1 ? "Parcela mensal" : "Impacto à vista", metrics.payment.monthly_payment],
-    ["Teto após a compra", metrics.remaining_after],
-    ["Margem sobre a reserva", metrics.projection_margin_after],
-  ];
+  const quick = metrics.purchase_context?.analysis_depth === "quick";
+  const values = quick
+    ? [
+      ["Valor da compra", metrics.purchase_amount],
+      ["Teto após a compra", metrics.remaining_after],
+    ]
+    : [
+      ["Valor da compra", metrics.purchase_amount],
+      [Number(metrics.payment.installments) > 1 ? "Parcela mensal" : "Impacto à vista", metrics.payment.monthly_payment],
+      ["Teto após a compra", metrics.remaining_after],
+      ["Margem sobre a reserva", metrics.projection_margin_after],
+    ];
   const grid = advisorElement("div", "advisor-metric-grid");
   values.forEach(([label, value]) => {
     if (value === undefined || value === null) return;
@@ -687,13 +697,14 @@ function appendAdvisorPurchaseMetrics(parent, metrics) {
   if (grid.children.length) parent.appendChild(grid);
 }
 
-function appendAdvisorReflection(parent, reflection) {
+function appendAdvisorReflection(parent, reflection, purchaseContext = null) {
   if (!reflection) return;
   const section = advisorElement("section", "advisor-reflection");
   const heading = advisorElement("div", "advisor-section-heading");
+  const quick = purchaseContext?.analysis_depth === "quick";
   heading.append(
-    advisorElement("span", "advisor-section-icon", "?"),
-    advisorElement("h4", "", "Antes de decidir"),
+    advisorElement("span", `advisor-section-icon${quick ? " proportional" : ""}`, quick ? "✓" : "?"),
+    advisorElement("h4", "", quick ? "Leitura proporcional" : "Antes de decidir"),
   );
   section.appendChild(heading);
 
@@ -800,8 +811,10 @@ function renderAdvisorAnswer(bubble, result) {
   appendAdvisorText(summary, sections.main);
   bubble.appendChild(summary);
   appendAdvisorPurchaseMetrics(bubble, result.metrics);
-  appendAdvisorReflection(bubble, sections.reflection);
-  appendAdvisorSchedule(bubble, result.metrics?.commitment_schedule);
+  appendAdvisorReflection(bubble, sections.reflection, result.metrics?.purchase_context);
+  if (result.metrics?.show_commitment_schedule !== false) {
+    appendAdvisorSchedule(bubble, result.metrics?.commitment_schedule);
+  }
 }
 
 async function loadAdvisor() {
@@ -846,7 +859,7 @@ async function askAdvisor(message) {
     renderAdvisorAnswer(loading, result);
     state.advisorHistory.push(
       { role: "user", content: message },
-      { role: "assistant", content: result.answer },
+      { role: "assistant", content: result.answer.slice(0, 8000) },
     );
     state.advisorHistory = state.advisorHistory.slice(-8);
   } catch (error) {
