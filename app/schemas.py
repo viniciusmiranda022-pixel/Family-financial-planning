@@ -53,7 +53,7 @@ class ManualTransactionRequest(BaseModel):
 
 class AdvisorHistoryItem(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
-    content: str = Field(min_length=1, max_length=1500)
+    content: str = Field(min_length=1, max_length=8000)
 
 
 class AdvisorRequest(BaseModel):
