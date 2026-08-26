@@ -196,7 +196,13 @@ def _account_display(account: Account | None) -> str:
 
 
 def _operational_cash_flow(rows: list[tuple[Transaction, str]]) -> dict:
-    """Separate actual income/outgoings from patrimonial transfers and reconciliations."""
+    """Separate real income, bank outgoings and card commitments.
+
+    Card purchases are commitments, not immediate withdrawals from a bank account.
+    Income marked as excluded or outside the Receitas category is not real household
+    income.  Excluded expenses may still represent actual cash outgoings (for example,
+    a patrimonial payment kept outside the monthly consumption cap).
+    """
     accounts: dict[str, dict[str, object]] = {}
     for transaction, category_name in rows:
         if transaction.possible_duplicate:
@@ -220,7 +226,12 @@ def _operational_cash_flow(rows: list[tuple[Transaction, str]]) -> dict:
             },
         )
         amount = Decimal(transaction.amount)
-        if transaction.transaction_type == "income" and amount > 0:
+        if (
+            transaction.transaction_type == "income"
+            and amount > 0
+            and not transaction.excluded
+            and category_name == "Receitas"
+        ):
             item["cash_in"] += amount
         elif transaction.transaction_type == "refund" and amount > 0:
             item["refunds"] += amount
@@ -242,22 +253,36 @@ def _operational_cash_flow(rows: list[tuple[Transaction, str]]) -> dict:
                 "account_type": item["account_type"],
                 "cash_in": decimal_value(cash_in),
                 "cash_out": decimal_value(cash_out),
+                "bank_cash_out": decimal_value(
+                    Decimal("0") if item["account_type"] == "credit_card" else cash_out
+                ),
+                "card_spending": decimal_value(
+                    cash_out if item["account_type"] == "credit_card" else Decimal("0")
+                ),
                 "refunds": decimal_value(refunds),
                 "net": decimal_value(money(cash_in - cash_out)),
             }
         )
     serialized.sort(key=lambda item: (item["account_type"], item["account"]))
+    cash_in = money(sum((Decimal(str(item["cash_in"])) for item in serialized), Decimal("0")))
+    bank_cash_out = money(
+        sum((Decimal(str(item["bank_cash_out"])) for item in serialized), Decimal("0"))
+    )
+    card_spending = money(
+        sum((Decimal(str(item["card_spending"])) for item in serialized), Decimal("0"))
+    )
     return {
-        "cash_in": decimal_value(
-            money(sum((Decimal(str(item["cash_in"])) for item in serialized), Decimal("0")))
-        ),
-        "cash_out": decimal_value(
-            money(sum((Decimal(str(item["cash_out"])) for item in serialized), Decimal("0")))
-        ),
+        "cash_in": decimal_value(cash_in),
+        "cash_out": decimal_value(money(bank_cash_out + card_spending)),
+        "bank_cash_out": decimal_value(bank_cash_out),
+        "card_spending": decimal_value(card_spending),
         "accounts": serialized,
     }
 
 
+def _large_entry_threshold(profile: FinancialProfile) -> Decimal:
+    """Require a second acknowledgement for values likely to be tests or simulations."""
+    return max(Decimal("5000"), money(profile.monthly_cash_cap * Decimal("2")))
 def _add_months_preserving_day(value: date, months: int) -> date:
     target = add_months(value.replace(day=1), months)
     return target.replace(day=min(value.day, monthrange(target.year, target.month)[1]))
@@ -1470,6 +1495,20 @@ def confirm_capture(
     selected = [item for item in payload.items if item.selected]
     if not selected:
         raise HTTPException(status_code=422, detail="Selecione ao menos um item para confirmar")
+    profile = profile_for(db, user.household_id)
+    large_threshold = _large_entry_threshold(profile)
+    if (
+        not payload.confirmed_large_amount
+        and any(item.kind == "transaction" and item.amount >= large_threshold for item in selected)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Há um lançamento de valor elevado. Confirme que ele aconteceu de verdade; "
+                f"simulações devem ser feitas no Consultor. Limite de confirmação: "
+                f"R$ {large_threshold:,.2f}."
+            ),
+        )
 
     result: dict[str, list[str]] = {
         "transactions": [],
@@ -1709,6 +1748,17 @@ def create_manual_transaction(
     )
     if not account:
         raise HTTPException(status_code=404, detail="Conta não encontrada")
+    profile = profile_for(db, user.household_id)
+    large_threshold = _large_entry_threshold(profile)
+    if payload.amount >= large_threshold and not payload.confirmed_large_amount:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Este valor exige confirmação adicional. Confirme apenas se a movimentação "
+                f"aconteceu de verdade; use o Consultor para simulações. Limite de confirmação: "
+                f"R$ {large_threshold:,.2f}."
+            ),
+        )
 
     category = None
     transaction_type = "expense"
@@ -2539,6 +2589,8 @@ def dashboard(
         "spending": decimal_value(spending),
         "cash_in": cash_flow["cash_in"],
         "cash_out": cash_flow["cash_out"],
+        "bank_cash_out": cash_flow["bank_cash_out"],
+        "card_spending": cash_flow["card_spending"],
         "cash_net": decimal_value(cash_net),
         "cash_flow_by_account": cash_flow["accounts"],
         "cash_cap": decimal_value(profile.monthly_cash_cap),
@@ -2617,6 +2669,8 @@ def reports(
         spending = money(item["spending"])
         cash_in = money(flow["cash_in"])
         cash_out = money(flow["cash_out"])
+        bank_cash_out = money(flow["bank_cash_out"])
+        card_spending = money(flow["card_spending"])
         cash_net = money(cash_in - cash_out)
         change_percentage = None
         if (
@@ -2633,6 +2687,8 @@ def reports(
                 "spending": decimal_value(spending),
                 "cash_in": decimal_value(cash_in),
                 "cash_out": decimal_value(cash_out),
+                "bank_cash_out": decimal_value(bank_cash_out),
+                "card_spending": decimal_value(card_spending),
                 "cash_net": decimal_value(cash_net),
                 "cash_cap": decimal_value(profile.monthly_cash_cap),
                 "remaining_cap": decimal_value(money(profile.monthly_cash_cap - spending)),
@@ -2646,6 +2702,12 @@ def reports(
     total_spending = money(sum((Decimal(str(item["spending"])) for item in serialized_months), Decimal("0")))
     total_cash_in = money(sum((Decimal(str(item["cash_in"])) for item in serialized_months), Decimal("0")))
     total_cash_out = money(sum((Decimal(str(item["cash_out"])) for item in serialized_months), Decimal("0")))
+    total_bank_cash_out = money(
+        sum((Decimal(str(item["bank_cash_out"])) for item in serialized_months), Decimal("0"))
+    )
+    total_card_spending = money(
+        sum((Decimal(str(item["card_spending"])) for item in serialized_months), Decimal("0"))
+    )
     covered_months = sum(item["transaction_count"] > 0 for item in serialized_months)
     average_denominator = Decimal(max(1, covered_months))
     average_spending = money(total_spending / average_denominator)
@@ -2686,6 +2748,8 @@ def reports(
             "average_spending": decimal_value(average_spending),
             "total_cash_in": decimal_value(total_cash_in),
             "total_cash_out": decimal_value(total_cash_out),
+            "total_bank_cash_out": decimal_value(total_bank_cash_out),
+            "total_card_spending": decimal_value(total_card_spending),
             "cash_net": decimal_value(money(total_cash_in - total_cash_out)),
             "liquidity_name": profile.investment_name,
             "liquidity_balance": decimal_value(profile.investment_balance),
@@ -3029,17 +3093,11 @@ def advisor_chat(
         available = Decimal(str(summary["liquidity_available"]))
         flow = Decimal(str(summary["liquidity_flow"]))
         if flow > 0:
-            month_note = (
-                f"Pelo fluxo operacional registrado, o mês gerou {_brl(flow)} de sobra para "
-                "ser direcionada a essa conta."
-            )
+            month_note = f"O resultado operacional registrado no mês foi positivo em {_brl(flow)}."
         elif flow < 0:
-            month_note = (
-                f"Pelo fluxo operacional registrado, o mês precisou de {_brl(abs(flow))} "
-                "dessa conta para cobrir a diferença."
-            )
+            month_note = f"O resultado operacional registrado no mês foi negativo em {_brl(abs(flow))}."
         else:
-            month_note = "O fluxo operacional registrado no mês ficou equilibrado."
+            month_note = "O resultado operacional registrado no mês ficou equilibrado."
         floor_note = (
             f"há {_brl(available)} de liquidez acima do piso"
             if available >= 0
@@ -3048,8 +3106,9 @@ def advisor_chat(
         answer = (
             f"O saldo informado do {profile.investment_name} é "
             f"{_brl(profile.investment_balance)}. Considerando o piso de segurança de "
-            f"{_brl(profile.emergency_floor)}, {floor_note}. {month_note} Aplicações e "
-            "resgates movimentam essa liquidez, mas não são contados como renda ou gasto."
+            f"{_brl(profile.emergency_floor)}, {floor_note}. {month_note} Este é um saldo "
+            "informado, não uma consulta ao Itaú nem uma conciliação bancária em tempo real. "
+            "Aplicações e resgates não são contados como renda ou gasto."
         )
         metrics.update(
             {
@@ -3085,9 +3144,11 @@ def advisor_chat(
             or "nenhuma saída identificada"
         )
         answer = (
-            f"Saíram {_brl(summary['cash_out'])} em despesas e pagamentos em {selected_month}. "
-            f"Aplicações, resgates, transferências internas e pagamento de fatura foram excluídos. "
-            f"Detalhamento: {detail}."
+            f"Em {selected_month}, as saídas registradas nas contas bancárias somaram "
+            f"{_brl(summary['bank_cash_out'])}; as compras nos cartões somaram "
+            f"{_brl(summary['card_spending'])}. O total de despesas e compromissos foi "
+            f"{_brl(summary['cash_out'])}. Aplicações, resgates, transferências internas e "
+            f"pagamento de fatura foram excluídos para evitar dupla contagem. Detalhamento: {detail}."
         )
         evidence = [detail]
     elif any(word in normalized for word in ("GASTEI", "GASTO", "GASTOS")):
@@ -3118,6 +3179,8 @@ def advisor_chat(
                 "spending": summary["spending"],
                 "cash_in": summary["cash_in"],
                 "cash_out": summary["cash_out"],
+                "bank_cash_out": summary["bank_cash_out"],
+                "card_spending": summary["card_spending"],
                 "cash_cap": summary["cash_cap"],
                 "remaining_cap": summary["remaining_cap"],
                 "liquidity_name": summary["liquidity_name"],

@@ -5,6 +5,7 @@ const state = {
   forecast: [],
   forecastFloor: 0,
   report: null,
+  dashboard: null,
   captureDraft: null,
   captureAudio: null,
   captureRecorder: null,
@@ -15,6 +16,25 @@ const compactMoney = new Intl.NumberFormat("pt-BR", { style: "currency", currenc
 const dateFormat = new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" });
 const monthFormat = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
 const accountTypeLabels = { checking: "Conta corrente", credit_card: "Cartão de crédito", investment: "Conta de liquidez / investimento", cash: "Dinheiro", other: "Outros" };
+
+function largeEntryThreshold() {
+  return Math.max(5000, Number(state.dashboard?.cash_cap || 0) * 2);
+}
+
+function selectedLargeTransactions(items) {
+  const threshold = largeEntryThreshold();
+  return items.filter((item) => item.kind !== "obligation" && item.kind !== "payroll" && Number(item.amount || 0) >= threshold);
+}
+
+function confirmLargeTransactions(items) {
+  const largeItems = selectedLargeTransactions(items);
+  if (!largeItems.length) return { allowed: true, confirmed: false };
+  const largest = Math.max(...largeItems.map((item) => Number(item.amount || 0)));
+  const allowed = window.confirm(
+    `Atenção: há movimentação de ${money.format(largest)}. Confirme somente se ela realmente aconteceu. Para testar uma compra, use o Consultor financeiro.`,
+  );
+  return { allowed, confirmed: allowed };
+}
 const systemCategories = new Set(["Conciliação", "Transferência patrimonial", "Transferência interna", "Repasses a confirmar", "Reembolsos e estornos", "Receitas", "Revisar"]);
 const pageNames = {
   dashboard: "Visão geral",
@@ -281,6 +301,7 @@ async function loadDashboard() {
     api(`/reports?end_month=${encodeURIComponent(selectedMonth)}&months=6`),
   ]);
   const selectedLabel = monthLabel(summary.month);
+  state.dashboard = summary;
   monthControl.value = summary.month;
   document.querySelector("#dashboard-period-label").textContent = selectedLabel;
   document.querySelector("#monthly-categories-title").textContent = `Gastos de ${selectedLabel} por categoria`;
@@ -288,11 +309,12 @@ async function loadDashboard() {
   document.querySelector("#kpi-liquidity-name").textContent = `Liquidez no ${liquidityName}`;
   document.querySelector("#kpi-investment").textContent = money.format(summary.liquidity_balance);
   document.querySelector("#kpi-liquidity-caption").textContent = summary.liquidity_available >= 0
-    ? `${money.format(summary.liquidity_available)} livres acima do piso de ${money.format(summary.emergency_floor)}`
-    : `${money.format(Math.abs(summary.liquidity_available))} abaixo do piso de ${money.format(summary.emergency_floor)}`;
+    ? `${money.format(summary.liquidity_available)} livres acima do piso • saldo informado, sem consulta ao Itaú`
+    : `${money.format(Math.abs(summary.liquidity_available))} abaixo do piso • saldo informado, sem consulta ao Itaú`;
   document.querySelector("#liquidity-kpi-card").classList.toggle("under-floor", summary.liquidity_available < 0);
   document.querySelector("#kpi-cash-in").textContent = money.format(summary.cash_in);
-  document.querySelector("#kpi-cash-out").textContent = money.format(summary.cash_out);
+  document.querySelector("#kpi-cash-out").textContent = money.format(summary.bank_cash_out);
+  document.querySelector("#kpi-cash-out-caption").textContent = `Cartões: ${money.format(summary.card_spending)} • compromissos totais: ${money.format(summary.cash_out)}`;
   document.querySelector("#kpi-spending").textContent = money.format(summary.spending);
   document.querySelector("#kpi-cap-caption").textContent = `de ${money.format(summary.cash_cap)} em ${selectedLabel}`;
   const remainingValue = document.querySelector("#kpi-remaining");
@@ -322,22 +344,16 @@ async function loadDashboard() {
   liquidityBridge.classList.add(liquidityDirection);
   liquidityBridge.querySelector(".liquidity-bridge-icon").textContent = liquidityDirection === "deposit" ? "↗" : liquidityDirection === "withdrawal" ? "↘" : "↔";
   document.querySelector("#liquidity-bridge-label").textContent = liquidityDirection === "deposit"
-    ? `Sobra de ${selectedLabel} para o ${liquidityName}`
+    ? `Resultado positivo de ${selectedLabel}`
     : liquidityDirection === "withdrawal"
-      ? `Déficit de ${selectedLabel} coberto pelo ${liquidityName}`
-      : `Fluxo de ${selectedLabel} equilibrado`;
-  document.querySelector("#liquidity-bridge-detail").textContent = liquidityDirection === "deposit"
-    ? "Depois das receitas e saídas operacionais registradas, esta é a sobra estimada para aplicar na conta central."
-    : liquidityDirection === "withdrawal"
-      ? "Depois das receitas e saídas operacionais registradas, esta é a retirada estimada para fechar o mês."
-      : "As receitas e saídas operacionais registradas ficaram equilibradas; não há aplicação ou retirada estimada.";
-  document.querySelector("#liquidity-bridge-value-label").textContent = liquidityDirection === "deposit"
-    ? "Aplicação estimada"
-    : liquidityDirection === "withdrawal" ? "Retirada estimada" : "Movimento estimado";
+      ? `Resultado negativo de ${selectedLabel}`
+      : `Resultado de ${selectedLabel} equilibrado`;
+  document.querySelector("#liquidity-bridge-detail").textContent = "Receitas reais menos saídas bancárias e compras nos cartões registradas. Esse resultado não altera automaticamente o saldo informado do Privilège.";
+  document.querySelector("#liquidity-bridge-value-label").textContent = "Resultado operacional";
   document.querySelector("#liquidity-bridge-value").textContent = money.format(Math.abs(liquidityFlow));
   document.querySelector("#liquidity-bridge-balance").textContent = summary.liquidity_available >= 0
-    ? `Saldo cadastrado ${money.format(summary.liquidity_balance)} • livre acima do piso ${money.format(summary.liquidity_available)}`
-    : `Saldo cadastrado ${money.format(summary.liquidity_balance)} • abaixo do piso em ${money.format(Math.abs(summary.liquidity_available))}`;
+    ? `Saldo informado ${money.format(summary.liquidity_balance)} • livre acima do piso ${money.format(summary.liquidity_available)}`
+    : `Saldo informado ${money.format(summary.liquidity_balance)} • abaixo do piso em ${money.format(Math.abs(summary.liquidity_available))}`;
   renderDashboardPulse(pulse);
   const qualityItems = [
     [summary.review_count === 0, "Fila de revisão", summary.review_count === 0 ? "Sem pendências" : `${summary.review_count} itens`],
@@ -398,7 +414,7 @@ function renderReport(report) {
   net.textContent = money.format(report.summary.cash_net);
   net.classList.toggle("amount-expense", report.summary.cash_net < 0);
   net.classList.toggle("amount-income", report.summary.cash_net >= 0);
-  document.querySelector("#report-liquidity-name").textContent = `Saldo no ${report.summary.liquidity_name}`;
+  document.querySelector("#report-liquidity-name").textContent = `Saldo informado no ${report.summary.liquidity_name}`;
   document.querySelector("#report-liquidity-balance").textContent = money.format(report.summary.liquidity_balance);
   const reportLiquidityAvailable = document.querySelector("#report-liquidity-available");
   reportLiquidityAvailable.textContent = money.format(report.summary.liquidity_available);
@@ -416,13 +432,9 @@ function renderReport(report) {
     reportInsight("◎", "CATEGORIA PRINCIPAL", top ? top.category : "Sem dados", top ? `${money.format(top.amount)} no período` : "Nenhum gasto classificado", "violet"),
     reportInsight(
       report.summary.liquidity_direction === "withdrawal" ? "↘" : report.summary.liquidity_direction === "deposit" ? "↗" : "↔",
-      "EFEITO NA LIQUIDEZ",
-      report.summary.liquidity_direction === "withdrawal"
-        ? `Retirar ${money.format(Math.abs(report.summary.liquidity_flow))}`
-        : report.summary.liquidity_direction === "deposit"
-          ? `Aplicar ${money.format(report.summary.liquidity_flow)}`
-          : "Sem movimento",
-      `${report.summary.liquidity_name}: ${money.format(report.summary.liquidity_balance)} de saldo cadastrado`,
+      "RESULTADO OPERACIONAL",
+      money.format(report.summary.liquidity_flow),
+      `Não altera automaticamente o saldo informado de ${money.format(report.summary.liquidity_balance)}`,
       report.summary.liquidity_direction === "withdrawal" ? "bad" : "mint",
     ),
   ];
@@ -451,10 +463,7 @@ function renderReport(report) {
     const variation = item.change_percentage === null
       ? "—"
       : `${item.change_percentage > 0 ? "+" : ""}${item.change_percentage.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
-    const liquidityMovement = item.cash_net > 0
-      ? `Aplicar ${money.format(item.cash_net)}`
-      : item.cash_net < 0 ? `Retirar ${money.format(Math.abs(item.cash_net))}` : "Equilibrado";
-    return `<tr><td><strong>${escapeHtml(monthLabel(item.month))}</strong><br><small>${item.transaction_count} movimentações</small></td><td class="right amount-income">${money.format(item.cash_in)}</td><td class="right amount-expense">${money.format(item.cash_out)}</td><td class="right">${money.format(item.spending)}</td><td class="right ${item.cash_net < 0 ? "amount-expense" : "amount-income"}">${money.format(item.cash_net)}</td><td class="right ${item.cash_net < 0 ? "amount-expense" : item.cash_net > 0 ? "amount-income" : ""}"><strong>${escapeHtml(liquidityMovement)}</strong></td><td class="right ${item.remaining_cap < 0 ? "amount-expense" : "amount-income"}">${money.format(item.remaining_cap)}</td><td class="right ${item.change_percentage > 0 ? "amount-expense" : item.change_percentage < 0 ? "amount-income" : ""}">${variation}</td></tr>`;
+    return `<tr><td><strong>${escapeHtml(monthLabel(item.month))}</strong><br><small>${item.transaction_count} movimentações</small></td><td class="right amount-income">${money.format(item.cash_in)}</td><td class="right amount-expense">${money.format(item.bank_cash_out)}</td><td class="right amount-expense">${money.format(item.card_spending)}</td><td class="right">${money.format(item.spending)}</td><td class="right ${item.cash_net < 0 ? "amount-expense" : "amount-income"}">${money.format(item.cash_net)}</td><td class="right ${item.remaining_cap < 0 ? "amount-expense" : "amount-income"}">${money.format(item.remaining_cap)}</td><td class="right ${item.change_percentage > 0 ? "amount-expense" : item.change_percentage < 0 ? "amount-income" : ""}">${variation}</td></tr>`;
   }).join("");
   document.querySelector("#report-data-quality").textContent = report.duplicates_ignored
     ? `${report.duplicates_ignored} cópia(s) entre fontes foram desconsideradas; os registros permanecem preservados para auditoria.`
@@ -1253,13 +1262,15 @@ document.querySelector("#capture-confirm").addEventListener("click", async () =>
     || (item.kind === "obligation" && !item.due_date)
     || (item.kind === "payroll" && (!item.competence || !item.payment_date)));
   if (invalid) return toast("Preencha os campos obrigatórios dos itens selecionados", true);
+  const largeConfirmation = confirmLargeTransactions(selected);
+  if (!largeConfirmation.allowed) return toast("Captura não confirmada; nenhum lançamento foi criado", true);
   const button = document.querySelector("#capture-confirm");
   button.disabled = true;
   button.textContent = "Confirmando...";
   try {
     const result = await api(`/captures/${state.captureDraft.id}/confirm`, {
       method: "POST",
-      body: JSON.stringify({ items }),
+      body: JSON.stringify({ items, confirmed_large_amount: largeConfirmation.confirmed }),
     });
     closeCapturePreview();
     document.querySelector("#capture-form").reset();
@@ -1294,6 +1305,9 @@ document.querySelector("#transaction-form").addEventListener("submit", async (ev
     const payload = formJson(event.target, ["amount"]);
     if (payload.category_id === "__other__") payload.category_id = null;
     else payload.category_name = null;
+    const largeConfirmation = confirmLargeTransactions([{ ...payload, kind: "transaction" }]);
+    if (!largeConfirmation.allowed) return toast("Lançamento cancelado; use o Consultor para simulações", true);
+    payload.confirmed_large_amount = largeConfirmation.confirmed;
     await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
     const month = payload.booked_at.slice(0, 7);
     event.target.reset();
