@@ -30,9 +30,9 @@ MOVEMENT_LABELS = {
 }
 
 MONEY_PATTERN = re.compile(
-    r"(?P<prefix>R\$\s*)?"
-    r"(?P<number>\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
-    r"\s*(?P<suffix>MIL|K|REAIS?)?",
+    r"(?<!\d)(?P<prefix>R\$\s*)?"
+    r"(?P<number>\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
+    r"\s*(?P<suffix>MIL|K|REAIS?)?(?!\d)",
     re.IGNORECASE,
 )
 FULL_DATE_PATTERN = re.compile(r"\b(\d{2}/\d{2}/(?:\d{2}|\d{4}))\b")
@@ -43,7 +43,22 @@ class CaptureParseError(ValueError):
     pass
 
 
-def _money_candidates(text: str) -> list[tuple[Decimal, int, int, str]]:
+def _is_shorthand_amount(text: str, start: int, end: int) -> bool:
+    before = text[:start].strip(" -:;")
+    after = text[end:].strip(" -:;")
+    if bool(before) == bool(after):
+        return False
+    description = after or before
+    words = normalize_description(description).split()
+    if not words or len(normalize_description(text).split()) > 8:
+        return False
+    timing_words = {"DIA", "HOJE", "ONTEM", "ANTEONTEM"}
+    return any(word not in timing_words and not word.isdigit() for word in words)
+
+
+def _money_candidates(
+    text: str, *, allow_shorthand: bool = False
+) -> list[tuple[Decimal, int, int, str]]:
     results: list[tuple[Decimal, int, int, str]] = []
     for match in MONEY_PATTERN.finditer(text):
         prefix = match.group("prefix")
@@ -54,7 +69,7 @@ def _money_candidates(text: str) -> list[tuple[Decimal, int, int, str]]:
             continue
         if not prefix and not suffix:
             context = normalize_description(text[max(0, match.start() - 45) : match.end() + 30])
-            if not any(
+            has_financial_context = any(
                 word in context
                 for word in (
                     "GASTEI",
@@ -74,6 +89,9 @@ def _money_candidates(text: str) -> list[tuple[Decimal, int, int, str]]:
                     "CUSTOU",
                     "CUSTA",
                 )
+            )
+            if not has_financial_context and not (
+                allow_shorthand and _is_shorthand_amount(text, match.start(), match.end())
             ):
                 continue
         try:
@@ -148,7 +166,7 @@ def _date_near_label(text: str, label: str, reference: date) -> date:
 
 def _movement_type(text: str) -> str:
     normalized = normalize_description(text)
-    if re.search(r"\b(INVESTI|APLIQUEI|APLICACAO|APLICAR)\b", normalized):
+    if re.search(r"\b(INVESTI|INVESTIMENTO|APLIQUEI|APLICACAO|APLICAR)\b", normalized):
         return "investment"
     if re.search(r"\b(RESGATEI|RESGATE|RETIREI DO INVESTIMENTO)\b", normalized):
         return "redemption"
@@ -174,7 +192,7 @@ def _category_for_text(text: str, amount: Decimal, movement_type: str) -> tuple[
 def parse_text_capture(text: str, reference: date | None = None) -> dict:
     reference = reference or date.today()
     cleaned = " ".join(text.split())
-    candidates = _money_candidates(cleaned)
+    candidates = _money_candidates(cleaned, allow_shorthand=True)
     if not candidates:
         raise CaptureParseError("Não encontrei um valor. Exemplo: ‘Gastei R$ 150 com combustível’. ")
     movement_type = _movement_type(cleaned)

@@ -31,6 +31,28 @@ def test_natural_language_purchase_accepts_bare_amount_after_object() -> None:
     assert item["movement_type"] == "expense"
 
 
+def test_short_message_accepts_amount_before_category() -> None:
+    item = parse_text_capture(
+        "1000 mercado",
+        reference=date(2026, 8, 25),
+    )
+    assert item["amount"] == 1000.0
+    assert item["movement_type"] == "expense"
+    assert item["category_name"] == "Mercado e itens domésticos"
+    assert item["confidence"] >= 0.9
+
+
+def test_short_message_supports_decimal_and_investment_nature() -> None:
+    pharmacy = parse_text_capture("89,90 farmácia", reference=date(2026, 8, 25))
+    assert pharmacy["amount"] == 89.9
+    assert pharmacy["category_name"] == "Saúde e farmácia"
+
+    investment = parse_text_capture("500 investimento", reference=date(2026, 8, 25))
+    assert investment["amount"] == 500.0
+    assert investment["movement_type"] == "investment"
+    assert investment["category_name"] == "Transferência patrimonial"
+
+
 def test_natural_language_investment_is_not_classified_as_spending() -> None:
     item = parse_text_capture(
         "Investi 500 reais no Privilège DI hoje",
