@@ -373,7 +373,7 @@ def _advisor_month(message: str) -> date:
 
 def _advisor_amount(message: str) -> Decimal | None:
     lowered = message.lower()
-    number = r"(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)"
+    number = r"(\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)(?!\d)"
     patterns = (
         rf"(?:custa|custando|valor(?:\s+de)?|compra(?:\s+de)?|pagar)\s*(?:r\$\s*)?{number}\s*(mil|k)?",
         rf"(?:comprar|compra|adquirir).{{0,80}}?\b(?:por|de|custa|custando|valor(?:\s+de)?)\s*(?:r\$\s*)?{number}\s*(mil|k)?",
@@ -2128,6 +2128,29 @@ def _advisor_commitment_appendix(schedule: list[dict]) -> str:
     return "Cronograma dos próximos meses já considerado no cálculo:\n" + "\n".join(lines)
 
 
+def _advisor_purchase_reflection_appendix(status_name: str) -> str:
+    if status_name == "not_recommended":
+        opening = (
+            "Pelo caixa, a resposta já é não por enquanto. Mesmo quando houver folga, "
+            "não transforme capacidade de pagamento em justificativa automática para comprar."
+        )
+    else:
+        opening = (
+            "Caber matematicamente no orçamento não significa que a compra vale a pena. "
+            "Antes de decidir, responda com honestidade:"
+        )
+    return (
+        f"Compra consciente:\n{opening}\n"
+        "- Necessidade: isso resolve um problema real agora ou é vontade do momento?\n"
+        "- Uso: quantas vezes você realmente usará nos próximos 12 meses?\n"
+        "- Alternativa: quanto custaria alugar, contratar o serviço ou comprar usado?\n"
+        "- Custo total: haverá manutenção, combustível, armazenamento ou perda de valor?\n"
+        "- Impulso: se não for urgente, espere 72 horas e refaça a pergunta.\n"
+        "Se o uso for ocasional ou a alternativa custar menos, a recomendação é não comprar, "
+        "mesmo que o saldo permita."
+    )
+
+
 @router.get("/cut-plan")
 def cut_plan(
     month: str | None = None,
@@ -2311,6 +2334,7 @@ def advisor_chat(
     metrics: dict[str, object] = {"month": selected_month}
     evidence: list[str] = []
     schedule_appendix = ""
+    reflection_appendix = ""
     assumptions = [
         "A reserva investida não é tratada como renda disponível",
         "Dados ainda não lançados não entram na análise",
@@ -2431,7 +2455,7 @@ def advisor_chat(
                         f"abaixo da reserva mínima em {_brl(abs(projection_margin_after))}. "
                         f"Restariam {_brl(remaining_after)} no teto após o primeiro impacto.{next_note}"
                     )
-                elif monthly_impact > remaining_before * Decimal("0.50") or projection_margin_after < total_cost:
+                elif monthly_impact >= remaining_before * Decimal("0.50") or projection_margin_after < total_cost:
                     status_name = "caution"
                     answer = (
                         f"A compra de {_brl(purchase_amount)} {payment_note} cabe matematicamente, "
@@ -2448,6 +2472,7 @@ def advisor_chat(
                         f"reserva mínima por {_brl(projection_margin_after)}.{next_note}"
                     )
                 answer += " A análise não inclui gastos que ainda não foram lançados."
+                reflection_appendix = _advisor_purchase_reflection_appendix(status_name)
                 metrics.update(
                     {
                         "purchase_amount": decimal_value(purchase_amount),
@@ -2614,8 +2639,9 @@ def advisor_chat(
             provider = "codex"
             provider_model = candidate.get("model")
 
-    if schedule_appendix:
-        answer = f"{answer.rstrip()}\n\n{schedule_appendix}"
+    appendices = [item for item in (reflection_appendix, schedule_appendix) if item]
+    if appendices:
+        answer = f"{answer.rstrip()}\n\n" + "\n\n".join(appendices)
 
     audit(
         db,
