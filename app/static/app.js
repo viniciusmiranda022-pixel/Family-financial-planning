@@ -4,18 +4,21 @@ const state = {
   categories: [],
   forecast: [],
   forecastFloor: 0,
+  report: null,
   captureDraft: null,
   captureAudio: null,
   captureRecorder: null,
   advisorHistory: [],
 };
 const money = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+const compactMoney = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", notation: "compact", maximumFractionDigits: 1 });
 const dateFormat = new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" });
 const monthFormat = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
 const accountTypeLabels = { checking: "Conta corrente", credit_card: "Cartão de crédito", investment: "Investimento", cash: "Dinheiro", other: "Outros" };
 const systemCategories = new Set(["Conciliação", "Transferência patrimonial", "Transferência interna", "Repasses a confirmar", "Reembolsos e estornos", "Receitas", "Revisar"]);
 const pageNames = {
   dashboard: "Visão geral",
+  reports: "Relatórios e análises",
   capture: "Lançar agora",
   imports: "Importações",
   transactions: "Lançamentos",
@@ -136,6 +139,7 @@ async function navigate(view) {
   document.querySelector("#page-title").textContent = pageNames[view];
   const loaders = {
     dashboard: loadDashboard,
+    reports: loadReports,
     capture: loadCapture,
     imports: loadImports,
     transactions: loadTransactions,
@@ -197,14 +201,84 @@ function monthLabel(month) {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
+function shortMonthLabel(month) {
+  const [name, year] = monthLabel(month).split(" de ");
+  return `${name.slice(0, 3)}/${String(year).slice(-2)}`;
+}
+
+function safeColor(value) {
+  return /^#[0-9a-f]{6}$/i.test(String(value || "")) ? value : "#64748B";
+}
+
+function changeBadge(value) {
+  if (value === null || value === undefined) return { label: "Sem comparação", tone: "neutral" };
+  if (Math.abs(value) < 0.01) return { label: "Estável", tone: "neutral" };
+  const direction = value > 0 ? "↑" : "↓";
+  return {
+    label: `${direction} ${Math.abs(value).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% vs mês anterior`,
+    tone: value > 0 ? "bad" : "good",
+  };
+}
+
+function setTrendBadge(element, value) {
+  const badge = changeBadge(value);
+  element.textContent = badge.label;
+  element.className = `trend-badge ${badge.tone}`;
+}
+
+function renderTrendChart(container, rows, compact = false) {
+  if (!rows.length || !rows.some((item) => item.transaction_count > 0)) {
+    container.innerHTML = '<div class="empty chart-empty">Ainda não há meses suficientes para desenhar a evolução.</div>';
+    return;
+  }
+  const width = 760;
+  const height = compact ? 190 : 260;
+  const padding = { top: 22, right: 20, bottom: 38, left: compact ? 18 : 64 };
+  const values = rows.flatMap((item) => [Number(item.spending || 0), Number(item.cash_cap || 0)]);
+  const max = Math.max(...values, 1) * 1.12;
+  const usableWidth = width - padding.left - padding.right;
+  const usableHeight = height - padding.top - padding.bottom;
+  const x = (index) => padding.left + (rows.length === 1 ? usableWidth / 2 : index * (usableWidth / (rows.length - 1)));
+  const y = (value) => padding.top + usableHeight - (Number(value || 0) / max) * usableHeight;
+  const points = rows.map((item, index) => `${x(index)},${y(item.spending)}`).join(" ");
+  const area = `${padding.left},${padding.top + usableHeight} ${points} ${x(rows.length - 1)},${padding.top + usableHeight}`;
+  const gradientId = `trend-${container.id}`;
+  const grid = [0, .25, .5, .75, 1].map((step) => {
+    const gridY = padding.top + usableHeight * step;
+    const value = max * (1 - step);
+    return `<line x1="${padding.left}" y1="${gridY}" x2="${width - padding.right}" y2="${gridY}" class="chart-grid-line" />${compact ? "" : `<text x="${padding.left - 9}" y="${gridY + 4}" text-anchor="end" class="chart-axis-label">${escapeHtml(compactMoney.format(value))}</text>`}`;
+  }).join("");
+  const cap = rows[rows.length - 1].cash_cap || 0;
+  const capLine = cap > 0 ? `<line x1="${padding.left}" y1="${y(cap)}" x2="${width - padding.right}" y2="${y(cap)}" class="chart-cap-line" />` : "";
+  const labels = rows.map((item, index) => `<text x="${x(index)}" y="${height - 12}" text-anchor="middle" class="chart-month-label">${escapeHtml(shortMonthLabel(item.month))}</text>`).join("");
+  const dots = rows.map((item, index) => `<circle cx="${x(index)}" cy="${y(item.spending)}" r="${compact ? 4 : 5}" class="chart-dot"><title>${escapeHtml(monthLabel(item.month))}: ${escapeHtml(money.format(item.spending))}</title></circle>`).join("");
+  container.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Evolução mensal dos gastos">
+    <defs><linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6C63E8" stop-opacity=".34"/><stop offset="1" stop-color="#6C63E8" stop-opacity=".02"/></linearGradient></defs>
+    ${grid}${capLine}<polygon points="${area}" fill="url(#${gradientId})"/><polyline points="${points}" class="chart-trend-line"/>${dots}${labels}
+  </svg>`;
+}
+
+function renderDashboardPulse(report) {
+  renderTrendChart(document.querySelector("#dashboard-trend-chart"), report.monthly, true);
+  setTrendBadge(document.querySelector("#dashboard-trend-badge"), report.summary.last_change_percentage);
+  const top = report.categories[0];
+  document.querySelector("#dashboard-top-category").textContent = top ? top.category : "Sem dados";
+  document.querySelector("#dashboard-top-category-detail").textContent = top
+    ? `${money.format(top.amount)} • ${top.share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% dos gastos do período`
+    : "Importe lançamentos para formar a análise.";
+  document.querySelector("#dashboard-average-spending").textContent = money.format(report.summary.average_spending);
+  document.querySelector("#dashboard-average-detail").textContent = `${report.covered_months} de ${report.months} meses possuem movimentações.`;
+}
+
 async function loadDashboard() {
   const monthControl = document.querySelector("#dashboard-month");
   if (!monthControl.value) monthControl.value = currentMonthKey();
   const selectedMonth = monthControl.value;
-  const [summary, transactions, cutPlan] = await Promise.all([
+  const [summary, transactions, cutPlan, pulse] = await Promise.all([
     api(`/dashboard?month=${encodeURIComponent(selectedMonth)}`),
     api(`/transactions?limit=8&month=${encodeURIComponent(selectedMonth)}`),
     api(`/cut-plan?month=${encodeURIComponent(selectedMonth)}`),
+    api(`/reports?end_month=${encodeURIComponent(selectedMonth)}&months=6`),
   ]);
   const selectedLabel = monthLabel(summary.month);
   monthControl.value = summary.month;
@@ -235,6 +309,7 @@ async function loadDashboard() {
   percentPill.classList.toggle("over", percent > 100);
   document.querySelector("#budget-used").textContent = `${money.format(summary.spending)} usados`;
   document.querySelector("#budget-total").textContent = `${money.format(summary.cash_cap)} de teto`;
+  renderDashboardPulse(pulse);
   const qualityItems = [
     [summary.review_count === 0, "Fila de revisão", summary.review_count === 0 ? "Sem pendências" : `${summary.review_count} itens`],
     [state.accounts.length > 0, "Contas cadastradas", state.accounts.length ? `${state.accounts.length} fontes` : "Cadastre a primeira"],
@@ -273,6 +348,80 @@ async function loadDashboard() {
   document.querySelector("#recent-transactions").innerHTML = transactions.length ? transactions.map((item) => `
     <tr><td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td><td>${escapeHtml(item.description)}</td><td><span class="status-chip">${escapeHtml(item.category)}</span></td><td>${escapeHtml(item.account)}</td><td class="right ${item.amount < 0 ? "amount-expense" : "amount-income"}">${money.format(item.amount)}</td></tr>
   `).join("") : emptyRow(5);
+}
+
+function reportInsight(icon, label, value, detail, tone = "") {
+  return `<div class="report-insight ${tone}"><span class="report-insight-icon">${escapeHtml(icon)}</span><div><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong><p>${escapeHtml(detail)}</p></div></div>`;
+}
+
+function renderReport(report) {
+  state.report = report;
+  const singleMonth = report.months === 1;
+  const periodText = singleMonth
+    ? monthLabel(report.end_month)
+    : `${monthLabel(report.start_month)} a ${monthLabel(report.end_month)}`;
+  document.querySelector("#report-period-label").textContent = `${periodText} • ${report.covered_months} mês(es) com dados`;
+  document.querySelector("#report-total-spending").textContent = money.format(report.summary.total_spending);
+  document.querySelector("#report-total-caption").textContent = singleMonth ? "No mês escolhido" : `Acumulado em ${report.months} meses`;
+  document.querySelector("#report-average-spending").textContent = money.format(report.summary.average_spending);
+  document.querySelector("#report-total-income").textContent = money.format(report.summary.total_cash_in);
+  const net = document.querySelector("#report-net-cash");
+  net.textContent = money.format(report.summary.cash_net);
+  net.classList.toggle("amount-expense", report.summary.cash_net < 0);
+  net.classList.toggle("amount-income", report.summary.cash_net >= 0);
+  const rate = report.summary.savings_rate;
+  const rateElement = document.querySelector("#report-savings-rate");
+  rateElement.textContent = `${rate.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
+  rateElement.classList.toggle("amount-expense", rate < 0);
+  rateElement.classList.toggle("amount-income", rate >= 0);
+  renderTrendChart(document.querySelector("#report-trend-chart"), report.monthly);
+  setTrendBadge(document.querySelector("#report-change-badge"), report.summary.last_change_percentage);
+
+  const top = report.categories[0];
+  const change = changeBadge(report.summary.last_change_percentage);
+  const insights = [
+    reportInsight("↑", "MÊS DE MAIOR GASTO", monthLabel(report.summary.highest_month), money.format(report.summary.highest_spending), "coral"),
+    reportInsight("↓", "MÊS DE MENOR GASTO", monthLabel(report.summary.lowest_month), money.format(report.summary.lowest_spending), "mint"),
+    reportInsight("◎", "CATEGORIA PRINCIPAL", top ? top.category : "Sem dados", top ? `${money.format(top.amount)} no período` : "Nenhum gasto classificado", "violet"),
+  ];
+  if (!singleMonth) {
+    const changeIcon = report.summary.last_change_percentage === null
+      ? "↔"
+      : report.summary.last_change_percentage > 0 ? "↗" : "↘";
+    insights.push(reportInsight(changeIcon, "ÚLTIMA VARIAÇÃO", change.label, "Comparação entre os dois últimos meses", change.tone));
+  }
+  document.querySelector("#report-insights").innerHTML = insights.join("");
+
+  const maxCategory = Math.max(...report.categories.map((item) => item.amount), 1);
+  document.querySelector("#report-category-ranking").innerHTML = report.categories.length
+    ? report.categories.slice(0, 10).map((item, index) => `<div class="category-rank-item" style="--category-color:${safeColor(item.color)}">
+      <div class="category-rank-heading"><span class="category-rank-number">${index + 1}</span><strong>${escapeHtml(item.category)}</strong><span>${money.format(item.amount)}</span></div>
+      <div class="category-rank-track"><i style="width:${Math.max(3, (item.amount / maxCategory) * 100)}%"></i></div>
+      <small>${item.share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% do período • média ${money.format(item.average)}/mês</small>
+    </div>`).join("")
+    : '<div class="empty compact-empty">Nenhuma categoria de gasto no período.</div>';
+
+  document.querySelector("#report-accounts-table").innerHTML = report.accounts.length
+    ? report.accounts.map((item) => `<tr><td><strong>${escapeHtml(item.account)}</strong></td><td>${escapeHtml(accountTypeLabels[item.account_type] || item.account_type)}</td><td class="right amount-income">${money.format(item.cash_in)}</td><td class="right amount-expense">${money.format(item.cash_out)}</td><td class="right ${item.net < 0 ? "amount-expense" : "amount-income"}">${money.format(item.net)}</td></tr>`).join("")
+    : emptyRow(5, "Nenhum fluxo operacional no período");
+
+  document.querySelector("#report-monthly-table").innerHTML = report.monthly.map((item) => {
+    const variation = item.change_percentage === null
+      ? "—"
+      : `${item.change_percentage > 0 ? "+" : ""}${item.change_percentage.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
+    return `<tr><td><strong>${escapeHtml(monthLabel(item.month))}</strong><br><small>${item.transaction_count} movimentações</small></td><td class="right amount-income">${money.format(item.cash_in)}</td><td class="right amount-expense">${money.format(item.cash_out)}</td><td class="right">${money.format(item.spending)}</td><td class="right ${item.cash_net < 0 ? "amount-expense" : "amount-income"}">${money.format(item.cash_net)}</td><td class="right ${item.remaining_cap < 0 ? "amount-expense" : "amount-income"}">${money.format(item.remaining_cap)}</td><td class="right ${item.change_percentage > 0 ? "amount-expense" : item.change_percentage < 0 ? "amount-income" : ""}">${variation}</td></tr>`;
+  }).join("");
+  document.querySelector("#report-data-quality").textContent = report.duplicates_ignored
+    ? `${report.duplicates_ignored} cópia(s) entre fontes foram desconsideradas; os registros permanecem preservados para auditoria.`
+    : "Nenhuma sobreposição entre fontes foi identificada neste período.";
+}
+
+async function loadReports() {
+  const endControl = document.querySelector("#report-end-month");
+  const monthsControl = document.querySelector("#report-months");
+  if (!endControl.value) endControl.value = document.querySelector("#dashboard-month").value || currentMonthKey();
+  const report = await api(`/reports?end_month=${encodeURIComponent(endControl.value)}&months=${encodeURIComponent(monthsControl.value)}`);
+  renderReport(report);
 }
 
 async function loadImports() {
@@ -979,6 +1128,17 @@ document.querySelector("#dashboard-current-month").addEventListener("click", () 
   document.querySelector("#dashboard-month").value = currentMonthKey();
   loadDashboard();
 });
+document.querySelector("#report-refresh").addEventListener("click", loadReports);
+document.querySelector("#report-end-month").addEventListener("change", loadReports);
+document.querySelector("#report-months").addEventListener("change", loadReports);
+document.querySelector("#report-calendar-year").addEventListener("click", () => {
+  const end = document.querySelector("#report-end-month");
+  const selected = end.value || currentMonthKey();
+  end.value = `${selected.slice(0, 4)}-12`;
+  document.querySelector("#report-months").value = "12";
+  loadReports();
+});
+document.querySelector("#report-print").addEventListener("click", () => window.print());
 document.querySelector("#refresh-transactions").addEventListener("click", loadTransactions);
 document.querySelector("#refresh-forecast").addEventListener("click", loadForecast);
 document.querySelector("#transaction-movement-type").addEventListener("change", updateManualTransactionFields);
