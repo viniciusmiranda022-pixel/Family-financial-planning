@@ -13,9 +13,9 @@ os.environ.setdefault("DATA_DIR", f"/tmp/ffp-plan-data-{uuid.uuid4().hex}")
 os.environ.setdefault("SECRET_KEY", "plan-import-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
-from app.api import _future_installments  # noqa: E402
+from app.api import _forecast_obligations, _future_installments  # noqa: E402
 from app.db import Base  # noqa: E402
-from app.models import Household, Transaction  # noqa: E402
+from app.models import Household, Obligation, Transaction  # noqa: E402
 from app.services.plan_workbook import import_plan_data, parse_plan_workbook  # noqa: E402
 
 
@@ -130,10 +130,10 @@ def _minimal_plan(path) -> None:
         ]
     )
     card.append(
-        [date(2026, 7, 8), "2026-07", date(2026, 6, 1), "KELLY (final 1234)", "Família", "Loja 01/03", 100, "Compras, casa e vestuário", "Discricionário", True, 1, 3]
+        [date(2026, 7, 8), "2026-07", date(2026, 6, 1), "KELLY (final 1234)", "Família", "Loja 01/05", 100, "Compras, casa e vestuário", "Discricionário", True, 1, 5]
     )
     card.append(
-        [date(2026, 8, 8), "2026-08", date(2026, 6, 1), "KELLY (final 1234)", "Família", "Loja 02/03", 100, "Compras, casa e vestuário", "Discricionário", True, 2, 3]
+        [date(2026, 8, 8), "2026-08", date(2026, 6, 1), "KELLY (final 1234)", "Família", "Loja 02/05", 100, "Compras, casa e vestuário", "Discricionário", True, 2, 5]
     )
 
     nubank = workbook["Nubank - Dados"]
@@ -186,4 +186,13 @@ def test_workbook_load_is_idempotent_and_installments_are_not_repeated(tmp_path)
         db.commit()
         assert second.created["transactions"] == 0
         assert db.scalar(select(func.count(Transaction.id))) == 3
-        assert _future_installments(db, household.id) == {"2026-09": Decimal("100.00")}
+        assert _future_installments(db, household.id) == {
+            "2026-09": Decimal("100.00"),
+            "2026-10": Decimal("100.00"),
+            "2026-11": Decimal("100.00"),
+        }
+        obligations = list(db.scalars(select(Obligation)).all())
+        assert _forecast_obligations(obligations) == {
+            "2026-09": Decimal("1500.00"),
+            "2026-10": Decimal("11500.00"),
+        }

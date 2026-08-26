@@ -151,7 +151,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             b"2026-07-31,iFood - NuPay,33.40\n"
             b"2026-08-04,iFood - NuPay,44.88\n"
             b"2026-08-03,Pagamento recebido,-1724.90\n"
-            b"2026-08-02,Spotify,31.90\n"
+            b"2026-08-02,Spotify 1/4,31.90\n"
         )
         upload = client.post(
             "/api/imports",
@@ -279,6 +279,9 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
 
         forecast = client.get("/api/forecast").json()
         by_month = {row["month"]: row for row in forecast["rows"]}
+        assert by_month["2026-09"]["installments"] == 31.9
+        assert by_month["2026-10"]["installments"] == 31.9
+        assert by_month["2026-11"]["installments"] == 31.9
         assert by_month["2027-03"]["commission_delayed"] == 9400.0
 
         restaurant_category = next(
@@ -505,6 +508,14 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert advisor_installments.status_code == 200
         assert advisor_installments.json()["intent"] == "purchase"
         assert advisor_installments.json()["metrics"]["payment"]["installments"] == 10
+        assert advisor_installments.json()["metrics"]["card_installments_in_projection"] == 95.7
+        assert "Outubro de 2026: cartões R$ 31,90" in advisor_installments.json()["answer"]
+        advisor_cuts = client.post(
+            "/api/advisor/chat",
+            json={"message": "Onde posso economizar?"},
+        )
+        assert advisor_cuts.status_code == 200
+        assert advisor_cuts.json()["intent"] == "cuts"
         assert client.delete(
             f"/api/transactions/{custom_expense.json()['id']}"
         ).status_code == 200
@@ -546,6 +557,15 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         ).json()
         assert advisor_obligations["intent"] == "obligations"
         assert "Conta próxima" in advisor_obligations["answer"]
+        schedule = {
+            item["month"]: item
+            for item in advisor_obligations["metrics"]["commitment_schedule"]
+        }
+        assert schedule["2026-10"]["card_installments"] == 31.9
+        assert schedule["2026-12"]["obligations"] == 1000
+        assert "Dezembro de 2026: cartões R$ 0,00 + obrigações R$ 1.000,00" in (
+            advisor_obligations["answer"]
+        )
         assert client.delete(f"/api/obligations/{obligation.json()['id']}").status_code == 200
         assert client.delete(
             f"/api/obligations/{alert_obligation.json()['id']}"

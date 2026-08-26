@@ -345,6 +345,21 @@ MONTHS_PT = {
     "DEZEMBRO": 12,
 }
 
+MONTH_LABELS_PT = {
+    1: "Janeiro",
+    2: "Fevereiro",
+    3: "Março",
+    4: "Abril",
+    5: "Maio",
+    6: "Junho",
+    7: "Julho",
+    8: "Agosto",
+    9: "Setembro",
+    10: "Outubro",
+    11: "Novembro",
+    12: "Dezembro",
+}
+
 
 def _advisor_month(message: str) -> date:
     normalized = normalize_description(message)
@@ -453,7 +468,7 @@ def _advisor_conversation_message(payload: AdvisorRequest) -> str:
         candidate = normalize_description(item.content)
         if item.role == "user" and any(
             word in candidate.split()
-            for word in {"COMPRA", "COMPRAR", "CUSTA", "POSSO", "ADQUIRIR"}
+            for word in {"COMPRA", "COMPRAR", "CUSTA", "ADQUIRIR"}
         ):
             return f"{item.content}. {current}"
     return current
@@ -2083,6 +2098,36 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
     }
 
 
+def _advisor_commitment_schedule(forecast_data: dict, months: int = 6) -> list[dict]:
+    schedule = []
+    for row in forecast_data.get("rows", [])[:months]:
+        installments = money(row.get("installments", 0))
+        obligations = money(row.get("obligations", 0))
+        schedule.append(
+            {
+                "month": row["month"],
+                "card_installments": decimal_value(installments),
+                "obligations": decimal_value(obligations),
+                "total": decimal_value(money(installments + obligations)),
+            }
+        )
+    return schedule
+
+
+def _advisor_commitment_appendix(schedule: list[dict]) -> str:
+    if not schedule:
+        return ""
+    lines = []
+    for row in schedule:
+        year, month = (int(value) for value in row["month"].split("-"))
+        lines.append(
+            f"- {MONTH_LABELS_PT[month]} de {year}: cartões "
+            f"{_brl(row['card_installments'])} + obrigações "
+            f"{_brl(row['obligations'])} = {_brl(row['total'])}"
+        )
+    return "Cronograma dos próximos meses já considerado no cálculo:\n" + "\n".join(lines)
+
+
 @router.get("/cut-plan")
 def cut_plan(
     month: str | None = None,
@@ -2265,13 +2310,14 @@ def advisor_chat(
     status_name = "informative"
     metrics: dict[str, object] = {"month": selected_month}
     evidence: list[str] = []
+    schedule_appendix = ""
     assumptions = [
         "A reserva investida não é tratada como renda disponível",
         "Dados ainda não lançados não entram na análise",
         "O sistema não consulta o saldo atual do internet banking",
     ]
 
-    purchase_words = {"COMPRA", "COMPRAR", "CUSTA", "POSSO", "ADQUIRIR"}
+    purchase_words = {"COMPRA", "COMPRAR", "CUSTA", "ADQUIRIR"}
     if any(word in normalized.split() for word in purchase_words):
         intent = "purchase"
         purchase_amount = _advisor_amount(conversation_message)
@@ -2296,6 +2342,26 @@ def advisor_chat(
                 status_name = "insufficient_data"
             else:
                 forecast_data = forecast(user=user, db=db)
+                commitment_schedule = _advisor_commitment_schedule(forecast_data)
+                schedule_appendix = _advisor_commitment_appendix(commitment_schedule)
+                card_installments_projected = money(
+                    sum(
+                        (
+                            Decimal(str(row["installments"]))
+                            for row in forecast_data["rows"]
+                        ),
+                        Decimal("0"),
+                    )
+                )
+                obligations_projected = money(
+                    sum(
+                        (
+                            Decimal(str(row["obligations"]))
+                            for row in forecast_data["rows"]
+                        ),
+                        Decimal("0"),
+                    )
+                )
                 remaining_before = Decimal(str(summary["remaining_cap"]))
                 monthly_impact = Decimal(str(payment["monthly_payment"]))
                 total_cost = Decimal(str(payment["total_cost"]))
@@ -2391,6 +2457,11 @@ def advisor_chat(
                         "projection_margin_before": decimal_value(projection_margin),
                         "projection_margin_after": decimal_value(projection_margin_after),
                         "obligations_next_180_days": decimal_value(upcoming_total),
+                        "card_installments_in_projection": decimal_value(
+                            card_installments_projected
+                        ),
+                        "obligations_in_projection": decimal_value(obligations_projected),
+                        "commitment_schedule": commitment_schedule,
                     }
                 )
                 evidence = [
@@ -2399,9 +2470,40 @@ def advisor_chat(
                     f"Impacto mensal da compra: {_brl(monthly_impact)}",
                     f"Margem conservadora após compromissos: {_brl(projection_margin_after)}",
                     f"Obrigações cadastradas nos próximos 180 dias: {_brl(upcoming_total)}",
+                    f"Parcelas futuras dos cartões na projeção: {_brl(card_installments_projected)}",
                 ]
     elif any(word in normalized for word in ("OBRIGAC", "VENCIMENTO", "VENCE", "PARCELA")):
         intent = "obligations"
+        forecast_data = forecast(user=user, db=db)
+        commitment_schedule = _advisor_commitment_schedule(forecast_data)
+        schedule_appendix = _advisor_commitment_appendix(commitment_schedule)
+        metrics.update(
+            {
+                "commitment_schedule": commitment_schedule,
+                "card_installments_in_projection": decimal_value(
+                    money(
+                        sum(
+                            (
+                                Decimal(str(row["installments"]))
+                                for row in forecast_data["rows"]
+                            ),
+                            Decimal("0"),
+                        )
+                    )
+                ),
+                "obligations_in_projection": decimal_value(
+                    money(
+                        sum(
+                            (
+                                Decimal(str(row["obligations"]))
+                                for row in forecast_data["rows"]
+                            ),
+                            Decimal("0"),
+                        )
+                    )
+                ),
+            }
+        )
         items = _obligation_rows(db, user.household_id)
         upcoming = [item for item in items if item["days_until_due"] >= 0][:5]
         if upcoming:
@@ -2511,6 +2613,9 @@ def advisor_chat(
             assumptions = [str(item) for item in candidate.get("assumptions", assumptions)][:6]
             provider = "codex"
             provider_model = candidate.get("model")
+
+    if schedule_appendix:
+        answer = f"{answer.rstrip()}\n\n{schedule_appendix}"
 
     audit(
         db,
