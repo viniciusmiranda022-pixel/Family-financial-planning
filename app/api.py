@@ -2591,6 +2591,158 @@ def dashboard(
     }
 
 
+@router.get("/reports")
+def reports(
+    end_month: str | None = None,
+    months: int = 6,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Build an auditable comparison for one to twelve consecutive months."""
+    if months < 1 or months > 12:
+        raise HTTPException(status_code=422, detail="O período deve ter entre 1 e 12 meses")
+
+    profile = profile_for(db, user.household_id)
+    last_month = _month_start(end_month)
+    start = add_months(last_month, -(months - 1))
+    end = add_months(last_month, 1)
+    expense_rows, duplicates_ignored = _consolidated_expenses(
+        db, user.household_id, start, end
+    )
+    movement_rows, _ignored_movements = _consolidated_transactions(
+        db, user.household_id, start, end
+    )
+
+    month_rows: dict[str, dict[str, object]] = {}
+    for offset in range(months):
+        current = add_months(start, offset)
+        key = month_key(current)
+        month_rows[key] = {
+            "month": key,
+            "spending": Decimal("0"),
+            "cash_in": Decimal("0"),
+            "cash_out": Decimal("0"),
+            "cash_net": Decimal("0"),
+            "cash_cap": money(profile.monthly_cash_cap),
+            "remaining_cap": money(profile.monthly_cash_cap),
+            "transaction_count": 0,
+        }
+
+    category_totals: dict[str, Decimal] = {}
+    for transaction, category_name in expense_rows:
+        key = month_key(transaction.booked_at.replace(day=1))
+        amount = max(Decimal("0"), -Decimal(transaction.amount))
+        month_rows[key]["spending"] += amount
+        category_totals[category_name] = category_totals.get(category_name, Decimal("0")) + amount
+
+    movements_by_month: dict[str, list[tuple[Transaction, str]]] = {
+        key: [] for key in month_rows
+    }
+    for transaction, category_name in movement_rows:
+        key = month_key(transaction.booked_at.replace(day=1))
+        if key in movements_by_month:
+            movements_by_month[key].append((transaction, category_name))
+            month_rows[key]["transaction_count"] += 1
+
+    serialized_months = []
+    previous_active_spending: Decimal | None = None
+    for key, item in month_rows.items():
+        flow = _operational_cash_flow(movements_by_month[key])
+        spending = money(item["spending"])
+        cash_in = money(flow["cash_in"])
+        cash_out = money(flow["cash_out"])
+        cash_net = money(cash_in - cash_out)
+        change_percentage = None
+        if item["transaction_count"] > 0 and previous_active_spending is not None and previous_active_spending > 0:
+            change_percentage = float(
+                money(
+                    ((spending - previous_active_spending) / previous_active_spending)
+                    * Decimal("100")
+                )
+            )
+        serialized_months.append(
+            {
+                "month": key,
+                "spending": decimal_value(spending),
+                "cash_in": decimal_value(cash_in),
+                "cash_out": decimal_value(cash_out),
+                "cash_net": decimal_value(cash_net),
+                "cash_cap": decimal_value(profile.monthly_cash_cap),
+                "remaining_cap": decimal_value(money(profile.monthly_cash_cap - spending)),
+                "transaction_count": int(item["transaction_count"]),
+                "change_percentage": change_percentage,
+            }
+        )
+        if item["transaction_count"] > 0:
+            previous_active_spending = spending
+
+    total_spending = money(
+        sum((Decimal(str(item["spending"])) for item in serialized_months), Decimal("0"))
+    )
+    total_cash_in = money(
+        sum((Decimal(str(item["cash_in"])) for item in serialized_months), Decimal("0"))
+    )
+    total_cash_out = money(
+        sum((Decimal(str(item["cash_out"])) for item in serialized_months), Decimal("0"))
+    )
+    covered_months = sum(item["transaction_count"] > 0 for item in serialized_months)
+    average_denominator = Decimal(max(1, covered_months))
+    average_spending = money(total_spending / average_denominator)
+    activity_rows = [item for item in serialized_months if item["transaction_count"] > 0]
+    comparison_rows = activity_rows or serialized_months
+    highest_month = max(comparison_rows, key=lambda item: item["spending"])
+    lowest_month = min(comparison_rows, key=lambda item: item["spending"])
+    category_colors = {
+        item.name: item.color
+        for item in db.scalars(
+            select(Category).where(Category.household_id == user.household_id)
+        ).all()
+    }
+    categories = [
+        {
+            "category": name,
+            "amount": decimal_value(money(amount)),
+            "average": decimal_value(money(amount / average_denominator)),
+            "share": float(money((amount / total_spending) * Decimal("100")))
+            if total_spending > 0
+            else 0,
+            "color": category_colors.get(name, "#64748B"),
+        }
+        for name, amount in sorted(category_totals.items(), key=lambda item: item[1], reverse=True)
+        if amount > 0
+    ]
+    last_change = activity_rows[-1]["change_percentage"] if months > 1 and activity_rows else None
+    operational = _operational_cash_flow(movement_rows)
+    savings_rate = (
+        money(((total_cash_in - total_cash_out) / total_cash_in) * Decimal("100"))
+        if total_cash_in > 0
+        else Decimal("0")
+    )
+    return {
+        "start_month": month_key(start),
+        "end_month": month_key(last_month),
+        "months": months,
+        "covered_months": covered_months,
+        "duplicates_ignored": duplicates_ignored,
+        "summary": {
+            "total_spending": decimal_value(total_spending),
+            "average_spending": decimal_value(average_spending),
+            "total_cash_in": decimal_value(total_cash_in),
+            "total_cash_out": decimal_value(total_cash_out),
+            "cash_net": decimal_value(money(total_cash_in - total_cash_out)),
+            "savings_rate": decimal_value(savings_rate),
+            "highest_month": highest_month["month"],
+            "highest_spending": highest_month["spending"],
+            "lowest_month": lowest_month["month"],
+            "lowest_spending": lowest_month["spending"],
+            "last_change_percentage": last_change,
+        },
+        "monthly": serialized_months,
+        "categories": categories,
+        "accounts": operational["accounts"],
+    }
+
+
 @router.get("/advisor/status")
 def advisor_status(user: User = Depends(get_current_user)) -> dict:
     del user
