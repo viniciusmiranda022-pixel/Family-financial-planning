@@ -54,10 +54,14 @@
 - Mercado pago em dinheiro pode ter teto zero quando a estratégia é usar VA/VR.
 - O potencial de economia é uma meta operacional; não é tratado como renda na projeção.
 
-## Investimento DI
+## Conta central de liquidez — Privilège DI
 
-- Todo o saldo permanece em uma única aplicação.
-- O saldo mínimo é meta de segurança, não uma separação bancária.
+- O Privilège DI funciona como o caixa central da família, embora tecnicamente seja uma aplicação.
+- A sobra operacional do mês é destinada a essa conta; quando as receitas não cobrem as saídas, o déficit é retirado dela.
+- Aplicações e resgates são movimentos patrimoniais e não viram receita, despesa ou consumo do teto.
+- Todo o saldo permanece em uma única conta de liquidez.
+- O saldo mínimo é um piso de segurança, não uma separação bancária nem um bloqueio de todo o saldo.
+- A margem livre é o saldo do Privilège DI menos o piso de segurança; se for negativa, o sistema deve mostrar quanto falta recompor.
 - A taxa líquida mensal estimada é calculada a partir do retorno bruto anual e do IR conservador.
 - O rendimento mensal incide sobre o saldo inicial positivo do mês.
 - Entradas do mês começam a influenciar o rendimento no mês seguinte.
@@ -83,4 +87,4 @@ saldo anterior
 - teto de gastos em dinheiro
 ```
 
-Viabilidade significa que o menor saldo do cenário conservador permanece maior ou igual ao saldo mínimo configurado.
+Viabilidade significa que o menor saldo projetado do Privilège DI no cenário conservador permanece maior ou igual ao piso de segurança configurado.
