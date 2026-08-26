@@ -267,6 +267,20 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert july_dashboard.json()["spending"] == 33.4
         assert july_dashboard.json()["review_count"] == 1
         assert client.get("/api/dashboard?month=07-2026").status_code == 422
+        report = client.get("/api/reports?end_month=2026-08&months=2")
+        assert report.status_code == 200
+        report_data = report.json()
+        assert report_data["start_month"] == "2026-07"
+        assert report_data["end_month"] == "2026-08"
+        assert report_data["months"] == 2
+        assert [item["month"] for item in report_data["monthly"]] == ["2026-07", "2026-08"]
+        assert report_data["monthly"][0]["spending"] == 33.4
+        assert report_data["monthly"][1]["spending"] == 76.78
+        assert report_data["summary"]["total_spending"] == 110.18
+        assert report_data["summary"]["average_spending"] == 55.09
+        assert report_data["summary"]["highest_month"] == "2026-08"
+        assert report_data["categories"][0]["amount"] > 0
+        assert client.get("/api/reports?months=13").status_code == 422
         july_cuts = client.get("/api/cut-plan?month=2026-07").json()
         assert july_cuts["covered_months"] == 1
         assert july_cuts["potential_monthly_savings"] == 8.35
