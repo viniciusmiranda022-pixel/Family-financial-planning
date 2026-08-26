@@ -853,7 +853,7 @@ async function askAdvisor(message) {
     loading.textContent = error.message;
     loading.className = "advisor-message assistant error";
   }
-  loading.scrollIntoView({ behavior: "smooth", block: "end" });
+  loading.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function loadUsers() {
