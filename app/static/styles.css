@@ -234,6 +234,7 @@ tr:last-child td { border-bottom: 0; }
 .advisor-section-heading h4 { margin: 0; color: var(--navy); font-size: 14px; }
 .advisor-section-heading small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }
 .advisor-section-icon { display: grid; place-items: center; width: 24px; height: 24px; flex: 0 0 24px; border-radius: 7px; color: white; background: var(--amber); font-weight: 900; }
+.advisor-section-icon.proportional { background: var(--green); }
 .advisor-section-icon.calendar { background: var(--teal); }
 .advisor-reflection-intro { margin: 0 0 12px; color: #60420f; line-height: 1.55; }
 .advisor-question-list { display: grid; gap: 7px; }
