@@ -52,6 +52,7 @@ class IntegrityRunTrigger(StrEnum):
     CLOSE = "close"
     BACKFILL = "backfill"
     SYSTEM = "system"
+    SNAPSHOT = "snapshot"
 
 
 class ConsolidatedIntegrityStatus(StrEnum):
