@@ -100,6 +100,35 @@
 - O Codex não participa do cálculo do score, status, finding determinístico ou gate de confiança.
 - A interface permanece oculta por padrão em `INTEGRITY_UI_ENABLED=false` até a etapa dedicada de UX.
 
+## Reconciliação, duplicidades e anomalias
+
+- Todo parser financeiro produz um `ParsedDocument` versionado. Um arquivo tabular sem nenhum
+  lançamento reconhecido é rejeitado; zero linhas nunca é tratado como importação válida.
+- Extrato reconciliado exige `saldo inicial + créditos - débitos = saldo final declarado`, com
+  tolerância de R$ 0,01. Fatura exige `saldo anterior + compras + encargos - créditos - pagamentos =
+  total declarado`. Holerite exige `bruto - descontos = líquido declarado`.
+- A ausência de qualquer componente obrigatório produz `unknown`; o sistema não inventa saldo,
+  total, competência ou data efetiva para fazer um documento fechar.
+- Observações de saldo são imutáveis. Uma correção cria nova observação, aponta `supersedes_id` e
+  invalida a anterior com usuário, data e justificativa; nenhuma linha histórica é apagada.
+- Duplicidades são agrupadas sem remover lançamentos. Sinais ponderados geram bandas `low`,
+  `probable` e `strong`; a banda provável permanece incluída até decisão humana. Evidência forte
+  pode aplicar precedência canônica persistida, mantendo a cópia de suporte auditável e excluída
+  apenas dos totais derivados.
+- A precedência de fonte é: planilha financeira consolidada (100), lançamento manual confirmado
+  (90), documento financeiro (70), captura confirmada (60) e legado/desconhecido (50).
+- Resolver um grupo como `distinct` ou `duplicate` é uma ação humana com justificativa. Uma nova
+  ocorrência compatível reabre o grupo para revisão sem apagar a resolução anterior, preservada
+  nos sinais do grupo.
+- Regras locais de classificação precisam de três correções confirmadas e distintas para chegar a
+  `pending_acceptance`; somente um administrador pode ativá-las. A ativação vale para classificações
+  futuras e nunca recategoriza o histórico silenciosamente.
+- A primeira baseline de anomalias usa somente meses explicitamente reconciliados e exige três
+  competências distintas. O limite é `mediana + máximo(3 × MAD, 50% da mediana)`. Amostra
+  insuficiente resulta em `unknown`, não em alerta inventado.
+- Codex/Advisor não calcula reconciliação, confiança de duplicidade, baseline, status canônico ou
+  decisão de exclusão; esses resultados permanecem determinísticos e auditáveis.
+
 ## Projeções
 
 O sistema produz três cenários:

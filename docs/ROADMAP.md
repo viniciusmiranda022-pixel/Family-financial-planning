@@ -54,7 +54,13 @@
 - runs e findings persistentes com fingerprint, score explicado, status, gates específicos e
   trilha before/after/reason/trace;
 - APIs autenticadas de execução e consulta, ainda sem habilitar a interface de Integridade;
-- próximos incrementos: reconciliação, snapshot canônico, validador de
+- contrato `ParsedDocument`, reconciliação determinística de documentos e observações imutáveis de
+  saldo implementados no incremento de reconciliação;
+- grupos persistentes de duplicidade com precedência de fonte, resolução explícita e nenhuma
+  limpeza destrutiva;
+- primeira baseline robusta de anomalias restrita a meses reconciliados e aprendizado local que
+  exige três confirmações mais aceite administrativo;
+- próximos incrementos: snapshot canônico, validador de
   projeção, auditor Codex, UI de Integridade e safety gates completos de CI.
 
 ## Fase 3 — Próximas evoluções
