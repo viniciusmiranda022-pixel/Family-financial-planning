@@ -1,5 +1,6 @@
 import hashlib
 import re
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -818,13 +819,24 @@ def import_plan_data(
             "installment_current": source.installment_current,
             "installment_total": source.installment_total,
             "source_line": source.source_line,
+            "occurred_at": source.booked_at,
+            "competence": source.booked_at.strftime("%Y-%m"),
+            "classification_source": "financial_plan_workbook",
+            "classification_version": "2026.09.1",
+            "canonical_status": "canonical",
+            "source_priority": 100,
             "confidence": source.confidence,
             "excluded": source.excluded,
             "possible_duplicate": False,
         }
         item = existing_transactions.get(fingerprint)
         if item is None:
-            item = Transaction(household_id=household_id, fingerprint=fingerprint, **values)
+            item = Transaction(
+                household_id=household_id,
+                fingerprint=fingerprint,
+                trace_id=str(uuid.uuid4()),
+                **values,
+            )
             db.add(item)
             db.flush()
             existing_transactions[fingerprint] = item

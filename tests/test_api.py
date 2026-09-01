@@ -94,6 +94,38 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
         assert account.status_code == 201
 
+        first_balance = client.post(
+            "/api/account-balances",
+            json={
+                "account_id": account.json()["id"],
+                "amount": "1234.56",
+                "as_of_date": "2026-08-01",
+                "observation_type": "point_in_time",
+            },
+        )
+        assert first_balance.status_code == 201
+        corrected_balance = client.post(
+            "/api/account-balances",
+            json={
+                "account_id": account.json()["id"],
+                "amount": "1250.00",
+                "as_of_date": "2026-08-01",
+                "observation_type": "point_in_time",
+                "supersedes_id": first_balance.json()["id"],
+                "reason": "Saldo confirmado novamente no aplicativo bancário",
+            },
+        )
+        assert corrected_balance.status_code == 201
+        balance_history = client.get(
+            f"/api/accounts/{account.json()['id']}/balances"
+        ).json()
+        assert len(balance_history) == 2
+        previous_balance = next(
+            item for item in balance_history if item["id"] == first_balance.json()["id"]
+        )
+        assert previous_balance["superseded_by_id"] == corrected_balance.json()["id"]
+        assert previous_balance["invalidated_at"] is not None
+
         with SessionLocal() as db:
             household = db.scalar(select(Household))
             duplicate_candidate = Transaction(
@@ -284,6 +316,14 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
         assert upload.status_code == 201
         assert upload.json()["records"] == 4
+        assert upload.json()["reconciliation"]["status"] == "unknown"
+        document_id = upload.json()["document_id"]
+        reconciliation = client.get(f"/api/imports/{document_id}/reconciliation")
+        assert reconciliation.status_code == 200
+        assert reconciliation.json()["reason"] == "missing_required_card_components"
+        rerun_reconciliation = client.post(f"/api/imports/{document_id}/reconcile")
+        assert rerun_reconciliation.status_code == 201
+        assert rerun_reconciliation.json()["status"] == "unknown"
 
         duplicate = client.post(
             "/api/imports",

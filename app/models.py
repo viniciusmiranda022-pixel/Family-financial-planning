@@ -106,6 +106,7 @@ class Transaction(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_transaction_household_date", "household_id", "booked_at"),
         Index("ix_transaction_fingerprint", "household_id", "fingerprint"),
+        Index("ix_transaction_household_competence", "household_id", "competence"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -130,6 +131,20 @@ class Transaction(Base, TimestampMixin):
     installment_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
     fingerprint: Mapped[str] = mapped_column(String(64))
     source_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    occurred_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    competence: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    classification_source: Mapped[str] = mapped_column(String(30), default="legacy")
+    classification_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    canonical_status: Mapped[str] = mapped_column(String(24), default="unassigned")
+    duplicate_group_id: Mapped[str | None] = mapped_column(
+        ForeignKey("duplicate_groups.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    linked_transaction_id: Mapped[str | None] = mapped_column(
+        ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True
+    )
+    transfer_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    source_priority: Mapped[int] = mapped_column(Integer, default=50)
     confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4), default=Decimal("1"))
     excluded: Mapped[bool] = mapped_column(Boolean, default=False)
     possible_duplicate: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -369,3 +384,200 @@ class IntegrityFinding(Base, TimestampMixin):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     resolution_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DocumentReconciliation(Base):
+    __tablename__ = "document_reconciliations"
+    __table_args__ = (
+        Index(
+            "ix_document_reconciliations_household_document",
+            "household_id",
+            "document_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    parser_name: Mapped[str] = mapped_column(String(80))
+    parser_version: Mapped[str] = mapped_column(String(40))
+    formula_id: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(24))
+    period: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    declared_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    reconstructed_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    difference: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    opening_balance: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    closing_balance_declared: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True
+    )
+    closing_balance_calculated: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True
+    )
+    credits_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    debits_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    purchases_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    fees_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    refunds_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    payments_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    tolerance: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.01"))
+    coverage: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+    reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    reconciled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AccountBalanceObservation(Base):
+    __tablename__ = "account_balance_observations"
+    __table_args__ = (
+        Index(
+            "ix_account_balance_observations_account_date",
+            "household_id",
+            "account_id",
+            "as_of_date",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    account_id: Mapped[str] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    as_of_date: Mapped[date] = mapped_column(Date)
+    observation_type: Mapped[str] = mapped_column(String(24))
+    source: Mapped[str] = mapped_column(String(30))
+    document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    confirmed_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4))
+    supersedes_id: Mapped[str | None] = mapped_column(
+        ForeignKey("account_balance_observations.id", ondelete="SET NULL"), nullable=True
+    )
+    superseded_by_id: Mapped[str | None] = mapped_column(
+        ForeignKey("account_balance_observations.id", ondelete="SET NULL"), nullable=True
+    )
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    invalidation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class DuplicateGroup(Base, TimestampMixin):
+    __tablename__ = "duplicate_groups"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id", "group_key", name="uq_duplicate_group_household_key"
+        ),
+        Index("ix_duplicate_groups_household_status", "household_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    group_key: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(30), default="open")
+    confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4))
+    resolution: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    canonical_transaction_id: Mapped[str | None] = mapped_column(
+        ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True
+    )
+    signals: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+    rule_version: Mapped[str] = mapped_column(String(40))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    resolution_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DuplicateGroupMember(Base):
+    __tablename__ = "duplicate_group_members"
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id",
+            "transaction_id",
+            name="uq_duplicate_group_member_transaction",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    group_id: Mapped[str] = mapped_column(
+        ForeignKey("duplicate_groups.id", ondelete="CASCADE"), index=True
+    )
+    transaction_id: Mapped[str] = mapped_column(
+        ForeignKey("transactions.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(24))
+    confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4))
+    signals: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+    source_priority: Mapped[int] = mapped_column(Integer)
+    excluded_by_policy: Mapped[bool] = mapped_column(Boolean, default=False)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ClassificationRule(Base, TimestampMixin):
+    __tablename__ = "classification_rules"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id",
+            "normalized_merchant",
+            "category_id",
+            "movement_type",
+            name="uq_classification_rule_consistent_choice",
+        ),
+        Index(
+            "ix_classification_rules_household_merchant",
+            "household_id",
+            "normalized_merchant",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    normalized_merchant: Mapped[str] = mapped_column(String(500))
+    category_id: Mapped[str] = mapped_column(
+        ForeignKey("categories.id", ondelete="CASCADE"), index=True
+    )
+    movement_type: Mapped[str] = mapped_column(String(30))
+    confirmation_count: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(30), default="observed")
+    priority: Mapped[int] = mapped_column(Integer, default=100)
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_from_correction: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_confirmed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    accepted_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)

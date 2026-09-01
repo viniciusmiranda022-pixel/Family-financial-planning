@@ -185,6 +185,26 @@ EXPECTED_0001_INDEXES = {
 }
 
 EXPECTED_0003_TABLES = {"integrity_runs", "integrity_findings"}
+EXPECTED_0004_TABLES = {
+    "account_balance_observations",
+    "classification_rules",
+    "document_reconciliations",
+    "duplicate_group_members",
+    "duplicate_groups",
+}
+
+EXPECTED_0004_TRANSACTION_COLUMNS = {
+    "occurred_at",
+    "competence",
+    "classification_source",
+    "classification_version",
+    "canonical_status",
+    "duplicate_group_id",
+    "linked_transaction_id",
+    "transfer_group_id",
+    "trace_id",
+    "source_priority",
+}
 
 EXPECTED_INTEGRITY_RUN_COLUMNS = {
     "id",
@@ -285,6 +305,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
     assert set(inspector.get_table_names()) == {
         *EXPECTED_0001_COLUMNS,
         *EXPECTED_0003_TABLES,
+        *EXPECTED_0004_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -322,6 +343,23 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_integrity_findings_run_id",
         "ix_integrity_findings_trace_id",
     }
+    assert EXPECTED_0004_TRANSACTION_COLUMNS.issubset(
+        {column["name"] for column in inspector.get_columns("transactions")}
+    )
+    assert {
+        "ix_transaction_household_competence",
+        "ix_transactions_duplicate_group_id",
+        "ix_transactions_trace_id",
+    }.issubset({index["name"] for index in inspector.get_indexes("transactions")})
+    assert {index["name"] for index in inspector.get_indexes("duplicate_groups")} == {
+        "ix_duplicate_groups_household_id",
+        "ix_duplicate_groups_household_status",
+    }
+    assert {index["name"] for index in inspector.get_indexes("classification_rules")} == {
+        "ix_classification_rules_category_id",
+        "ix_classification_rules_household_id",
+        "ix_classification_rules_household_merchant",
+    }
     engine.dispose()
 
     command.downgrade(config, "0001")
@@ -349,6 +387,11 @@ def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     assert "CREATE TABLE capture_drafts" in sql
     assert "CREATE TABLE integrity_runs" in sql
     assert "CREATE TABLE integrity_findings" in sql
+    assert "CREATE TABLE document_reconciliations" in sql
+    assert "CREATE TABLE account_balance_observations" in sql
+    assert "CREATE TABLE duplicate_groups" in sql
+    assert "CREATE TABLE duplicate_group_members" in sql
+    assert "CREATE TABLE classification_rules" in sql
     assert "ALTER TABLE audit_events ADD COLUMN before_state JSONB" in sql
     assert "CREATE TABLE transactions" in sql
     assert "INSERT INTO alembic_version" in sql
@@ -398,7 +441,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0003"
+        ).scalar_one() == "0004"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -424,6 +467,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0003"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0004"
     engine.dispose()
     get_settings.cache_clear()

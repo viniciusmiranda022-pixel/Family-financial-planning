@@ -2,12 +2,15 @@ import csv
 import hashlib
 import io
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from app.services.classifier import normalize_description
+
+PARSER_CONTRACT_VERSION = "2026.09.1"
 
 
 @dataclass(frozen=True)
@@ -19,6 +22,7 @@ class ParsedTransaction:
     card_last_four: str | None = None
     installment_current: int | None = None
     installment_total: int | None = None
+    occurred_at: date | None = None
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,21 @@ class ParsedPayroll:
     deductions: Decimal
     net_amount: Decimal
     payroll_loan: Decimal
+
+
+@dataclass(frozen=True)
+class ParsedDocument:
+    document_type: str
+    parser_name: str
+    parser_version: str
+    transactions: tuple[ParsedTransaction, ...] = ()
+    payroll: ParsedPayroll | None = None
+    declared_fields: Mapping[str, Decimal | str | None] = field(default_factory=dict)
+    calculated_fields: Mapping[str, Decimal | str | None] = field(default_factory=dict)
+    reconciliation_formula: str = "unsupported"
+    coverage: Mapping[str, bool] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+    period: str | None = None
 
 
 def file_sha256(payload: bytes) -> str:
@@ -115,9 +134,21 @@ def parse_csv(payload: bytes, document_type: str) -> list[ParsedTransaction]:
         if document_type == "credit_card":
             amount = _normalize_credit_card_amount(description, amount)
         current, total = _installment(description)
+        booked_at = parse_date(row[date_key])
         parsed.append(
-            ParsedTransaction(parse_date(row[date_key]), description, amount, line, None, current, total)
+            ParsedTransaction(
+                booked_at,
+                description,
+                amount,
+                line,
+                None,
+                current,
+                total,
+                occurred_at=booked_at,
+            )
         )
+    if not parsed:
+        raise ValueError("CSV sem lançamentos financeiros reconhecidos")
     return parsed
 
 
@@ -213,6 +244,7 @@ def parse_credit_card_pdf(payload: bytes) -> list[ParsedTransaction]:
                                 card_last_four,
                                 current,
                                 total,
+                                _card_date(raw_date, reference),
                             )
                         )
     except Exception as exc:
@@ -305,15 +337,185 @@ def parse_pdf(payload: bytes, document_type: str) -> list[ParsedTransaction]:
     raise ValueError("Tipo de PDF não suportado para lançamentos")
 
 
-def parse_document(filename: str, payload: bytes, document_type: str) -> list[ParsedTransaction]:
+def parse_document_contract(filename: str, payload: bytes, document_type: str) -> ParsedDocument:
     suffix = Path(filename).suffix.lower()
     if suffix in {".csv", ".txt"}:
-        return parse_csv(payload, document_type)
-    if suffix in {".ofx", ".qfx"}:
-        return parse_ofx(payload)
-    if suffix == ".pdf":
-        return parse_pdf(payload, document_type)
-    raise ValueError("Formato não suportado. Use PDF textual, CSV ou OFX")
+        rows = tuple(parse_csv(payload, document_type))
+        parser_name = "tabular_csv"
+        declared_fields: dict[str, Decimal | str | None] = {}
+    elif suffix in {".ofx", ".qfx"}:
+        rows = tuple(parse_ofx(payload))
+        parser_name = "ofx_statement"
+        declared_fields = _ofx_declared_fields(payload)
+    elif suffix == ".pdf":
+        rows = tuple(parse_pdf(payload, document_type))
+        parser_name = (
+            "itau_credit_card_pdf" if document_type == "credit_card" else "bank_statement_pdf"
+        )
+        text = _pdf_text(payload)
+        declared_fields = (
+            _credit_card_declared_fields(text)
+            if document_type == "credit_card"
+            else _statement_declared_fields(text)
+        )
+    else:
+        raise ValueError("Formato não suportado. Use PDF textual, CSV ou OFX")
+
+    calculated = _transaction_components(rows, document_type)
+    formula = (
+        "card_previous_plus_purchases_fees_minus_credits_payments"
+        if document_type == "credit_card"
+        else "statement_opening_plus_credits_minus_debits"
+    )
+    required = (
+        ("declared_total", "opening_balance")
+        if document_type == "credit_card"
+        else ("opening_balance", "closing_balance")
+    )
+    period = _single_period(rows)
+    return ParsedDocument(
+        document_type=document_type,
+        parser_name=parser_name,
+        parser_version=PARSER_CONTRACT_VERSION,
+        transactions=rows,
+        declared_fields=declared_fields,
+        calculated_fields=calculated,
+        reconciliation_formula=formula,
+        coverage={
+            "transactions": bool(rows),
+            **{field_name: declared_fields.get(field_name) is not None for field_name in required},
+        },
+        warnings=tuple(
+            f"missing_{field_name}" for field_name in required if declared_fields.get(field_name) is None
+        ),
+        period=period,
+    )
+
+
+def parse_document(filename: str, payload: bytes, document_type: str) -> list[ParsedTransaction]:
+    """Compatibility adapter for consumers not yet migrated to ParsedDocument."""
+
+    return list(parse_document_contract(filename, payload, document_type).transactions)
+
+
+def parse_payroll_document(payload: bytes) -> ParsedDocument:
+    payroll = parse_payroll_pdf(payload)
+    calculated_net = parse_decimal(payroll.gross_amount - payroll.deductions)
+    return ParsedDocument(
+        document_type="payroll",
+        parser_name="payroll_pdf",
+        parser_version=PARSER_CONTRACT_VERSION,
+        payroll=payroll,
+        declared_fields={
+            "gross_amount": payroll.gross_amount,
+            "deductions": payroll.deductions,
+            "net_amount": payroll.net_amount,
+            "payroll_loan": payroll.payroll_loan,
+            "payment_date": payroll.payment_date.isoformat(),
+        },
+        calculated_fields={"calculated_net": calculated_net},
+        reconciliation_formula="payroll_gross_minus_deductions",
+        coverage={
+            "competence": True,
+            "payment_date": True,
+            "gross_amount": True,
+            "deductions": True,
+            "net_amount": True,
+            "payroll_loan": True,
+        },
+        period=payroll.competence.strftime("%Y-%m"),
+    )
+
+
+def _single_period(rows: tuple[ParsedTransaction, ...]) -> str | None:
+    periods = {row.booked_at.strftime("%Y-%m") for row in rows}
+    return next(iter(periods)) if len(periods) == 1 else None
+
+
+def _transaction_components(
+    rows: tuple[ParsedTransaction, ...], document_type: str
+) -> dict[str, Decimal]:
+    credits = Decimal("0")
+    debits = Decimal("0")
+    purchases = Decimal("0")
+    fees = Decimal("0")
+    refunds = Decimal("0")
+    payments = Decimal("0")
+    for row in rows:
+        amount = parse_decimal(row.amount)
+        normalized = normalize_description(row.description)
+        if amount > 0:
+            credits += amount
+        elif amount < 0:
+            debits += abs(amount)
+        if document_type != "credit_card":
+            continue
+        if re.search(r"PAGAMENTO.*FATURA|PAGAMENTO RECEBIDO|FATURA PAGA", normalized):
+            payments += abs(amount)
+        elif re.search(r"ESTORNO|CREDITO.*COMPRA|CREDITO.*CARTAO", normalized):
+            refunds += abs(amount)
+        elif re.search(r"IOF|JUROS|TARIFA|ENCARGO", normalized):
+            fees += abs(amount)
+        elif amount < 0:
+            purchases += abs(amount)
+    return {
+        "credits_total": parse_decimal(credits),
+        "debits_total": parse_decimal(debits),
+        "purchases_total": parse_decimal(purchases),
+        "fees_total": parse_decimal(fees),
+        "refunds_total": parse_decimal(refunds),
+        "payments_total": parse_decimal(payments),
+    }
+
+
+def _ofx_declared_fields(payload: bytes) -> dict[str, Decimal | str | None]:
+    text = payload.decode("latin-1", errors="replace")
+    balance = _ofx_tag(text, "BALAMT")
+    as_of = _ofx_tag(text, "DTASOF")
+    return {
+        "closing_balance": parse_decimal(balance) if balance is not None else None,
+        "as_of_date": parse_date(as_of[:8]).isoformat() if as_of else None,
+    }
+
+
+def _statement_declared_fields(text: str) -> dict[str, Decimal | str | None]:
+    openings = re.findall(
+        r"SALDO\s+(?:ANTERIOR|INICIAL).*?(-?\s*[\d.]+,\d{2})",
+        text,
+        re.IGNORECASE,
+    )
+    closings = re.findall(
+        r"SALDO\s+(?:FINAL|DO DIA).*?(-?\s*[\d.]+,\d{2})",
+        text,
+        re.IGNORECASE,
+    )
+    as_of_match = re.search(
+        r"(?:PER[IÍ]ODO[^\n]*?AT[EÉ]|SALDO\s+(?:FINAL|DO DIA))[^\n]*?(\d{2}/\d{2}/\d{4})",
+        text,
+        re.IGNORECASE,
+    )
+    return {
+        "opening_balance": parse_decimal(openings[0]) if openings else None,
+        "closing_balance": parse_decimal(closings[-1]) if closings else None,
+        "as_of_date": parse_date(as_of_match.group(1)).isoformat() if as_of_match else None,
+    }
+
+
+def _credit_card_declared_fields(text: str) -> dict[str, Decimal | str | None]:
+    totals = re.findall(
+        r"TOTAL\s+(?:DA FATURA|A PAGAR).*?R?\$?\s*([\d.]+,\d{2})",
+        text,
+        re.IGNORECASE,
+    )
+    previous = re.findall(
+        r"SALDO\s+ANTERIOR.*?R?\$?\s*([\d.]+,\d{2})",
+        text,
+        re.IGNORECASE,
+    )
+    return {
+        "declared_total": parse_decimal(totals[-1]) if totals else None,
+        "opening_balance": parse_decimal(previous[-1]) if previous else None,
+    }
 
 
 def transaction_fingerprint(

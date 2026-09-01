@@ -176,3 +176,31 @@ class IntegrityRunRequest(BaseModel):
         ):
             raise ValueError("Auditoria global não aceita período ou entidade")
         return self
+
+
+class AccountBalanceObservationRequest(BaseModel):
+    account_id: str = Field(min_length=1, max_length=36)
+    amount: Decimal
+    as_of_date: date
+    observation_type: str = Field(pattern="^(opening|closing|point_in_time)$")
+    document_id: str | None = Field(default=None, max_length=36)
+    supersedes_id: str | None = Field(default=None, max_length=36)
+    reason: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_supersession_reason(self) -> "AccountBalanceObservationRequest":
+        if self.supersedes_id and not self.reason:
+            raise ValueError("Correção de saldo exige justificativa")
+        return self
+
+
+class DuplicateResolutionRequest(BaseModel):
+    resolution: str = Field(pattern="^(duplicate|distinct)$")
+    canonical_transaction_id: str | None = Field(default=None, max_length=36)
+    reason: str = Field(min_length=3, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_canonical_choice(self) -> "DuplicateResolutionRequest":
+        if self.resolution == "duplicate" and not self.canonical_transaction_id:
+            raise ValueError("Resolução como duplicidade exige a fonte canônica")
+        return self

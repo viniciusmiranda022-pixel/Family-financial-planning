@@ -15,11 +15,16 @@ from app.config import get_settings
 from app.db import get_db
 from app.models import (
     Account,
+    AccountBalanceObservation,
     AuditEvent,
     CaptureDraft,
     Category,
+    ClassificationRule,
     Commission,
     Document,
+    DocumentReconciliation,
+    DuplicateGroup,
+    DuplicateGroupMember,
     FinancialProfile,
     Household,
     IntegrityFinding,
@@ -31,10 +36,12 @@ from app.models import (
     User,
 )
 from app.schemas import (
+    AccountBalanceObservationRequest,
     AccountRequest,
     AdvisorRequest,
     CaptureConfirmRequest,
     CommissionRequest,
+    DuplicateResolutionRequest,
     IntegrityRunRequest,
     LoginRequest,
     ManualTransactionRequest,
@@ -52,9 +59,21 @@ from app.security import (
     set_session_cookie,
     verify_password,
 )
-from app.services.classifier import classify, normalize_description
+from app.services.classification_learning import (
+    accept_classification_rule,
+    classify_with_local_rules,
+    record_confirmed_correction,
+    serialize_classification_rule,
+)
+from app.services.classifier import normalize_description
 from app.services.codex_client import CodexAdvisorClient
 from app.services.crypto import EncryptedDocumentStore
+from app.services.duplicates import (
+    register_transaction_duplicates,
+    resolve_duplicate_group,
+    serialize_duplicate_group,
+    source_priority,
+)
 from app.services.finance import (
     ForecastCommission,
     ForecastInput,
@@ -75,11 +94,18 @@ from app.services.financial_integrity import (
     serialize_run,
 )
 from app.services.importer import (
+    PARSER_CONTRACT_VERSION,
     ParsedTransaction,
     file_sha256,
-    parse_document,
-    parse_payroll_pdf,
+    parse_document_contract,
+    parse_payroll_document,
     transaction_fingerprint,
+)
+from app.services.reconciliation import (
+    persist_reconciliation,
+    reconcile_parsed_document,
+    serialize_reconciliation,
+    unknown_reconciliation,
 )
 from app.services.smart_capture import CaptureParseError, preview_capture
 
@@ -160,10 +186,17 @@ def _consolidated_transactions(
         _expense_signature(transaction, account_type)
         for transaction, _category, account_type, document_type in raw_rows
         if document_type == "financial_plan_workbook"
+        and transaction.canonical_status != "supporting"
     }
     result: list[tuple[Transaction, str]] = []
     ignored: list[Transaction] = []
     for transaction, category_name, account_type, document_type in raw_rows:
+        if transaction.canonical_status == "supporting":
+            ignored.append(transaction)
+            continue
+        if transaction.canonical_status in {"canonical", "distinct"}:
+            result.append((transaction, str(category_name or "Revisar")))
+            continue
         signature = _expense_signature(transaction, account_type)
         if document_type != "financial_plan_workbook" and signature in workbook_signatures:
             ignored.append(transaction)
@@ -1264,6 +1297,138 @@ def create_account(
     return {"id": account.id, "name": account.name}
 
 
+@router.post("/account-balances", status_code=status.HTTP_201_CREATED)
+def create_account_balance_observation(
+    payload: AccountBalanceObservationRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    account = db.scalar(
+        select(Account).where(
+            Account.id == payload.account_id,
+            Account.household_id == user.household_id,
+        )
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Conta não encontrada")
+    if payload.document_id:
+        document = db.scalar(
+            select(Document).where(
+                Document.id == payload.document_id,
+                Document.household_id == user.household_id,
+                Document.account_id == account.id,
+            )
+        )
+        if not document:
+            raise HTTPException(status_code=404, detail="Documento da conta não encontrado")
+    previous = None
+    if payload.supersedes_id:
+        previous = db.scalar(
+            select(AccountBalanceObservation).where(
+                AccountBalanceObservation.id == payload.supersedes_id,
+                AccountBalanceObservation.household_id == user.household_id,
+                AccountBalanceObservation.account_id == account.id,
+            )
+        )
+        if not previous:
+            raise HTTPException(status_code=404, detail="Observação anterior não encontrada")
+        if previous.superseded_by_id:
+            raise HTTPException(status_code=409, detail="A observação já foi substituída")
+
+    trace_id = str(uuid.uuid4())
+    observation = AccountBalanceObservation(
+        household_id=user.household_id,
+        account_id=account.id,
+        amount=money(payload.amount),
+        as_of_date=payload.as_of_date,
+        observation_type=payload.observation_type,
+        source="manual_confirmed",
+        document_id=payload.document_id,
+        confirmed_by=user.id,
+        confidence=Decimal("1.0000"),
+        supersedes_id=previous.id if previous else None,
+        trace_id=trace_id,
+    )
+    db.add(observation)
+    db.flush()
+    if previous:
+        previous.superseded_by_id = observation.id
+        previous.invalidated_at = datetime.now(UTC)
+        previous.invalidated_by = user.id
+        previous.invalidation_reason = payload.reason
+    audit(
+        db,
+        user,
+        "account_balance.confirm",
+        "account_balance_observation",
+        observation.id,
+        {"account_id": account.id, "as_of_date": payload.as_of_date.isoformat()},
+        before_state=(
+            {"observation_id": previous.id, "amount": str(previous.amount)}
+            if previous
+            else None
+        ),
+        after_state={
+            "observation_id": observation.id,
+            "amount": str(observation.amount),
+            "as_of_date": observation.as_of_date.isoformat(),
+        },
+        reason=payload.reason or "Saldo confirmado manualmente pelo usuário",
+        trace_id=trace_id,
+        source="balance_observation",
+    )
+    db.commit()
+    return _balance_observation_response(observation)
+
+
+@router.get("/accounts/{account_id}/balances")
+def account_balance_history(
+    account_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    if not db.scalar(
+        select(Account.id).where(
+            Account.id == account_id,
+            Account.household_id == user.household_id,
+        )
+    ):
+        raise HTTPException(status_code=404, detail="Conta não encontrada")
+    rows = db.scalars(
+        select(AccountBalanceObservation)
+        .where(
+            AccountBalanceObservation.household_id == user.household_id,
+            AccountBalanceObservation.account_id == account_id,
+        )
+        .order_by(
+            AccountBalanceObservation.as_of_date.desc(),
+            AccountBalanceObservation.created_at.desc(),
+        )
+    ).all()
+    return [_balance_observation_response(item) for item in rows]
+
+
+def _balance_observation_response(item: AccountBalanceObservation) -> dict:
+    return {
+        "id": item.id,
+        "account_id": item.account_id,
+        "amount": str(item.amount),
+        "as_of_date": item.as_of_date,
+        "observation_type": item.observation_type,
+        "source": item.source,
+        "document_id": item.document_id,
+        "confirmed_by": item.confirmed_by,
+        "confidence": str(item.confidence),
+        "supersedes_id": item.supersedes_id,
+        "superseded_by_id": item.superseded_by_id,
+        "invalidated_at": item.invalidated_at,
+        "invalidated_by": item.invalidated_by,
+        "invalidation_reason": item.invalidation_reason,
+        "trace_id": item.trace_id,
+        "created_at": item.created_at,
+    }
+
+
 @router.post("/imports", status_code=201)
 async def import_document(
     account_id: str | None = Form(default=None),
@@ -1300,10 +1465,26 @@ async def import_document(
     document.encrypted_path = EncryptedDocumentStore().save(document.id, payload)
     if document_type == "payroll":
         try:
-            payroll = parse_payroll_pdf(payload)
+            parsed_document = parse_payroll_document(payload)
+            payroll = parsed_document.payroll
+            if payroll is None:
+                raise ValueError("Holerite sem os campos obrigatórios; encaminhado para revisão")
         except ValueError as exc:
             document.status = "review_required"
             document.notes = str(exc)
+            parsed_document, reconciliation = unknown_reconciliation(
+                document_type=document_type,
+                parser_name="payroll_pdf",
+                reason="payroll_parse_failed",
+            )
+            reconciliation_row = persist_reconciliation(
+                db,
+                household_id=user.household_id,
+                document_id=document.id,
+                parsed=parsed_document,
+                result=reconciliation,
+                confirmed_by=user.id,
+            )
             db.add(
                 ReviewItem(
                     household_id=user.household_id,
@@ -1319,6 +1500,7 @@ async def import_document(
                 "status": document.status,
                 "records": 0,
                 "message": str(exc),
+                "reconciliation": serialize_reconciliation(reconciliation_row),
             }
         record = PayrollRecord(
             household_id=user.household_id,
@@ -1334,17 +1516,49 @@ async def import_document(
             notes="Importado automaticamente do holerite",
         )
         db.add(record)
+        reconciliation = reconcile_parsed_document(parsed_document)
+        reconciliation_row = persist_reconciliation(
+            db,
+            household_id=user.household_id,
+            document_id=document.id,
+            parsed=parsed_document,
+            result=reconciliation,
+            confirmed_by=user.id,
+        )
         document.status = "imported"
         document.record_count = 1
         audit(db, user, "document.import", "document", document.id, {"records": 1})
         db.commit()
-        return {"document_id": document.id, "status": document.status, "records": 1, "review_items": 0}
+        return {
+            "document_id": document.id,
+            "status": document.status,
+            "records": 1,
+            "review_items": 0,
+            "reconciliation": serialize_reconciliation(reconciliation_row),
+        }
 
     try:
-        parsed = parse_document(document.original_name, payload, document_type)
+        parsed_document = parse_document_contract(
+            document.original_name, payload, document_type
+        )
+        parsed = parsed_document.transactions
     except ValueError as exc:
         document.status = "review_required"
         document.notes = str(exc)
+        parsed_document, reconciliation = unknown_reconciliation(
+            document_type=document_type,
+            parser_name="document_parser",
+            reason="document_parse_failed",
+        )
+        reconciliation_row = persist_reconciliation(
+            db,
+            household_id=user.household_id,
+            document_id=document.id,
+            parsed=parsed_document,
+            result=reconciliation,
+            account_id=account.id,
+            confirmed_by=user.id,
+        )
         db.add(
             ReviewItem(
                 household_id=user.household_id,
@@ -1355,7 +1569,13 @@ async def import_document(
         )
         audit(db, user, "document.review_required", "document", document.id, {"reason": str(exc)})
         db.commit()
-        return {"document_id": document.id, "status": document.status, "records": 0, "message": str(exc)}
+        return {
+            "document_id": document.id,
+            "status": document.status,
+            "records": 0,
+            "message": str(exc),
+            "reconciliation": serialize_reconciliation(reconciliation_row),
+        }
 
     imported = 0
     review_count = 0
@@ -1367,16 +1587,15 @@ async def import_document(
     )
     for item in parsed:
         fingerprint = transaction_fingerprint(account.id, item, account.owner_label)
-        duplicate = bool(
-            db.scalar(
-                select(Transaction.id).where(
-                    Transaction.household_id == user.household_id,
-                    Transaction.fingerprint == fingerprint,
-                )
-            )
+        classification = classify_with_local_rules(
+            db,
+            household_id=user.household_id,
+            description=item.description,
+            amount=float(item.amount),
+            internal_aliases=internal_aliases,
         )
-        classification = classify(item.description, float(item.amount), internal_aliases)
         category = category_for(db, user.household_id, classification.category)
+        transaction_trace_id = str(uuid.uuid4())
         transaction = Transaction(
             household_id=user.household_id,
             account_id=account.id,
@@ -1393,16 +1612,34 @@ async def import_document(
             installment_total=item.installment_total,
             fingerprint=fingerprint,
             source_line=item.source_line,
+            occurred_at=item.occurred_at or item.booked_at,
+            competence=item.booked_at.strftime("%Y-%m"),
+            classification_source=classification.source,
+            classification_version=classification.version,
+            canonical_status="unassigned",
+            trace_id=transaction_trace_id,
+            source_priority=source_priority(document_type),
             confidence=Decimal(str(classification.confidence)),
-            excluded=classification.excluded or duplicate,
-            possible_duplicate=duplicate,
+            excluded=classification.excluded,
+            possible_duplicate=False,
         )
         db.add(transaction)
         db.flush()
+        duplicate_group, duplicate_assessment = register_transaction_duplicates(
+            db,
+            transaction=transaction,
+            household_id=user.household_id,
+        )
+        duplicate = duplicate_group is not None
         if duplicate or classification.review_reason:
             reason = "possible_duplicate" if duplicate else "classification_low_confidence"
             details = (
-                "Possível repetição de período já importado" if duplicate else classification.review_reason
+                (
+                    "Possível repetição persistida em grupo "
+                    f"({duplicate_assessment.band}, confiança {duplicate_assessment.confidence})"
+                )
+                if duplicate and duplicate_assessment
+                else classification.review_reason
             )
             db.add(
                 ReviewItem(
@@ -1415,6 +1652,26 @@ async def import_document(
             )
             review_count += 1
         imported += 1
+    reconciliation = reconcile_parsed_document(parsed_document)
+    reconciliation_row = persist_reconciliation(
+        db,
+        household_id=user.household_id,
+        document_id=document.id,
+        parsed=parsed_document,
+        result=reconciliation,
+        account_id=account.id,
+        confirmed_by=user.id,
+    )
+    if reconciliation.status == "not_reconciled":
+        db.add(
+            ReviewItem(
+                household_id=user.household_id,
+                document_id=document.id,
+                reason="document_not_reconciled",
+                details="Os componentes declarados não fecham dentro da tolerância de R$ 0,01",
+            )
+        )
+        review_count += 1
     document.status = "imported_with_review" if review_count else "imported"
     document.record_count = imported
     audit(
@@ -1423,7 +1680,20 @@ async def import_document(
         "document.import",
         "document",
         document.id,
-        {"records": imported, "review_items": review_count, "sha256": digest},
+        {
+            "records": imported,
+            "review_items": review_count,
+            "sha256": digest,
+            "reconciliation_status": reconciliation.status,
+            "reconciliation_id": reconciliation_row.id,
+        },
+        after_state={
+            "status": document.status,
+            "record_count": imported,
+            "reconciliation_status": reconciliation.status,
+        },
+        trace_id=reconciliation_row.trace_id,
+        source="document_reconciliation",
     )
     db.commit()
     return {
@@ -1431,6 +1701,7 @@ async def import_document(
         "status": document.status,
         "records": imported,
         "review_items": review_count,
+        "reconciliation": serialize_reconciliation(reconciliation_row),
     }
 
 
@@ -1454,6 +1725,93 @@ def list_imports(user: User = Depends(get_current_user), db: Session = Depends(g
         }
         for item in rows
     ]
+
+
+@router.get("/imports/{document_id}/reconciliation")
+def document_reconciliation(
+    document_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    document = db.scalar(
+        select(Document).where(
+            Document.id == document_id,
+            Document.household_id == user.household_id,
+        )
+    )
+    if not document:
+        raise HTTPException(status_code=404, detail="Documento não encontrado")
+    reconciliation = db.scalar(
+        select(DocumentReconciliation)
+        .where(
+            DocumentReconciliation.document_id == document.id,
+            DocumentReconciliation.household_id == user.household_id,
+        )
+        .order_by(
+            DocumentReconciliation.reconciled_at.desc(),
+            DocumentReconciliation.id.desc(),
+        )
+        .limit(1)
+    )
+    if not reconciliation:
+        raise HTTPException(status_code=404, detail="Reconciliação ainda não executada")
+    return serialize_reconciliation(reconciliation)
+
+
+@router.post("/imports/{document_id}/reconcile", status_code=status.HTTP_201_CREATED)
+def rerun_document_reconciliation(
+    document_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    document = db.scalar(
+        select(Document).where(
+            Document.id == document_id,
+            Document.household_id == user.household_id,
+        )
+    )
+    if not document:
+        raise HTTPException(status_code=404, detail="Documento não encontrado")
+    try:
+        payload = EncryptedDocumentStore().read(document.encrypted_path)
+        if document.document_type == "payroll":
+            parsed_document = parse_payroll_document(payload)
+        else:
+            parsed_document = parse_document_contract(
+                document.original_name,
+                payload,
+                document.document_type,
+            )
+        result = reconcile_parsed_document(parsed_document)
+    except ValueError as exc:
+        parsed_document, result = unknown_reconciliation(
+            document_type=document.document_type,
+            parser_name="document_parser",
+            reason="reconciliation_parse_failed",
+        )
+        document.notes = str(exc)
+    reconciliation = persist_reconciliation(
+        db,
+        household_id=user.household_id,
+        document_id=document.id,
+        parsed=parsed_document,
+        result=result,
+        account_id=document.account_id,
+        confirmed_by=user.id,
+    )
+    audit(
+        db,
+        user,
+        "document.reconcile",
+        "document",
+        document.id,
+        {"reconciliation_id": reconciliation.id, "status": reconciliation.status},
+        after_state={"reconciliation_status": reconciliation.status},
+        trace_id=reconciliation.trace_id,
+        source="document_reconciliation",
+    )
+    db.commit()
+    return serialize_reconciliation(reconciliation)
 
 
 @router.post("/captures/preview", status_code=201)
@@ -1816,22 +2174,7 @@ def confirm_capture(
                 installment_total=proposal.installment_total,
             )
             fingerprint = transaction_fingerprint(account.id, parsed, account.owner_label)
-            duplicate = bool(
-                db.scalar(
-                    select(Transaction.id).where(
-                        Transaction.household_id == user.household_id,
-                        Transaction.fingerprint == fingerprint,
-                    )
-                )
-            )
-            if investment_movement and not duplicate:
-                profile = profile_for(db, user.household_id)
-                if investment_movement == "investment":
-                    profile.investment_balance += abs(proposal.amount)
-                else:
-                    profile.investment_balance = max(
-                        Decimal("0"), profile.investment_balance - abs(proposal.amount)
-                    )
+            transaction_trace_id = str(uuid.uuid4())
             transaction = Transaction(
                 household_id=user.household_id,
                 account_id=account.id,
@@ -1848,13 +2191,35 @@ def confirm_capture(
                 installment_total=proposal.installment_total,
                 fingerprint=fingerprint,
                 source_line=proposal.source_line,
+                occurred_at=proposal.booked_at,
+                competence=proposal.booked_at.strftime("%Y-%m"),
+                classification_source="capture_confirmed",
+                classification_version=PARSER_CONTRACT_VERSION,
+                canonical_status="unassigned",
+                trace_id=transaction_trace_id,
+                source_priority=source_priority("capture"),
                 confidence=Decimal("1"),
-                excluded=excluded or duplicate,
-                possible_duplicate=duplicate,
-                reviewed=not duplicate,
+                excluded=excluded,
+                possible_duplicate=False,
+                reviewed=True,
             )
             db.add(transaction)
             db.flush()
+            duplicate_group, duplicate_assessment = register_transaction_duplicates(
+                db,
+                transaction=transaction,
+                household_id=user.household_id,
+            )
+            duplicate = duplicate_group is not None
+            transaction.reviewed = not duplicate
+            if investment_movement and not duplicate:
+                profile = profile_for(db, user.household_id)
+                if investment_movement == "investment":
+                    profile.investment_balance += abs(proposal.amount)
+                else:
+                    profile.investment_balance = max(
+                        Decimal("0"), profile.investment_balance - abs(proposal.amount)
+                    )
             result["transactions"].append(transaction.id)
             if duplicate:
                 db.add(
@@ -1863,7 +2228,13 @@ def confirm_capture(
                         transaction_id=transaction.id,
                         document_id=capture.document_id if structured_document else None,
                         reason="possible_duplicate",
-                        details="Captura confirmada coincide com um lançamento existente",
+                        details=(
+                            "Captura confirmada agrupada como possível repetição "
+                            f"({duplicate_assessment.band}, confiança "
+                            f"{duplicate_assessment.confidence})"
+                            if duplicate_assessment
+                            else "Captura confirmada coincide com um lançamento existente"
+                        ),
                     )
                 )
                 review_count += 1
@@ -2051,6 +2422,14 @@ def create_manual_transaction(
         amount = abs(payload.amount)
         category = category_for(db, user.household_id, "Reembolsos e estornos")
 
+    parsed = ParsedTransaction(
+        booked_at=payload.booked_at,
+        description=payload.description,
+        amount=money(amount),
+        source_line=1,
+        occurred_at=payload.booked_at,
+    )
+    transaction_trace_id = str(uuid.uuid4())
     transaction = Transaction(
         household_id=user.household_id,
         account_id=account.id,
@@ -2061,13 +2440,41 @@ def create_manual_transaction(
         amount=money(amount),
         transaction_type=transaction_type,
         owner_label=account.owner_label,
-        fingerprint=uuid.uuid4().hex + uuid.uuid4().hex,
+        fingerprint=transaction_fingerprint(account.id, parsed, account.owner_label),
+        occurred_at=payload.booked_at,
+        competence=payload.booked_at.strftime("%Y-%m"),
+        classification_source="manual_confirmed",
+        classification_version=PARSER_CONTRACT_VERSION,
+        canonical_status="unassigned",
+        trace_id=transaction_trace_id,
+        source_priority=source_priority("manual"),
         confidence=Decimal("1"),
         excluded=excluded,
         reviewed=True,
     )
     db.add(transaction)
     db.flush()
+    duplicate_group, duplicate_assessment = register_transaction_duplicates(
+        db,
+        transaction=transaction,
+        household_id=user.household_id,
+    )
+    if duplicate_group is not None:
+        transaction.reviewed = False
+        db.add(
+            ReviewItem(
+                household_id=user.household_id,
+                transaction_id=transaction.id,
+                reason="possible_duplicate",
+                details=(
+                    "Lançamento manual agrupado como possível repetição "
+                    f"({duplicate_assessment.band}, confiança "
+                    f"{duplicate_assessment.confidence})"
+                    if duplicate_assessment
+                    else "Lançamento manual coincide com um lançamento existente"
+                ),
+            )
+        )
     audit(
         db,
         user,
@@ -2098,6 +2505,13 @@ def update_transaction(
     )
     if not transaction:
         raise HTTPException(status_code=404, detail="Lançamento não encontrado")
+    before_state = {
+        "category_id": transaction.category_id,
+        "excluded": transaction.excluded,
+        "possible_duplicate": transaction.possible_duplicate,
+        "reviewed": transaction.reviewed,
+        "owner_label": transaction.owner_label,
+    }
     changes = payload.model_dump(exclude_unset=True)
     if "category_id" in changes and changes["category_id"]:
         category = db.scalar(
@@ -2116,7 +2530,40 @@ def update_transaction(
         for item in reviews:
             item.status = "resolved"
             item.resolved_at = datetime.now(UTC)
-    audit(db, user, "transaction.update", "transaction", transaction.id, changes)
+    learned_rule = None
+    if (
+        changes.get("reviewed") is True
+        and changes.get("category_id")
+        and changes["category_id"] != before_state["category_id"]
+    ):
+        learned_rule = record_confirmed_correction(
+            db,
+            household_id=user.household_id,
+            transaction_id=transaction.id,
+            description=transaction.description,
+            category_id=changes["category_id"],
+            movement_type=transaction.transaction_type,
+        )
+    after_state = {
+        "category_id": transaction.category_id,
+        "excluded": transaction.excluded,
+        "possible_duplicate": transaction.possible_duplicate,
+        "reviewed": transaction.reviewed,
+        "owner_label": transaction.owner_label,
+        "classification_rule_id": learned_rule.id if learned_rule else None,
+    }
+    audit(
+        db,
+        user,
+        "transaction.update",
+        "transaction",
+        transaction.id,
+        changes,
+        before_state=before_state,
+        after_state=after_state,
+        reason="Correção confirmada pelo usuário" if changes.get("reviewed") else None,
+        trace_id=transaction.trace_id,
+    )
     db.commit()
     return {"ok": True}
 
@@ -2214,6 +2661,147 @@ def resolve_review(
     audit(db, user, "review.resolve", "review_item", item.id)
     db.commit()
     return {"ok": True}
+
+
+@router.get("/duplicate-groups")
+def duplicate_groups(
+    group_status: str | None = Query(default=None, alias="status"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    if group_status and group_status not in {"open", "resolved"}:
+        raise HTTPException(status_code=422, detail="Status de grupo inválido")
+    statement = select(DuplicateGroup).where(
+        DuplicateGroup.household_id == user.household_id
+    )
+    if group_status:
+        statement = statement.where(DuplicateGroup.status == group_status)
+    groups = db.scalars(
+        statement.order_by(DuplicateGroup.updated_at.desc()).limit(200)
+    ).all()
+    result = []
+    for group in groups:
+        members = db.scalars(
+            select(DuplicateGroupMember)
+            .where(DuplicateGroupMember.group_id == group.id)
+            .order_by(DuplicateGroupMember.role, DuplicateGroupMember.added_at)
+        ).all()
+        result.append(serialize_duplicate_group(group, members))
+    return result
+
+
+@router.get("/duplicate-groups/{group_id}")
+def duplicate_group_detail(
+    group_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    group = db.scalar(
+        select(DuplicateGroup).where(
+            DuplicateGroup.id == group_id,
+            DuplicateGroup.household_id == user.household_id,
+        )
+    )
+    if not group:
+        raise HTTPException(status_code=404, detail="Grupo de duplicidade não encontrado")
+    members = db.scalars(
+        select(DuplicateGroupMember)
+        .where(DuplicateGroupMember.group_id == group.id)
+        .order_by(DuplicateGroupMember.role, DuplicateGroupMember.added_at)
+    ).all()
+    return serialize_duplicate_group(group, members)
+
+
+@router.post("/duplicate-groups/{group_id}/resolve")
+def resolve_persisted_duplicate_group(
+    group_id: str,
+    payload: DuplicateResolutionRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        group = resolve_duplicate_group(
+            db,
+            group_id=group_id,
+            household_id=user.household_id,
+            resolution=payload.resolution,
+            canonical_transaction_id=payload.canonical_transaction_id,
+            user_id=user.id,
+            reason=payload.reason,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Grupo de duplicidade não encontrado") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "duplicate_group.resolve",
+        "duplicate_group",
+        group.id,
+        {"resolution": group.resolution},
+        after_state={
+            "status": group.status,
+            "resolution": group.resolution,
+            "canonical_transaction_id": group.canonical_transaction_id,
+        },
+        reason=payload.reason,
+        source="duplicate_engine",
+    )
+    db.commit()
+    return duplicate_group_detail(group.id, user, db)
+
+
+@router.get("/classification-rules")
+def classification_rules(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    rows = db.execute(
+        select(ClassificationRule, Category.name)
+        .join(Category, Category.id == ClassificationRule.category_id)
+        .where(ClassificationRule.household_id == user.household_id)
+        .order_by(
+            ClassificationRule.active.desc(),
+            ClassificationRule.confirmation_count.desc(),
+            ClassificationRule.updated_at.desc(),
+        )
+    ).all()
+    return [serialize_classification_rule(rule, category_name) for rule, category_name in rows]
+
+
+@router.post("/classification-rules/{rule_id}/activate")
+def activate_classification_rule(
+    rule_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        rule = accept_classification_rule(
+            db,
+            household_id=user.household_id,
+            rule_id=rule_id,
+            user_id=user.id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Regra local não encontrada") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    category_name = db.scalar(select(Category.name).where(Category.id == rule.category_id))
+    audit(
+        db,
+        user,
+        "classification_rule.activate",
+        "classification_rule",
+        rule.id,
+        {"confirmation_count": rule.confirmation_count},
+        after_state={"status": rule.status, "active": rule.active},
+        reason="Aceite explícito de regra após três correções consistentes",
+        source="classification_learning",
+    )
+    db.commit()
+    return serialize_classification_rule(rule, category_name or "")
 
 
 @router.get("/commissions")
