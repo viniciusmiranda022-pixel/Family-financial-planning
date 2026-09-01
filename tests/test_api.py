@@ -17,7 +17,16 @@ os.environ["SESSION_SECURE"] = "false"
 
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Account, Category, Document, Household, ReviewItem, Transaction  # noqa: E402
+from app.models import (  # noqa: E402
+    Account,
+    AuditEvent,
+    Category,
+    Document,
+    Household,
+    IntegrityFinding,
+    ReviewItem,
+    Transaction,
+)
 from app.services.codex_client import CodexResult  # noqa: E402
 
 Base.metadata.create_all(bind=engine)
@@ -47,6 +56,16 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
         assert setup.status_code == 201
 
+        empty_integrity_run = client.post("/api/integrity/runs", json={"scope": "global"})
+        assert empty_integrity_run.status_code == 201
+        assert empty_integrity_run.json()["summary"]["status"] == "unknown"
+        assert empty_integrity_run.json()["summary"]["score"] is None
+        assert empty_integrity_run.json()["summary"]["trusted_for_projection"] is False
+        assert client.get(
+            f"/api/integrity/runs/{empty_integrity_run.json()['id']}"
+        ).status_code == 200
+        assert client.get("/api/integrity/status").json()["status"] == "unknown"
+
         family_user = client.post(
             "/api/users",
             json={
@@ -74,6 +93,73 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             },
         )
         assert account.status_code == 201
+
+        with SessionLocal() as db:
+            household = db.scalar(select(Household))
+            duplicate_candidate = Transaction(
+                household_id=household.id,
+                account_id=account.json()["id"],
+                booked_at=date(2026, 8, 15),
+                description="Candidato controlado de duplicidade",
+                normalized_description="CANDIDATO CONTROLADO DE DUPLICIDADE",
+                amount=Decimal("-10.00"),
+                transaction_type="expense",
+                owner_label="Família",
+                fingerprint="f" * 64,
+                confidence=Decimal("0.9000"),
+                possible_duplicate=True,
+                excluded=False,
+                reviewed=False,
+            )
+            db.add(duplicate_candidate)
+            db.commit()
+            duplicate_candidate_id = duplicate_candidate.id
+
+        first_integrity_run = client.post("/api/integrity/runs", json={"scope": "global"})
+        assert first_integrity_run.status_code == 201
+        assert first_integrity_run.json()["summary"]["status"] == "critical"
+        findings = client.get(
+            "/api/integrity/findings",
+            params={"status": "open", "invariant_id": "INV-014"},
+        ).json()
+        assert findings["total"] == 1
+        assert findings["items"][0]["occurrence_count"] == 1
+        finding_id = findings["items"][0]["id"]
+        assert client.get(f"/api/integrity/findings/{finding_id}").status_code == 200
+        first_run_detail = client.get(
+            f"/api/integrity/runs/{first_integrity_run.json()['id']}"
+        ).json()
+        assert [item["id"] for item in first_run_detail["findings"]] == [finding_id]
+
+        second_integrity_run = client.post("/api/integrity/runs", json={"scope": "global"})
+        assert second_integrity_run.status_code == 201
+        repeated_findings = client.get(
+            "/api/integrity/findings",
+            params={"status": "open", "invariant_id": "INV-014"},
+        ).json()
+        assert repeated_findings["total"] == 1
+        assert repeated_findings["items"][0]["id"] == finding_id
+        assert repeated_findings["items"][0]["occurrence_count"] == 2
+        assert client.get("/api/integrity/status").json()["status"] == "critical"
+
+        with SessionLocal() as db:
+            integrity_audit = db.scalar(
+                select(AuditEvent)
+                .where(AuditEvent.event_type == "integrity.run")
+                .order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
+            )
+            assert integrity_audit.after_state["status"] == "completed"
+            assert integrity_audit.reason == "Execução manual solicitada por administrador"
+            assert integrity_audit.trace_id
+            finding = db.get(IntegrityFinding, finding_id)
+            assert finding.metadata_json["required_facts"] == [
+                "duplicate_confidence",
+                "resolution_status",
+                "included_in_totals",
+            ]
+            transaction = db.get(Transaction, duplicate_candidate_id)
+            db.delete(transaction)
+            db.commit()
 
         capture_preview = client.post(
             "/api/captures/preview",

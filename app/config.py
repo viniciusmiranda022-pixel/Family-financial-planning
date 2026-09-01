@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     advisor_url: str = "http://advisor:8081"
     advisor_shared_secret: str = ""
     advisor_timeout_seconds: int = 75
+    integrity_ui_enabled: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

@@ -5,7 +5,7 @@ from calendar import monthrange
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -22,6 +22,8 @@ from app.models import (
     Document,
     FinancialProfile,
     Household,
+    IntegrityFinding,
+    IntegrityRun,
     Obligation,
     PayrollRecord,
     ReviewItem,
@@ -33,6 +35,7 @@ from app.schemas import (
     AdvisorRequest,
     CaptureConfirmRequest,
     CommissionRequest,
+    IntegrityRunRequest,
     LoginRequest,
     ManualTransactionRequest,
     ObligationRequest,
@@ -61,6 +64,15 @@ from app.services.finance import (
     money,
     month_key,
     monthly_net_rate,
+)
+from app.services.financial_integrity import (
+    IntegrityRunScope,
+    IntegrityRunTrigger,
+    build_baseline_checks,
+    consolidated_integrity_status,
+    execute_integrity_run,
+    serialize_finding,
+    serialize_run,
 )
 from app.services.importer import (
     ParsedTransaction,
@@ -695,6 +707,13 @@ def audit(
     entity_type: str | None = None,
     entity_id: str | None = None,
     details: dict | None = None,
+    *,
+    before_state: dict | None = None,
+    after_state: dict | None = None,
+    reason: str | None = None,
+    trace_id: str | None = None,
+    source: str = "application",
+    request_id: str | None = None,
 ) -> None:
     db.add(
         AuditEvent(
@@ -704,8 +723,20 @@ def audit(
             entity_type=entity_type,
             entity_id=entity_id,
             details=json.dumps(details, ensure_ascii=False, default=str) if details else None,
+            before_state=_audit_state(before_state),
+            after_state=_audit_state(after_state),
+            reason=reason,
+            trace_id=trace_id,
+            source=source,
+            request_id=request_id,
         )
     )
+
+
+def _audit_state(value: dict | None) -> dict | None:
+    if value is None:
+        return None
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
 def category_for(db: Session, household_id: str, name: str) -> Category:
@@ -931,6 +962,181 @@ def logout(response: Response, user: User = Depends(get_current_user), db: Sessi
 @router.get("/auth/me")
 def me(user: User = Depends(get_current_user)) -> dict:
     return {"id": user.id, "name": user.name, "username": user.username, "is_admin": user.is_admin}
+
+
+@router.post("/integrity/runs", status_code=status.HTTP_201_CREATED)
+def create_integrity_run(
+    payload: IntegrityRunRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    run_scope = IntegrityRunScope(payload.scope)
+    try:
+        checks = build_baseline_checks(
+            db,
+            household_id=user.household_id,
+            scope=run_scope,
+            period=payload.period,
+            entity_type=payload.entity_type,
+            entity_id=payload.entity_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Entidade não encontrada") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        run, _results = execute_integrity_run(
+            db,
+            household_id=user.household_id,
+            scope=run_scope,
+            trigger=IntegrityRunTrigger.MANUAL,
+            checks=checks,
+            created_by=user.id,
+            period=payload.period,
+            scope_entity_type=payload.entity_type,
+            scope_entity_id=payload.entity_id,
+        )
+    except Exception as exc:
+        db.commit()
+        raise HTTPException(
+            status_code=500,
+            detail="A auditoria falhou sem alterar os dados financeiros",
+        ) from exc
+
+    audit(
+        db,
+        user,
+        "integrity.run",
+        "integrity_run",
+        run.id,
+        {"scope": run.scope, "period": run.period},
+        after_state={"status": run.status, "summary": run.summary},
+        reason="Execução manual solicitada por administrador",
+        trace_id=run.trace_id,
+        source="financial_integrity_engine",
+    )
+    db.commit()
+    return serialize_run(run) or {}
+
+
+@router.get("/integrity/runs/{run_id}")
+def integrity_run_detail(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    run = db.scalar(
+        select(IntegrityRun).where(
+            IntegrityRun.id == run_id,
+            IntegrityRun.household_id == user.household_id,
+        )
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Execução de integridade não encontrada")
+    finding_ids = tuple((run.summary or {}).get("finding_ids", ()))
+    findings = (
+        db.scalars(
+            select(IntegrityFinding)
+            .where(
+                IntegrityFinding.household_id == user.household_id,
+                IntegrityFinding.id.in_(finding_ids),
+            )
+            .order_by(IntegrityFinding.severity.desc(), IntegrityFinding.created_at)
+        ).all()
+        if finding_ids
+        else []
+    )
+    return {**(serialize_run(run) or {}), "findings": [serialize_finding(item) for item in findings]}
+
+
+@router.get("/integrity/status")
+def integrity_status(
+    period: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return consolidated_integrity_status(
+            db,
+            household_id=user.household_id,
+            period=period,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/integrity/findings")
+def integrity_findings(
+    status_filter: str | None = Query(default=None, alias="status"),
+    severity: str | None = None,
+    period: str | None = None,
+    invariant_id: str | None = None,
+    page: int = 1,
+    limit: int = 50,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if page < 1 or limit < 1 or limit > 200:
+        raise HTTPException(status_code=422, detail="Paginação inválida")
+    if status_filter and status_filter not in {
+        "open",
+        "acknowledged",
+        "resolved",
+        "ignored",
+        "false_positive",
+    }:
+        raise HTTPException(status_code=422, detail="Status de finding inválido")
+    if severity and severity not in {"info", "warning", "review", "critical", "block"}:
+        raise HTTPException(status_code=422, detail="Severidade inválida")
+    if period:
+        try:
+            datetime.strptime(period, "%Y-%m")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from exc
+
+    filters = [IntegrityFinding.household_id == user.household_id]
+    if status_filter:
+        filters.append(IntegrityFinding.status == status_filter)
+    if severity:
+        filters.append(IntegrityFinding.severity == severity)
+    if period:
+        filters.append(IntegrityFinding.period == period)
+    if invariant_id:
+        filters.append(IntegrityFinding.invariant_id == invariant_id.upper())
+
+    total = db.scalar(select(func.count(IntegrityFinding.id)).where(*filters)) or 0
+    rows = db.scalars(
+        select(IntegrityFinding)
+        .where(*filters)
+        .order_by(IntegrityFinding.last_seen_at.desc(), IntegrityFinding.id)
+        .offset((page - 1) * limit)
+        .limit(limit)
+    ).all()
+    return {
+        "items": [serialize_finding(item) for item in rows],
+        "page": page,
+        "limit": limit,
+        "total": total,
+    }
+
+
+@router.get("/integrity/findings/{finding_id}")
+def integrity_finding_detail(
+    finding_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    finding = db.scalar(
+        select(IntegrityFinding).where(
+            IntegrityFinding.id == finding_id,
+            IntegrityFinding.household_id == user.household_id,
+        )
+    )
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding não encontrado")
+    return serialize_finding(finding)
 
 
 @router.get("/users")

@@ -69,6 +69,25 @@
 - O rendimento mensal incide sobre o saldo inicial positivo do mês.
 - Entradas do mês começam a influenciar o rendimento no mês seguinte.
 
+## Integridade persistente
+
+- Toda execução registra escopo, gatilho, versões, duração, `trace_id` e resumo; ela não altera
+  lançamento, documento, perfil ou qualquer outro dado financeiro de origem.
+- Somente regras com fatos determinísticos disponíveis são executadas. Sem checks aplicáveis, o
+  status é `unknown`, o score é `null` e os gates de confiança permanecem fechados.
+- O score usa os pesos formais INFO=1, WARNING=2, REVIEW=4, CRITICAL=8 e BLOCK=16, combinados aos
+  fatores pass=1, warning=0,75, unknown=0,50 e fail=0.
+- Resultados são agregados por `(invariant_id, scope, period)`; o pior resultado da chave prevalece
+  para impedir que repetição de itens maquie o score.
+- Findings não aprovados são persistidos por fingerprint. Reincidência atualiza `last_seen_at` e o
+  contador sem criar cópia nem apagar o primeiro registro.
+- Findings não resolvem nem corrigem dados automaticamente. A correção continua no fluxo próprio e
+  deve ser ligada à trilha de auditoria.
+- `trusted_for_projection` e `trusted_for_reports` são gates específicos e começam fechados quando
+  não existe evidência aplicável; eles não são inferidos apenas do score geral.
+- O Codex não participa do cálculo do score, status, finding determinístico ou gate de confiança.
+- A interface permanece oculta por padrão em `INTEGRITY_UI_ENABLED=false` até a etapa dedicada de UX.
+
 ## Projeções
 
 O sistema produz três cenários:

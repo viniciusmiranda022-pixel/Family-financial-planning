@@ -184,6 +184,65 @@ EXPECTED_0001_INDEXES = {
     "users": {"ix_users_household_id", "ix_users_username"},
 }
 
+EXPECTED_0003_TABLES = {"integrity_runs", "integrity_findings"}
+
+EXPECTED_INTEGRITY_RUN_COLUMNS = {
+    "id",
+    "household_id",
+    "scope",
+    "scope_entity_type",
+    "scope_entity_id",
+    "period",
+    "status",
+    "trigger",
+    "financial_rules_version",
+    "calculation_version",
+    "started_at",
+    "completed_at",
+    "duration_ms",
+    "summary",
+    "error_code",
+    "trace_id",
+    "created_by",
+}
+
+EXPECTED_INTEGRITY_FINDING_COLUMNS = {
+    "id",
+    "household_id",
+    "run_id",
+    "invariant_id",
+    "fingerprint",
+    "financial_rules_version",
+    "trace_id",
+    "source",
+    "status",
+    "check_status",
+    "severity",
+    "scope",
+    "entity_type",
+    "entity_id",
+    "period",
+    "title",
+    "message",
+    "expected_amount",
+    "actual_amount",
+    "difference_amount",
+    "expected",
+    "actual",
+    "metadata",
+    "recommended_action",
+    "first_seen_at",
+    "last_seen_at",
+    "occurrence_count",
+    "acknowledged_at",
+    "acknowledged_by",
+    "resolved_at",
+    "resolved_by",
+    "resolution_reason",
+    "created_at",
+    "updated_at",
+}
+
 
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
@@ -225,12 +284,43 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
     engine, inspector = _inspect(database_url)
     assert set(inspector.get_table_names()) == {
         *EXPECTED_0001_COLUMNS,
+        *EXPECTED_0003_TABLES,
         "capture_drafts",
         "alembic_version",
     }
     assert {index["name"] for index in inspector.get_indexes("capture_drafts")} == {
         "ix_capture_drafts_household_id",
         "ix_capture_household_created",
+    }
+    assert {column["name"] for column in inspector.get_columns("integrity_runs")} == (
+        EXPECTED_INTEGRITY_RUN_COLUMNS
+    )
+    assert {column["name"] for column in inspector.get_columns("integrity_findings")} == (
+        EXPECTED_INTEGRITY_FINDING_COLUMNS
+    )
+    assert {
+        "before_state",
+        "after_state",
+        "reason",
+        "trace_id",
+        "source",
+        "request_id",
+    }.issubset({column["name"] for column in inspector.get_columns("audit_events")})
+    assert {index["name"] for index in inspector.get_indexes("integrity_runs")} == {
+        "ix_integrity_runs_household_id",
+        "ix_integrity_runs_household_period",
+        "ix_integrity_runs_household_status",
+        "ix_integrity_runs_trace_id",
+    }
+    assert {index["name"] for index in inspector.get_indexes("integrity_findings")} == {
+        "ix_integrity_findings_household_fingerprint",
+        "ix_integrity_findings_household_id",
+        "ix_integrity_findings_household_invariant",
+        "ix_integrity_findings_household_period",
+        "ix_integrity_findings_household_severity",
+        "ix_integrity_findings_household_status",
+        "ix_integrity_findings_run_id",
+        "ix_integrity_findings_trace_id",
     }
     engine.dispose()
 
@@ -257,8 +347,59 @@ def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     sql = output.getvalue()
     assert "CREATE TABLE households" in sql
     assert "CREATE TABLE capture_drafts" in sql
+    assert "CREATE TABLE integrity_runs" in sql
+    assert "CREATE TABLE integrity_findings" in sql
+    assert "ALTER TABLE audit_events ADD COLUMN before_state JSONB" in sql
     assert "CREATE TABLE transactions" in sql
     assert "INSERT INTO alembic_version" in sql
+    get_settings.cache_clear()
+
+
+def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
+    monkeypatch, tmp_path
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'existing-0002.sqlite'}"
+    config = _alembic_config(monkeypatch, database_url)
+    command.upgrade(config, "0002")
+
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO households (id, name) VALUES (?, ?)",
+            ("household-preserved", "Família preservada"),
+        )
+        connection.exec_driver_sql(
+            """
+            INSERT INTO audit_events
+                (id, household_id, event_type, details)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                "audit-preserved",
+                "household-preserved",
+                "legacy.event",
+                '{"preserved": true}',
+            ),
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            "SELECT name FROM households WHERE id = 'household-preserved'"
+        ).scalar_one() == "Família preservada"
+        audit_row = connection.exec_driver_sql(
+            """
+            SELECT details, before_state, after_state, reason, trace_id
+            FROM audit_events WHERE id = 'audit-preserved'
+            """
+        ).one()
+        assert audit_row == ('{"preserved": true}', None, None, None, None)
+        assert connection.exec_driver_sql(
+            "SELECT version_num FROM alembic_version"
+        ).scalar_one() == "0003"
+    engine.dispose()
     get_settings.cache_clear()
 
 
@@ -283,6 +424,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0002"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0003"
     engine.dispose()
     get_settings.cache_clear()
