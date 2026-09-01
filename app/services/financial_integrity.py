@@ -19,6 +19,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.services.financial_invariants import (
@@ -248,11 +249,15 @@ def execute_integrity_run(
         # run can survive the `except` branch below, which only records the
         # run itself as `failed`.
         with db.begin_nested():
-            finding_ids = [
-                _persist_finding(db, run, result)
-                for result in results
-                if result.status is not InvariantStatus.PASS
-            ]
+            finding_ids: list[str] = []
+            superseded_finding_ids: list[str] = []
+            for result in results:
+                if result.status is InvariantStatus.PASS:
+                    superseded_id = _supersede_finding_if_active(db, run, result)
+                    if superseded_id is not None:
+                        superseded_finding_ids.append(superseded_id)
+                else:
+                    finding_ids.append(_persist_finding(db, run, result))
         completed_at = datetime.now(UTC)
         run.status = "completed"
         run.completed_at = completed_at
@@ -261,6 +266,7 @@ def execute_integrity_run(
             **assessment.to_dict(),
             "checks": [result.to_dict() for result in results],
             "finding_ids": finding_ids,
+            "superseded_finding_ids": superseded_finding_ids,
             "financial_rules_version": FINANCIAL_RULES_VERSION,
             "trace_id": trace_id,
         }
@@ -582,22 +588,33 @@ def _run_context(context: InvariantContext, run: IntegrityRun, trace_id: str) ->
     )
 
 
-def _persist_finding(db: Session, run: IntegrityRun, result: InvariantResult) -> str:
+def _select_finding_for_update(
+    db: Session, household_id: str, fingerprint: str
+) -> IntegrityFinding | None:
+    """Lock the finding row for `fingerprint`, if one already exists.
+
+    `SELECT ... FOR UPDATE` can only lock a row that exists at read time --
+    it locks nothing for a fingerprint no run has ever persisted yet, which is
+    exactly the gap `_persist_finding` has to recover from on a concurrent
+    first-insert race (see its docstring).
+    """
+
     from app.models import IntegrityFinding
 
-    fingerprint = _finding_fingerprint(result)
-    finding = db.scalar(
+    return db.scalar(
         select(IntegrityFinding)
         .where(
-            IntegrityFinding.household_id == run.household_id,
+            IntegrityFinding.household_id == household_id,
             IntegrityFinding.fingerprint == fingerprint,
         )
         .with_for_update()
     )
+
+
+def _finding_values(result: InvariantResult, run: IntegrityRun, *, now: datetime) -> dict[str, Any]:
     payload = result.to_dict()
-    now = datetime.now(UTC)
     definition = get_invariant(result.invariant_id)
-    values = {
+    return {
         "financial_rules_version": result.financial_rules_version,
         "trace_id": result.trace_id or run.trace_id,
         "check_status": result.status.value,
@@ -620,23 +637,122 @@ def _persist_finding(db: Session, run: IntegrityRun, result: InvariantResult) ->
         "recommended_action": _recommended_action(result.severity),
         "last_seen_at": now,
     }
-    if finding:
-        for key, value in values.items():
-            setattr(finding, key, value)
-        finding.occurrence_count += 1
-    else:
-        finding = IntegrityFinding(
-            household_id=run.household_id,
-            run_id=run.id,
-            invariant_id=result.invariant_id,
-            fingerprint=fingerprint,
-            source="deterministic",
-            status="open",
-            first_seen_at=now,
-            occurrence_count=1,
-            **values,
+
+
+def _apply_finding_reincidence(finding: IntegrityFinding, values: dict[str, Any]) -> None:
+    for key, value in values.items():
+        setattr(finding, key, value)
+    finding.occurrence_count += 1
+
+
+def _persist_finding(db: Session, run: IntegrityRun, result: InvariantResult) -> str:
+    """Create or update the open finding for `result`'s fingerprint.
+
+    Only called for non-PASS results (see `execute_integrity_run`).
+
+    `SELECT ... FOR UPDATE` correctly serializes two runs racing to update an
+    *existing* row, but it locks nothing when neither run has ever persisted
+    this fingerprint before: there is no row yet to lock. Two concurrent runs
+    can then both see no match and both attempt to `INSERT`, and only one can
+    satisfy `uq_integrity_finding_household_fingerprint`. The loser's insert
+    is therefore attempted inside its own SAVEPOINT: on a unique-constraint
+    violation, SQLAlchemy rolls back only that SAVEPOINT (the run-level
+    SAVEPOINT in `execute_integrity_run` and the session stay usable), and the
+    loser re-selects -- now with the winner's row visible and lockable -- and
+    falls back to the same reincidence update a normal repeat occurrence uses,
+    so `occurrence_count` reflects both observations instead of the loser
+    crashing the run.
+    """
+
+    from app.models import IntegrityFinding
+
+    fingerprint = _finding_fingerprint(result)
+    finding = _select_finding_for_update(db, run.household_id, fingerprint)
+    now = datetime.now(UTC)
+    values = _finding_values(result, run, now=now)
+
+    if finding is not None:
+        _apply_finding_reincidence(finding, values)
+        db.flush()
+        return finding.id
+
+    try:
+        with db.begin_nested():
+            finding = IntegrityFinding(
+                household_id=run.household_id,
+                run_id=run.id,
+                invariant_id=result.invariant_id,
+                fingerprint=fingerprint,
+                source="deterministic",
+                status="open",
+                first_seen_at=now,
+                occurrence_count=1,
+                **values,
+            )
+            db.add(finding)
+            db.flush()
+    except IntegrityError:
+        finding = _select_finding_for_update(db, run.household_id, fingerprint)
+        if finding is None:
+            # The unique violation was against this fingerprint (there is no
+            # other unique constraint on the table), so the winner's row must
+            # be visible now; a miss here means something else is wrong.
+            raise
+        _apply_finding_reincidence(finding, values)
+        db.flush()
+
+    return finding.id
+
+
+def _supersede_finding_if_active(
+    db: Session, run: IntegrityRun, result: InvariantResult
+) -> str | None:
+    """Deactivate the still-active finding for a check that now PASSes.
+
+    This never sets `status="resolved"`, `resolved_at` or `resolved_by`: those
+    are reserved for the human-driven `POST /findings/{id}/resolve` action
+    (docs/INTEGRITY_IMPLEMENTATION_PLAN.md section 9.1), and
+    docs/FINANCIAL_RULES.md states findings are not resolved automatically.
+    "Superseded" instead records the deterministic, factual observation that
+    the most recent re-evaluation of this exact check no longer reproduces
+    the failure -- the same pattern `financial_snapshots` uses to keep a
+    prior version on record while marking it `superseded` by a newer one
+    (docs/INTEGRITY_IMPLEMENTATION_PLAN.md section 8.5). Without this, a
+    finding created by a genuine FAIL/UNKNOWN stays `open` forever once the
+    underlying condition is legitimately resolved through the normal review
+    workflow (e.g. `Transaction.reviewed`), and `consolidated_integrity_status`
+    would keep overlaying that stale evidence onto every later status
+    forever. Full history is preserved: `occurrence_count`, `first_seen_at`
+    and the last non-pass `check_status` are left untouched.
+    """
+
+    from app.models import IntegrityFinding
+
+    fingerprint = _finding_fingerprint(result)
+    finding = db.scalar(
+        select(IntegrityFinding)
+        .where(
+            IntegrityFinding.household_id == run.household_id,
+            IntegrityFinding.fingerprint == fingerprint,
+            IntegrityFinding.status.in_(ACTIVE_FINDING_STATUSES),
         )
-        db.add(finding)
+        .with_for_update()
+    )
+    if finding is None:
+        return None
+
+    now = datetime.now(UTC)
+    finding.status = "superseded"
+    finding.metadata_json = {
+        **dict(finding.metadata_json or {}),
+        "superseded_at": now.isoformat(),
+        "superseded_by_run_id": run.id,
+        "superseded_trace_id": result.trace_id or run.trace_id,
+        "superseded_reason": (
+            "Reavaliação determinística mais recente retornou PASS; o finding "
+            "não é mais reproduzido pelas evidências atuais."
+        ),
+    }
     db.flush()
     return finding.id
 

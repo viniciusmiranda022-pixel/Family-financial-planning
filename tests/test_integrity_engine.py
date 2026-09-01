@@ -1,6 +1,6 @@
 import os
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -18,10 +18,12 @@ import app.services.financial_integrity as financial_integrity_module  # noqa: E
 from app.db import Base  # noqa: E402
 from app.models import Account, Household, IntegrityFinding, IntegrityRun, Transaction  # noqa: E402
 from app.services.financial_integrity import (  # noqa: E402
+    ACTIVE_FINDING_STATUSES,
     IntegrityRunScope,
     IntegrityRunTrigger,
     assess_integrity,
     build_baseline_checks,
+    consolidated_integrity_status,
     execute_integrity_run,
 )
 from app.services.financial_invariants import (  # noqa: E402
@@ -378,3 +380,181 @@ def test_execute_integrity_run_rolls_back_partial_findings_on_failure(monkeypatc
             select(IntegrityFinding).where(IntegrityFinding.household_id == household.id)
         ).all()
         assert findings == []
+
+
+def test_execute_integrity_run_supersedes_stale_finding_when_check_passes() -> None:
+    """A FAIL creates an open finding. Once the household resolves the
+    duplicate through the supported review workflow (`Transaction.reviewed`,
+    not direct DB surgery) and INV-014 re-evaluates to PASS, the prior
+    finding must stop being active: `consolidated_integrity_status` must not
+    stay `critical` forever on stale evidence. The finding is never marked
+    `resolved` automatically -- docs/FINANCIAL_RULES.md reserves that for the
+    human-driven resolve action -- so history (first_seen_at, occurrence
+    count, resolved_at/resolved_by staying empty) must survive untouched."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = _seeded_colliding_transactions(
+            db, classification_confidences=(Decimal("0.9000"), Decimal("0.9000"))
+        )
+        db.commit()
+
+        checks = build_baseline_checks(db, household_id=household.id, scope=IntegrityRunScope.GLOBAL)
+        _, results = execute_integrity_run(
+            db,
+            household_id=household.id,
+            scope=IntegrityRunScope.GLOBAL,
+            trigger=IntegrityRunTrigger.MANUAL,
+            checks=checks,
+        )
+        db.commit()
+        assert all(result.status is InvariantStatus.FAIL for result in results)
+
+        opened = db.scalars(
+            select(IntegrityFinding).where(IntegrityFinding.household_id == household.id)
+        ).all()
+        assert len(opened) == 2
+        assert all(finding.status == "open" for finding in opened)
+        first_seen_by_id = {finding.id: finding.first_seen_at for finding in opened}
+        occurrence_by_id = {finding.id: finding.occurrence_count for finding in opened}
+
+        status_before = consolidated_integrity_status(db, household_id=household.id)
+        assert status_before["status"] == "critical"
+        assert status_before["open_findings"] == 2
+
+        transactions = db.scalars(
+            select(Transaction).where(Transaction.household_id == household.id)
+        ).all()
+        for transaction in transactions:
+            transaction.reviewed = True
+        db.flush()
+
+        rerun_checks = build_baseline_checks(
+            db, household_id=household.id, scope=IntegrityRunScope.GLOBAL
+        )
+        _, rerun_results = execute_integrity_run(
+            db,
+            household_id=household.id,
+            scope=IntegrityRunScope.GLOBAL,
+            trigger=IntegrityRunTrigger.MANUAL,
+            checks=rerun_checks,
+        )
+        db.commit()
+        assert all(result.status is InvariantStatus.PASS for result in rerun_results)
+
+        db.expire_all()
+        superseded = db.scalars(
+            select(IntegrityFinding).where(IntegrityFinding.household_id == household.id)
+        ).all()
+        assert len(superseded) == 2
+        for finding in superseded:
+            assert finding.status == "superseded"
+            assert finding.status not in ACTIVE_FINDING_STATUSES
+            # Never claims a human resolution happened.
+            assert finding.resolved_at is None
+            assert finding.resolved_by is None
+            assert finding.resolution_reason is None
+            # History is preserved, not rewritten.
+            assert finding.first_seen_at == first_seen_by_id[finding.id]
+            assert finding.occurrence_count == occurrence_by_id[finding.id]
+            assert finding.check_status == "fail"
+            assert finding.metadata_json.get("superseded_by_run_id")
+
+        status_after = consolidated_integrity_status(db, household_id=household.id)
+        assert status_after["status"] == "healthy"
+        assert status_after["open_findings"] == 0
+
+
+def test_persist_finding_recovers_from_concurrent_insert_race(monkeypatch) -> None:
+    """`SELECT ... FOR UPDATE` cannot lock a fingerprint no run has persisted
+    yet, so two runs racing to be the first to persist the same new
+    fingerprint can both miss and both attempt to `INSERT`. The loser must
+    recover via the unique constraint (savepoint + retry + reselect) and fall
+    back to the reincidence update, instead of leaving the run's session in a
+    broken transaction or losing the winner's finding."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = _seeded_colliding_transactions(
+            db, classification_confidences=(Decimal("0.9000"), Decimal("0.9000"))
+        )
+        db.commit()
+
+        checks = build_baseline_checks(db, household_id=household.id, scope=IntegrityRunScope.GLOBAL)
+        assert len(checks) == 2
+        result = evaluate_invariant(checks[0].invariant_id, checks[0].context)
+        assert result.status is InvariantStatus.FAIL
+
+        run = IntegrityRun(
+            household_id=household.id,
+            scope=IntegrityRunScope.GLOBAL.value,
+            status="running",
+            trigger=IntegrityRunTrigger.MANUAL.value,
+            financial_rules_version=FINANCIAL_RULES_VERSION,
+            calculation_version=FINANCIAL_RULES_VERSION,
+            started_at=datetime.now(UTC),
+            trace_id="trace-race",
+        )
+        db.add(run)
+        db.flush()
+
+        fingerprint = financial_integrity_module._finding_fingerprint(result)
+
+        # Simulate the concurrent winner: another run's row for this exact
+        # fingerprint already committed before our own SELECT ... FOR UPDATE
+        # became visible to it -- the scenario `SELECT ... FOR UPDATE` cannot
+        # protect against because no row existed for it to lock at read time.
+        now = datetime.now(UTC)
+        winner = IntegrityFinding(
+            household_id=household.id,
+            run_id=run.id,
+            invariant_id=result.invariant_id,
+            fingerprint=fingerprint,
+            source="deterministic",
+            status="open",
+            financial_rules_version=result.financial_rules_version,
+            trace_id="trace-winner",
+            check_status=result.status.value,
+            severity=result.severity.value,
+            scope=str(result.scope),
+            entity_type=result.entity_type,
+            entity_id=str(result.entity_id),
+            period=result.period,
+            title="Duplicidade",
+            message="ocorrência concorrente original",
+            metadata_json={},
+            first_seen_at=now,
+            last_seen_at=now,
+            occurrence_count=1,
+        )
+        db.add(winner)
+        db.flush()
+
+        calls = {"count": 0}
+        original_select = financial_integrity_module._select_finding_for_update
+
+        def miss_once(session, household_id, fingerprint_value):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return None
+            return original_select(session, household_id, fingerprint_value)
+
+        monkeypatch.setattr(financial_integrity_module, "_select_finding_for_update", miss_once)
+
+        finding_id = financial_integrity_module._persist_finding(db, run, result)
+        db.flush()
+
+        assert calls["count"] == 2
+        assert finding_id == winner.id
+
+        rows = db.scalars(
+            select(IntegrityFinding).where(
+                IntegrityFinding.household_id == household.id,
+                IntegrityFinding.fingerprint == fingerprint,
+            )
+        ).all()
+        assert len(rows) == 1
+        assert rows[0].occurrence_count == 2
+        assert rows[0].status == "open"
