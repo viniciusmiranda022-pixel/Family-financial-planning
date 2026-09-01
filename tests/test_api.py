@@ -262,7 +262,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             )
             db.commit()
 
-        dashboard = client.get("/api/dashboard").json()
+        dashboard = client.get("/api/dashboard?month=2026-08").json()
         assert dashboard["spending"] == 76.78
         assert dashboard["food_benefits"] == 1630.0
         assert dashboard["liquidity_name"] == "Privilege DI"
