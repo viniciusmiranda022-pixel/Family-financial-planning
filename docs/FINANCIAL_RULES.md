@@ -90,4 +90,13 @@ saldo anterior
 - teto de gastos em dinheiro
 ```
 
-Viabilidade significa que o menor saldo projetado do Privilège DI no cenário conservador permanece maior ou igual ao piso de segurança configurado.
+O fechamento canônico aplica:
+
+```text
+saldo final = máximo(0, saldo anterior + resultado do mês)
+déficit sem cobertura = máximo(0, -(saldo anterior + resultado do mês))
+```
+
+Viabilidade significa que o menor saldo projetado do Privilège DI no cenário conservador permanece
+maior ou igual ao piso de segurança. Abaixo do piso o cenário continua calculável, mas recebe alerta;
+com déficit sem cobertura, não pode ser apresentado como plenamente confiável.

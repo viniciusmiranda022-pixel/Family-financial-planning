@@ -15,9 +15,12 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Revision 0001 creates metadata dynamically.  On a brand-new installation
-    # the current model may therefore already include this table.
-    if "capture_drafts" in sa.inspect(op.get_bind()).get_table_names():
+    # Compatibility guard for installations that executed the former dynamic
+    # version of revision 0001 before that historical migration was frozen.
+    if (
+        not op.get_context().as_sql
+        and "capture_drafts" in sa.inspect(op.get_bind()).get_table_names()
+    ):
         return
     op.create_table(
         "capture_drafts",
@@ -44,9 +47,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_capture_drafts_household_id", "capture_drafts", ["household_id"])
-    op.create_index(
-        "ix_capture_household_created", "capture_drafts", ["household_id", "created_at"]
-    )
+    op.create_index("ix_capture_household_created", "capture_drafts", ["household_id", "created_at"])
 
 
 def downgrade() -> None:

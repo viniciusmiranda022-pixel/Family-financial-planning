@@ -1,6 +1,6 @@
 # Family Financial Planning
 
-Sistema financeiro familiar **on-premises**, com PostgreSQL, importação de documentos, deduplicação, fila de revisão e projeções auditáveis.
+Sistema financeiro familiar **on-premises**, com PostgreSQL, importação de documentos, deduplicação,\nfila de revisão, projeções auditáveis e contrato determinístico de integridade financeira.
 
 O código pode ficar no GitHub, mas extratos, faturas, holerites, banco de dados, backups e chaves permanecem somente no servidor Linux.
 
