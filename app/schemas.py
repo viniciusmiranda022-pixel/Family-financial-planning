@@ -155,3 +155,24 @@ class ProfileRequest(BaseModel):
     investment_gross_annual_rate: Decimal = Field(ge=0, le=1)
     investment_income_tax_rate: Decimal = Field(ge=0, le=1)
     projection_end: date
+
+
+class IntegrityRunRequest(BaseModel):
+    scope: str = Field(pattern="^(entity|period|global)$")
+    period: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    entity_type: str | None = Field(default=None, max_length=80)
+    entity_id: str | None = Field(default=None, max_length=80)
+
+    @model_validator(mode="after")
+    def validate_scope_fields(self) -> "IntegrityRunRequest":
+        if self.scope == "period" and not self.period:
+            raise ValueError("Auditoria por período exige mês no formato AAAA-MM")
+        if self.scope == "entity" and (
+            self.entity_type != "transaction" or not self.entity_id
+        ):
+            raise ValueError("Auditoria por entidade exige uma transação")
+        if self.scope == "global" and any(
+            value is not None for value in (self.period, self.entity_type, self.entity_id)
+        ):
+            raise ValueError("Auditoria global não aceita período ou entidade")
+        return self

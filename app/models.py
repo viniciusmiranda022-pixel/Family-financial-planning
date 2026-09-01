@@ -1,8 +1,10 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Date,
     DateTime,
@@ -15,9 +17,12 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+
+JSON_DOCUMENT = JSON().with_variant(JSONB(), "postgresql")
 
 
 def new_id() -> str:
@@ -258,6 +263,109 @@ class AuditEvent(Base):
     entity_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
     entity_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    before_state: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    after_state: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    source: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )
+
+
+class IntegrityRun(Base):
+    __tablename__ = "integrity_runs"
+    __table_args__ = (
+        Index("ix_integrity_runs_household_status", "household_id", "status"),
+        Index("ix_integrity_runs_household_period", "household_id", "period"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    scope: Mapped[str] = mapped_column(String(20))
+    scope_entity_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    scope_entity_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    period: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    trigger: Mapped[str] = mapped_column(String(20))
+    financial_rules_version: Mapped[str] = mapped_column(String(20))
+    calculation_version: Mapped[str] = mapped_column(String(40))
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    created_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class IntegrityFinding(Base, TimestampMixin):
+    __tablename__ = "integrity_findings"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id",
+            "fingerprint",
+            name="uq_integrity_finding_household_fingerprint",
+        ),
+        Index("ix_integrity_findings_household_status", "household_id", "status"),
+        Index("ix_integrity_findings_household_severity", "household_id", "severity"),
+        Index("ix_integrity_findings_household_period", "household_id", "period"),
+        Index("ix_integrity_findings_household_invariant", "household_id", "invariant_id"),
+        Index("ix_integrity_findings_household_fingerprint", "household_id", "fingerprint"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("integrity_runs.id", ondelete="CASCADE"), index=True
+    )
+    invariant_id: Mapped[str] = mapped_column(String(12))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    financial_rules_version: Mapped[str] = mapped_column(String(20))
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    source: Mapped[str] = mapped_column(String(24), default="deterministic")
+    status: Mapped[str] = mapped_column(String(24), default="open")
+    check_status: Mapped[str] = mapped_column(String(16))
+    severity: Mapped[str] = mapped_column(String(16))
+    scope: Mapped[str] = mapped_column(String(20))
+    entity_type: Mapped[str] = mapped_column(String(80))
+    entity_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    period: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    title: Mapped[str] = mapped_column(String(200))
+    message: Mapped[str] = mapped_column(Text)
+    expected_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    actual_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    difference_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    expected: Mapped[dict[str, Any] | list[Any] | str | int | float | bool | None] = mapped_column(
+        JSON_DOCUMENT, nullable=True
+    )
+    actual: Mapped[dict[str, Any] | list[Any] | str | int | float | bool | None] = mapped_column(
+        JSON_DOCUMENT, nullable=True
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSON_DOCUMENT, default=dict)
+    recommended_action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    occurrence_count: Mapped[int] = mapped_column(Integer, default=1)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    resolution_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

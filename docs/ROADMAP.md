@@ -51,7 +51,10 @@
 - registry executável com resultado estruturado e `unknown` para fatos insuficientes;
 - regra canônica do Privilège DI coberta por testes de propriedades e cenários de borda;
 - migração inicial congelada, sem dependência dos modelos ORM futuros;
-- próximos incrementos: findings persistentes, reconciliação, snapshot canônico, validador de
+- runs e findings persistentes com fingerprint, score explicado, status, gates específicos e
+  trilha before/after/reason/trace;
+- APIs autenticadas de execução e consulta, ainda sem habilitar a interface de Integridade;
+- próximos incrementos: reconciliação, snapshot canônico, validador de
   projeção, auditor Codex, UI de Integridade e safety gates completos de CI.
 
 ## Fase 3 — Próximas evoluções
