@@ -24,6 +24,13 @@ Base.metadata.create_all(bind=engine)
 
 
 def test_complete_local_financial_flow(monkeypatch) -> None:
+    class FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return cls(2026, 8, 31)
+
+    monkeypatch.setattr("app.api.date", FixedDate)
+
     with TestClient(app) as client:
         setup = client.post(
             "/api/auth/setup",
@@ -608,7 +615,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert advisor_reflection.json()["metrics"]["purchase_reflection_answered"] is True
         assert "uso seria ocasional" in advisor_reflection.json()["answer"]
 
-        shared_due_date = date.today() + timedelta(days=60)
+        shared_due_date = FixedDate.today() + timedelta(days=60)
         same_day_obligations = []
         for name in ("Parcela mensal da chácara", "Reforço da chácara"):
             response = client.post(
@@ -737,7 +744,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             },
         )
         assert obligation.status_code == 201
-        due_soon = date.today() + timedelta(days=5)
+        due_soon = FixedDate.today() + timedelta(days=5)
         alert_obligation = client.post(
             "/api/obligations",
             json={
