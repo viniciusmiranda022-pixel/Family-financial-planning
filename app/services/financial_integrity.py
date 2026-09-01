@@ -32,7 +32,7 @@ from app.services.financial_invariants import (
 from app.services.invariant_registry import evaluate_invariant, get_invariant
 
 if TYPE_CHECKING:
-    from app.models import IntegrityFinding, IntegrityRun
+    from app.models import IntegrityFinding, IntegrityRun, Transaction
 
 
 class IntegrityRunScope(StrEnum):
@@ -242,11 +242,17 @@ def execute_integrity_run(
             for check in checks
         )
         assessment = assess_integrity(results)
-        finding_ids = [
-            _persist_finding(db, run, result)
-            for result in results
-            if result.status is not InvariantStatus.PASS
-        ]
+        # Derived finding persistence is isolated in its own SAVEPOINT. If any
+        # write in this loop fails partway through, SQLAlchemy rolls back to the
+        # savepoint automatically, so no partial finding mutation from a failed
+        # run can survive the `except` branch below, which only records the
+        # run itself as `failed`.
+        with db.begin_nested():
+            finding_ids = [
+                _persist_finding(db, run, result)
+                for result in results
+                if result.status is not InvariantStatus.PASS
+            ]
         completed_at = datetime.now(UTC)
         run.status = "completed"
         run.completed_at = completed_at
@@ -273,6 +279,31 @@ def execute_integrity_run(
         }
         db.flush()
         raise
+
+
+DUPLICATE_FINGERPRINT_CONFIDENCE = Decimal("1.00")
+
+
+def _duplicate_confidence(transaction: Transaction) -> Decimal | None:
+    """Derive INV-014's `duplicate_confidence` from deterministic evidence only.
+
+    The only duplicate signal the current schema proves is an exact fingerprint
+    collision (`Transaction.possible_duplicate`), which requires the account,
+    booked date, amount, normalized description, owner and installment metadata
+    to match precisely (see `transaction_fingerprint`). That is treated as full
+    confidence (1.00), which sits inside the documented "strong" band.
+
+    `Transaction.confidence` is a *different* fact: it is the classifier's
+    confidence in the category assigned during import and carries no
+    information about duplication, so it must never be reused here. When the
+    deterministic fingerprint signal is absent, duplicate confidence cannot be
+    proven from current facts and `None` is returned so the invariant reports
+    `unknown` instead of guessing.
+    """
+
+    if transaction.possible_duplicate:
+        return DUPLICATE_FINGERPRINT_CONFIDENCE
+    return None
 
 
 def build_baseline_checks(
@@ -325,7 +356,7 @@ def build_baseline_checks(
             invariant_id="INV-014",
             context=InvariantContext(
                 facts={
-                    "duplicate_confidence": transaction.confidence,
+                    "duplicate_confidence": _duplicate_confidence(transaction),
                     "resolution_status": "resolved" if transaction.reviewed else "open",
                     "included_in_totals": not transaction.excluded,
                 },
