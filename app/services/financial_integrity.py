@@ -360,26 +360,67 @@ def build_baseline_checks(
     as canonical reconciliations and snapshots arrive in PRs 3-5.
     """
 
-    from app.models import Transaction
+    from app.models import IntegrityFinding, Transaction
 
     run_scope = IntegrityRunScope(str(scope))
-    statement = select(Transaction).where(
+    if run_scope is IntegrityRunScope.ENTITY and (entity_type != "transaction" or not entity_id):
+        raise ValueError("entity scope requires a transaction entity_id")
+
+    flagged_statement = select(Transaction).where(
         Transaction.household_id == household_id,
         Transaction.possible_duplicate.is_(True),
     )
+    # A finding only stays superseded (or reopens) while its check keeps being
+    # evaluated. The supported UI resolution flow -- "considerar lançamento
+    # legítimo" -- sends `PATCH /transactions/{id}` with `possible_duplicate:
+    # false, reviewed: true, excluded: false`, which removes the transaction
+    # from `flagged_statement` entirely. Without also tracking active INV-014
+    # findings, that transaction's check would simply stop running, so
+    # `_supersede_finding_if_active` in `execute_integrity_run` would never
+    # fire for it and the finding would stay `open` forever -- exactly the
+    # stale-critical bug the engineer flagged. Re-including any transaction
+    # that still has an *active* INV-014 finding, regardless of its current
+    # `possible_duplicate` value, guarantees the check keeps running with live
+    # evidence until the finding is deterministically superseded or actually
+    # reproduced again.
+    active_finding_statement = select(IntegrityFinding.entity_id).where(
+        IntegrityFinding.household_id == household_id,
+        IntegrityFinding.invariant_id == "INV-014",
+        IntegrityFinding.status.in_(ACTIVE_FINDING_STATUSES),
+    )
 
     if run_scope is IntegrityRunScope.ENTITY:
-        if entity_type != "transaction" or not entity_id:
-            raise ValueError("entity scope requires a transaction entity_id")
-        statement = statement.where(Transaction.id == entity_id)
+        flagged_statement = flagged_statement.where(Transaction.id == entity_id)
+        active_finding_statement = active_finding_statement.where(
+            IntegrityFinding.entity_id == entity_id
+        )
     elif run_scope is IntegrityRunScope.PERIOD:
         start, end = _period_bounds(period)
-        statement = statement.where(
+        flagged_statement = flagged_statement.where(
             Transaction.booked_at >= start,
             Transaction.booked_at < end,
         )
+        active_finding_statement = active_finding_statement.where(
+            IntegrityFinding.period == period
+        )
 
-    rows = tuple(db.scalars(statement.order_by(Transaction.booked_at, Transaction.id)).all())
+    flagged_rows = tuple(db.scalars(flagged_statement).all())
+    flagged_ids = {transaction.id for transaction in flagged_rows}
+    stale_finding_entity_ids = set(db.scalars(active_finding_statement).all()) - flagged_ids
+    stale_rows: tuple[Transaction, ...] = ()
+    if stale_finding_entity_ids:
+        stale_rows = tuple(
+            db.scalars(
+                select(Transaction).where(
+                    Transaction.household_id == household_id,
+                    Transaction.id.in_(stale_finding_entity_ids),
+                )
+            ).all()
+        )
+
+    rows = tuple(
+        sorted(flagged_rows + stale_rows, key=lambda transaction: (transaction.booked_at, transaction.id))
+    )
     if run_scope is IntegrityRunScope.ENTITY and not rows:
         entity_exists = db.scalar(
             select(Transaction.id).where(
@@ -639,14 +680,46 @@ def _finding_values(result: InvariantResult, run: IntegrityRun, *, now: datetime
     }
 
 
-def _apply_finding_reincidence(finding: IntegrityFinding, values: dict[str, Any]) -> None:
+def _apply_finding_reincidence(
+    finding: IntegrityFinding, values: dict[str, Any], *, now: datetime
+) -> None:
+    """Update an existing finding row with a new non-PASS occurrence.
+
+    Only called from `_persist_finding`, i.e. only for non-PASS results.
+    `finding.status` here can be `open`, `acknowledged` -- already active, no
+    reopen needed -- or `superseded` -- reactivated by `_supersede_finding_if_active`
+    the last time the same fingerprint evaluated to PASS. A `superseded`
+    finding whose condition is reproduced again must not stay `superseded`:
+    `ACTIVE_FINDING_STATUSES` (and therefore `consolidated_integrity_status`)
+    would keep ignoring a currently-failing check, which is a worse blind spot
+    than the stale-open finding this same lifecycle was built to fix -- it
+    manufactures false confidence instead of stale suspicion. So any status
+    outside `ACTIVE_FINDING_STATUSES` is deterministically reopened to `open`
+    (never straight to a terminal status the human resolve/ignore/false-positive
+    actions own), and the transition is recorded in `metadata_json` for audit.
+    """
+
+    previous_status = finding.status
+    reopened = previous_status not in ACTIVE_FINDING_STATUSES
     for key, value in values.items():
         setattr(finding, key, value)
     finding.occurrence_count += 1
+    if reopened:
+        finding.status = "open"
+        finding.metadata_json = {
+            **dict(finding.metadata_json or {}),
+            "reopened_at": now.isoformat(),
+            "reopened_from_status": previous_status,
+            "reopened_reason": (
+                "Reavaliação determinística voltou a reproduzir a falha/estado "
+                f"'{values.get('check_status')}' após o finding ter sido "
+                f"marcado '{previous_status}'."
+            ),
+        }
 
 
 def _persist_finding(db: Session, run: IntegrityRun, result: InvariantResult) -> str:
-    """Create or update the open finding for `result`'s fingerprint.
+    """Create or reopen/update the active finding for `result`'s fingerprint.
 
     Only called for non-PASS results (see `execute_integrity_run`).
 
@@ -667,12 +740,15 @@ def _persist_finding(db: Session, run: IntegrityRun, result: InvariantResult) ->
     from app.models import IntegrityFinding
 
     fingerprint = _finding_fingerprint(result)
+    # Selected regardless of status -- including `superseded` -- so a
+    # reproduced failure updates and reopens the existing row instead of
+    # violating the fingerprint uniqueness constraint with a second insert.
     finding = _select_finding_for_update(db, run.household_id, fingerprint)
     now = datetime.now(UTC)
     values = _finding_values(result, run, now=now)
 
     if finding is not None:
-        _apply_finding_reincidence(finding, values)
+        _apply_finding_reincidence(finding, values, now=now)
         db.flush()
         return finding.id
 
@@ -698,7 +774,7 @@ def _persist_finding(db: Session, run: IntegrityRun, result: InvariantResult) ->
             # other unique constraint on the table), so the winner's row must
             # be visible now; a miss here means something else is wrong.
             raise
-        _apply_finding_reincidence(finding, values)
+        _apply_finding_reincidence(finding, values, now=now)
         db.flush()
 
     return finding.id

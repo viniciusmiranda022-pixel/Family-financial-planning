@@ -556,6 +556,28 @@ Além dos campos solicitados no prompt, incluir `run_id`, `fingerprint`, `financ
 
 Valores monetários devem ser `Numeric`, e `metadata` deve ser `JSONB`. Deve existir índice por família, status, severidade, período, invariant e fingerprint. O fingerprint impede a abertura repetida do mesmo finding; uma nova ocorrência atualiza `last_seen_at` sem apagar o histórico.
 
+**Ciclo de vida de `status`** (coluna `String`, sem `CHECK` fixo para permitir evolução aditiva):
+
+| Status | Ativo nos gates? | Como é atingido |
+|---|---|---|
+| `open` | sim | criado na primeira ocorrência não-`PASS`; também o destino de uma reabertura automática |
+| `acknowledged` | sim | reservado para `POST /findings/{id}/acknowledge` (ação humana, ainda não implementada nesta fatia) |
+| `superseded` | não | automático e determinístico: a reavaliação mais recente do mesmo fingerprint retornou `PASS` |
+| `resolved` | não | reservado para `POST /findings/{id}/resolve` (ação humana explícita com evidência, ainda não implementada) |
+| `ignored` | não | reservado para `POST /findings/{id}/ignore` (ação humana, ainda não implementada) |
+| `false_positive` | não | reservado para `POST /findings/{id}/false-positive` (ação humana, ainda não implementada) |
+
+`superseded` segue o mesmo padrão de `financial_snapshots` (seção 8.5: recomputação marca a versão
+anterior como `superseded`), mas é o motor -- nunca uma ação humana -- quem faz essa transição, e
+nunca preenche `resolved_at`/`resolved_by`/`resolution_reason`: esses campos ficam reservados
+exclusivamente para o endpoint `resolve` humano. Se o fingerprint voltar a produzir um resultado
+não-`PASS` depois de `superseded`, o finding é reaberto automaticamente para `open` (nunca para um
+dos estados terminais reservados a ação humana) na mesma atualização que registra a nova ocorrência,
+preservando `first_seen_at` e incrementando `occurrence_count`; a transição (`reopened_from_status`,
+`reopened_at`) fica registrada em `metadata`. Sem essa reabertura, um finding `superseded` que volte
+a falhar ficaria fora de `ACTIVE_FINDING_STATUSES` e o status consolidado reportaria confiança
+indevida sobre uma condição atualmente violada.
+
 ### 8.3 `document_reconciliations`
 
 ```text

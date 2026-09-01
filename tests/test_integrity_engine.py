@@ -558,3 +558,177 @@ def test_persist_finding_recovers_from_concurrent_insert_race(monkeypatch) -> No
         assert len(rows) == 1
         assert rows[0].occurrence_count == 2
         assert rows[0].status == "open"
+
+
+def test_supported_ui_resolution_flow_supersedes_finding_even_after_flag_flip() -> None:
+    """Reproduces the exact payload the UI sends for "considerar lançamento
+    legítimo": `PATCH /transactions/{id}` with `possible_duplicate=False,
+    reviewed=True, excluded=False`. `build_baseline_checks` used to select
+    only `possible_duplicate=True` rows, so this payload removed the
+    transaction from the next run's checks entirely -- `_supersede_finding_if_active`
+    was then never called, and the finding stayed `open` (and
+    `consolidated_integrity_status` stayed `critical`) forever, even though a
+    human had legitimately resolved it. `build_baseline_checks` must keep
+    evaluating any transaction with an active INV-014 finding regardless of
+    its current `possible_duplicate` value, so the resolution is honored."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = _seeded_colliding_transactions(
+            db, classification_confidences=(Decimal("0.9000"), Decimal("0.9000"))
+        )
+        db.commit()
+
+        checks = build_baseline_checks(db, household_id=household.id, scope=IntegrityRunScope.GLOBAL)
+        _, results = execute_integrity_run(
+            db,
+            household_id=household.id,
+            scope=IntegrityRunScope.GLOBAL,
+            trigger=IntegrityRunTrigger.MANUAL,
+            checks=checks,
+        )
+        db.commit()
+        assert all(result.status is InvariantStatus.FAIL for result in results)
+
+        opened = db.scalars(
+            select(IntegrityFinding).where(IntegrityFinding.household_id == household.id)
+        ).all()
+        assert len(opened) == 2
+        assert all(finding.status == "open" for finding in opened)
+
+        status_before = consolidated_integrity_status(db, household_id=household.id)
+        assert status_before["status"] == "critical"
+
+        # Mirrors the real UI payload for both duplicate-pair members: the
+        # flag that made them selectable in the first place is cleared.
+        transactions = db.scalars(
+            select(Transaction).where(Transaction.household_id == household.id)
+        ).all()
+        for transaction in transactions:
+            transaction.excluded = False
+            transaction.possible_duplicate = False
+            transaction.reviewed = True
+        db.flush()
+
+        # Without tracking active findings, this would now be empty.
+        rerun_checks = build_baseline_checks(
+            db, household_id=household.id, scope=IntegrityRunScope.GLOBAL
+        )
+        assert len(rerun_checks) == 2
+
+        _, rerun_results = execute_integrity_run(
+            db,
+            household_id=household.id,
+            scope=IntegrityRunScope.GLOBAL,
+            trigger=IntegrityRunTrigger.MANUAL,
+            checks=rerun_checks,
+        )
+        db.commit()
+        assert all(result.status is InvariantStatus.PASS for result in rerun_results)
+
+        db.expire_all()
+        superseded = db.scalars(
+            select(IntegrityFinding).where(IntegrityFinding.household_id == household.id)
+        ).all()
+        assert len(superseded) == 2
+        for finding in superseded:
+            assert finding.status == "superseded"
+            assert finding.status not in ACTIVE_FINDING_STATUSES
+
+        status_after = consolidated_integrity_status(db, household_id=household.id)
+        assert status_after["status"] == "healthy"
+        assert status_after["open_findings"] == 0
+
+
+def test_superseded_finding_reopens_on_reproduced_failure() -> None:
+    """FAIL creates an `open` finding; a later PASS supersedes it; a further
+    re-evaluation that reproduces the original failure must reopen it to
+    `open` -- not leave it `superseded`, which `ACTIVE_FINDING_STATUSES`
+    excludes from `consolidated_integrity_status`, manufacturing false
+    confidence about a condition that is failing right now. History
+    (`first_seen_at`) survives; `occurrence_count` keeps incrementing and the
+    reopen transition is recorded in `metadata`."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = _seeded_colliding_transactions(
+            db, classification_confidences=(Decimal("0.9000"), Decimal("0.9000"))
+        )
+        db.commit()
+
+        checks = build_baseline_checks(db, household_id=household.id, scope=IntegrityRunScope.GLOBAL)
+        _, results = execute_integrity_run(
+            db,
+            household_id=household.id,
+            scope=IntegrityRunScope.GLOBAL,
+            trigger=IntegrityRunTrigger.MANUAL,
+            checks=checks,
+        )
+        db.commit()
+        assert all(result.status is InvariantStatus.FAIL for result in results)
+
+        opened = db.scalars(
+            select(IntegrityFinding).where(IntegrityFinding.household_id == household.id)
+        ).all()
+        assert len(opened) == 2
+        first_seen_by_id = {finding.id: finding.first_seen_at for finding in opened}
+        assert all(finding.occurrence_count == 1 for finding in opened)
+
+        transactions = db.scalars(
+            select(Transaction).where(Transaction.household_id == household.id)
+        ).all()
+
+        # Human review resolves the duplicate: PASS supersedes both findings.
+        for transaction in transactions:
+            transaction.reviewed = True
+        db.flush()
+        _, superseding_results = execute_integrity_run(
+            db,
+            household_id=household.id,
+            scope=IntegrityRunScope.GLOBAL,
+            trigger=IntegrityRunTrigger.MANUAL,
+            checks=build_baseline_checks(db, household_id=household.id, scope=IntegrityRunScope.GLOBAL),
+        )
+        db.commit()
+        assert all(result.status is InvariantStatus.PASS for result in superseding_results)
+        db.expire_all()
+        superseded = db.scalars(
+            select(IntegrityFinding).where(IntegrityFinding.household_id == household.id)
+        ).all()
+        assert all(finding.status == "superseded" for finding in superseded)
+        assert consolidated_integrity_status(db, household_id=household.id)["status"] == "healthy"
+
+        # The review is undone (or the condition is genuinely reproduced
+        # again): the same fingerprint fails once more.
+        for transaction in transactions:
+            transaction.reviewed = False
+        db.flush()
+        _, reopening_results = execute_integrity_run(
+            db,
+            household_id=household.id,
+            scope=IntegrityRunScope.GLOBAL,
+            trigger=IntegrityRunTrigger.MANUAL,
+            checks=build_baseline_checks(db, household_id=household.id, scope=IntegrityRunScope.GLOBAL),
+        )
+        db.commit()
+        assert all(result.status is InvariantStatus.FAIL for result in reopening_results)
+
+        db.expire_all()
+        reopened = db.scalars(
+            select(IntegrityFinding).where(IntegrityFinding.household_id == household.id)
+        ).all()
+        assert len(reopened) == 2
+        for finding in reopened:
+            assert finding.status == "open"
+            assert finding.status in ACTIVE_FINDING_STATUSES
+            assert finding.occurrence_count == 2
+            assert finding.check_status == "fail"
+            assert finding.first_seen_at == first_seen_by_id[finding.id]
+            assert finding.metadata_json.get("reopened_from_status") == "superseded"
+            assert finding.metadata_json.get("reopened_at")
+
+        status_final = consolidated_integrity_status(db, household_id=household.id)
+        assert status_final["status"] == "critical"
+        assert status_final["open_findings"] == 2
