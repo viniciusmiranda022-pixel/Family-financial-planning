@@ -155,6 +155,7 @@ class ProfileRequest(BaseModel):
     investment_gross_annual_rate: Decimal = Field(ge=0, le=1)
     investment_income_tax_rate: Decimal = Field(ge=0, le=1)
     projection_end: date
+    central_liquidity_account_id: str | None = Field(default=None, max_length=36)
 
 
 class IntegrityRunRequest(BaseModel):

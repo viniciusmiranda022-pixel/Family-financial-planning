@@ -26,6 +26,8 @@ from app.models import (
     DuplicateGroup,
     DuplicateGroupMember,
     FinancialProfile,
+    FinancialSnapshot,
+    FinancialSnapshotLineage,
     Household,
     IntegrityFinding,
     IntegrityRun,
@@ -83,6 +85,13 @@ from app.services.finance import (
     money,
     month_key,
     monthly_net_rate,
+)
+from app.services.financial_engine import (
+    build_financial_snapshot,
+    build_snapshot_invariant_checks,
+    persist_financial_snapshot,
+    serialize_financial_snapshot,
+    serialize_lineage,
 )
 from app.services.financial_integrity import (
     IntegrityRunScope,
@@ -2974,6 +2983,7 @@ def get_profile(user: User = Depends(get_current_user), db: Session = Depends(ge
         "investment_gross_annual_rate": decimal_value(item.investment_gross_annual_rate),
         "investment_income_tax_rate": decimal_value(item.investment_income_tax_rate),
         "projection_end": item.projection_end,
+        "central_liquidity_account_id": item.central_liquidity_account_id,
     }
 
 
@@ -2982,11 +2992,125 @@ def update_profile(
     payload: ProfileRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
     item = profile_for(db, user.household_id)
+    if payload.central_liquidity_account_id:
+        account = db.get(Account, payload.central_liquidity_account_id)
+        if account is None or account.household_id != user.household_id:
+            raise HTTPException(status_code=422, detail="Conta de liquidez central inválida")
     for field, value in payload.model_dump().items():
         setattr(item, field, value)
     audit(db, user, "profile.update", "financial_profile", item.id, payload.model_dump())
     db.commit()
     return {"ok": True}
+
+
+def _validate_period_param(period: str) -> None:
+    try:
+        datetime.strptime(period, "%Y-%m")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from exc
+
+
+@router.get("/financial-snapshots/{period}")
+def financial_snapshot_for_period(
+    period: str,
+    snapshot_kind: str = "actual",
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _validate_period_param(period)
+    snapshot = db.scalar(
+        select(FinancialSnapshot).where(
+            FinancialSnapshot.household_id == user.household_id,
+            FinancialSnapshot.period == period,
+            FinancialSnapshot.snapshot_kind == snapshot_kind,
+            FinancialSnapshot.status == "current",
+        )
+    )
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot financeiro não encontrado para o período")
+    return serialize_financial_snapshot(snapshot)
+
+
+@router.get("/financial-snapshots/{snapshot_id}/lineage")
+def financial_snapshot_lineage(
+    snapshot_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    snapshot = db.scalar(
+        select(FinancialSnapshot).where(
+            FinancialSnapshot.id == snapshot_id,
+            FinancialSnapshot.household_id == user.household_id,
+        )
+    )
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot financeiro não encontrado")
+    rows = db.scalars(
+        select(FinancialSnapshotLineage)
+        .where(FinancialSnapshotLineage.snapshot_id == snapshot.id)
+        .order_by(FinancialSnapshotLineage.metric_key, FinancialSnapshotLineage.entity_id)
+    ).all()
+    return {"snapshot_id": snapshot.id, "period": snapshot.period, "items": serialize_lineage(rows)}
+
+
+@router.post("/financial-snapshots/{period}/rebuild", status_code=201)
+def rebuild_financial_snapshot(
+    period: str,
+    snapshot_kind: str = "actual",
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    _validate_period_param(period)
+    if snapshot_kind != "actual":
+        raise HTTPException(status_code=422, detail="Somente snapshots 'actual' são suportados nesta fatia")
+
+    build = build_financial_snapshot(
+        db, household_id=user.household_id, period=period, snapshot_kind=snapshot_kind
+    )
+    snapshot = persist_financial_snapshot(db, build, created_by=user.id)
+
+    checks = (
+        *build_baseline_checks(
+            db, household_id=user.household_id, scope=IntegrityRunScope.PERIOD, period=period
+        ),
+        *build_snapshot_invariant_checks(build),
+    )
+    try:
+        run, _results = execute_integrity_run(
+            db,
+            household_id=user.household_id,
+            scope=IntegrityRunScope.PERIOD,
+            trigger=IntegrityRunTrigger.SNAPSHOT,
+            checks=checks,
+            created_by=user.id,
+            period=period,
+            calculation_version=build.calculation_version,
+        )
+    except Exception as exc:
+        db.commit()
+        raise HTTPException(
+            status_code=500,
+            detail="A recomputação do snapshot falhou sem alterar os dados financeiros de origem",
+        ) from exc
+
+    audit(
+        db,
+        user,
+        "financial_snapshot.rebuild",
+        "financial_snapshot",
+        snapshot.id,
+        {"period": period, "snapshot_kind": snapshot_kind, "version": snapshot.version},
+        after_state={"integrity_status": snapshot.integrity_status, "checksum": snapshot.checksum},
+        reason="Recomputação manual solicitada por administrador",
+        trace_id=snapshot.trace_id,
+        source="financial_engine",
+    )
+    db.commit()
+    return {
+        "snapshot": serialize_financial_snapshot(snapshot),
+        "integrity_run": serialize_run(run),
+    }
 
 
 def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:

@@ -922,6 +922,43 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert payroll.status_code == 201
         assert client.delete(f"/api/payroll/{payroll.json()['id']}").status_code == 200
         assert client.delete(f"/api/commissions/{commission.json()['id']}").status_code == 200
+
+        snapshot_rebuild = client.post("/api/financial-snapshots/2026-08/rebuild")
+        assert snapshot_rebuild.status_code == 201
+        rebuild_payload = snapshot_rebuild.json()
+        snapshot_payload = rebuild_payload["snapshot"]
+        assert snapshot_payload["period"] == "2026-08"
+        assert snapshot_payload["version"] == 1
+        assert snapshot_payload["status"] == "current"
+        assert snapshot_payload["financial_rules_version"] == "2026.09.1"
+        # No confirmed Privilège balance observation exists in this flow, so
+        # liquidity fields must stay null rather than a fabricated number.
+        assert snapshot_payload["integrity_status"] == "incomplete"
+        assert snapshot_payload["opening_liquidity_balance"] is None
+        assert snapshot_payload["closing_liquidity_balance"] is None
+        assert rebuild_payload["integrity_run"]["status"] == "completed"
+
+        fetched_snapshot = client.get("/api/financial-snapshots/2026-08").json()
+        assert fetched_snapshot["id"] == snapshot_payload["id"]
+        assert fetched_snapshot["checksum"] == snapshot_payload["checksum"]
+        assert client.get("/api/financial-snapshots/2020-01").status_code == 404
+
+        lineage = client.get(f"/api/financial-snapshots/{snapshot_payload['id']}/lineage").json()
+        assert lineage["period"] == "2026-08"
+        assert lineage["items"]
+        assert {item["source_role"] for item in lineage["items"]} <= {
+            "canonical",
+            "supporting",
+            "excluded",
+            "reconciled",
+        }
+
+        # A rebuild with unchanged underlying facts is idempotent: a new
+        # version is created, the previous one superseded, same checksum.
+        second_rebuild = client.post("/api/financial-snapshots/2026-08/rebuild").json()
+        assert second_rebuild["snapshot"]["version"] == 2
+        assert second_rebuild["snapshot"]["checksum"] == snapshot_payload["checksum"]
+
         with TestClient(app) as family_client:
             family_login = family_client.post(
                 "/api/auth/login",
@@ -931,6 +968,10 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             assert family_login.json()["is_admin"] is False
             assert family_client.get("/api/dashboard?month=2026-08").json()["spending"] == 76.78
             assert family_client.get("/api/users").status_code == 403
+            assert family_client.get("/api/financial-snapshots/2026-08").status_code == 200
+            assert (
+                family_client.post("/api/financial-snapshots/2026-08/rebuild").status_code == 403
+            )
         assert client.delete(f"/api/users/{family_user.json()['id']}").status_code == 200
         assert (
             next(item for item in client.get("/api/users").json() if item["username"] == "kelly")["active"]

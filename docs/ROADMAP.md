@@ -60,7 +60,10 @@
   limpeza destrutiva;
 - primeira baseline robusta de anomalias restrita a meses reconciliados e aprendizado local que
   exige três confirmações mais aceite administrativo;
-- próximos incrementos: snapshot canônico, validador de
+- `FinancialSnapshot` canônico e Financial Engine determinístico, com lineage auditável, regra
+  correta do Privilège DI e separação de gasto econômico, caixa bancário, cartão e patrimônio;
+  dashboard, relatórios e Advisor ainda não migraram para consumi-lo (fatia seguinte);
+- próximos incrementos: migração de dashboard/relatórios/Advisor para o snapshot, validador de
   projeção, auditor Codex, UI de Integridade e safety gates completos de CI.
 
 ## Fase 3 — Próximas evoluções
