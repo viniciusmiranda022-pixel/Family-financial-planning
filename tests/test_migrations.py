@@ -192,6 +192,7 @@ EXPECTED_0004_TABLES = {
     "duplicate_group_members",
     "duplicate_groups",
 }
+EXPECTED_0005_TABLES = {"financial_snapshots", "financial_snapshot_lineage"}
 
 EXPECTED_0004_TRANSACTION_COLUMNS = {
     "occurred_at",
@@ -305,7 +306,8 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
     assert set(inspector.get_table_names()) == {
         *EXPECTED_0001_COLUMNS,
         *EXPECTED_0003_TABLES,
-        *EXPECTED_0004_TABLES,
+            *EXPECTED_0004_TABLES,
+            *EXPECTED_0005_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -360,6 +362,20 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_classification_rules_household_id",
         "ix_classification_rules_household_merchant",
     }
+    assert {index["name"] for index in inspector.get_indexes("financial_snapshots")} == {
+        "ix_financial_snapshots_checksum",
+        "ix_financial_snapshots_household_id",
+        "ix_financial_snapshots_household_period_status",
+        "ix_financial_snapshots_trace_id",
+    }
+    assert {
+        index["name"] for index in inspector.get_indexes("financial_snapshot_lineage")
+    } == {
+        "ix_financial_snapshot_lineage_household_id",
+        "ix_financial_snapshot_lineage_metric",
+        "ix_financial_snapshot_lineage_snapshot_id",
+        "ix_financial_snapshot_lineage_trace_id",
+    }
     engine.dispose()
 
     command.downgrade(config, "0001")
@@ -392,6 +408,8 @@ def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     assert "CREATE TABLE duplicate_groups" in sql
     assert "CREATE TABLE duplicate_group_members" in sql
     assert "CREATE TABLE classification_rules" in sql
+    assert "CREATE TABLE financial_snapshots" in sql
+    assert "CREATE TABLE financial_snapshot_lineage" in sql
     assert "ALTER TABLE audit_events ADD COLUMN before_state JSONB" in sql
     assert "CREATE TABLE transactions" in sql
     assert "INSERT INTO alembic_version" in sql
@@ -441,7 +459,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0004"
+        ).scalar_one() == "0005"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -467,6 +485,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0004"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0005"
     engine.dispose()
     get_settings.cache_clear()

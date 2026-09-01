@@ -26,6 +26,8 @@ from app.models import (
     DuplicateGroup,
     DuplicateGroupMember,
     FinancialProfile,
+    FinancialSnapshot,
+    FinancialSnapshotLineage,
     Household,
     IntegrityFinding,
     IntegrityRun,
@@ -84,6 +86,7 @@ from app.services.finance import (
     month_key,
     monthly_net_rate,
 )
+from app.services.financial_engine import settle_liquidity
 from app.services.financial_integrity import (
     IntegrityRunScope,
     IntegrityRunTrigger,
@@ -93,6 +96,7 @@ from app.services.financial_integrity import (
     serialize_finding,
     serialize_run,
 )
+from app.services.financial_snapshots import build_snapshot, serialize_snapshot
 from app.services.importer import (
     PARSER_CONTRACT_VERSION,
     ParsedTransaction,
@@ -3372,6 +3376,100 @@ def cut_plan(
     }
 
 
+@router.get("/financial-snapshots/{period}")
+def financial_snapshot(
+    period: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    start = _month_start(period)
+    snapshot = build_snapshot(
+        db,
+        household_id=user.household_id,
+        period=month_key(start),
+        generated_by=user.id,
+    )
+    db.commit()
+    db.refresh(snapshot)
+    return serialize_snapshot(snapshot)
+
+
+@router.post("/financial-snapshots/{period}/rebuild")
+def rebuild_financial_snapshot(
+    period: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    start = _month_start(period)
+    snapshot = build_snapshot(
+        db,
+        household_id=user.household_id,
+        period=month_key(start),
+        generated_by=user.id,
+        force=True,
+    )
+    audit(
+        db,
+        user,
+        "financial_snapshot.rebuilt",
+        "financial_snapshot",
+        snapshot.id,
+        {"period": snapshot.period, "version": snapshot.version, "checksum": snapshot.checksum},
+        trace_id=snapshot.trace_id,
+    )
+    db.commit()
+    db.refresh(snapshot)
+    return serialize_snapshot(snapshot)
+
+
+@router.get("/financial-snapshots/{snapshot_id}/lineage")
+def financial_snapshot_lineage(
+    snapshot_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    snapshot = db.scalar(
+        select(FinancialSnapshot).where(
+            FinancialSnapshot.id == snapshot_id,
+            FinancialSnapshot.household_id == user.household_id,
+        )
+    )
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot financeiro não encontrado")
+    rows = tuple(
+        db.scalars(
+            select(FinancialSnapshotLineage)
+            .where(FinancialSnapshotLineage.snapshot_id == snapshot.id)
+            .order_by(
+                FinancialSnapshotLineage.metric_key,
+                FinancialSnapshotLineage.created_at,
+                FinancialSnapshotLineage.id,
+            )
+        ).all()
+    )
+    return {
+        "snapshot_id": snapshot.id,
+        "checksum": snapshot.checksum,
+        "trace_id": snapshot.trace_id,
+        "items": [
+            {
+                "id": item.id,
+                "metric_key": item.metric_key,
+                "entity_type": item.entity_type,
+                "entity_id": item.entity_id,
+                "document_id": item.document_id,
+                "rule_id": item.rule_id,
+                "contribution": (
+                    decimal_value(item.contribution) if item.contribution is not None else None
+                ),
+                "source_role": item.source_role,
+                "trace_id": item.trace_id,
+            }
+            for item in rows
+        ],
+    }
+
+
 @router.get("/dashboard")
 def dashboard(
     month: str | None = None,
@@ -3381,28 +3479,13 @@ def dashboard(
     profile = profile_for(db, user.household_id)
     start = _month_start(month)
     end = add_months(start, 1)
-    expense_rows, duplicates_ignored = _consolidated_expenses(
+    snapshot = build_snapshot(
         db,
-        user.household_id,
-        start,
-        end,
+        household_id=user.household_id,
+        period=month_key(start),
+        generated_by=user.id,
     )
-    spending = max(
-        Decimal("0"),
-        sum((-Decimal(transaction.amount) for transaction, _ in expense_rows), Decimal("0")),
-    )
-    movement_rows, _ignored_movements = _consolidated_transactions(
-        db,
-        user.household_id,
-        start,
-        end,
-    )
-    cash_flow = _operational_cash_flow(movement_rows)
-    category_totals: dict[str, Decimal] = {}
-    for transaction, category_name in expense_rows:
-        category_totals[category_name] = category_totals.get(category_name, Decimal("0")) - Decimal(
-            transaction.amount
-        )
+    snapshot_payload = serialize_snapshot(snapshot)
     review_count = db.scalar(
         select(func.count(ReviewItem.id))
         .join(Transaction, Transaction.id == ReviewItem.transaction_id)
@@ -3424,43 +3507,39 @@ def dashboard(
     obligation_alerts = [
         item for item in _obligation_rows(db, user.household_id) if item["days_until_due"] <= 30
     ][:5]
-    cash_net = money(Decimal(str(cash_flow["cash_in"])) - Decimal(str(cash_flow["cash_out"])))
-    liquidity = _liquidity_settlement(
-        Decimal(profile.investment_balance),
-        cash_net,
-        Decimal(profile.emergency_floor),
-    )
+    db.commit()
+    cash_net = Decimal(snapshot.operating_result)
     return {
         "month": month_key(start),
-        "spending": decimal_value(spending),
-        "cash_in": cash_flow["cash_in"],
-        "cash_out": cash_flow["cash_out"],
-        "bank_cash_out": cash_flow["bank_cash_out"],
-        "card_spending": cash_flow["card_spending"],
+        "snapshot_id": snapshot.id,
+        "snapshot_checksum": snapshot.checksum,
+        "integrity_status": snapshot.integrity_status,
+        "trusted_for_reports": snapshot.trusted_for_reports,
+        "spending": decimal_value(snapshot.operating_expenses),
+        "cash_in": decimal_value(snapshot.operating_income),
+        "cash_out": decimal_value(snapshot.operating_expenses),
+        "bank_cash_out": decimal_value(snapshot.bank_cash_out),
+        "card_spending": decimal_value(snapshot.card_spend),
         "cash_net": decimal_value(cash_net),
-        "cash_flow_by_account": cash_flow["accounts"],
-        "cash_cap": decimal_value(profile.monthly_cash_cap),
-        "remaining_cap": decimal_value(money(profile.monthly_cash_cap - spending)),
+        "cash_flow_by_account": snapshot_payload["cash_flow_by_account"],
+        "cash_cap": decimal_value(snapshot.budget_cap),
+        "remaining_cap": decimal_value(snapshot.budget_remaining),
         "investment_balance": decimal_value(profile.investment_balance),
         "liquidity_name": profile.investment_name,
-        "liquidity_starting_balance": decimal_value(liquidity["starting_balance"]),
-        "liquidity_balance": decimal_value(liquidity["closing_balance"]),
-        "liquidity_closing_balance": decimal_value(liquidity["closing_balance"]),
-        "liquidity_available": decimal_value(liquidity["floor_gap"]),
-        "liquidity_deposit": decimal_value(liquidity["deposit"]),
-        "liquidity_withdrawal": decimal_value(liquidity["withdrawal"]),
-        "liquidity_uncovered_deficit": decimal_value(liquidity["uncovered_deficit"]),
+        "liquidity_starting_balance": decimal_value(snapshot.opening_liquidity_balance),
+        "liquidity_balance": decimal_value(snapshot.closing_liquidity_balance),
+        "liquidity_closing_balance": decimal_value(snapshot.closing_liquidity_balance),
+        "liquidity_available": decimal_value(snapshot.distance_to_floor),
+        "liquidity_deposit": decimal_value(snapshot_payload["liquidity_deposit"]),
+        "liquidity_withdrawal": decimal_value(snapshot.liquidity_used),
+        "liquidity_uncovered_deficit": decimal_value(snapshot.closing_uncovered_deficit),
         "liquidity_flow": decimal_value(cash_net),
         "liquidity_direction": ("deposit" if cash_net > 0 else "withdrawal" if cash_net < 0 else "balanced"),
         "emergency_floor": decimal_value(profile.emergency_floor),
         "food_benefits": decimal_value(benefit),
         "review_count": int(review_count or 0),
-        "duplicates_ignored": duplicates_ignored,
-        "category_spending": [
-            {"category": name, "amount": decimal_value(max(Decimal("0"), amount))}
-            for name, amount in sorted(category_totals.items(), key=lambda item: item[1], reverse=True)
-            if amount > 0
-        ],
+        "duplicates_ignored": snapshot_payload["duplicates_ignored"],
+        "category_spending": snapshot_payload["category_spending"],
         "future_commissions_gross": decimal_value(future_commission),
         "obligation_alerts": obligation_alerts,
     }
@@ -3514,15 +3593,22 @@ def reports(
             month_rows[key]["transaction_count"] += 1
 
     serialized_months = []
+    report_snapshots: list[FinancialSnapshot] = []
     previous_active_spending: Decimal | None = None
     for key, item in month_rows.items():
-        flow = _operational_cash_flow(movements_by_month[key])
-        spending = money(item["spending"])
-        cash_in = money(flow["cash_in"])
-        cash_out = money(flow["cash_out"])
-        bank_cash_out = money(flow["bank_cash_out"])
-        card_spending = money(flow["card_spending"])
-        cash_net = money(cash_in - cash_out)
+        snapshot = build_snapshot(
+            db,
+            household_id=user.household_id,
+            period=key,
+            generated_by=user.id,
+        )
+        report_snapshots.append(snapshot)
+        spending = money(snapshot.operating_expenses)
+        cash_in = money(snapshot.operating_income)
+        cash_out = money(snapshot.operating_expenses)
+        bank_cash_out = money(snapshot.bank_cash_out)
+        card_spending = money(snapshot.card_spend)
+        cash_net = money(snapshot.operating_result)
         change_percentage = None
         if (
             item["transaction_count"] > 0
@@ -3545,6 +3631,9 @@ def reports(
                 "remaining_cap": decimal_value(money(profile.monthly_cash_cap - spending)),
                 "transaction_count": int(item["transaction_count"]),
                 "change_percentage": change_percentage,
+                "snapshot_id": snapshot.id,
+                "snapshot_checksum": snapshot.checksum,
+                "integrity_status": snapshot.integrity_status,
             }
         )
         if item["transaction_count"] > 0:
@@ -3582,18 +3671,65 @@ def reports(
         if amount > 0
     ]
     last_change = activity_rows[-1]["change_percentage"] if months > 1 and activity_rows else None
-    operational = _operational_cash_flow(movement_rows)
     total_result = money(total_cash_in - total_cash_out)
-    liquidity = _liquidity_settlement(
-        Decimal(profile.investment_balance),
-        total_result,
-        Decimal(profile.emergency_floor),
+    first_snapshot = report_snapshots[0]
+    liquidity = settle_liquidity(
+        opening_balance=Decimal(first_snapshot.opening_liquidity_balance),
+        operating_result=total_result,
+        opening_uncovered_deficit=Decimal(first_snapshot.opening_uncovered_deficit),
+        safety_floor=Decimal(first_snapshot.safety_floor),
     )
     savings_rate = (
         money(((total_cash_in - total_cash_out) / total_cash_in) * Decimal("100"))
         if total_cash_in > 0
         else Decimal("0")
     )
+    account_totals: dict[str, dict[str, object]] = {}
+    for snapshot in report_snapshots:
+        for account in snapshot.payload.get("cash_flow_by_account", []):
+            key = str(account.get("account_id") or "unidentified")
+            total = account_totals.setdefault(
+                key,
+                {
+                    **account,
+                    "cash_in": Decimal("0"),
+                    "cash_out": Decimal("0"),
+                    "bank_cash_out": Decimal("0"),
+                    "card_spending": Decimal("0"),
+                    "refunds": Decimal("0"),
+                    "net": Decimal("0"),
+                },
+            )
+            for metric in (
+                "cash_in",
+                "cash_out",
+                "bank_cash_out",
+                "card_spending",
+                "refunds",
+                "net",
+            ):
+                total[metric] = Decimal(str(total[metric])) + Decimal(str(account.get(metric, 0)))
+    report_accounts = [
+        {
+            **item,
+            **{
+                metric: decimal_value(money(Decimal(str(item[metric]))))
+                for metric in (
+                    "cash_in",
+                    "cash_out",
+                    "bank_cash_out",
+                    "card_spending",
+                    "refunds",
+                    "net",
+                )
+            },
+        }
+        for item in sorted(
+            account_totals.values(),
+            key=lambda item: (str(item["account_type"]), str(item["account"])),
+        )
+    ]
+    db.commit()
     return {
         "start_month": month_key(start),
         "end_month": month_key(last_month),
@@ -3609,14 +3745,14 @@ def reports(
             "total_card_spending": decimal_value(total_card_spending),
             "cash_net": decimal_value(total_result),
             "liquidity_name": profile.investment_name,
-            "liquidity_starting_balance": decimal_value(liquidity["starting_balance"]),
-            "liquidity_balance": decimal_value(liquidity["closing_balance"]),
-            "liquidity_closing_balance": decimal_value(liquidity["closing_balance"]),
+            "liquidity_starting_balance": decimal_value(liquidity.opening_balance),
+            "liquidity_balance": decimal_value(liquidity.closing_balance),
+            "liquidity_closing_balance": decimal_value(liquidity.closing_balance),
             "emergency_floor": decimal_value(profile.emergency_floor),
-            "liquidity_available": decimal_value(liquidity["floor_gap"]),
-            "liquidity_deposit": decimal_value(liquidity["deposit"]),
-            "liquidity_withdrawal": decimal_value(liquidity["withdrawal"]),
-            "liquidity_uncovered_deficit": decimal_value(liquidity["uncovered_deficit"]),
+            "liquidity_available": decimal_value(liquidity.distance_to_floor),
+            "liquidity_deposit": decimal_value(liquidity.deposit),
+            "liquidity_withdrawal": decimal_value(liquidity.liquidity_used),
+            "liquidity_uncovered_deficit": decimal_value(liquidity.closing_uncovered_deficit),
             "liquidity_flow": decimal_value(total_result),
             "liquidity_direction": (
                 "deposit"
@@ -3634,7 +3770,7 @@ def reports(
         },
         "monthly": serialized_months,
         "categories": categories,
-        "accounts": operational["accounts"],
+        "accounts": report_accounts,
     }
 
 
@@ -3668,7 +3804,12 @@ def advisor_chat(
     profile = profile_for(db, user.household_id)
     intent = "help"
     status_name = "informative"
-    metrics: dict[str, object] = {"month": selected_month}
+    metrics: dict[str, object] = {
+        "month": selected_month,
+        "snapshot_id": summary["snapshot_id"],
+        "snapshot_checksum": summary["snapshot_checksum"],
+        "integrity_status": summary["integrity_status"],
+    }
     evidence: list[str] = []
     schedule_appendix = ""
     reflection_appendix = ""
@@ -4070,6 +4211,9 @@ def advisor_chat(
             "conversation_history": [item.model_dump() for item in payload.history[-8:]],
             "selected_month": selected_month,
             "financial_summary": {
+                "snapshot_id": summary["snapshot_id"],
+                "snapshot_checksum": summary["snapshot_checksum"],
+                "integrity_status": summary["integrity_status"],
                 "spending": summary["spending"],
                 "cash_in": summary["cash_in"],
                 "cash_out": summary["cash_out"],
@@ -4137,4 +4281,7 @@ def advisor_chat(
         "model": provider_model,
         "evidence": evidence,
         "assumptions": assumptions,
+        "snapshot_id": summary["snapshot_id"],
+        "snapshot_checksum": summary["snapshot_checksum"],
+        "integrity_status": summary["integrity_status"],
     }

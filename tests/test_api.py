@@ -414,6 +414,26 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard["card_spending"] == 76.78
         assert dashboard["duplicates_ignored"] == 1
         assert dashboard["review_count"] == 1
+        assert dashboard["snapshot_id"]
+        assert len(dashboard["snapshot_checksum"]) == 64
+        snapshot = client.get("/api/financial-snapshots/2026-08")
+        assert snapshot.status_code == 200
+        assert snapshot.json()["id"] == dashboard["snapshot_id"]
+        assert snapshot.json()["opening_balance_source"] == "legacy_profile"
+        assert snapshot.json()["trusted_for_reports"] is False
+        lineage = client.get(
+            f"/api/financial-snapshots/{snapshot.json()['id']}/lineage"
+        )
+        assert lineage.status_code == 200
+        assert lineage.json()["checksum"] == dashboard["snapshot_checksum"]
+        assert any(
+            item["rule_id"] == "OPENING-LIQUIDITY-LEGACY-FALLBACK"
+            for item in lineage.json()["items"]
+        )
+        rebuilt = client.post("/api/financial-snapshots/2026-08/rebuild")
+        assert rebuilt.status_code == 200
+        assert rebuilt.json()["version"] == snapshot.json()["version"] + 1
+        assert rebuilt.json()["id"] != snapshot.json()["id"]
         assert dashboard["category_spending"][0] == {
             "category": "Restaurantes e delivery",
             "amount": 44.88,
@@ -442,6 +462,13 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert july_dashboard.json()["review_count"] == 1
         assert client.get("/api/dashboard?month=07-2026").status_code == 422
         report = client.get("/api/reports?end_month=2026-08&months=2")
+        assert all(item["snapshot_id"] for item in report.json()["monthly"])
+        assert all(len(item["snapshot_checksum"]) == 64 for item in report.json()["monthly"])
+        august_report = next(
+            item for item in report.json()["monthly"] if item["month"] == "2026-08"
+        )
+        assert august_report["snapshot_id"] == rebuilt.json()["id"]
+        assert august_report["snapshot_checksum"] == rebuilt.json()["checksum"]
         assert report.status_code == 200
         report_data = report.json()
         assert report_data["start_month"] == "2026-07"
@@ -620,6 +647,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert exhausted["liquidity_available"] == -10000
         assert exhausted["liquidity_uncovered_deficit"] == 5076.78
         assert client.delete(f"/api/transactions/{uncovered_expense.json()['id']}").status_code == 200
+        restored_dashboard = client.get("/api/dashboard?month=2026-08").json()
 
         liquidity_answer = client.post(
             "/api/advisor/chat",
@@ -627,6 +655,11 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
         assert liquidity_answer.status_code == 200
         liquidity_data = liquidity_answer.json()
+        assert liquidity_data["snapshot_id"] == restored_dashboard["snapshot_id"]
+        assert (
+            liquidity_data["snapshot_checksum"]
+            == restored_dashboard["snapshot_checksum"]
+        )
         assert liquidity_data["intent"] == "liquidity"
         assert liquidity_data["metrics"]["liquidity_starting_balance"] == 20000
         assert liquidity_data["metrics"]["liquidity_balance"] == 19923.22

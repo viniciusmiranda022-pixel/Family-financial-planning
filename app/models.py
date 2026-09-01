@@ -581,3 +581,107 @@ class ClassificationRule(Base, TimestampMixin):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+
+
+class FinancialSnapshot(Base):
+    __tablename__ = "financial_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id",
+            "period",
+            "snapshot_kind",
+            "version",
+            name="uq_financial_snapshot_version",
+        ),
+        Index(
+            "ix_financial_snapshots_household_period_status",
+            "household_id",
+            "period",
+            "status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    period: Mapped[str] = mapped_column(String(7))
+    snapshot_kind: Mapped[str] = mapped_column(String(20), default="actual")
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), default="current")
+    operating_income: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    operating_expenses: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    operating_result: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    bank_cash_in: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    bank_cash_out: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    bank_cash_result: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    investments: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    redemptions: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    internal_transfers: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    card_spend: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    card_payments: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    refunds: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    opening_liquidity_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    investment_yield: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    liquidity_used: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    closing_liquidity_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    opening_uncovered_deficit: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    closing_uncovered_deficit: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    safety_floor: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    distance_to_floor: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    budget_cap: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    budget_usage: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    budget_remaining: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    commitments: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    projected_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+    checksum: Mapped[str] = mapped_column(String(64), index=True)
+    calculation_version: Mapped[str] = mapped_column(String(40))
+    financial_rules_version: Mapped[str] = mapped_column(String(20))
+    integrity_status: Mapped[str] = mapped_column(String(30), default="unknown")
+    trusted_for_reports: Mapped[bool] = mapped_column(Boolean, default=False)
+    trusted_for_projection: Mapped[bool] = mapped_column(Boolean, default=False)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    superseded_by_id: Mapped[str | None] = mapped_column(
+        ForeignKey("financial_snapshots.id", ondelete="SET NULL"), nullable=True
+    )
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    generated_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+
+
+class FinancialSnapshotLineage(Base):
+    __tablename__ = "financial_snapshot_lineage"
+    __table_args__ = (
+        Index(
+            "ix_financial_snapshot_lineage_metric",
+            "snapshot_id",
+            "metric_key",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("financial_snapshots.id", ondelete="CASCADE"), index=True
+    )
+    metric_key: Mapped[str] = mapped_column(String(80))
+    entity_type: Mapped[str] = mapped_column(String(80))
+    entity_id: Mapped[str] = mapped_column(String(36))
+    document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    rule_id: Mapped[str] = mapped_column(String(80))
+    contribution: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    source_role: Mapped[str] = mapped_column(String(24))
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
