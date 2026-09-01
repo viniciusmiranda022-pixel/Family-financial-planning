@@ -266,6 +266,9 @@ class FinancialProfile(Base, TimestampMixin):
     investment_gross_annual_rate: Mapped[Decimal] = mapped_column(Numeric(9, 8), default=0)
     investment_income_tax_rate: Mapped[Decimal] = mapped_column(Numeric(9, 8), default=0)
     projection_end: Mapped[date | None] = mapped_column(Date, nullable=True)
+    central_liquidity_account_id: Mapped[str | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class AuditEvent(Base):
@@ -581,3 +584,130 @@ class ClassificationRule(Base, TimestampMixin):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+
+
+class FinancialSnapshot(Base, TimestampMixin):
+    """Canonical, immutable financial fact for one household/period/kind.
+
+    A recomputation never mutates a persisted snapshot: it inserts a new row with
+    an incremented `version` and marks the previous `current` row `superseded`
+    (see `app.services.financial_engine.persist_financial_snapshot`). Dashboard,
+    reports and the Advisor must read this table instead of recomputing totals
+    (PR 5), which is the concrete mechanism behind INV-019/INV-020/INV-021.
+    """
+
+    __tablename__ = "financial_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id",
+            "period",
+            "snapshot_kind",
+            "version",
+            name="uq_financial_snapshot_period_version",
+        ),
+        Index("ix_financial_snapshots_household_period", "household_id", "period"),
+        Index("ix_financial_snapshots_household_status", "household_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    period: Mapped[str] = mapped_column(String(7))
+    snapshot_kind: Mapped[str] = mapped_column(String(16), default="actual")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(16), default="current")
+    integrity_status: Mapped[str] = mapped_column(String(16), default="incomplete")
+    financial_rules_version: Mapped[str] = mapped_column(String(20))
+    calculation_version: Mapped[str] = mapped_column(String(40))
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    checksum: Mapped[str] = mapped_column(String(64))
+
+    operating_income: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    operating_expenses: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    operating_result: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    budget_usage: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    bank_cash_in: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    bank_cash_out: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    bank_cash_result: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    card_spend: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    card_payments: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    investments: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    redemptions: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    internal_transfers: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    refunds: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    commitments: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
+    projected_balance: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+
+    opening_liquidity_balance: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    investment_yield: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    liquidity_used: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    closing_liquidity_balance: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    opening_uncovered_deficit: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    closing_uncovered_deficit: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    safety_floor: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    distance_to_floor: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    floor_breached: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    opening_balance_source_type: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    opening_balance_source_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    supersedes_id: Mapped[str | None] = mapped_column(
+        ForeignKey("financial_snapshots.id", ondelete="SET NULL"), nullable=True
+    )
+    superseded_by_id: Mapped[str | None] = mapped_column(
+        ForeignKey("financial_snapshots.id", ondelete="SET NULL"), nullable=True
+    )
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    created_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class FinancialSnapshotLineage(Base):
+    """One row per source contribution behind a snapshot's material aggregate.
+
+    `metric_key` names the FinancialSnapshot column the row explains (for example
+    `operating_expenses` or `opening_liquidity_balance`). `source_role` follows
+    docs/INTEGRITY_IMPLEMENTATION_PLAN.md 8.6: `canonical` (counted in the
+    metric), `supporting`/`excluded` (preserved but not counted, e.g. a
+    duplicate copy) or `reconciled` (a confirmed balance observation).
+    """
+
+    __tablename__ = "financial_snapshot_lineage"
+    __table_args__ = (
+        Index(
+            "ix_financial_snapshot_lineage_household_snapshot",
+            "household_id",
+            "snapshot_id",
+        ),
+        Index(
+            "ix_financial_snapshot_lineage_snapshot_metric",
+            "snapshot_id",
+            "metric_key",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("financial_snapshots.id", ondelete="CASCADE"), index=True
+    )
+    metric_key: Mapped[str] = mapped_column(String(40))
+    entity_type: Mapped[str] = mapped_column(String(40))
+    entity_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    rule_id: Mapped[str] = mapped_column(String(80))
+    contribution: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    source_role: Mapped[str] = mapped_column(String(20))
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

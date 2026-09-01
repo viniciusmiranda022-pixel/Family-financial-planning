@@ -206,6 +206,70 @@ EXPECTED_0004_TRANSACTION_COLUMNS = {
     "source_priority",
 }
 
+EXPECTED_0005_TABLES = {"financial_snapshots", "financial_snapshot_lineage"}
+
+EXPECTED_FINANCIAL_SNAPSHOT_COLUMNS = {
+    "id",
+    "household_id",
+    "period",
+    "snapshot_kind",
+    "version",
+    "status",
+    "integrity_status",
+    "financial_rules_version",
+    "calculation_version",
+    "trace_id",
+    "checksum",
+    "operating_income",
+    "operating_expenses",
+    "operating_result",
+    "budget_usage",
+    "bank_cash_in",
+    "bank_cash_out",
+    "bank_cash_result",
+    "card_spend",
+    "card_payments",
+    "investments",
+    "redemptions",
+    "internal_transfers",
+    "refunds",
+    "commitments",
+    "projected_balance",
+    "opening_liquidity_balance",
+    "investment_yield",
+    "liquidity_used",
+    "closing_liquidity_balance",
+    "opening_uncovered_deficit",
+    "closing_uncovered_deficit",
+    "safety_floor",
+    "distance_to_floor",
+    "floor_breached",
+    "opening_balance_source_type",
+    "opening_balance_source_id",
+    "source_count",
+    "supersedes_id",
+    "superseded_by_id",
+    "generated_at",
+    "created_by",
+    "created_at",
+    "updated_at",
+}
+
+EXPECTED_FINANCIAL_SNAPSHOT_LINEAGE_COLUMNS = {
+    "id",
+    "household_id",
+    "snapshot_id",
+    "metric_key",
+    "entity_type",
+    "entity_id",
+    "document_id",
+    "rule_id",
+    "contribution",
+    "source_role",
+    "trace_id",
+    "created_at",
+}
+
 EXPECTED_INTEGRITY_RUN_COLUMNS = {
     "id",
     "household_id",
@@ -306,6 +370,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         *EXPECTED_0001_COLUMNS,
         *EXPECTED_0003_TABLES,
         *EXPECTED_0004_TABLES,
+        *EXPECTED_0005_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -360,6 +425,30 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_classification_rules_household_id",
         "ix_classification_rules_household_merchant",
     }
+    assert {column["name"] for column in inspector.get_columns("financial_snapshots")} == (
+        EXPECTED_FINANCIAL_SNAPSHOT_COLUMNS
+    )
+    assert {
+        column["name"] for column in inspector.get_columns("financial_snapshot_lineage")
+    } == EXPECTED_FINANCIAL_SNAPSHOT_LINEAGE_COLUMNS
+    assert "central_liquidity_account_id" in {
+        column["name"] for column in inspector.get_columns("financial_profiles")
+    }
+    assert {index["name"] for index in inspector.get_indexes("financial_snapshots")} == {
+        "ix_financial_snapshots_household_id",
+        "ix_financial_snapshots_trace_id",
+        "ix_financial_snapshots_household_period",
+        "ix_financial_snapshots_household_status",
+    }
+    assert {
+        index["name"] for index in inspector.get_indexes("financial_snapshot_lineage")
+    } == {
+        "ix_financial_snapshot_lineage_household_id",
+        "ix_financial_snapshot_lineage_snapshot_id",
+        "ix_financial_snapshot_lineage_trace_id",
+        "ix_financial_snapshot_lineage_household_snapshot",
+        "ix_financial_snapshot_lineage_snapshot_metric",
+    }
     engine.dispose()
 
     command.downgrade(config, "0001")
@@ -394,6 +483,11 @@ def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     assert "CREATE TABLE classification_rules" in sql
     assert "ALTER TABLE audit_events ADD COLUMN before_state JSONB" in sql
     assert "CREATE TABLE transactions" in sql
+    assert "CREATE TABLE financial_snapshots" in sql
+    assert "CREATE TABLE financial_snapshot_lineage" in sql
+    assert (
+        "ALTER TABLE financial_profiles ADD COLUMN central_liquidity_account_id VARCHAR(36)" in sql
+    )
     assert "INSERT INTO alembic_version" in sql
     get_settings.cache_clear()
 
@@ -441,7 +535,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0004"
+        ).scalar_one() == "0005"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -467,6 +561,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0004"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0005"
     engine.dispose()
     get_settings.cache_clear()
