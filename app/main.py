@@ -8,6 +8,7 @@ from app.api import router
 from app.config import get_settings
 from app.db import SessionLocal
 from app.models import User
+from app.services.financial_invariants import FINANCIAL_RULES_VERSION
 
 settings = get_settings()
 APP_VERSION = "0.3.1"
@@ -24,7 +25,11 @@ templates = Jinja2Templates(directory="app/templates")
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "healthy", "version": APP_VERSION}
+    return {
+        "status": "healthy",
+        "version": APP_VERSION,
+        "financial_rules_version": FINANCIAL_RULES_VERSION,
+    }
 
 
 @app.get("/", response_class=HTMLResponse)

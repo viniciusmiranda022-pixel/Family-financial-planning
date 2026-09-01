@@ -1,0 +1,338 @@
+# Contrato de invariantes financeiros
+
+**Versão das regras:** `2026.09.1`
+**Status:** normativo
+**Implementação executável:** `app/services/invariant_registry.py`
+
+Este documento define as condições que precisam permanecer verdadeiras em importações,
+fechamentos, projeções, snapshots, dashboards, relatórios e contextos enviados ao Advisor.
+Os identificadores `INV-XXX` são permanentes: uma mudança semântica deve alterar a versão das
+regras, nunca reaproveitar silenciosamente um identificador com outro significado.
+
+O PostgreSQL, as regras aqui documentadas, o Financial Engine determinístico e o Financial
+Integrity Engine formam a fonte oficial. O Codex pode encontrar e explicar uma possível
+incoerência, mas não pode transformar `fail` em `pass`, modificar valores ou substituir uma regra.
+
+## Convenções de avaliação
+
+Cada execução retorna, no mínimo:
+
+```json
+{
+  "invariant_id": "INV-002",
+  "financial_rules_version": "2026.09.1",
+  "status": "pass|fail|warning|unknown",
+  "severity": "info|warning|review|critical|block",
+  "scope": "transaction|document|period|projection|report|system",
+  "entity_type": "transaction",
+  "entity_id": "identificador",
+  "period": "2026-08",
+  "trace_id": "identificador-da-execução",
+  "message": "explicação objetiva",
+  "expected": "resultado esperado",
+  "actual": "resultado encontrado",
+  "difference": null,
+  "metadata": {}
+}
+```
+
+- `pass`: a regra foi avaliada e satisfeita.
+- `fail`: a regra foi avaliada e violada.
+- `warning`: a condição merece atenção, sem prova suficiente de violação.
+- `unknown`: faltam fatos ou o formato não permite avaliação segura. `unknown` nunca equivale a
+  `pass`.
+- Valores monetários são arredondados em cada evento econômico com `ROUND_HALF_UP` e duas casas.
+- Comparações entre motores e canais usam tolerância padrão de `R$ 0,01`, declarada no contexto.
+- Uma regra só é executada sobre entidades às quais ela se aplica. Ausência de dados obrigatórios
+  produz `unknown`; o motor não fabrica fatos para completar a avaliação.
+- O piso de segurança do Privilège DI é indicador e alerta. Ele não é subtraído da liquidez
+  disponível para cobrir déficit.
+- Confiança de duplicidade: `0,00–0,59` baixa; `0,60–0,84` provável; `0,85–1,00` forte.
+
+## INV-001 — Transferência interna
+
+**Título:** Transferência interna sem efeito operacional
+**Descrição:** Transferência entre contas pertencentes à família movimenta duas posições de caixa,
+mas não cria receita, despesa, consumo de teto ou resultado operacional.
+**Motivação:** Evitar que origem e destino sejam tratados como dois eventos econômicos e inflem os
+totais.
+**Entradas:** efeito em receita, despesa, consumo, resultado operacional e caixa familiar líquido.
+**Resultado esperado:** todos os efeitos agregados são `R$ 0,00`; os movimentos de origem e destino
+permanecem rastreáveis.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_internal_transfer_never_changes_operating_result`.
+
+## INV-002 — Pagamento de cartão
+
+**Título:** Pagamento de fatura não é nova despesa
+**Descrição:** O pagamento liquida uma obrigação. As compras individuais são as despesas econômicas.
+**Motivação:** Impedir dupla contabilização de compras mais pagamento da mesma fatura.
+**Entradas:** efeitos do pagamento em receita, despesa, consumo e resultado operacional.
+**Resultado esperado:** todos os efeitos operacionais são `R$ 0,00`; a saída de caixa permanece na
+conciliação.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_card_payment_is_reconciliation_only`.
+
+## INV-003 — Aplicações
+
+**Título:** Aplicação é movimento patrimonial
+**Descrição:** Aplicação no Privilège DI ou em outro investimento não é despesa operacional e não
+consome o teto.
+**Motivação:** Separar patrimônio, liquidez, consumo e resultado operacional.
+**Entradas:** efeitos em receita, despesa, consumo, resultado operacional e patrimônio líquido.
+**Resultado esperado:** efeitos operacionais e patrimonial líquido iguais a zero; apenas a composição
+do patrimônio muda.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_application_is_patrimonial_movement`.
+
+## INV-004 — Resgates
+
+**Título:** Resgate não é receita operacional
+**Descrição:** Resgate converte investimento em caixa e não aumenta renda familiar.
+**Motivação:** Evitar renda artificialmente inflada e decisões baseadas em liquidez já existente.
+**Entradas:** efeitos em receita, despesa, consumo, resultado operacional e patrimônio líquido.
+**Resultado esperado:** efeitos operacionais e patrimonial líquido iguais a zero; a liquidez muda de
+posição.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_redemption_is_not_operating_income`.
+
+## INV-005 — Privilège não negativo
+
+**Título:** Saldo de liquidez nunca negativo
+**Descrição:** Se o déficit exceder o saldo disponível, o saldo final é zero e a diferença é déficit
+sem cobertura.
+**Motivação:** Um saldo patrimonial negativo fictício esconde dívida ou falta de recursos.
+**Entradas:** saldo inicial, resultado mensal, saldo final, liquidez utilizada e déficit sem cobertura.
+**Resultado esperado:**
+`saldo_final = max(0, saldo_inicial + resultado_mensal)` e
+`deficit_sem_cobertura = max(0, -(saldo_inicial + resultado_mensal))`.
+**Severidade se violado:** `BLOCK`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_liquidity_transition_never_produces_negative_balance`.
+
+## INV-006 — Déficit consome liquidez
+
+**Título:** Resultado negativo usa a conta central
+**Descrição:** Resultado mensal negativo consome o Privilège DI disponível antes de produzir déficit
+sem cobertura, inclusive quando rompe o piso.
+**Motivação:** O Privilège DI é o caixa operacional real e diariamente movimentado pela família.
+**Entradas:** saldo inicial, resultado mensal, retirada utilizada, saldo final e déficit sem cobertura.
+**Resultado esperado:**
+`retirada = min(saldo_inicial, abs(min(resultado_mensal, 0)))`.
+**Severidade se violado:** `BLOCK`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_deficit_uses_all_available_liquidity_before_becoming_uncovered`.
+
+## INV-007 — Piso não é dinheiro bloqueado
+
+**Título:** Piso de segurança é referência
+**Descrição:** O piso gera indicador e alerta, mas não impede resgate necessário para cobrir déficit
+real.
+**Motivação:** Não exibir simultaneamente um saldo “protegido” e uma dívida que esse próprio saldo
+deveria ter reduzido.
+**Entradas:** saldo inicial, resultado mensal, piso, retirada utilizada, saldo final e déficit sem
+cobertura.
+**Resultado esperado:** a retirada canônica independe do piso; cruzar o piso altera somente alertas e
+confiança.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_safety_floor_never_blocks_real_deficit_coverage`.
+
+## INV-008 — Comissão por competência
+
+**Título:** Comissão somente no período do cenário
+**Descrição:** A comissão existe apenas no período definido para o cenário analisado.
+**Motivação:** Evitar antecipação de receita e comparação entre períodos incompatíveis.
+**Entradas:** período da comissão, período do cenário, indicador de que o cenário considera comissões
+e indicador de inclusão em receita.
+**Resultado esperado:** inclusão somente quando o cenário considerar comissões e os períodos forem
+iguais. O cenário “sem comissão” permanece válido sem incluir o evento.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_commission_is_included_only_in_its_scenario_period`.
+
+## INV-009 — Imposto PJ individual
+
+**Título:** Imposto calculado por recebível
+**Descrição:** O imposto total é a soma do imposto arredondado individualmente em cada recebível.
+**Motivação:** `total × alíquota` pode divergir da obrigação produzida por arredondamento individual.
+**Entradas:** lista de recebíveis com valor bruto e alíquota; imposto total calculado.
+**Resultado esperado:**
+`imposto_total = soma(arredondar_centavos(bruto_i × aliquota_i))`.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_tax_is_rounded_for_each_receivable`.
+
+## INV-010 — Cenário conservador
+
+**Título:** Atraso nunca antecipa comissão
+**Descrição:** O cenário conservador mantém ou desloca o recebimento para uma data posterior.
+**Motivação:** Uma hipótese conservadora não pode criar renda antes da data original.
+**Entradas:** data original e data conservadora do recebimento.
+**Resultado esperado:** `data_conservadora >= data_original`.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_conservative_delay_never_advances_receipt`.
+
+## INV-011 — Consignado
+
+**Título:** Consignado líquido não é descontado duas vezes
+**Descrição:** Se o empréstimo já está refletido no salário líquido do holerite, a projeção não cria
+novo abatimento.
+**Motivação:** Evitar despesa artificial e redução dupla da capacidade familiar.
+**Entradas:** indicador de desconto no salário e abatimento consignado da projeção.
+**Resultado esperado:** abatimento adicional igual a zero quando já descontado.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_net_salary_does_not_repeat_payroll_loan`.
+
+## INV-012 — Férias
+
+**Título:** Adiantamento de férias não é renda extra
+**Descrição:** Apenas o adicional líquido efetivo pode ser um evento adicional; adiantamento salarial
+é competência deslocada.
+**Motivação:** Impedir inflação temporária de renda seguida de déficit artificial.
+**Entradas:** adiantamento, adicional líquido efetivo e efeito de renda adicional.
+**Resultado esperado:** efeito adicional igual somente ao adicional líquido efetivo.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_vacation_advance_is_not_extra_income`.
+
+## INV-013 — Benefícios
+
+**Título:** VA/VR não são caixa livre
+**Descrição:** Benefícios representam capacidade de consumo específica, sem financiar dívida, imóvel
+ou saldo bancário.
+**Motivação:** Preservar a diferença entre benefício restrito, renda e liquidez.
+**Entradas:** valor do benefício e efeitos em caixa, dívida e parcela de imóvel.
+**Resultado esperado:** todos esses efeitos livres são zero; o benefício pode aparecer em capacidade
+alimentar separada.
+**Severidade se violado:** `REVIEW`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_benefits_do_not_increase_free_cash`.
+
+## INV-014 — Duplicidade
+
+**Título:** Duplicidade provável fora dos totais
+**Descrição:** Registro com confiança provável ou forte permanece preservado, auditável e excluído dos
+totais até resolução.
+**Motivação:** Evitar dupla contagem sem apagar duas compras legítimas semelhantes.
+**Entradas:** confiança, status da resolução e indicador de inclusão nos totais.
+**Resultado esperado:** confiança a partir de `0,60` e status pendente implica
+`included_in_totals = false`.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_probable_duplicate_stays_out_of_totals_until_resolution`.
+
+## INV-015 — Fonte canônica histórica
+
+**Título:** Uma fonte nos totais, todas preservadas
+**Descrição:** Quando planilha e documento histórico representam o mesmo evento, somente a fonte
+canônica entra nos totais; todas permanecem armazenadas e relacionadas.
+**Motivação:** Evitar dupla contagem sem destruir evidência histórica.
+**Entradas:** fonte canônica, todas as fontes relacionadas, fontes contadas e fontes preservadas.
+**Resultado esperado:** exatamente a fonte canônica é contada uma vez e todas as fontes relacionadas
+permanecem preservadas sem duplicação.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_only_canonical_historical_source_is_counted`.
+
+## INV-016 — Estorno
+
+**Título:** Estorno compensa gasto
+**Descrição:** O estorno reduz a despesa correspondente ou cria crédito corretamente, sem virar
+receita operacional comum.
+**Motivação:** Não inflar simultaneamente receitas e despesas pela reversão do mesmo evento.
+**Entradas:** valor do estorno, redução de despesa e efeito em receita operacional.
+**Resultado esperado:** redução igual ao estorno e efeito em receita igual a zero.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_refund_offsets_expense_without_creating_income`.
+
+## INV-017 — Competência de cartão
+
+**Título:** Compra segue competência da fatura
+**Descrição:** A compra é contabilizada segundo a política canônica da fatura, preservando a data
+original como linhagem.
+**Motivação:** Evitar que dashboard, fechamento e relatório escolham competências diferentes.
+**Entradas:** competência canônica e competência em que a compra foi contada.
+**Resultado esperado:** competências iguais.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_card_purchase_uses_statement_competence`.
+
+## INV-018 — Projeção consistente
+
+**Título:** Motor e validador de projeção concordam
+**Descrição:** Todos os cenários usam a fórmula canônica e são reproduzidos por caminho independente.
+**Motivação:** Detectar regressão no componente que orienta decisões futuras.
+**Entradas:** valores mensais do Financial Engine, valores do Projection Validator e tolerância.
+**Resultado esperado:** mesmas chaves e diferença absoluta de cada valor menor ou igual à tolerância.
+**Severidade se violado:** `BLOCK`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_projection_mismatch_blocks_trust`.
+
+## INV-019 — Fonte única do dashboard
+
+**Título:** Dashboard não recalcula totais
+**Descrição:** O dataset do dashboard é derivado do snapshot canônico produzido no backend.
+**Motivação:** Eliminar regras financeiras escondidas em templates e JavaScript.
+**Entradas:** valores do Financial Engine, valores fornecidos ao dashboard e tolerância.
+**Resultado esperado:** datasets monetários equivalentes dentro da tolerância.
+**Severidade se violado:** `BLOCK`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_dashboard_dataset_matches_financial_engine`.
+
+## INV-020 — Fonte única dos relatórios
+
+**Título:** Relatórios não recalculam totais
+**Descrição:** PDF, impressão, Excel e relatório web recebem o snapshot canônico já calculado.
+**Motivação:** Garantir que o mesmo período não publique números diferentes por canal.
+**Entradas:** valores do Financial Engine, valores do relatório e tolerância.
+**Resultado esperado:** datasets monetários equivalentes dentro da tolerância.
+**Severidade se violado:** `BLOCK`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_report_dataset_matches_financial_engine`.
+
+## INV-021 — Advisor sem cálculo oficial independente
+
+**Título:** IA explica, código prova
+**Descrição:** O Advisor pode interpretar e comparar, mas preserva todos os números oficiais recebidos
+do backend.
+**Motivação:** Impedir que uma resposta probabilística substitua o livro e os motores determinísticos.
+**Entradas:** valores oficiais, valores repetidos no contexto/resposta e tolerância.
+**Resultado esperado:** os valores financeiros são idênticos; observações semânticas ficam separadas.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_advisor_cannot_override_official_values`.
+
+## INV-022 — Rastreabilidade
+
+**Título:** Agregado reproduzível até a origem
+**Descrição:** Todo agregado relevante identifica lançamentos, fontes, documentos quando aplicável,
+regras, período, contas, categorias e versão do cálculo.
+**Motivação:** Permitir responder de onde veio qualquer número e reproduzi-lo durante auditoria.
+**Entradas:** contagem e IDs de fontes, lançamentos, documentos, regras, contas, categorias, período e
+versão do cálculo.
+**Resultado esperado:** dimensões obrigatórias não vazias, documentos presentes quando exigidos e
+`source_count` igual ao número de fontes únicas.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_aggregate_requires_complete_lineage`.
+
+## Controle de mudança
+
+Toda alteração deste contrato exige:
+
+1. justificativa financeira explícita;
+2. atualização de `financial_rules_version` conforme versionamento `AAAA.MM.revisão`;
+3. alteração conjunta de documentação, registry e testes;
+4. avaliação de impacto em snapshots já persistidos;
+5. migração ou backfill somente quando necessário, sem reescrever silenciosamente o histórico;
+6. registro no audit trail quando a alteração chegar ao ambiente da família.
+
+Uma regra crítica ou `BLOCK` sem teste automatizado impede publicação confiável e merge.

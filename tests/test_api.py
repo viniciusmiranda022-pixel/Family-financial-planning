@@ -32,6 +32,10 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
     monkeypatch.setattr("app.api.date", FixedDate)
 
     with TestClient(app) as client:
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["financial_rules_version"] == "2026.09.1"
+
         setup = client.post(
             "/api/auth/setup",
             json={
