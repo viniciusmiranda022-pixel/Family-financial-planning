@@ -284,24 +284,57 @@ def execute_integrity_run(
 DUPLICATE_FINGERPRINT_CONFIDENCE = Decimal("1.00")
 
 
-def _duplicate_confidence(transaction: Transaction) -> Decimal | None:
-    """Derive INV-014's `duplicate_confidence` from deterministic evidence only.
+def _duplicate_confidence(db: Session, transaction: Transaction) -> Decimal | None:
+    """Derive INV-014's `duplicate_confidence` from a proven fingerprint collision.
 
-    The only duplicate signal the current schema proves is an exact fingerprint
-    collision (`Transaction.possible_duplicate`), which requires the account,
-    booked date, amount, normalized description, owner and installment metadata
-    to match precisely (see `transaction_fingerprint`). That is treated as full
-    confidence (1.00), which sits inside the documented "strong" band.
+    `Transaction.possible_duplicate` is a workflow/review flag, not proof of
+    duplication: `TransactionUpdate` lets any authenticated user flip it via
+    `PATCH /transactions/{id}` on any row, with or without a matching
+    transaction, so it must never be trusted directly as the confidence fact.
 
-    `Transaction.confidence` is a *different* fact: it is the classifier's
-    confidence in the category assigned during import and carries no
-    information about duplication, so it must never be reused here. When the
-    deterministic fingerprint signal is absent, duplicate confidence cannot be
-    proven from current facts and `None` is returned so the invariant reports
-    `unknown` instead of guessing.
+    The stored `Transaction.fingerprint` column is not trusted either. It is
+    computed once at import time from `transaction_fingerprint()` (account,
+    booked date, amount, normalized description, owner label and installment
+    position), but `owner_label` -- one of those inputs -- can be edited later
+    through the same PATCH endpoint without the stored fingerprint being
+    recomputed. A stale stored fingerprint could therefore either miss a real
+    collision or, in principle, still equal another row's stale fingerprint
+    without the live fields actually matching.
+
+    The only fact this function trusts is a live query: does another, distinct
+    transaction row in the same household currently match every field
+    `transaction_fingerprint()` hashes? `normalized_description` (and the
+    `description` it derives from) is safe to compare directly because
+    `TransactionUpdate` never allows either to change after import, so it
+    cannot have drifted from the value used at creation time. When such a row
+    exists, the duplication is deterministic and proven, so full confidence
+    (1.00) is returned -- the documented "strong" band. Absent that evidence --
+    including when `possible_duplicate` was set manually without a real
+    match -- the fact cannot be proven from current data and `None` is
+    returned so the invariant reports `unknown` instead of trusting the flag.
+
+    `Transaction.confidence` (the importer's category-classification
+    confidence) is a distinct fact and is never read here.
     """
 
-    if transaction.possible_duplicate:
+    from app.models import Transaction as TransactionModel
+
+    match = db.scalar(
+        select(TransactionModel.id)
+        .where(
+            TransactionModel.household_id == transaction.household_id,
+            TransactionModel.id != transaction.id,
+            TransactionModel.account_id == transaction.account_id,
+            TransactionModel.booked_at == transaction.booked_at,
+            TransactionModel.amount == transaction.amount,
+            TransactionModel.normalized_description == transaction.normalized_description,
+            TransactionModel.owner_label == transaction.owner_label,
+            TransactionModel.installment_current == transaction.installment_current,
+            TransactionModel.installment_total == transaction.installment_total,
+        )
+        .limit(1)
+    )
+    if match is not None:
         return DUPLICATE_FINGERPRINT_CONFIDENCE
     return None
 
@@ -356,7 +389,7 @@ def build_baseline_checks(
             invariant_id="INV-014",
             context=InvariantContext(
                 facts={
-                    "duplicate_confidence": _duplicate_confidence(transaction),
+                    "duplicate_confidence": _duplicate_confidence(db, transaction),
                     "resolution_status": "resolved" if transaction.reviewed else "open",
                     "included_in_totals": not transaction.excluded,
                 },

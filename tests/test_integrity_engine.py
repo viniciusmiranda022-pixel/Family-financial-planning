@@ -132,6 +132,12 @@ def test_integrity_orchestrator_has_no_advisor_or_codex_dependency() -> None:
 
 
 def _seeded_duplicate_transactions(db: Session, *, classification_confidences: tuple[Decimal, ...]) -> Household:
+    """Seed N transactions flagged `possible_duplicate=True` but with distinct
+    dates and descriptions (no real fingerprint collision). Only useful for
+    exercising `build_baseline_checks` selection and persistence plumbing --
+    never for asserting a `duplicate_confidence` value, since none of these
+    rows actually collide."""
+
     household = Household(name="Família Teste")
     db.add(household)
     db.flush()
@@ -166,14 +172,98 @@ def _seeded_duplicate_transactions(db: Session, *, classification_confidences: t
     return household
 
 
+def _seeded_colliding_transactions(
+    db: Session, *, classification_confidences: tuple[Decimal, ...]
+) -> Household:
+    """Seed N transactions that share every field `transaction_fingerprint()`
+    hashes (account, booked date, amount, normalized description, owner label,
+    installment position) -- a real, database-provable duplicate collision.
+
+    Each row is given a *different* stored `fingerprint` column value on
+    purpose, so a test built on this fixture can only pass if the derivation
+    compares live fields and never trusts the persisted (and, in production,
+    potentially stale) `fingerprint` column.
+    """
+
+    household = Household(name="Família Teste")
+    db.add(household)
+    db.flush()
+    account = Account(
+        household_id=household.id,
+        name="Cartão",
+        institution="Banco",
+        account_type="credit_card",
+        owner_label="Família",
+    )
+    db.add(account)
+    db.flush()
+    for index, classification_confidence in enumerate(classification_confidences, start=1):
+        db.add(
+            Transaction(
+                household_id=household.id,
+                account_id=account.id,
+                booked_at=date(2026, 8, 15),
+                description="Loja Exemplo",
+                normalized_description="LOJA EXEMPLO",
+                amount=Decimal("-10.00"),
+                transaction_type="expense",
+                owner_label="Família",
+                fingerprint=str(index) * 64,
+                confidence=classification_confidence,
+                possible_duplicate=True,
+                excluded=False,
+                reviewed=False,
+            )
+        )
+    db.flush()
+    return household
+
+
+def _seeded_unpaired_transaction(db: Session, *, possible_duplicate: bool) -> Transaction:
+    """Seed a single transaction with no other row sharing its fingerprint
+    fields, so it can never be a real duplicate collision."""
+
+    household = Household(name="Família Teste")
+    db.add(household)
+    db.flush()
+    account = Account(
+        household_id=household.id,
+        name="Cartão",
+        institution="Banco",
+        account_type="credit_card",
+        owner_label="Família",
+    )
+    db.add(account)
+    db.flush()
+    transaction = Transaction(
+        household_id=household.id,
+        account_id=account.id,
+        booked_at=date(2026, 8, 20),
+        description="Compra única",
+        normalized_description="COMPRA UNICA",
+        amount=Decimal("-42.00"),
+        transaction_type="expense",
+        owner_label="Família",
+        fingerprint="a" * 64,
+        confidence=Decimal("0.9900"),
+        possible_duplicate=possible_duplicate,
+        excluded=False,
+        reviewed=False,
+    )
+    db.add(transaction)
+    db.flush()
+    return transaction
+
+
 def test_duplicate_confidence_ignores_classification_confidence() -> None:
-    """INV-014's duplicate_confidence must come from the exact fingerprint match,
-    never from Transaction.confidence (the classifier's category confidence)."""
+    """INV-014's duplicate_confidence must come from a real fingerprint
+    collision between two distinct rows, never from Transaction.confidence
+    (the classifier's category confidence)."""
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        household = _seeded_duplicate_transactions(
+        household = _seeded_colliding_transactions(
             db, classification_confidences=(Decimal("0.1000"), Decimal("0.9900"))
         )
         db.commit()
@@ -190,20 +280,55 @@ def test_duplicate_confidence_ignores_classification_confidence() -> None:
             assert result.metadata["confidence_band"] == "strong"
 
 
-def test_duplicate_confidence_is_unknown_without_deterministic_evidence() -> None:
-    """When the schema cannot prove a duplicate (no fingerprint match), the
-    engine must report `unknown` instead of guessing from another field."""
+def test_duplicate_confidence_is_unknown_without_real_pair() -> None:
+    """`possible_duplicate` is a workflow/review flag that `PATCH
+    /transactions/{id}` lets any user set on any row, with or without a real
+    match. Manually flagging an unpaired transaction must not fabricate
+    confidence: the engine must report `unknown`, never `1.00`/"strong"."""
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        household = _seeded_duplicate_transactions(db, classification_confidences=(Decimal("0.9900"),))
-        transaction = db.scalar(select(Transaction).where(Transaction.household_id == household.id))
-        assert financial_integrity_module._duplicate_confidence(transaction) == Decimal("1.00")
+        transaction = _seeded_unpaired_transaction(db, possible_duplicate=True)
+        db.commit()
 
-        transaction.possible_duplicate = False
+        assert financial_integrity_module._duplicate_confidence(db, transaction) is None
+
+        checks = build_baseline_checks(
+            db, household_id=transaction.household_id, scope=IntegrityRunScope.GLOBAL
+        )
+        assert len(checks) == 1
+        assert checks[0].context.facts["duplicate_confidence"] is None
+        result = evaluate_invariant(checks[0].invariant_id, checks[0].context)
+        assert result.status is InvariantStatus.UNKNOWN
+
+
+def test_duplicate_confidence_follows_live_fields_not_stale_stored_fingerprint() -> None:
+    """`Transaction.fingerprint` is computed once at import time and never
+    recomputed. `owner_label` -- one of its inputs -- can later be edited via
+    `PATCH /transactions/{id}` without the stored fingerprint changing, so the
+    derivation must follow the live `owner_label` value, not the frozen
+    column, once the pair no longer actually matches."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = _seeded_colliding_transactions(
+            db, classification_confidences=(Decimal("0.9000"), Decimal("0.9000"))
+        )
+        db.commit()
+
+        first, second = db.scalars(
+            select(Transaction).where(Transaction.household_id == household.id).order_by(Transaction.id)
+        ).all()
+        assert financial_integrity_module._duplicate_confidence(db, first) == Decimal("1.00")
+
+        # Mirrors PATCH /transactions/{id}: owner_label changes, the stored
+        # `fingerprint` column is intentionally left untouched.
+        second.owner_label = "Outro Responsável"
         db.flush()
-        assert financial_integrity_module._duplicate_confidence(transaction) is None
+
+        assert financial_integrity_module._duplicate_confidence(db, first) is None
 
 
 def test_execute_integrity_run_rolls_back_partial_findings_on_failure(monkeypatch) -> None:
