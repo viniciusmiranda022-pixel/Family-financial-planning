@@ -330,6 +330,25 @@ test("digits embedded in finding prose never authorize a financial claim", async
   assert.equal(result.observations.length, 0);
 });
 
+test("Unicode digits are removed from provider-authored prose", async () => {
+  for (const message of ["Saldo de R$ １２３.", "Saldo de ١٢٣ reais."]) {
+    const result = await runAudit({
+      payload: basePayload,
+      provider: fakeProvider("success", {
+        responseOverrides: {
+          summary: "Status attention: revisão consultiva.",
+          observations: [
+            { category: "liquidity", type: "hypothesis", severity: "review", message },
+          ],
+        },
+      }),
+      timeoutMs: 1000,
+    });
+    assert.equal(result.available, true);
+    assert.equal(result.observations.length, 0);
+  }
+});
+
 test("a request payload outside the allowlisted input schema is rejected before any provider call", async () => {
   let providerCalled = false;
   const result = await runAudit({

@@ -135,6 +135,14 @@ def _coerce_observation(raw: Any) -> AuditObservation | None:
     recommendation = (
         str(recommendation_raw).strip()[:MAX_RECOMMENDATION_LENGTH] if recommendation_raw else None
     )
+    # Independent enforcement of the sidecar's zero-numeric-prose boundary.
+    # `str.isnumeric()` covers ASCII and Unicode digits (including full-width
+    # and Arabic-Indic forms). Numeric evidence belongs in engine-owned fields,
+    # never in provider-authored messages/recommendations.
+    if any(character.isnumeric() for character in message) or (
+        recommendation and any(character.isnumeric() for character in recommendation)
+    ):
+        return None
 
     return AuditObservation(
         category=category,

@@ -81,17 +81,11 @@ function unknownEvidenceRefs(output, knownIds) {
  * Codex observations refer to opaque evidence ids and stay qualitative.
  */
 function extractNumberClaims(text) {
-  // Match complete numeric lexemes, including short household amounts and
-  // formatted decimals (99, 99.90, 1.234,56), while ignoring digits embedded
-  // in words/opaque identifiers. Exact lexeme matching is intentionally
-  // conservative: if the provider reformats a number, the claim is dropped
-  // rather than guessed equivalent.
-  return Array.from(
-    String(text || "").matchAll(
-      /(?<![\p{L}\p{N}])[-+]?\d+(?:[.,]\d+)*(?:[eE][-+]?\d+)?(?![\p{L}\p{N}])/gu
-    ),
-    (match) => match[0]
-  );
+  // Any Unicode numeric character is sufficient to reject provider prose.
+  // This covers ASCII/scientific/formatted forms plus full-width, Arabic-
+  // Indic and other digits that render as numbers to a user. Evidence ids
+  // remain allowed in the structured evidence_ref field, never free text.
+  return Array.from(String(text || "").matchAll(/\p{N}/gu), (match) => match[0]);
 }
 
 function deterministicAuditSummary(input) {

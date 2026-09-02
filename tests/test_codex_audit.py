@@ -236,6 +236,34 @@ def test_observation_with_disallowed_severity_is_dropped_not_upgraded() -> None:
     assert outcome.observations[0].message == "Observação válida."
 
 
+def test_numeric_provider_prose_is_dropped_at_the_python_boundary() -> None:
+    for text_field, numeric_text in (
+        ("message", "Saldo de R$ 777."),
+        ("message", "Saldo de R$ １２３."),
+        ("recommendation", "Revisar ١٢٣ itens."),
+    ):
+        observation = {
+            "category": "liquidity",
+            "type": "hypothesis",
+            "severity": "review",
+            "message": "Hipótese qualitativa.",
+        }
+        observation[text_field] = numeric_text
+        client = FakeCodexClient(
+            response={
+                "available": True,
+                "summary": "Status attention: revisão consultiva.",
+                "confidence": 0.5,
+                "observations": [observation],
+            }
+        )
+        outcome = run_semantic_audit(
+            audit_type="period_review", integrity_status=BASE_INTEGRITY_STATUS, client=client
+        )
+        assert outcome.available is True
+        assert outcome.observations == ()
+
+
 def test_the_payload_sent_to_the_client_never_contains_the_household_id_or_secrets() -> None:
     client = FakeCodexClient(
         response={
