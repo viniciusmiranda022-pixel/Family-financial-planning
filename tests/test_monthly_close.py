@@ -28,13 +28,19 @@ from app.db import Base  # noqa: E402
 from app.models import (  # noqa: E402
     Account,
     Category,
+    Commission,
     FinancialProfile,
     FinancialSnapshot,
     Household,
     IntegrityFinding,
     IntegrityRun,
+    PayrollRecord,
     Transaction,
     User,
+)
+from app.services.financial_revision import (  # noqa: E402
+    current_household_financial_revision,
+    lock_household_financial_revision,
 )
 from app.services.financial_snapshots import build_snapshot  # noqa: E402
 from app.services.monthly_close import (  # noqa: E402
@@ -408,6 +414,152 @@ def test_trust_succeeds_when_healthy_and_snapshot_trusted() -> None:
             trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
         with pytest.raises(MonthlyCloseStateError):
             assert_close_runnable(db, household_id=household.id, period=PERIOD)
+
+
+def test_financial_revision_barrier_covers_integrity_and_projection_gate_models() -> None:
+    """PR 7, Round 8: `FINANCIAL_REVISION_MODELS` (`app/models.py`) must
+    include every model `consolidated_integrity_status()` and
+    `_build_projection_gate_checks()` read to decide `trust_monthly_close`'s
+    gates, not only `_collect()`'s snapshot inputs -- otherwise a concurrent
+    write to one of them can commit inside the revision barrier's own
+    window without ever bumping the counter `trust_monthly_close` locks and
+    compares. See the engineering review on PR 7, Round 8: "this model list
+    omits IntegrityRun and IntegrityFinding ... and also omits Commission
+    and PayrollRecord".
+
+    Asserts the household's revision strictly increases after a mutation to
+    each of the four previously-omitted models, one at a time.
+    """
+
+    with _engine_session() as db:
+        household, _user = _household_and_user(db)
+        baseline = current_household_financial_revision(db, household_id=household.id)
+
+        run = IntegrityRun(
+            household_id=household.id,
+            scope="period",
+            period=PERIOD,
+            status="completed",
+            trigger="close",
+            financial_rules_version="2026.09.1",
+            calculation_version="test",
+            completed_at=datetime.now(UTC),
+            trace_id=str(uuid.uuid4()),
+            summary=_healthy_summary(),
+        )
+        db.add(run)
+        db.flush()
+        after_run = current_household_financial_revision(db, household_id=household.id)
+        assert after_run > baseline
+
+        db.add(
+            IntegrityFinding(
+                household_id=household.id,
+                run_id=run.id,
+                invariant_id="INV-014",
+                fingerprint=uuid.uuid4().hex,
+                financial_rules_version="2026.09.1",
+                trace_id=str(uuid.uuid4()),
+                status="open",
+                check_status="fail",
+                severity="critical",
+                scope="transaction",
+                entity_type="transaction",
+                entity_id="tx-1",
+                period=PERIOD,
+                title="Duplicidade",
+                message="Possível duplicidade não resolvida",
+            )
+        )
+        db.flush()
+        after_finding = current_household_financial_revision(db, household_id=household.id)
+        assert after_finding > after_run
+
+        db.add(
+            Commission(
+                household_id=household.id,
+                description="Comissão de vendas",
+                expected_date=date(2026, 9, 1),
+                gross_amount=Decimal("1000.00"),
+            )
+        )
+        db.flush()
+        after_commission = current_household_financial_revision(db, household_id=household.id)
+        assert after_commission > after_finding
+
+        db.add(
+            PayrollRecord(
+                household_id=household.id,
+                person_name="Fulano",
+                competence=date(2026, 9, 1),
+                payment_date=date(2026, 9, 5),
+                payroll_kind="thirteenth",
+                net_amount=Decimal("500.00"),
+            )
+        )
+        db.flush()
+        after_payroll = current_household_financial_revision(db, household_id=household.id)
+        assert after_payroll > after_commission
+
+
+def test_run_revision_persisted_then_stale_mutation_blocks_trust() -> None:
+    """PR 7, Round 8: a source mutation that changes what a *different*
+    period's projection would recompute to -- without changing the closed
+    period's own snapshot checksum -- must still block `trust` once a
+    `financial_revision` was persisted by `run`.
+
+    Simulates `run` persisting `financial_revision` (via
+    `lock_household_financial_revision`, the same barrier
+    `trust_monthly_close` uses, read again after the run's own
+    `IntegrityRun` write settles -- exactly what `run_monthly_close`
+    does in `app/api.py`), then books a `Commission` for a future month
+    (a `_build_projection_gate_checks` input for INV-018, unrelated to
+    `PERIOD`'s own `_collect()` and therefore unable to change
+    `PERIOD`'s snapshot checksum) with no intervening rebuild, and asserts
+    `trust` is rejected specifically for a stale *run* -- not for a stale
+    *snapshot*, which alone would stay silent here.
+    """
+
+    with _engine_session() as db:
+        household, user = _household_and_user(db)
+
+        lock_household_financial_revision(db, household_id=household.id)
+        run = _completed_period_run(db, household_id=household.id, summary=_healthy_summary())
+        snapshot = _snapshot(db, household_id=household.id, trusted=True)
+        run_financial_revision = current_household_financial_revision(db, household_id=household.id)
+
+        upsert_monthly_close_after_run(
+            db,
+            household_id=household.id,
+            period=PERIOD,
+            snapshot_id=snapshot.id,
+            integrity_run_id=run.id,
+            financial_revision=run_financial_revision,
+        )
+
+        snapshot_checksum_before = snapshot.checksum
+
+        # A source mutation happens that a projection gate (INV-018) reads
+        # but `PERIOD`'s own `_collect()` does not: a commission expected in
+        # a later month. No rebuild happens in between.
+        db.add(
+            Commission(
+                household_id=household.id,
+                description="Comissão futura",
+                expected_date=date(2026, 10, 15),
+                gross_amount=Decimal("2000.00"),
+            )
+        )
+        db.flush()
+
+        rebuilt = build_snapshot(db, household_id=household.id, period=PERIOD)
+        assert rebuilt.checksum == snapshot_checksum_before
+        assert rebuilt.id == snapshot.id
+
+        with pytest.raises(MonthlyCloseGateError) as excinfo:
+            trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
+        assert any("última execução do fechamento (run)" in reason for reason in excinfo.value.reasons)
+        assert not any("mudaram durante a validação" in reason for reason in excinfo.value.reasons)
 
 
 def test_reopen_requires_trusted_and_preserves_close_history() -> None:

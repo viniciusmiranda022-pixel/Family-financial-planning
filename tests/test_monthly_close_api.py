@@ -407,6 +407,150 @@ def test_monthly_close_reaches_trusted_for_a_real_clean_period() -> None:
         app.dependency_overrides.pop(get_db, None)
 
 
+def test_run_to_trust_revision_barrier_blocks_stale_projection_input() -> None:
+    """PR 7, Round 8: a projection-gate input mutation (`Commission`) that
+    commits strictly between a real `run` and a real `trust` -- with no
+    intervening rebuild -- must block `trust`, even though it does not
+    change the closed period's own snapshot checksum (a `Commission` is not
+    one of `_collect()`'s inputs; it only feeds `_build_projection_gate_checks`'
+    INV-018 check). Before this fix, neither the snapshot-identity check nor
+    the run's stored `healthy` summary would ever notice this mutation. See
+    the engineering review on PR 7, Round 8: "Fresh evidence ... is that
+    this model list omits ... Commission and PayrollRecord ... A concurrent
+    run/finding or projection-input mutation can therefore commit ... without
+    ever contending on the locked revision row, leaving the close trusted
+    from obsolete evidence" and "Persist the revision used by /run on the
+    close/run and require it to equal the locked revision before trusting."
+    """
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        _create_household_admin(
+            household_name="Família Comissão Entre Run e Trust",
+            username="admin-close-revision-barrier",
+            password="senha-local-segura",
+        )
+        with TestClient(app) as client:
+            login = client.post(
+                "/api/auth/login",
+                json={"username": "admin-close-revision-barrier", "password": "senha-local-segura"},
+            )
+            assert login.status_code == 200
+
+            investment = client.post(
+                "/api/accounts",
+                json={
+                    "name": "Reserva DI",
+                    "institution": "Banco XP",
+                    "account_type": "investment",
+                    "owner_label": "Família",
+                },
+            )
+            assert investment.status_code == 201
+
+            checking = client.post(
+                "/api/accounts",
+                json={
+                    "name": "Conta corrente",
+                    "institution": "Banco XP",
+                    "account_type": "checking",
+                    "owner_label": "Família",
+                },
+            )
+            assert checking.status_code == 201
+
+            balance = client.post(
+                "/api/account-balances",
+                json={
+                    "account_id": investment.json()["id"],
+                    "amount": "1000.00",
+                    "as_of_date": f"{PERIOD}-01",
+                    "observation_type": "opening",
+                },
+            )
+            assert balance.status_code == 201
+
+            with _TestSessionLocal() as db:
+                household = db.scalar(
+                    select(Household).where(Household.name == "Família Comissão Entre Run e Trust")
+                )
+                income_category = Category(household_id=household.id, name="Receitas")
+                db.add(income_category)
+                db.flush()
+                db.add(
+                    Transaction(
+                        household_id=household.id,
+                        account_id=checking.json()["id"],
+                        category_id=income_category.id,
+                        booked_at=date(2026, 8, 10),
+                        description="Salário",
+                        normalized_description="SALARIO",
+                        amount=Decimal("500.00"),
+                        transaction_type="income",
+                        owner_label="Família",
+                        fingerprint="r" * 64,
+                        possible_duplicate=False,
+                        excluded=False,
+                        reviewed=True,
+                    )
+                )
+                db.commit()
+
+            run_response = client.post(f"/api/monthly-closes/{PERIOD}/run")
+            assert run_response.status_code == 200
+            assert run_response.json()["pending"]["eligible_for_trust"] is True
+
+            with _TestSessionLocal() as db:
+                snapshot_before = db.scalar(
+                    select(FinancialSnapshot).where(
+                        FinancialSnapshot.household_id == household.id,
+                        FinancialSnapshot.period == PERIOD,
+                        FinancialSnapshot.status == "current",
+                    )
+                )
+                checksum_before = snapshot_before.checksum
+
+                # A commission is booked with no intervening rebuild -- a
+                # projection-gate input (INV-018), not one of `_collect()`'s
+                # own snapshot inputs.
+                db.add(
+                    Commission(
+                        household_id=household.id,
+                        description="Comissão futura",
+                        expected_date=date(2026, 10, 15),
+                        gross_amount=Decimal("2000.00"),
+                    )
+                )
+                db.commit()
+
+            trust_response = client.post(f"/api/monthly-closes/{PERIOD}/trust")
+            assert trust_response.status_code == 422
+            reasons = trust_response.json()["detail"]["reasons"]
+            assert any("última execução do fechamento (run)" in reason for reason in reasons)
+
+            with _TestSessionLocal() as db:
+                snapshot_after = db.scalar(
+                    select(FinancialSnapshot).where(
+                        FinancialSnapshot.household_id == household.id,
+                        FinancialSnapshot.period == PERIOD,
+                        FinancialSnapshot.status == "current",
+                    )
+                )
+                # The commission never touched this period's own snapshot --
+                # proving this rejection came from the revision barrier, not
+                # from the (silent, in this case) snapshot-identity check.
+                assert snapshot_after.id == snapshot_before.id
+                assert snapshot_after.checksum == checksum_before
+
+            # A fresh `run` re-observes the current revision and clears trust.
+            rerun = client.post(f"/api/monthly-closes/{PERIOD}/run")
+            assert rerun.status_code == 200
+            assert rerun.json()["pending"]["eligible_for_trust"] is True
+            assert client.post(f"/api/monthly-closes/{PERIOD}/trust").status_code == 200
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
 def test_future_commissions_gross_stays_noncanonical_after_trust() -> None:
     """PR 7, Round 7: a live figure must never get folded into a `trusted` close.
 

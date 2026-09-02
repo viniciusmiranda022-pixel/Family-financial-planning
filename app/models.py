@@ -696,6 +696,30 @@ class MonthlyFinancialClose(Base, TimestampMixin):
     `FinancialSnapshot` and `IntegrityRun` a household reviewed for a period,
     and the human decision (`trusted`) or reversal (`reopened_*`) built on top
     of them. See docs/INTEGRITY_IMPLEMENTATION_PLAN.md section 8.8.
+
+    `financial_revision` (PR 7, Round 8) is the household's
+    `HouseholdFinancialRevision.revision` value as of the end of the last
+    successful `POST .../run` for this period -- captured under the same
+    revision barrier `trust_monthly_close` uses
+    (`lock_household_financial_revision`), after `run`'s own
+    `IntegrityRun`/`IntegrityFinding` writes. `trust_monthly_close` requires
+    this to still equal the barrier's current value before accepting
+    `trusted`: comparing `close.snapshot_id` to a freshly rebuilt snapshot
+    alone (the Round 6 fix) only detects a mutation that changed *this
+    period's* recomputed snapshot. A mutation to a source `run` also
+    depends on but that does not change this period's snapshot -- e.g.
+    editing `installment_total` on a transaction booked in an *earlier*
+    period, which changes `_future_installments()`'s next-month projection
+    without touching the closed period's own snapshot -- would otherwise
+    leave both the snapshot identity check and the old run's stored
+    `healthy` status silently satisfied. See the engineering review on PR 7,
+    Round 8: "Persist the revision used by /run on the close/run and
+    require it to equal the locked revision before trusting."　Nullable:
+    a close created before this column existed (or one manufactured
+    directly by a test that bypasses the real `run` endpoint) has no
+    recorded value, and `trust_monthly_close` treats `None` as "not
+    applicable" rather than an unconditional block -- it does not weaken
+    any of the other deterministic gates, which still apply in full.
     """
 
     __tablename__ = "monthly_financial_closes"
@@ -718,6 +742,7 @@ class MonthlyFinancialClose(Base, TimestampMixin):
     integrity_run_id: Mapped[str | None] = mapped_column(
         ForeignKey("integrity_runs.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    financial_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_by: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -769,15 +794,23 @@ class HouseholdFinancialRevision(Base):
     )
 
 
-# Every model whose rows `app/services/financial_snapshots.py`'s `_collect()`
-# reads to build a period's `FinancialSnapshot` -- a mutation to any of
-# these can change what a period would recompute to, so each one must bump
+# Every model whose rows feed either (a) `app/services/financial_snapshots.py`'s
+# `_collect()` (what a period's `FinancialSnapshot` recomputes to) or (b) a
+# deterministic gate `trust_monthly_close` relies on without recomputing --
+# `consolidated_integrity_status()` (reads `IntegrityRun`/`IntegrityFinding`)
+# and `_build_projection_gate_checks()`/INV-018 (reads `Commission`/
+# `PayrollRecord` for the projection's commission/extra-payroll inputs). A
+# mutation to any of these can change what the period's snapshot or its
+# integrity/projection gates would recompute to, so each one must bump
 # `HouseholdFinancialRevision`. Kept next to the model (not buried in
-# `app/services/financial_revision.py`) so adding a new snapshot-input model
-# elsewhere in this file is a one-line, code-reviewable decision about
-# whether it belongs here, not a separate cross-module wiring step easy to
-# forget -- see the engineering review on PR 7, Round 7: "source mutation
-# endpoints do not share the snapshot advisory lock".
+# `app/services/financial_revision.py`) so adding a new snapshot-input or
+# gate-input model elsewhere in this file is a one-line, code-reviewable
+# decision about whether it belongs here, not a separate cross-module wiring
+# step easy to forget -- see the engineering review on PR 7, Round 7 ("source
+# mutation endpoints do not share the snapshot advisory lock") and Round 8
+# ("Fresh evidence in the Round 8 barrier is that this model list omits
+# IntegrityRun and IntegrityFinding ... and also omits Commission and
+# PayrollRecord").
 FINANCIAL_REVISION_MODELS: tuple[type, ...] = (
     Transaction,
     Account,
@@ -787,6 +820,10 @@ FINANCIAL_REVISION_MODELS: tuple[type, ...] = (
     DocumentReconciliation,
     Category,
     Document,
+    Commission,
+    PayrollRecord,
+    IntegrityRun,
+    IntegrityFinding,
 )
 
 

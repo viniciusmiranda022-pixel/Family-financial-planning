@@ -146,12 +146,22 @@ def upsert_monthly_close_after_run(
     period: str,
     snapshot_id: str,
     integrity_run_id: str,
+    financial_revision: int | None = None,
 ) -> MonthlyFinancialClose:
     """Link a just-completed run/snapshot pair. Always leaves status `review_required`.
 
     A run never promotes a close straight to `trusted` on its own -- the Work
     Order (item 7) requires "executar checks", "confiar" and "reabrir" to
     stay separate, deliberate actions, even when the run comes back clean.
+
+    `financial_revision` (PR 7, Round 8) should be the household's
+    `HouseholdFinancialRevision.revision` as of the end of the run that
+    produced `integrity_run_id`/`snapshot_id`, captured under
+    `lock_household_financial_revision` -- see
+    `MonthlyFinancialClose.financial_revision`'s docstring and
+    `trust_monthly_close`'s use of it. Defaults to `None` (no comparison at
+    trust time) for callers that manufacture a close outside the real `run`
+    endpoint -- see the parameter's docstring on the model.
     """
 
     close = get_monthly_close(db, household_id=household_id, period=period)
@@ -161,6 +171,7 @@ def upsert_monthly_close_after_run(
     close.status = "review_required"
     close.snapshot_id = snapshot_id
     close.integrity_run_id = integrity_run_id
+    close.financial_revision = financial_revision
     db.flush()
     return close
 
@@ -203,6 +214,32 @@ def trust_monthly_close(
     # enforcement mechanism on SQLite, where the lock above is a no-op --
     # see `lock_household_financial_revision`'s docstring.
     revision_at_lock = lock_household_financial_revision(db, household_id=household_id)
+
+    # Require the revision this close's *run* observed to still match the
+    # one just locked -- closes the gap the revision barrier above and the
+    # snapshot-identity check below still miss together: a source mutation
+    # that changes what a *different* period's projection/gate would
+    # recompute to (e.g. editing `installment_total` on a transaction booked
+    # in an earlier period, which changes `_future_installments()`'s
+    # next-month projection) bumps `HouseholdFinancialRevision` without
+    # necessarily changing *this* period's own snapshot checksum, so the
+    # rebuild below stays a no-op and the run's stored `healthy` status is
+    # never re-evaluated. `close.financial_revision` is the revision `run`
+    # itself locked and observed (see `MonthlyFinancialClose`'s docstring);
+    # if the barrier's current value has moved since, the run's gates were
+    # evaluated against data that is no longer current, and this trust
+    # attempt must be rejected -- exactly the case a
+    # `financial_revision is None` close (created before this column
+    # existed, or manufactured directly by a test) cannot be judged on, so
+    # it is skipped rather than unconditionally blocked. See the
+    # engineering review on PR 7, Round 8: "Persist the revision used by
+    # /run on the close/run and require it to equal the locked revision
+    # before trusting."
+    if close.financial_revision is not None and close.financial_revision != revision_at_lock:
+        reasons.append(
+            "Dados financeiros do household mudaram desde a última execução do "
+            "fechamento (run); execute o fechamento novamente."
+        )
 
     # Recompute the period's canonical snapshot before trusting it -- exactly
     # what `GET /dashboard`/`GET /reports` already do on every read via
