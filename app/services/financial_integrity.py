@@ -568,9 +568,15 @@ class FindingLifecycleError(ValueError):
 
 
 def acknowledge_finding(finding: IntegrityFinding, *, user_id: str, reason: str) -> None:
-    """Record human acknowledgement. Finding stays active (counts for gates/status)."""
+    """Record human acknowledgement. Finding stays active (counts for gates/status).
 
-    if finding.status not in ACTIVE_FINDING_STATUSES:
+    Only valid from `open`: acknowledgement is a single decision point, not an
+    idempotently-repeatable note. A finding already `acknowledged` moves on
+    from here via `resolve`/`ignore`/`false-positive`, not a second
+    acknowledgement.
+    """
+
+    if finding.status != "open":
         raise FindingLifecycleError(
             f"Finding não pode ser reconhecido a partir do status '{finding.status}'."
         )

@@ -1405,11 +1405,17 @@ def mark_integrity_finding_false_positive(
     )
 
 
+_PERIOD_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
 def _validate_period(period: str) -> None:
-    try:
-        datetime.strptime(period, "%Y-%m")
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from exc
+    # Stricter than `integrity_findings`' `datetime.strptime(period, "%Y-%m")`
+    # (which accepts non-zero-padded months like "2026-8"): this value is fed
+    # straight into `consolidated_integrity_status` -> `_period_bounds`,
+    # which uses `date.fromisoformat` and would otherwise raise an unhandled
+    # 500 instead of a clean 422.
+    if not _PERIOD_PATTERN.match(period):
+        raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from None
 
 
 @router.get("/monthly-closes/{period}")
