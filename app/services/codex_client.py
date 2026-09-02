@@ -92,3 +92,17 @@ class CodexAdvisorClient:
 
     def analyze(self, payload: dict) -> CodexResult:
         return self._request("/v1/analyze", payload)
+
+    def audit(self, payload: dict) -> CodexResult:
+        """Call the dedicated `/v1/audit` semantic-audit contract.
+
+        The Advisor sidecar always answers this route with HTTP 200, even
+        when the underlying Codex call failed or timed out -- a safe
+        `{"available": false, "reason": ...}` body is a normal, schema-shaped
+        result, not an exception. A ``CodexResult(None, error)`` from this
+        method therefore means the *transport* itself failed (network,
+        auth, sidecar down); see `app.services.codex_audit` for how both
+        cases collapse into one fail-safe outcome.
+        """
+
+        return self._request("/v1/audit", payload)

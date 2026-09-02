@@ -178,6 +178,23 @@ class IntegrityRunRequest(BaseModel):
         return self
 
 
+class SemanticAuditRequest(BaseModel):
+    """Request body for POST /api/integrity/semantic-audit.
+
+    This is a request for a *consultative* Codex annotation of the
+    deterministic integrity status the Financial Integrity Engine already
+    computed -- see app/services/codex_audit.py. It never accepts a status,
+    score, or any financial figure: the endpoint always recomputes those
+    itself from the database and echoes them back unchanged.
+    """
+
+    audit_type: str = Field(
+        default="period_review",
+        pattern="^(period_review|projection_review|reconciliation_review|report_review)$",
+    )
+    period: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
 class AccountBalanceObservationRequest(BaseModel):
     account_id: str = Field(min_length=1, max_length=36)
     amount: Decimal
