@@ -214,7 +214,11 @@ def build_synthetic_household(
             transaction_type=transaction_type,
             fingerprint=key.rjust(64, "0"),
             competence=period,
-            canonical_status="canonical",
+            # Left at the model default ("unassigned"), matching genuinely
+            # legacy source data that predates duplicate detection (PR 3):
+            # `register_transaction_duplicates` is what a live import or
+            # `app.cli.backfill` uses to classify it -- see
+            # `duplicate_statement_copy`/`duplicate_card_copy` below.
             excluded=excluded,
         )
 
@@ -326,8 +330,6 @@ def build_synthetic_household(
             day=12,
         ),
     }
-    for key in ("duplicate_statement_copy", "duplicate_card_copy"):
-        transactions[key].canonical_status = "unassigned"
     db.add_all(transactions.values())
     db.flush()
 
