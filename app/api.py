@@ -3150,6 +3150,7 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
                 current_snapshot.payload.get("balance_evidence_trusted", False)
                 and validation.valid
             ),
+            "projection_formula_trusted": validation.valid,
             "source_snapshot_trusted_for_projection": current_snapshot.trusted_for_projection,
             "source_balance_evidence_trusted": bool(
                 current_snapshot.payload.get("balance_evidence_trusted", False)

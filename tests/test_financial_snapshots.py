@@ -17,7 +17,89 @@ from app.models import (
     Transaction,
     User,
 )
-from app.services.financial_snapshots import build_snapshot
+from app.services.financial_snapshots import _observation_is_trusted, build_snapshot
+
+
+def test_only_confirmed_or_reconciled_balance_evidence_is_trusted() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família Evidência")
+        db.add(household)
+        db.flush()
+        investment = Account(
+            household_id=household.id,
+            name="Reserva DI",
+            account_type="investment",
+        )
+        db.add(investment)
+        db.flush()
+        imported = AccountBalanceObservation(
+            household_id=household.id,
+            account_id=investment.id,
+            amount=Decimal("100"),
+            as_of_date=date(2026, 9, 1),
+            observation_type="closing",
+            source="statement",
+            confidence=Decimal("0.7000"),
+            trace_id="unreconciled",
+        )
+        confirmed = AccountBalanceObservation(
+            household_id=household.id,
+            account_id=investment.id,
+            amount=Decimal("100"),
+            as_of_date=date(2026, 9, 2),
+            observation_type="point_in_time",
+            source="manual_confirmed",
+            confidence=Decimal("1.0000"),
+            trace_id="confirmed",
+        )
+        db.add_all([imported, confirmed])
+        db.flush()
+
+        assert not _observation_is_trusted(db, imported)
+        assert _observation_is_trusted(db, confirmed)
+
+
+def test_point_in_time_balance_becomes_next_period_opening_evidence() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família Ponto no Tempo")
+        db.add(household)
+        db.flush()
+        investment = Account(
+            household_id=household.id,
+            name="Reserva DI",
+            account_type="investment",
+        )
+        profile = FinancialProfile(
+            household_id=household.id,
+            investment_name="Reserva DI",
+            investment_balance=Decimal("999"),
+        )
+        db.add_all([investment, profile])
+        db.flush()
+        db.add(
+            AccountBalanceObservation(
+                household_id=household.id,
+                account_id=investment.id,
+                amount=Decimal("321.45"),
+                as_of_date=date(2026, 9, 2),
+                observation_type="point_in_time",
+                source="manual_confirmed",
+                confidence=Decimal("1.0000"),
+                trace_id="confirmed-point",
+            )
+        )
+        db.flush()
+
+        september = build_snapshot(db, household_id=household.id, period="2026-09")
+        october = build_snapshot(db, household_id=household.id, period="2026-10")
+
+        assert not september.payload["balance_evidence_trusted"]
+        assert october.payload["balance_evidence_trusted"]
+        assert october.opening_liquidity_balance == Decimal("321.45")
 
 
 def _transaction(
@@ -68,9 +150,7 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
         expense = Category(household_id=household.id, name="Compras")
         income = Category(household_id=household.id, name="Receitas")
         reconciliation = Category(household_id=household.id, name="Conciliação")
-        patrimonial = Category(
-            household_id=household.id, name="Transferência patrimonial"
-        )
+        patrimonial = Category(household_id=household.id, name="Transferência patrimonial")
         db.add_all([investment, card, expense, income, reconciliation, patrimonial])
         db.flush()
         profile = FinancialProfile(
@@ -196,16 +276,12 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
         assert september.closing_liquidity_balance == Decimal("25.00")
         lineage = tuple(
             db.scalars(
-                select(FinancialSnapshotLineage).where(
-                    FinancialSnapshotLineage.snapshot_id == september.id
-                )
+                select(FinancialSnapshotLineage).where(FinancialSnapshotLineage.snapshot_id == september.id)
             ).all()
         )
         assert any(item.rule_id == "PRIOR-UNCOVERED-DEFICIT-CARRY" for item in lineage)
 
-        rebuilt = build_snapshot(
-            db, household_id=household.id, period="2026-08", force=True
-        )
+        rebuilt = build_snapshot(db, household_id=household.id, period="2026-08", force=True)
         db.commit()
         db.refresh(august)
         assert rebuilt.version == august.version + 1
