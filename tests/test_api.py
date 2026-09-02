@@ -486,8 +486,8 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert report_data["summary"]["highest_month"] == "2026-08"
         assert report_data["summary"]["liquidity_name"] == "Privilege DI"
         assert report_data["summary"]["liquidity_starting_balance"] == 20000
-        assert report_data["summary"]["liquidity_balance"] == 19889.82
-        assert report_data["summary"]["liquidity_available"] == 9889.82
+        assert report_data["summary"]["liquidity_balance"] == 19923.22
+        assert report_data["summary"]["liquidity_available"] == 9923.22
         assert report_data["summary"]["liquidity_withdrawal"] == 110.18
         assert report_data["summary"]["liquidity_uncovered_deficit"] == 0
         assert report_data["summary"]["liquidity_flow"] == -110.18

@@ -86,7 +86,6 @@ from app.services.finance import (
     month_key,
     monthly_net_rate,
 )
-from app.services.financial_engine import settle_liquidity
 from app.services.financial_integrity import (
     IntegrityRunScope,
     IntegrityRunTrigger,
@@ -3560,7 +3559,6 @@ def reports(
     last_month = _month_start(end_month)
     start = add_months(last_month, -(months - 1))
     end = add_months(last_month, 1)
-    expense_rows, duplicates_ignored = _consolidated_expenses(db, user.household_id, start, end)
     movement_rows, _ignored_movements = _consolidated_transactions(db, user.household_id, start, end)
 
     month_rows: dict[str, dict[str, object]] = {}
@@ -3578,13 +3576,6 @@ def reports(
             "transaction_count": 0,
         }
 
-    category_totals: dict[str, Decimal] = {}
-    for transaction, category_name in expense_rows:
-        key = month_key(transaction.booked_at.replace(day=1))
-        amount = max(Decimal("0"), -Decimal(transaction.amount))
-        month_rows[key]["spending"] += amount
-        category_totals[category_name] = category_totals.get(category_name, Decimal("0")) + amount
-
     movements_by_month: dict[str, list[tuple[Transaction, str]]] = {key: [] for key in month_rows}
     for transaction, category_name in movement_rows:
         key = month_key(transaction.booked_at.replace(day=1))
@@ -3594,6 +3585,8 @@ def reports(
 
     serialized_months = []
     report_snapshots: list[FinancialSnapshot] = []
+    category_totals: dict[str, Decimal] = {}
+    duplicates_ignored = 0
     previous_active_spending: Decimal | None = None
     for key, item in month_rows.items():
         snapshot = build_snapshot(
@@ -3603,6 +3596,12 @@ def reports(
             generated_by=user.id,
         )
         report_snapshots.append(snapshot)
+        duplicates_ignored += int(snapshot.payload.get("duplicates_ignored", 0))
+        for category in snapshot.payload.get("category_spending", []):
+            name = str(category["category"])
+            category_totals[name] = category_totals.get(name, Decimal("0")) + Decimal(
+                str(category["amount"])
+            )
         spending = money(snapshot.operating_expenses)
         cash_in = money(snapshot.operating_income)
         cash_out = money(snapshot.operating_expenses)
@@ -3673,11 +3672,15 @@ def reports(
     last_change = activity_rows[-1]["change_percentage"] if months > 1 and activity_rows else None
     total_result = money(total_cash_in - total_cash_out)
     first_snapshot = report_snapshots[0]
-    liquidity = settle_liquidity(
-        opening_balance=Decimal(first_snapshot.opening_liquidity_balance),
-        operating_result=total_result,
-        opening_uncovered_deficit=Decimal(first_snapshot.opening_uncovered_deficit),
-        safety_floor=Decimal(first_snapshot.safety_floor),
+    last_snapshot = report_snapshots[-1]
+    total_liquidity_deposit = money(
+        sum(
+            (Decimal(str(item.payload["liquidity_deposit"])) for item in report_snapshots),
+            Decimal("0"),
+        )
+    )
+    total_liquidity_used = money(
+        sum((Decimal(item.liquidity_used) for item in report_snapshots), Decimal("0"))
     )
     savings_rate = (
         money(((total_cash_in - total_cash_out) / total_cash_in) * Decimal("100"))
@@ -3745,14 +3748,16 @@ def reports(
             "total_card_spending": decimal_value(total_card_spending),
             "cash_net": decimal_value(total_result),
             "liquidity_name": profile.investment_name,
-            "liquidity_starting_balance": decimal_value(liquidity.opening_balance),
-            "liquidity_balance": decimal_value(liquidity.closing_balance),
-            "liquidity_closing_balance": decimal_value(liquidity.closing_balance),
+            "liquidity_starting_balance": decimal_value(first_snapshot.opening_liquidity_balance),
+            "liquidity_balance": decimal_value(last_snapshot.closing_liquidity_balance),
+            "liquidity_closing_balance": decimal_value(last_snapshot.closing_liquidity_balance),
             "emergency_floor": decimal_value(profile.emergency_floor),
-            "liquidity_available": decimal_value(liquidity.distance_to_floor),
-            "liquidity_deposit": decimal_value(liquidity.deposit),
-            "liquidity_withdrawal": decimal_value(liquidity.liquidity_used),
-            "liquidity_uncovered_deficit": decimal_value(liquidity.closing_uncovered_deficit),
+            "liquidity_available": decimal_value(last_snapshot.distance_to_floor),
+            "liquidity_deposit": decimal_value(total_liquidity_deposit),
+            "liquidity_withdrawal": decimal_value(total_liquidity_used),
+            "liquidity_uncovered_deficit": decimal_value(
+                last_snapshot.closing_uncovered_deficit
+            ),
             "liquidity_flow": decimal_value(total_result),
             "liquidity_direction": (
                 "deposit"

@@ -4,6 +4,7 @@ from decimal import Decimal
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from app.api import reports
 from app.db import Base
 from app.models import (
     Account,
@@ -14,6 +15,7 @@ from app.models import (
     FinancialSnapshotLineage,
     Household,
     Transaction,
+    User,
 )
 from app.services.financial_snapshots import build_snapshot
 
@@ -132,10 +134,32 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
                 ),
             ]
         )
+        duplicate_candidate = _transaction(
+            household,
+            card,
+            expense,
+            booked_at=date(2026, 8, 6),
+            amount="-200",
+            transaction_type="expense",
+            suffix="5",
+        )
+        duplicate_candidate.canonical_status = "unassigned"
+        duplicate_candidate.possible_duplicate = True
+        db.add(duplicate_candidate)
         db.commit()
 
-        august = build_snapshot(db, household_id=household.id, period="2026-08")
+        # Requesting September first must materialize August and carry exactly
+        # the same deterministic predecessor state.
+        september = build_snapshot(db, household_id=household.id, period="2026-09")
         db.commit()
+        august = db.scalar(
+            select(FinancialSnapshot).where(
+                FinancialSnapshot.household_id == household.id,
+                FinancialSnapshot.period == "2026-08",
+                FinancialSnapshot.status == "current",
+            )
+        )
+        assert august is not None
         assert august.opening_liquidity_balance == Decimal("50.00")
         assert august.operating_expenses == Decimal("100.00")
         assert august.card_spend == Decimal("100.00")
@@ -145,11 +169,19 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
         assert august.closing_liquidity_balance == Decimal("0.00")
         assert august.closing_uncovered_deficit == Decimal("50.00")
         assert august.payload["opening_balance_source"] == "observation"
+        assert august.payload["duplicates_ignored"] == 1
+        duplicate_lineage = db.scalar(
+            select(FinancialSnapshotLineage).where(
+                FinancialSnapshotLineage.snapshot_id == august.id,
+                FinancialSnapshotLineage.entity_id == duplicate_candidate.id,
+            )
+        )
+        assert duplicate_lineage is not None
+        assert duplicate_lineage.source_role == "excluded"
+        assert duplicate_lineage.contribution is None
 
         same = build_snapshot(db, household_id=household.id, period="2026-08")
         assert same.id == august.id
-        september = build_snapshot(db, household_id=household.id, period="2026-09")
-        db.commit()
         assert september.opening_uncovered_deficit == Decimal("50.00")
         assert september.closing_uncovered_deficit == Decimal("0.00")
         assert september.closing_liquidity_balance == Decimal("25.00")
@@ -172,3 +204,99 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
         assert august.status == "superseded"
         assert august.superseded_by_id == rebuilt.id
         assert db.scalar(select(FinancialSnapshot).where(FinancialSnapshot.id == rebuilt.id))
+
+
+def test_report_aggregates_snapshot_refunds_and_latest_balance_observation() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        household = Household(name="Família Relatório")
+        db.add(household)
+        db.flush()
+        user = User(
+            household_id=household.id,
+            name="Admin",
+            username="report-admin",
+            password_hash="hash",
+            is_admin=True,
+        )
+        investment = Account(
+            household_id=household.id,
+            name="Reserva DI",
+            account_type="investment",
+        )
+        card = Account(
+            household_id=household.id,
+            name="Cartão",
+            account_type="credit_card",
+        )
+        purchases = Category(household_id=household.id, name="Compras")
+        profile = FinancialProfile(
+            household_id=household.id,
+            monthly_cash_cap=Decimal("500"),
+            emergency_floor=Decimal("0"),
+            investment_name="Reserva DI",
+            investment_balance=Decimal("9999"),
+        )
+        db.add_all([user, investment, card, purchases, profile])
+        db.flush()
+        db.add_all(
+            [
+                AccountBalanceObservation(
+                    household_id=household.id,
+                    account_id=investment.id,
+                    amount=Decimal("100"),
+                    as_of_date=date(2026, 8, 1),
+                    observation_type="opening",
+                    source="manual_confirmed",
+                    confidence=Decimal("1"),
+                    trace_id="august-balance",
+                ),
+                AccountBalanceObservation(
+                    household_id=household.id,
+                    account_id=investment.id,
+                    amount=Decimal("1000"),
+                    as_of_date=date(2026, 9, 1),
+                    observation_type="opening",
+                    source="manual_confirmed",
+                    confidence=Decimal("1"),
+                    trace_id="september-balance",
+                ),
+                _transaction(
+                    household,
+                    card,
+                    purchases,
+                    booked_at=date(2026, 8, 5),
+                    amount="-100",
+                    transaction_type="expense",
+                    suffix="report-expense",
+                ),
+                _transaction(
+                    household,
+                    card,
+                    purchases,
+                    booked_at=date(2026, 8, 6),
+                    amount="20",
+                    transaction_type="refund",
+                    suffix="report-refund",
+                ),
+            ]
+        )
+        db.commit()
+
+        result = reports(end_month="2026-09", months=2, user=user, db=db)
+
+        assert result["summary"]["total_spending"] == 80.0
+        assert result["categories"] == [
+            {
+                "category": "Compras",
+                "amount": 80.0,
+                "average": 80.0,
+                "share": 100.0,
+                "color": "#64748B",
+            }
+        ]
+        assert result["summary"]["liquidity_starting_balance"] == 100.0
+        assert result["summary"]["liquidity_balance"] == 1000.0
+        assert result["summary"]["liquidity_withdrawal"] == 80.0
+        assert result["monthly"][-1]["snapshot_id"]

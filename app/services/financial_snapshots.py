@@ -116,6 +116,7 @@ def _opening_balance(
     household_id: str,
     profile: FinancialProfile,
     period_start: date,
+    previous_snapshot: FinancialSnapshot | None,
 ) -> tuple[Decimal, SnapshotSource, bool]:
     investment_accounts = tuple(
         db.scalars(
@@ -137,20 +138,22 @@ def _opening_balance(
     eligible = matching or (investment_accounts if len(investment_accounts) == 1 else ())
     observation = None
     if eligible:
+        statement = select(AccountBalanceObservation).where(
+            AccountBalanceObservation.household_id == household_id,
+            AccountBalanceObservation.account_id.in_([item.id for item in eligible]),
+            AccountBalanceObservation.invalidated_at.is_(None),
+            AccountBalanceObservation.superseded_by_id.is_(None),
+        )
+        statement = statement.where(
+            AccountBalanceObservation.as_of_date == period_start
+            if previous_snapshot is not None
+            else AccountBalanceObservation.as_of_date <= period_start
+        )
         observation = db.scalar(
-            select(AccountBalanceObservation)
-            .where(
-                AccountBalanceObservation.household_id == household_id,
-                AccountBalanceObservation.account_id.in_([item.id for item in eligible]),
-                AccountBalanceObservation.as_of_date <= period_start,
-                AccountBalanceObservation.invalidated_at.is_(None),
-                AccountBalanceObservation.superseded_by_id.is_(None),
-            )
-            .order_by(
+            statement.order_by(
                 AccountBalanceObservation.as_of_date.desc(),
                 AccountBalanceObservation.created_at.desc(),
-            )
-            .limit(1)
+            ).limit(1)
         )
     if observation is not None:
         return (
@@ -163,6 +166,22 @@ def _opening_balance(
                 "OPENING-LIQUIDITY-OBSERVATION",
                 "opening_liquidity_balance",
                 money(observation.amount),
+            ),
+            True,
+        )
+    if previous_snapshot is not None and previous_snapshot.payload.get(
+        "balance_evidence_trusted", False
+    ):
+        return (
+            money(previous_snapshot.closing_liquidity_balance),
+            SnapshotSource(
+                "financial_snapshot",
+                previous_snapshot.id,
+                None,
+                "canonical",
+                "PRIOR-CLOSING-LIQUIDITY-CARRY",
+                "opening_liquidity_balance",
+                money(previous_snapshot.closing_liquidity_balance),
             ),
             True,
         )
@@ -214,24 +233,28 @@ def _collect(
     profile = db.scalar(select(FinancialProfile).where(FinancialProfile.household_id == household_id))
     if profile is None:
         raise ValueError("financial profile is required")
-    rows, ignored = consolidated_transactions(db, household_id, start, end)
-    opening, opening_source, observed_balance = _opening_balance(
-        db, household_id, profile, start
-    )
-    sources = [opening_source]
+    previous_period = add_months(start, -1).strftime("%Y-%m")
     previous_snapshot = db.scalar(
         select(FinancialSnapshot)
         .where(
             FinancialSnapshot.household_id == household_id,
-            FinancialSnapshot.period < period,
+            FinancialSnapshot.period == previous_period,
             FinancialSnapshot.snapshot_kind == "actual",
             FinancialSnapshot.status == "current",
         )
         .order_by(FinancialSnapshot.period.desc(), FinancialSnapshot.version.desc())
         .limit(1)
     )
+    rows, ignored = consolidated_transactions(db, household_id, start, end)
+    opening, opening_source, observed_balance = _opening_balance(
+        db, household_id, profile, start, previous_snapshot
+    )
+    sources = [opening_source]
     opening_uncovered_deficit = Decimal("0")
-    if previous_snapshot is not None and previous_snapshot.closing_uncovered_deficit > 0:
+    if (
+        previous_snapshot is not None
+        and Decimal(previous_snapshot.closing_uncovered_deficit) > 0
+    ):
         opening_uncovered_deficit = money(previous_snapshot.closing_uncovered_deficit)
         sources.append(
             SnapshotSource(
@@ -260,13 +283,17 @@ def _collect(
     }
     categories: dict[str, Decimal] = {}
     accounts: dict[str, dict[str, Any]] = {}
+    pending_duplicates = 0
     for transaction, category_name in rows:
         amount = money(transaction.amount)
         role = "excluded" if transaction.excluded else "canonical"
         account_type = transaction.account.account_type if transaction.account else "other"
         metric = "source_count"
         contribution: Decimal | None = None
-        if category_name == "Transferência patrimonial":
+        if transaction.possible_duplicate and transaction.canonical_status == "unassigned":
+            pending_duplicates += 1
+            role = "excluded"
+        elif category_name == "Transferência patrimonial":
             metric = "investments" if amount < 0 else "redemptions"
             totals[metric] += abs(amount)
             contribution = abs(amount)
@@ -397,8 +424,15 @@ def _collect(
     payload.update(
         {
             "source_hash": _source_hash(sources, profile),
-            "opening_balance_source": "observation" if observed_balance else "legacy_profile",
-            "duplicates_ignored": len(ignored),
+            "opening_balance_source": (
+                "observation"
+                if opening_source.entity_type == "account_balance_observation"
+                else "prior_snapshot"
+                if opening_source.entity_type == "financial_snapshot"
+                else "legacy_profile"
+            ),
+            "balance_evidence_trusted": observed_balance,
+            "duplicates_ignored": len(ignored) + pending_duplicates,
             "category_spending": [
                 {"category": key, "amount": float(money(value))}
                 for key, value in sorted(categories.items(), key=lambda item: item[1], reverse=True)
@@ -452,6 +486,12 @@ def build_snapshot(
     generated_by: str | None = None,
     force: bool = False,
 ) -> FinancialSnapshot:
+    _ensure_immediate_predecessor(
+        db,
+        household_id=household_id,
+        period=period,
+        generated_by=generated_by,
+    )
     payload, sources, metadata = _collect(db, household_id, period)
     current = db.scalar(
         select(FinancialSnapshot)
@@ -494,7 +534,11 @@ def build_snapshot(
         generated_by=generated_by,
         trace_id=trace_id,
         **{
-            key: payload[key]
+            key: (
+                int(payload[key])
+                if key == "source_count"
+                else Decimal(str(payload[key]))
+            )
             for key in (
                 "operating_income", "operating_expenses", "operating_result",
                 "bank_cash_in", "bank_cash_out", "bank_cash_result", "investments",
@@ -530,6 +574,49 @@ def build_snapshot(
         current.superseded_by_id = snapshot.id
     db.flush()
     return snapshot
+
+
+def _ensure_immediate_predecessor(
+    db: Session,
+    *,
+    household_id: str,
+    period: str,
+    generated_by: str | None,
+) -> None:
+    """Materialize every relevant prior state so results never depend on view order."""
+
+    start = datetime.strptime(period, "%Y-%m").date()
+    earliest_transaction = db.scalar(
+        select(func.min(Transaction.booked_at)).where(Transaction.household_id == household_id)
+    )
+    earliest_observation = db.scalar(
+        select(func.min(AccountBalanceObservation.as_of_date)).where(
+            AccountBalanceObservation.household_id == household_id,
+            AccountBalanceObservation.invalidated_at.is_(None),
+        )
+    )
+    earliest_snapshot = db.scalar(
+        select(func.min(FinancialSnapshot.period)).where(
+            FinancialSnapshot.household_id == household_id,
+            FinancialSnapshot.snapshot_kind == "actual",
+        )
+    )
+    candidates = [
+        value.strftime("%Y-%m") if isinstance(value, date) else value
+        for value in (earliest_transaction, earliest_observation, earliest_snapshot)
+        if value is not None
+    ]
+    if not candidates:
+        return
+    previous_period = add_months(start, -1).strftime("%Y-%m")
+    if previous_period < min(candidates):
+        return
+    build_snapshot(
+        db,
+        household_id=household_id,
+        period=previous_period,
+        generated_by=generated_by,
+    )
 
 
 def serialize_snapshot(snapshot: FinancialSnapshot) -> dict[str, Any]:
