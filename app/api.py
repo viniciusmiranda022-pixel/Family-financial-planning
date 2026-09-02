@@ -3088,11 +3088,24 @@ def rebuild_financial_snapshot(
             calculation_version=build.calculation_version,
         )
     except Exception as exc:
-        db.commit()
+        # The new snapshot (and the superseding of the previous `current` row)
+        # was only ever flushed inside this same still-open transaction, never
+        # committed. Rolling back here -- instead of committing -- is what
+        # actually keeps the promise this endpoint makes: a failed audit must
+        # never leave a new `current` snapshot in place, published as if the
+        # recomputation had succeeded.
+        db.rollback()
         raise HTTPException(
             status_code=500,
             detail="A recomputação do snapshot falhou sem alterar os dados financeiros de origem",
         ) from exc
+
+    # `integrity_status` is only known once the checks built from this exact
+    # snapshot have actually been evaluated; `run.summary["status"]` is that
+    # real ConsolidatedIntegrityStatus assessment (see `assess_integrity`).
+    # Persisting it here -- rather than any heuristic computed before the run
+    # even executed -- is what keeps the field honest.
+    snapshot.integrity_status = run.summary["status"]
 
     audit(
         db,
@@ -3101,7 +3114,11 @@ def rebuild_financial_snapshot(
         "financial_snapshot",
         snapshot.id,
         {"period": period, "snapshot_kind": snapshot_kind, "version": snapshot.version},
-        after_state={"integrity_status": snapshot.integrity_status, "checksum": snapshot.checksum},
+        after_state={
+            "integrity_status": snapshot.integrity_status,
+            "completeness_status": snapshot.completeness_status,
+            "checksum": snapshot.checksum,
+        },
         reason="Recomputação manual solicitada por administrador",
         trace_id=snapshot.trace_id,
         source="financial_engine",

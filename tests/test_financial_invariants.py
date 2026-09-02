@@ -41,7 +41,7 @@ ZERO_OPERATING_EFFECTS = {
 
 
 def test_registry_contains_all_permanent_invariants_once() -> None:
-    assert FINANCIAL_RULES_VERSION == "2026.09.1"
+    assert FINANCIAL_RULES_VERSION == "2026.09.2"
     assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 23))
     assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 22
     assert all(item.required_facts for item in INVARIANT_REGISTRY.values())
@@ -179,6 +179,110 @@ def test_deficit_uses_all_available_liquidity_before_becoming_uncovered(
     }
     assert _evaluate("INV-005", **facts).status is InvariantStatus.PASS
     assert _evaluate("INV-006", **facts).status is InvariantStatus.PASS
+
+
+def test_liquidity_transition_defaults_reproduce_original_formula_exactly() -> None:
+    """The new optional parameter must be a pure extension: omitting it (or
+    passing 0) is bit-for-bit identical to the pre-PR-4 formula for every
+    existing caller/test."""
+
+    without_param = calculate_liquidity_transition(Decimal("87068.54"), Decimal("-270014.03"))
+    with_zero = calculate_liquidity_transition(
+        Decimal("87068.54"), Decimal("-270014.03"), Decimal("0.00")
+    )
+    assert without_param == with_zero
+    assert without_param.closing_balance == Decimal("0.00")
+    assert without_param.uncovered_deficit == Decimal("182945.49")
+
+
+@pytest.mark.parametrize(
+    ("opening", "result", "carried_deficit", "used", "closing", "uncovered"),
+    (
+        # Month N closes with a 100.00 uncovered deficit (opening forced to 0
+        # by INV-005). Month N+1's surplus is smaller/equal/larger than the debt:
+        # the surplus pays the debt down first; only the excess becomes new
+        # liquidity (docs/work-orders/PR4... item 1's mandatory chained example).
+        ("0.00", "30.00", "100.00", "0.00", "0.00", "70.00"),  # surplus < debt
+        ("0.00", "100.00", "100.00", "0.00", "0.00", "0.00"),  # surplus == debt
+        ("0.00", "150.00", "100.00", "0.00", "50.00", "0.00"),  # surplus > debt
+        # A second consecutive negative month adds to the carried debt instead
+        # of resetting it.
+        ("0.00", "-20.00", "100.00", "0.00", "0.00", "120.00"),
+        # A carried debt can also be repaid out of genuine opening liquidity
+        # (e.g. a fresh confirmed observation), not only out of this period's
+        # own result.
+        ("50.00", "0.00", "30.00", "30.00", "20.00", "0.00"),
+    ),
+)
+def test_liquidity_transition_carries_forward_prior_uncovered_deficit(
+    opening: str, result: str, carried_deficit: str, used: str, closing: str, uncovered: str
+) -> None:
+    transition = calculate_liquidity_transition(opening, result, carried_deficit)
+    assert transition.liquidity_used == Decimal(used)
+    assert transition.closing_balance == Decimal(closing)
+    assert transition.uncovered_deficit == Decimal(uncovered)
+    # Liquidity can never be positive next to an unpaid prior deficit.
+    assert not (transition.closing_balance > 0 and transition.uncovered_deficit > 0)
+
+    facts = {
+        "opening_liquidity_balance": opening,
+        "monthly_operating_result": result,
+        "opening_uncovered_deficit": carried_deficit,
+        "liquidity_used": used,
+        "closing_liquidity_balance": closing,
+        "uncovered_deficit": uncovered,
+    }
+    assert _evaluate("INV-005", **facts).status is InvariantStatus.PASS
+    assert _evaluate("INV-006", **facts).status is InvariantStatus.PASS
+    # Feeding the *pre*-carry-forward raw transition (as if the carried debt
+    # did not exist) must now FAIL -- this is the exact regression the
+    # engineer's review caught: a snapshot that ignores the inherited deficit.
+    raw_transition = calculate_liquidity_transition(opening, result)
+    raw_differs = raw_transition.closing_balance != Decimal(closing) or (
+        raw_transition.uncovered_deficit != Decimal(uncovered)
+    )
+    if raw_differs:
+        raw_facts = {
+            **facts,
+            "closing_liquidity_balance": raw_transition.closing_balance,
+            "uncovered_deficit": raw_transition.uncovered_deficit,
+            "liquidity_used": raw_transition.liquidity_used,
+        }
+        assert _evaluate("INV-005", **raw_facts).status is InvariantStatus.FAIL
+
+
+@given(
+    opening=st.decimals(
+        min_value=Decimal("0.00"),
+        max_value=Decimal("10000000.00"),
+        places=2,
+        allow_nan=False,
+        allow_infinity=False,
+    ),
+    result=st.decimals(
+        min_value=Decimal("-20000000.00"),
+        max_value=Decimal("10000000.00"),
+        places=2,
+        allow_nan=False,
+        allow_infinity=False,
+    ),
+    carried_deficit=st.decimals(
+        min_value=Decimal("0.00"),
+        max_value=Decimal("10000000.00"),
+        places=2,
+        allow_nan=False,
+        allow_infinity=False,
+    ),
+)
+@settings(max_examples=500, deadline=None)
+def test_liquidity_transition_with_carry_forward_never_produces_negative_balance(
+    opening: Decimal, result: Decimal, carried_deficit: Decimal
+) -> None:
+    transition = calculate_liquidity_transition(opening, result, carried_deficit)
+    assert transition.closing_balance >= 0
+    assert transition.uncovered_deficit >= 0
+    assert not (transition.closing_balance > 0 and transition.uncovered_deficit > 0)
+    assert transition.closing_balance - transition.uncovered_deficit == opening + result - carried_deficit
 
 
 def test_safety_floor_never_blocks_real_deficit_coverage() -> None:

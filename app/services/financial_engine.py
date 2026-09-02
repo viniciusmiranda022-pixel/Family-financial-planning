@@ -33,24 +33,35 @@ full rationale and evidence):
   discovery-phase note) and omitting it would make `closing_liquidity_balance`
   wrong.
 * Full carry-forward of a prior `uncovered_deficit` (future surplus pays it
-  down first -- INTEGRITY_IMPLEMENTATION_PLAN.md §7.3) is NOT implemented as
-  an algorithmic offset here. `opening_uncovered_deficit` is persisted
-  (chained from the previous snapshot) for transparency only; the transition
-  itself uses the plain, already-tested `calculate_liquidity_transition`
-  formula, matching INV-005/INV-006/INV-007 and the Work Order's literal
-  "Regras financeiras obrigatórias" verbatim. Feeding a carry-forward-adjusted
-  result into those frozen validators would make them fail on a mismatch that
-  is an engine/validator disagreement, not a real defect -- implementing the
-  offset for real means extending that tested contract and bumping
-  `financial_rules_version`, which is a deliberate follow-up decision, not
-  something to slip in silently.
+  down first -- INTEGRITY_IMPLEMENTATION_PLAN.md §7.3) IS implemented as a
+  deliberate, versioned extension of `calculate_liquidity_transition`
+  (financial_rules_version bumped 2026.09.1 -> 2026.09.2 for this change):
+  the function now takes an optional `opening_uncovered_deficit` parameter
+  that a surplus pays down before any of it becomes new closing liquidity.
+  Passing the default `0` reproduces the original formula exactly, so every
+  pre-existing call site/test is unaffected; `compute_liquidity` always
+  passes the chained `opening_uncovered_deficit` through, and
+  `build_snapshot_invariant_checks` feeds the same fact to INV-005/006/007
+  so the persisted validators check the post-carry-forward numbers, not the
+  pre-PR-4 ones.
 * Opening liquidity balance is resolved only from a confirmed
   `AccountBalanceObservation` for `financial_profiles.central_liquidity_account_id`
   (new additive column) or chained from the previous period's own snapshot.
   `FinancialProfile.investment_balance` is never used as a silent fallback --
   it has no reliable `as_of_date` (docs/INTEGRITY_IMPLEMENTATION_PLAN.md §7.4).
-  Missing evidence yields `integrity_status="incomplete"` with null liquidity
-  fields, never a fabricated number.
+  Missing evidence yields `completeness_status="incomplete"` with null
+  liquidity fields, never a fabricated number. `completeness_status` (do we
+  have enough facts to attempt liquidity) and `integrity_status` (what did
+  the deterministic audit of this exact snapshot actually find --
+  ConsolidatedIntegrityStatus: blocked/critical/review_required/attention/
+  healthy/unknown) are deliberately two different, explicitly named fields;
+  the latter is only ever set from a real `execute_integrity_run` result
+  (see `POST /financial-snapshots/{period}/rebuild`), never inferred from
+  whether an opening balance happened to be available.
+* `commitments` and (when no `FinancialProfile` exists) `budget_cap`/
+  `budget_remaining` are persisted as `None`, not `0.00`, when this slice has
+  no canonical source to compute them from -- an absent fact must never look
+  like a computed zero.
 """
 
 from __future__ import annotations
@@ -276,15 +287,21 @@ def compute_liquidity(
     operating_result: Decimal,
     monthly_investment_rate: Decimal,
     safety_floor: Decimal | None,
+    opening_uncovered_deficit: Decimal = Decimal("0.00"),
 ) -> LiquiditySnapshot:
     """Apply the canonical Privilège transition, with the documented yield.
 
-    Reuses `calculate_liquidity_transition` (frozen/tested in PR 1) unchanged:
+    Reuses `calculate_liquidity_transition` (frozen/tested in PR 1, extended in
+    PR 4 -- financial_rules_version 2026.09.2 -- with the optional
+    `opening_uncovered_deficit` carry-forward parameter) unchanged in shape:
     `monthly_result = operating_result + investment_yield`, where the yield
     only accrues on a positive opening balance (docs/FINANCIAL_RULES.md "O
     rendimento mensal incide sobre o saldo inicial positivo do mês"), matching
     the same `max(0, opening) * rate` shape `app.services.finance.build_forecast`
-    already uses for projections.
+    already uses for projections. When `opening_uncovered_deficit > 0`
+    (INTEGRITY_IMPLEMENTATION_PLAN.md §7.3), this period's result pays that
+    debt down before any surplus can become new `closing_balance` -- the
+    engine never reports positive liquidity next to an unpaid prior deficit.
     """
 
     if opening_balance is None:
@@ -301,7 +318,7 @@ def compute_liquidity(
 
     investment_yield = _money(max(Decimal("0"), opening_balance) * monthly_investment_rate)
     monthly_result = _money(operating_result + investment_yield)
-    transition = calculate_liquidity_transition(opening_balance, monthly_result)
+    transition = calculate_liquidity_transition(opening_balance, monthly_result, opening_uncovered_deficit)
     floor = safety_floor if safety_floor is not None else Decimal("0.00")
     return LiquiditySnapshot(
         investment_yield=investment_yield,
@@ -362,7 +379,9 @@ class FinancialSnapshotBuild:
     opening_balance_source_type: str | None
     opening_balance_source_id: str | None
     opening_uncovered_deficit: Decimal
-    integrity_status: str
+    budget_cap: Decimal | None
+    budget_remaining: Decimal | None
+    completeness_status: str
     movement_facts: tuple[MovementFact, ...]
     generated_at: datetime
 
@@ -467,6 +486,14 @@ def build_financial_snapshot(
         else Decimal("0")
     )
     safety_floor = _money(profile.emergency_floor) if profile is not None else None
+    # `budget_cap` is the household's configured cash-spending ceiling
+    # (`FinancialProfile.monthly_cash_cap`, docs/FINANCIAL_RULES.md
+    # "teto de gastos em dinheiro"), the same source the existing cash-cap
+    # report already reads (`app.api` `cash_cap`/`remaining_cap`). Absent a
+    # profile there is no configured cap to report, so both fields stay
+    # `None` rather than a fabricated zero.
+    budget_cap = _money(profile.monthly_cash_cap) if profile is not None else None
+    budget_remaining = _money(budget_cap - totals.budget_usage) if budget_cap is not None else None
 
     (
         opening_balance,
@@ -480,6 +507,7 @@ def build_financial_snapshot(
         operating_result=totals.operating_result,
         monthly_investment_rate=monthly_rate,
         safety_floor=safety_floor,
+        opening_uncovered_deficit=opening_uncovered_deficit,
     )
 
     return FinancialSnapshotBuild(
@@ -495,7 +523,9 @@ def build_financial_snapshot(
         opening_balance_source_type=opening_source_type,
         opening_balance_source_id=opening_source_id,
         opening_uncovered_deficit=opening_uncovered_deficit,
-        integrity_status="complete" if opening_balance is not None else "incomplete",
+        budget_cap=budget_cap,
+        budget_remaining=budget_remaining,
+        completeness_status="complete" if opening_balance is not None else "incomplete",
         movement_facts=movement_facts,
         generated_at=datetime.now(UTC),
     )
@@ -604,7 +634,19 @@ def persist_financial_snapshot(
             snapshot_kind=build.snapshot_kind,
             version=next_version,
             status="current",
-            integrity_status=build.integrity_status,
+            # `integrity_status` is the *real* deterministic audit outcome
+            # (ConsolidatedIntegrityStatus: blocked/critical/review_required/
+            # attention/healthy/unknown). It cannot be known before this
+            # snapshot's checks are actually evaluated, so it is persisted as
+            # "unknown" here and the caller that runs
+            # `execute_integrity_run(... build_snapshot_invariant_checks(build))`
+            # against this same snapshot is responsible for overwriting it with
+            # the run's real assessment before committing (see
+            # `POST /financial-snapshots/{period}/rebuild`). `completeness_status`
+            # is the separate, purely structural "do we even have enough
+            # source facts (an opening balance) to attempt liquidity" signal.
+            integrity_status="unknown",
+            completeness_status=build.completeness_status,
             financial_rules_version=build.financial_rules_version,
             calculation_version=build.calculation_version,
             trace_id=build.trace_id,
@@ -622,7 +664,15 @@ def persist_financial_snapshot(
             redemptions=build.totals.redemptions,
             internal_transfers=build.totals.internal_transfers,
             refunds=build.totals.refunds,
-            commitments=Decimal("0.00"),
+            # Not computed in this slice: there is no documented, canonical
+            # formula yet for "commitments" of a *closed/actual* period (only
+            # the projection-scenario formula in docs/FINANCIAL_RULES.md
+            # "Projeções" is defined, and migrating to it is PR 5 scope).
+            # `None` represents that honestly; it must never be fabricated
+            # as `0.00` (docs/work-orders/PR4... "Proibições").
+            commitments=None,
+            budget_cap=build.budget_cap,
+            budget_remaining=build.budget_remaining,
             projected_balance=None,
             opening_liquidity_balance=build.opening_liquidity_balance,
             investment_yield=build.liquidity.investment_yield,
@@ -663,6 +713,8 @@ def _checksum(build: FinancialSnapshotBuild) -> str:
         "financial_rules_version": build.financial_rules_version,
         "opening_liquidity_balance": _optional_str(build.opening_liquidity_balance),
         "opening_uncovered_deficit": str(build.opening_uncovered_deficit),
+        "budget_cap": _optional_str(build.budget_cap),
+        "budget_remaining": _optional_str(build.budget_remaining),
         "totals": {key: str(value) for key, value in asdict(build.totals).items()},
         "liquidity": {
             key: (str(value) if isinstance(value, Decimal) else value)
@@ -765,7 +817,65 @@ def _build_lineage_rows(
                 trace_id=build.trace_id,
             )
         )
+    rows.extend(_liquidity_lineage_rows(build, snapshot_id))
     return rows
+
+
+_LIQUIDITY_SOURCE_ENTITY_TYPES = {
+    "observation": "account_balance_observation",
+    "previous_snapshot": "financial_snapshot",
+}
+
+
+def _liquidity_lineage_rows(
+    build: FinancialSnapshotBuild, snapshot_id: str
+) -> list[FinancialSnapshotLineage]:
+    """Lineage for the liquidity *transition* itself, not just its opening input.
+
+    `_build_lineage_rows` already explains where `opening_liquidity_balance`
+    came from. The values the Privilège transition *derives* from it --
+    `investment_yield`, `liquidity_used`, `closing_liquidity_balance`,
+    `closing_uncovered_deficit` and `distance_to_floor` -- are not individually
+    traceable to a transaction (they are a pure formula over the opening
+    balance, the operating result and the safety floor), but they must still
+    each carry an auditable rule id/version and a reference back to the same
+    opening-balance evidence, per the Work Order's lineage requirement. One
+    row per populated metric; nothing is emitted when there is no opening
+    balance to begin with (liquidity stays `None`, already honestly absent).
+    """
+
+    from app.models import FinancialSnapshotLineage as LineageModel
+
+    if build.liquidity.closing_balance is None:
+        return []
+
+    entity_type = _LIQUIDITY_SOURCE_ENTITY_TYPES.get(
+        build.opening_balance_source_type or "", "unknown"
+    )
+    rule_id = f"liquidity_transition:{build.financial_rules_version}"
+    metrics: tuple[tuple[str, Decimal | None], ...] = (
+        ("investment_yield", build.liquidity.investment_yield),
+        ("liquidity_used", build.liquidity.liquidity_used),
+        ("closing_liquidity_balance", build.liquidity.closing_balance),
+        ("closing_uncovered_deficit", build.liquidity.closing_uncovered_deficit),
+        ("distance_to_floor", build.liquidity.distance_to_floor),
+    )
+    return [
+        LineageModel(
+            household_id=build.household_id,
+            snapshot_id=snapshot_id,
+            metric_key=metric_key,
+            entity_type=entity_type,
+            entity_id=build.opening_balance_source_id,
+            document_id=None,
+            rule_id=rule_id,
+            contribution=value,
+            source_role="canonical",
+            trace_id=build.trace_id,
+        )
+        for metric_key, value in metrics
+        if value is not None
+    ]
 
 
 def _optional_str(value: Decimal | None) -> str | None:
@@ -786,6 +896,7 @@ def serialize_financial_snapshot(snapshot: FinancialSnapshot) -> dict[str, Any]:
         "version": snapshot.version,
         "status": snapshot.status,
         "integrity_status": snapshot.integrity_status,
+        "completeness_status": snapshot.completeness_status,
         "financial_rules_version": snapshot.financial_rules_version,
         "calculation_version": snapshot.calculation_version,
         "trace_id": snapshot.trace_id,
@@ -803,7 +914,9 @@ def serialize_financial_snapshot(snapshot: FinancialSnapshot) -> dict[str, Any]:
         "redemptions": str(snapshot.redemptions),
         "internal_transfers": str(snapshot.internal_transfers),
         "refunds": str(snapshot.refunds),
-        "commitments": str(snapshot.commitments),
+        "commitments": _optional_str(snapshot.commitments),
+        "budget_cap": _optional_str(snapshot.budget_cap),
+        "budget_remaining": _optional_str(snapshot.budget_remaining),
         "projected_balance": _optional_str(snapshot.projected_balance),
         "opening_liquidity_balance": _optional_str(snapshot.opening_liquidity_balance),
         "investment_yield": _optional_str(snapshot.investment_yield),
@@ -997,43 +1110,50 @@ def build_snapshot_invariant_checks(build: FinancialSnapshotBuild) -> tuple[Inte
                 )
             )
 
-    if build.liquidity.closing_balance is not None:
-        liquidity_facts: dict[str, object] = {
-            "opening_liquidity_balance": build.opening_liquidity_balance,
-            "monthly_operating_result": build.liquidity.monthly_result,
-            "closing_liquidity_balance": build.liquidity.closing_balance,
-            "uncovered_deficit": build.liquidity.closing_uncovered_deficit,
-            "liquidity_used": build.liquidity.liquidity_used,
-        }
-        entity_id = f"{build.period}:{build.snapshot_kind}"
-        for invariant_id in ("INV-005", "INV-006"):
-            checks.append(
-                IntegrityCheck(
-                    invariant_id,
-                    InvariantContext(
-                        facts=dict(liquidity_facts),
-                        scope=InvariantScope.PERIOD,
-                        entity_type="financial_snapshot",
-                        entity_id=entity_id,
-                        period=build.period,
-                        trace_id=build.trace_id,
-                    ),
-                )
+    # INV-005/006/007 are always emitted for the period, whether or not an
+    # opening balance was resolved. Omitting the check entirely when liquidity
+    # is unresolved would silently drop the one signal a consumer has that the
+    # snapshot's liquidity is unproven; `InvariantDefinition.evaluate` already
+    # turns a missing required fact into an explicit `unknown` result rather
+    # than a fabricated `pass` (`_require`), so feeding the (possibly `None`)
+    # values through unconditionally is exactly "unknown, never silently
+    # skipped" (docs/work-orders/PR4... §"Invariantes prioritários").
+    liquidity_facts: dict[str, object] = {
+        "opening_liquidity_balance": build.opening_liquidity_balance,
+        "monthly_operating_result": build.liquidity.monthly_result,
+        "closing_liquidity_balance": build.liquidity.closing_balance,
+        "uncovered_deficit": build.liquidity.closing_uncovered_deficit,
+        "liquidity_used": build.liquidity.liquidity_used,
+        "opening_uncovered_deficit": build.opening_uncovered_deficit,
+    }
+    entity_id = f"{build.period}:{build.snapshot_kind}"
+    for invariant_id in ("INV-005", "INV-006"):
+        checks.append(
+            IntegrityCheck(
+                invariant_id,
+                InvariantContext(
+                    facts=dict(liquidity_facts),
+                    scope=InvariantScope.PERIOD,
+                    entity_type="financial_snapshot",
+                    entity_id=entity_id,
+                    period=build.period,
+                    trace_id=build.trace_id,
+                ),
             )
-        if build.liquidity.safety_floor is not None:
-            checks.append(
-                IntegrityCheck(
-                    "INV-007",
-                    InvariantContext(
-                        facts={**liquidity_facts, "safety_floor": build.liquidity.safety_floor},
-                        scope=InvariantScope.PERIOD,
-                        entity_type="financial_snapshot",
-                        entity_id=entity_id,
-                        period=build.period,
-                        trace_id=build.trace_id,
-                    ),
-                )
-            )
+        )
+    checks.append(
+        IntegrityCheck(
+            "INV-007",
+            InvariantContext(
+                facts={**liquidity_facts, "safety_floor": build.liquidity.safety_floor},
+                scope=InvariantScope.PERIOD,
+                entity_type="financial_snapshot",
+                entity_id=entity_id,
+                period=build.period,
+                trace_id=build.trace_id,
+            ),
+        )
+    )
 
     for metric_key, info in _lineage_metric_totals(build).items():
         if info["source_count"] <= 0:

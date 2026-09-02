@@ -551,7 +551,13 @@ def test_build_snapshot_full_flow_separates_every_concept() -> None:
         db.commit()
         assert snapshot.version == 1
         assert snapshot.status == "current"
-        assert snapshot.integrity_status == "incomplete"  # no confirmed opening balance yet
+        assert snapshot.completeness_status == "incomplete"  # no confirmed opening balance yet
+        # No integrity run has evaluated this snapshot yet at this level (that
+        # only happens in the `rebuild` endpoint, one layer up).
+        assert snapshot.integrity_status == "unknown"
+        assert snapshot.commitments is None
+        assert snapshot.budget_cap is None
+        assert snapshot.budget_remaining is None
         # Every fetched transaction is traceable in lineage, including the
         # excluded duplicate copy -- it stays auditable, just not counted.
         assert snapshot.source_count == 9
@@ -676,7 +682,103 @@ def test_opening_liquidity_uses_confirmed_observation_over_legacy_profile_field(
 
         assert build.opening_liquidity_balance == Decimal("10000.00")
         assert build.opening_balance_source_type == "observation"
-        assert build.integrity_status == "complete"
+        assert build.completeness_status == "complete"
+
+
+def test_liquidity_transition_metrics_are_individually_traceable_in_lineage() -> None:
+    """Every liquidity metric the Work Order calls out (`investment_yield`,
+    `liquidity_used`, `closing_liquidity_balance`, `closing_uncovered_deficit`,
+    `distance_to_floor`) must have its own auditable lineage row, referencing
+    both the rule/version used and the opening-balance evidence -- not just
+    `opening_liquidity_balance` itself."""
+
+    with _engine_session() as db:
+        household, checking, _card = _seeded_household(db)
+        profile = FinancialProfile(
+            household_id=household.id,
+            emergency_floor=Decimal("1000.00"),
+            central_liquidity_account_id=checking.id,
+        )
+        db.add(profile)
+        observation = AccountBalanceObservation(
+            household_id=household.id,
+            account_id=checking.id,
+            amount=Decimal("5000.00"),
+            as_of_date=date(2026, 8, 1),
+            observation_type="opening",
+            source="manual_confirmed",
+            confidence=Decimal("1.0000"),
+            trace_id="trace-obs-lineage",
+        )
+        db.add(observation)
+        db.commit()
+
+        build = build_financial_snapshot(db, household_id=household.id, period="2026-08")
+        snapshot = persist_financial_snapshot(db, build)
+        db.commit()
+
+        lineage_rows = db.scalars(
+            select(FinancialSnapshotLineage).where(FinancialSnapshotLineage.snapshot_id == snapshot.id)
+        ).all()
+        liquidity_metric_keys = {
+            "investment_yield",
+            "liquidity_used",
+            "closing_liquidity_balance",
+            "closing_uncovered_deficit",
+            "distance_to_floor",
+        }
+        by_metric = {row.metric_key: row for row in lineage_rows if row.metric_key in liquidity_metric_keys}
+        assert set(by_metric) == liquidity_metric_keys
+        for row in by_metric.values():
+            assert row.rule_id == f"liquidity_transition:{build.financial_rules_version}"
+            assert row.entity_type == "account_balance_observation"
+            assert row.entity_id == observation.id
+            assert row.source_role == "canonical"
+        assert by_metric["closing_liquidity_balance"].contribution == build.liquidity.closing_balance
+
+
+def test_budget_cap_and_remaining_come_from_financial_profile_cash_cap() -> None:
+    """`budget_cap`/`budget_remaining` (INTEGRITY_IMPLEMENTATION_PLAN.md §7.2
+    minimum contract fields) must be populated from the same canonical source
+    the existing cash-cap report already reads (`FinancialProfile.
+    monthly_cash_cap`), never a new parallel calculation -- and stay `None`,
+    not a fabricated `0`, when no profile is configured at all."""
+
+    with _engine_session() as db:
+        household, checking, _card = _seeded_household(db)
+        expense_category = _category(db, household.id, "Mercado e itens domésticos")
+        profile = FinancialProfile(household_id=household.id, monthly_cash_cap=Decimal("2000.00"))
+        db.add(profile)
+        _transaction(
+            db,
+            household_id=household.id,
+            account_id=checking.id,
+            category_id=expense_category.id,
+            booked_at=date(2026, 8, 6),
+            amount="-300.00",
+            transaction_type="expense",
+        )
+        db.commit()
+
+        build = build_financial_snapshot(db, household_id=household.id, period="2026-08")
+        assert build.budget_cap == Decimal("2000.00")
+        assert build.budget_remaining == Decimal("1700.00")
+        assert build.budget_remaining == build.budget_cap - build.totals.budget_usage
+
+        snapshot = persist_financial_snapshot(db, build)
+        db.commit()
+        assert snapshot.budget_cap == Decimal("2000.00")
+        assert snapshot.budget_remaining == Decimal("1700.00")
+
+
+def test_budget_cap_is_none_without_a_financial_profile() -> None:
+    with _engine_session() as db:
+        household, _checking, _card = _seeded_household(db)
+        db.commit()
+
+        build = build_financial_snapshot(db, household_id=household.id, period="2026-08")
+        assert build.budget_cap is None
+        assert build.budget_remaining is None
 
 
 def test_opening_liquidity_is_unknown_without_observation_or_prior_snapshot() -> None:
@@ -687,7 +789,7 @@ def test_opening_liquidity_is_unknown_without_observation_or_prior_snapshot() ->
         build = build_financial_snapshot(db, household_id=household.id, period="2026-08")
 
         assert build.opening_liquidity_balance is None
-        assert build.integrity_status == "incomplete"
+        assert build.completeness_status == "incomplete"
         assert build.liquidity.closing_balance is None
 
 
@@ -717,6 +819,140 @@ def test_opening_liquidity_chains_from_previous_snapshot_closing_balance() -> No
         august_build = build_financial_snapshot(db, household_id=household.id, period="2026-08")
         assert august_build.opening_balance_source_type == "previous_snapshot"
         assert august_build.opening_liquidity_balance == july_build.liquidity.closing_balance
+
+
+def test_opening_uncovered_deficit_is_paid_down_by_next_period_surplus_before_new_liquidity() -> None:
+    """Full end-to-end regression for the Work Order's mandatory chained
+    example (item 1): month N closes with an uncovered deficit; month N+1's
+    surplus must pay that debt down first, and only the excess may become new
+    `closing_liquidity_balance` -- through the real DB-backed two-snapshot
+    chain, not just the pure `calculate_liquidity_transition` helper."""
+
+    with _engine_session() as db:
+        household, checking, _card = _seeded_household(db)
+        income_category = _category(db, household.id, "Receitas")
+        expense_category = _category(db, household.id, "Mercado e itens domésticos")
+        profile = FinancialProfile(household_id=household.id, central_liquidity_account_id=checking.id)
+        db.add(profile)
+        db.add(
+            AccountBalanceObservation(
+                household_id=household.id,
+                account_id=checking.id,
+                amount=Decimal("1000.00"),
+                as_of_date=date(2026, 7, 1),
+                observation_type="opening",
+                source="manual_confirmed",
+                confidence=Decimal("1.0000"),
+                trace_id="trace-obs-carry-1",
+            )
+        )
+        # July: a 3000.00 expense against a 1000.00 opening balance leaves a
+        # 2000.00 uncovered deficit (INV-005/006's own worked formula).
+        _transaction(
+            db,
+            household_id=household.id,
+            account_id=checking.id,
+            category_id=expense_category.id,
+            booked_at=date(2026, 7, 10),
+            amount="-3000.00",
+            transaction_type="expense",
+            fingerprint_seed="a",
+        )
+        db.commit()
+
+        july_build = build_financial_snapshot(db, household_id=household.id, period="2026-07")
+        assert july_build.liquidity.closing_balance == Decimal("0.00")
+        assert july_build.liquidity.closing_uncovered_deficit == Decimal("2000.00")
+        persist_financial_snapshot(db, july_build)
+        db.commit()
+
+        # August: a 2500.00 income surplus. It must pay the inherited 2000.00
+        # debt down first; only the 500.00 excess becomes new liquidity.
+        _transaction(
+            db,
+            household_id=household.id,
+            account_id=checking.id,
+            category_id=income_category.id,
+            booked_at=date(2026, 8, 5),
+            amount="2500.00",
+            transaction_type="income",
+            fingerprint_seed="b",
+        )
+        db.commit()
+
+        august_build = build_financial_snapshot(db, household_id=household.id, period="2026-08")
+        assert august_build.opening_balance_source_type == "previous_snapshot"
+        assert august_build.opening_liquidity_balance == Decimal("0.00")
+        assert august_build.opening_uncovered_deficit == Decimal("2000.00")
+        assert august_build.liquidity.closing_balance == Decimal("500.00")
+        assert august_build.liquidity.closing_uncovered_deficit == Decimal("0.00")
+
+        # The persisted snapshot and its INV-005/006 checks must agree.
+        august_snapshot = persist_financial_snapshot(db, august_build)
+        db.commit()
+        assert august_snapshot.closing_liquidity_balance == Decimal("500.00")
+        assert august_snapshot.closing_uncovered_deficit == Decimal("0.00")
+        for check in build_snapshot_invariant_checks(august_build):
+            if check.invariant_id in {"INV-005", "INV-006"}:
+                result = evaluate_invariant(check.invariant_id, check.context)
+                assert result.status is InvariantStatus.PASS, (check.invariant_id, result.to_dict())
+
+
+def test_opening_uncovered_deficit_smaller_surplus_leaves_remaining_debt() -> None:
+    """Same chained scenario, but August's surplus (1200.00) is smaller than
+    the inherited debt (2000.00): liquidity must stay at zero and the
+    remaining 800.00 debt must carry forward, never a fabricated positive
+    balance."""
+
+    with _engine_session() as db:
+        household, checking, _card = _seeded_household(db)
+        income_category = _category(db, household.id, "Receitas")
+        expense_category = _category(db, household.id, "Mercado e itens domésticos")
+        profile = FinancialProfile(household_id=household.id, central_liquidity_account_id=checking.id)
+        db.add(profile)
+        db.add(
+            AccountBalanceObservation(
+                household_id=household.id,
+                account_id=checking.id,
+                amount=Decimal("1000.00"),
+                as_of_date=date(2026, 7, 1),
+                observation_type="opening",
+                source="manual_confirmed",
+                confidence=Decimal("1.0000"),
+                trace_id="trace-obs-carry-2",
+            )
+        )
+        _transaction(
+            db,
+            household_id=household.id,
+            account_id=checking.id,
+            category_id=expense_category.id,
+            booked_at=date(2026, 7, 10),
+            amount="-3000.00",
+            transaction_type="expense",
+            fingerprint_seed="a",
+        )
+        db.commit()
+
+        july_build = build_financial_snapshot(db, household_id=household.id, period="2026-07")
+        persist_financial_snapshot(db, july_build)
+        db.commit()
+
+        _transaction(
+            db,
+            household_id=household.id,
+            account_id=checking.id,
+            category_id=income_category.id,
+            booked_at=date(2026, 8, 5),
+            amount="1200.00",
+            transaction_type="income",
+            fingerprint_seed="b",
+        )
+        db.commit()
+
+        august_build = build_financial_snapshot(db, household_id=household.id, period="2026-08")
+        assert august_build.liquidity.closing_balance == Decimal("0.00")
+        assert august_build.liquidity.closing_uncovered_deficit == Decimal("800.00")
 
 
 # ---------------------------------------------------------------------------

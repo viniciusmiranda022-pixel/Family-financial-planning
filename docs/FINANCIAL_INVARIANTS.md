@@ -1,6 +1,6 @@
 # Contrato de invariantes financeiros
 
-**Versão das regras:** `2026.09.1`
+**Versão das regras:** `2026.09.2`
 **Status:** normativo
 **Implementação executável:** `app/services/invariant_registry.py`
 
@@ -20,7 +20,7 @@ Cada execução retorna, no mínimo:
 ```json
 {
   "invariant_id": "INV-002",
-  "financial_rules_version": "2026.09.1",
+  "financial_rules_version": "2026.09.2",
   "status": "pass|fail|warning|unknown",
   "severity": "info|warning|review|critical|block",
   "scope": "transaction|document|period|projection|report|system",
@@ -104,28 +104,38 @@ posição.
 
 **Título:** Saldo de liquidez nunca negativo
 **Descrição:** Se o déficit exceder o saldo disponível, o saldo final é zero e a diferença é déficit
-sem cobertura.
+sem cobertura. Desde `2026.09.2` (PR 4), quando o período abre com um `opening_uncovered_deficit`
+herdado (déficit sem cobertura do período anterior ainda não coberto), o resultado do mês reduz essa
+dívida antes de qualquer excedente virar `closing_liquidity_balance` positivo — o sistema nunca pode
+publicar liquidez positiva ao lado de uma dívida anterior não coberta (§7.3).
 **Motivação:** Um saldo patrimonial negativo fictício esconde dívida ou falta de recursos.
-**Entradas:** saldo inicial, resultado mensal, saldo final, liquidez utilizada e déficit sem cobertura.
+**Entradas:** saldo inicial, resultado mensal, saldo final, liquidez utilizada, déficit sem cobertura e,
+quando aplicável, déficit sem cobertura herdado do período anterior.
 **Resultado esperado:**
-`saldo_final = max(0, saldo_inicial + resultado_mensal)` e
-`deficit_sem_cobertura = max(0, -(saldo_inicial + resultado_mensal))`.
+`combinado = resultado_mensal - deficit_sem_cobertura_anterior`;
+`saldo_final = max(0, saldo_inicial + combinado)` e
+`deficit_sem_cobertura = max(0, -(saldo_inicial + combinado))`. Com `deficit_sem_cobertura_anterior = 0`
+(caso padrão), reduz-se exatamente à fórmula original.
 **Severidade se violado:** `BLOCK`.
 **Teste automatizado associado:**
-`tests/test_financial_invariants.py::test_liquidity_transition_never_produces_negative_balance`.
+`tests/test_financial_invariants.py::test_liquidity_transition_never_produces_negative_balance`,
+`tests/test_financial_invariants.py::test_liquidity_transition_carries_forward_prior_uncovered_deficit`.
 
 ## INV-006 — Déficit consome liquidez
 
 **Título:** Resultado negativo usa a conta central
 **Descrição:** Resultado mensal negativo consome o Privilège DI disponível antes de produzir déficit
-sem cobertura, inclusive quando rompe o piso.
+sem cobertura, inclusive quando rompe o piso. Um déficit sem cobertura herdado do período anterior
+(ver INV-005) é tratado como parte do mesmo déficit combinado a cobrir.
 **Motivação:** O Privilège DI é o caixa operacional real e diariamente movimentado pela família.
-**Entradas:** saldo inicial, resultado mensal, retirada utilizada, saldo final e déficit sem cobertura.
+**Entradas:** saldo inicial, resultado mensal, retirada utilizada, saldo final, déficit sem cobertura e,
+quando aplicável, déficit sem cobertura herdado do período anterior.
 **Resultado esperado:**
-`retirada = min(saldo_inicial, abs(min(resultado_mensal, 0)))`.
+`retirada = min(saldo_inicial, abs(min(resultado_mensal - deficit_sem_cobertura_anterior, 0)))`.
 **Severidade se violado:** `BLOCK`.
 **Teste automatizado associado:**
-`tests/test_financial_invariants.py::test_deficit_uses_all_available_liquidity_before_becoming_uncovered`.
+`tests/test_financial_invariants.py::test_deficit_uses_all_available_liquidity_before_becoming_uncovered`,
+`tests/test_financial_invariants.py::test_liquidity_transition_carries_forward_prior_uncovered_deficit`.
 
 ## INV-007 — Piso não é dinheiro bloqueado
 

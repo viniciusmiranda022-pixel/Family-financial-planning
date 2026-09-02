@@ -47,7 +47,8 @@
 ## Em andamento — Financial Integrity Engine
 
 - discovery técnico e matriz de fontes de verdade documentados;
-- contrato formal `INV-001` a `INV-022` na versão `2026.09.1`;
+- contrato formal `INV-001` a `INV-022` na versão `2026.09.2` (INV-005/006 estendidos no PR 4 com o
+  carry-forward do déficit sem cobertura entre períodos, docs/INTEGRITY_IMPLEMENTATION_PLAN.md §7.3);
 - registry executável com resultado estruturado e `unknown` para fatos insuficientes;
 - regra canônica do Privilège DI coberta por testes de propriedades e cenários de borda;
 - migração inicial congelada, sem dependência dos modelos ORM futuros;
@@ -60,9 +61,12 @@
   limpeza destrutiva;
 - primeira baseline robusta de anomalias restrita a meses reconciliados e aprendizado local que
   exige três confirmações mais aceite administrativo;
-- `FinancialSnapshot` canônico e Financial Engine determinístico, com lineage auditável, regra
-  correta do Privilège DI e separação de gasto econômico, caixa bancário, cartão e patrimônio;
+- `FinancialSnapshot` canônico e Financial Engine determinístico, com lineage auditável (incluindo a
+  transição de liquidez), regra correta do Privilège DI com carry-forward do déficit sem cobertura
+  entre períodos, `integrity_status` derivado da avaliação real do Financial Integrity Engine (nunca
+  de completude de dados) e separação de gasto econômico, caixa bancário, cartão e patrimônio;
   dashboard, relatórios e Advisor ainda não migraram para consumi-lo (fatia seguinte);
+  `commitments` fica `null` nesta fatia (sem fonte canônica ainda para um período fechado);
 - próximos incrementos: migração de dashboard/relatórios/Advisor para o snapshot, validador de
   projeção, auditor Codex, UI de Integridade e safety gates completos de CI.
 

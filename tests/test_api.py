@@ -22,6 +22,7 @@ from app.models import (  # noqa: E402
     AuditEvent,
     Category,
     Document,
+    FinancialSnapshot,
     Household,
     IntegrityFinding,
     ReviewItem,
@@ -43,7 +44,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
     with TestClient(app) as client:
         health = client.get("/health")
         assert health.status_code == 200
-        assert health.json()["financial_rules_version"] == "2026.09.1"
+        assert health.json()["financial_rules_version"] == "2026.09.2"
 
         setup = client.post(
             "/api/auth/setup",
@@ -930,13 +931,24 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert snapshot_payload["period"] == "2026-08"
         assert snapshot_payload["version"] == 1
         assert snapshot_payload["status"] == "current"
-        assert snapshot_payload["financial_rules_version"] == "2026.09.1"
+        assert snapshot_payload["financial_rules_version"] == "2026.09.2"
         # No confirmed Privilège balance observation exists in this flow, so
         # liquidity fields must stay null rather than a fabricated number.
-        assert snapshot_payload["integrity_status"] == "incomplete"
+        assert snapshot_payload["completeness_status"] == "incomplete"
         assert snapshot_payload["opening_liquidity_balance"] is None
         assert snapshot_payload["closing_liquidity_balance"] is None
+        # `integrity_status` is the *real* audit outcome, not a copy of
+        # completeness: with no opening balance to evaluate, INV-005/006
+        # (BLOCK severity) come back `unknown` rather than being silently
+        # skipped, so the household-visible status is honestly "blocked"
+        # instead of a falsely reassuring "incomplete".
+        assert snapshot_payload["integrity_status"] == "blocked"
         assert rebuild_payload["integrity_run"]["status"] == "completed"
+        run_checks = {
+            check["invariant_id"]: check for check in rebuild_payload["integrity_run"]["summary"]["checks"]
+        }
+        assert run_checks["INV-005"]["status"] == "unknown"
+        assert run_checks["INV-006"]["status"] == "unknown"
 
         fetched_snapshot = client.get("/api/financial-snapshots/2026-08").json()
         assert fetched_snapshot["id"] == snapshot_payload["id"]
@@ -979,3 +991,93 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
 
     assert list(Path(os.environ["DATA_DIR"]).glob("documents/*.bin"))
+
+
+def test_snapshot_rebuild_failed_integrity_run_leaves_no_new_current_snapshot(
+    monkeypatch, tmp_path
+) -> None:
+    """A failed `execute_integrity_run` must not leave a new `current`
+    snapshot in place: the endpoint must roll back, not commit, on that path
+    (the exact atomicity bug the engineer's review caught -- `except: db.commit()`).
+
+    This app is single-tenant (`/auth/setup` 409s once any user exists), so it
+    cannot share the module-level database the other tests in this file use.
+    A second, fully isolated engine/session is wired in through FastAPI's
+    dependency override instead of a second `/auth/setup` call.
+    """
+
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.orm import sessionmaker
+
+    from app.db import Base as DbBase
+    from app.db import get_db
+
+    isolated_engine = create_engine(
+        f"sqlite:///{tmp_path / 'isolated.sqlite'}", connect_args={"check_same_thread": False}
+    )
+
+    # This isolated engine is a separate object from `app.db.engine`, so it
+    # does not automatically pick up that module's pysqlite transaction-control
+    # fix (see `app/db.py`) -- without it, this exact test would spuriously
+    # pass by luck of a bug (pysqlite silently ending the ambient transaction
+    # around `RELEASE SAVEPOINT`) rather than by the endpoint's actual rollback.
+    @event.listens_for(isolated_engine, "connect")
+    def _disable_pysqlite_transaction_control(dbapi_connection, _connection_record) -> None:
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(isolated_engine, "begin")
+    def _emit_explicit_begin(conn) -> None:
+        conn.exec_driver_sql("BEGIN")
+
+    DbBase.metadata.create_all(bind=isolated_engine)
+    IsolatedSession = sessionmaker(bind=isolated_engine, autoflush=False, expire_on_commit=False)
+
+    def _override_get_db():
+        db = IsolatedSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as client:
+            setup = client.post(
+                "/api/auth/setup",
+                json={
+                    "household_name": "Família Atomicidade",
+                    "name": "Administrador",
+                    "username": "admin-atomic",
+                    "password": "senha-local-segura",
+                },
+            )
+            assert setup.status_code == 201
+
+            first_rebuild = client.post("/api/financial-snapshots/2026-08/rebuild")
+            assert first_rebuild.status_code == 201
+            first_snapshot = first_rebuild.json()["snapshot"]
+            assert first_snapshot["version"] == 1
+
+            def _boom(*_args, **_kwargs):
+                raise RuntimeError("simulated integrity run failure")
+
+            monkeypatch.setattr("app.api.execute_integrity_run", _boom)
+            second_rebuild = client.post("/api/financial-snapshots/2026-08/rebuild")
+            assert second_rebuild.status_code == 500
+            monkeypatch.undo()
+
+            # The endpoint must not have published a new `current` snapshot:
+            # the original version-1 row is still the only `current` one.
+            with IsolatedSession() as db:
+                rows = db.scalars(select(FinancialSnapshot)).all()
+            assert [row.version for row in rows] == [1]
+            assert rows[0].status == "current"
+            assert rows[0].id == first_snapshot["id"]
+            assert rows[0].checksum == first_snapshot["checksum"]
+
+            fetched = client.get("/api/financial-snapshots/2026-08").json()
+            assert fetched["id"] == first_snapshot["id"]
+            assert fetched["version"] == 1
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        isolated_engine.dispose()

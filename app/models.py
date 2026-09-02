@@ -617,7 +617,16 @@ class FinancialSnapshot(Base, TimestampMixin):
     snapshot_kind: Mapped[str] = mapped_column(String(16), default="actual")
     version: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(16), default="current")
-    integrity_status: Mapped[str] = mapped_column(String(16), default="incomplete")
+    # Real deterministic audit outcome (ConsolidatedIntegrityStatus:
+    # blocked/critical/review_required/attention/healthy/unknown), derived
+    # from `execute_integrity_run`'s assessment of this exact snapshot's
+    # checks -- never inferred from whether an opening balance was found.
+    # "unknown" until the first integrity run against this snapshot completes.
+    integrity_status: Mapped[str] = mapped_column(String(16), default="unknown")
+    # Purely structural: do we have enough source facts (an opening liquidity
+    # balance) to even attempt the liquidity transition. Distinct concept from
+    # `integrity_status` on purpose -- see `app.services.financial_engine`.
+    completeness_status: Mapped[str] = mapped_column(String(16), default="incomplete")
     financial_rules_version: Mapped[str] = mapped_column(String(20))
     calculation_version: Mapped[str] = mapped_column(String(40))
     trace_id: Mapped[str] = mapped_column(String(36), index=True)
@@ -636,7 +645,12 @@ class FinancialSnapshot(Base, TimestampMixin):
     redemptions: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     internal_transfers: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     refunds: Mapped[Decimal] = mapped_column(Numeric(14, 2))
-    commitments: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
+    # Nullable: no canonical source computes "commitments" for a closed/actual
+    # period in this slice yet. `None` is the honest absent-fact state; it
+    # must never be fabricated as `0.00` (see `financial_engine` module docstring).
+    commitments: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    budget_cap: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    budget_remaining: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
     projected_balance: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
 
     opening_liquidity_balance: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)

@@ -14,7 +14,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 
-FINANCIAL_RULES_VERSION = "2026.09.1"
+FINANCIAL_RULES_VERSION = "2026.09.2"
 MONEY_TOLERANCE = Decimal("0.01")
 PROBABLE_DUPLICATE_THRESHOLD = Decimal("0.60")
 STRONG_DUPLICATE_THRESHOLD = Decimal("0.85")
@@ -153,29 +153,47 @@ class LiquidityTransition:
 def calculate_liquidity_transition(
     opening_balance: Decimal | int | float | str,
     monthly_result: Decimal | int | float | str,
+    opening_uncovered_deficit: Decimal | int | float | str = Decimal("0"),
 ) -> LiquidityTransition:
     """Apply the canonical Privilège/central-liquidity closing rule.
 
     A negative result consumes all available liquidity before producing uncovered
     deficit. The safety floor is intentionally absent: it is an alert, not locked
     money. A positive result increases central liquidity.
+
+    `opening_uncovered_deficit` (financial_rules_version 2026.09.2,
+    INTEGRITY_IMPLEMENTATION_PLAN.md §7.3, added for PR 4) is the debt still
+    unpaid from a previous period's closing `uncovered_deficit`. When present,
+    this period's result first pays that debt down before any of it can turn
+    into new closing liquidity -- the system may never show a positive
+    `closing_balance` while an earlier deficit remains uncovered. Passing the
+    default `0` reproduces the exact original single-period formula bit for
+    bit, so every existing call site and test is unaffected.
     """
 
     opening = _money(opening_balance)
     result = _money(monthly_result)
+    carried_deficit = _money(opening_uncovered_deficit)
     if opening < 0:
         raise ValueError("opening liquidity balance cannot be negative")
+    if carried_deficit < 0:
+        raise ValueError("opening uncovered deficit cannot be negative")
 
-    if result >= 0:
+    # `combined` nets this period's result against the debt carried in from
+    # the previous period, exactly like a single deficit -- a surplus reduces
+    # the old debt first, and only the excess (if any) becomes new liquidity.
+    combined = result - carried_deficit
+
+    if combined >= 0:
         return LiquidityTransition(
             opening_balance=opening,
             monthly_result=result,
             liquidity_used=Decimal("0.00"),
-            closing_balance=_money(opening + result),
+            closing_balance=_money(opening + combined),
             uncovered_deficit=Decimal("0.00"),
         )
 
-    deficit = -result
+    deficit = -combined
     used = min(opening, deficit)
     return LiquidityTransition(
         opening_balance=opening,
@@ -731,8 +749,17 @@ def _liquidity_values(
 ) -> tuple[LiquidityTransition, dict[str, Decimal]]:
     opening = _decimal(context, "opening_liquidity_balance")
     monthly_result = _decimal(context, "monthly_operating_result")
+    # `opening_uncovered_deficit` is deliberately optional here (not part of
+    # any invariant's `required_facts`): a caller that never carries a prior
+    # deficit -- every call site that predates PR 4's carry-forward rule --
+    # keeps evaluating the original single-period formula unchanged.
+    carried_deficit = (
+        _decimal(context, "opening_uncovered_deficit")
+        if context.facts.get("opening_uncovered_deficit") is not None
+        else Decimal("0.00")
+    )
     try:
-        transition = calculate_liquidity_transition(opening, monthly_result)
+        transition = calculate_liquidity_transition(opening, monthly_result, carried_deficit)
     except ValueError as exc:
         raise InvalidFactError(str(exc)) from exc
     actual = {
