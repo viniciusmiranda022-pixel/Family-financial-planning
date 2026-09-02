@@ -3148,7 +3148,6 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
             "trusted_for_projection": bool(
                 current_snapshot.trusted_for_projection
                 and validation.valid
-                and integrity_run.summary.get("trusted_for_projection", False)
             ),
             "integrity_status": validation_results[0].status.value,
             "integrity_run_id": integrity_run.id,
