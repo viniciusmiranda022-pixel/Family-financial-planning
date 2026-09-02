@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 import app.services.financial_snapshots as financial_snapshots_module
-from app.api import reports
+from app.api import dashboard, reports
 from app.db import Base
 from app.models import (
     Account,
@@ -639,6 +639,133 @@ def test_reports_endpoint_uses_the_shared_savings_rate_function(monkeypatch) -> 
             Decimal(str(result["summary"]["total_cash_out"])),
         )
         assert Decimal(str(result["summary"]["savings_rate"])) == expected + Decimal("7.00")
+
+
+def test_dashboard_publication_mutation_is_caught_by_inv019_and_the_real_endpoint(monkeypatch) -> None:
+    """A bug confined to `/dashboard`'s response-shaping step -- not the
+    Financial Engine, not the pre-aliasing attribute reads in
+    `dashboard_monetary_dataset` -- must corrupt the real HTTP response
+    *and* fail INV-019.
+
+    Before PR 7 Round 3's structural fix, `dashboard_and_report_consistency_facts()`
+    built `dashboard_values` by independently calling `dashboard_monetary_dataset()`
+    again, so a bug confined to the endpoint's own key-aliasing/mapping step
+    (a wrong key, a stray offset applied after the canonical monetary
+    calculation) would corrupt what `/dashboard` actually returns while the
+    invariant, recomputing separately from the same untouched inputs, kept
+    agreeing with itself and stayed PASS -- see the engineering review on PR
+    7, Round 3: "the invariant never captures or compares the endpoint's
+    actual serialized response."
+
+    This patches `dashboard_monetary_publication` -- the one function
+    `dashboard()` now spreads verbatim into its response, and the same
+    function `dashboard_and_report_consistency_facts()` calls for
+    `dashboard_values` -- to add 0.02 to `cash_out` only, strictly after the
+    canonical monetary calculation already ran inside it (`snapshot`/
+    `profile`, the engine truth, are never touched). Proves both halves of
+    the required convergence in one test: the real endpoint publishes the
+    wrong number, and INV-019 -- whose `financial_engine_values` are read
+    straight off `snapshot`/`profile` and never call the mutated function --
+    fails against that same real divergence, not a hand-simulated one.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        household, profile, snapshot = _consistency_household(db)
+        user = User(
+            household_id=household.id,
+            name="Revisor",
+            username="revisor-dashboard-publication",
+            password_hash="x",
+            is_admin=True,
+        )
+        db.add(user)
+        db.commit()
+
+        real_publication = financial_snapshots_module.dashboard_monetary_publication
+        expected_cash_out = real_publication(snapshot, profile=profile)["cash_out"]
+
+        def _corrupted_publication(snapshot_arg, *, profile):
+            values = dict(real_publication(snapshot_arg, profile=profile))
+            values["cash_out"] = values["cash_out"] + Decimal("0.02")
+            return values
+
+        monkeypatch.setattr(
+            financial_snapshots_module, "dashboard_monetary_publication", _corrupted_publication
+        )
+        import app.api as api_module
+
+        monkeypatch.setattr(api_module, "dashboard_monetary_publication", _corrupted_publication)
+
+        # (1) The real endpoint's actual published contract diverges.
+        response = dashboard(month="2026-09", user=user, db=db)
+        assert Decimal(str(response["cash_out"])) == expected_cash_out + Decimal("0.02")
+
+        # (2) INV-019, evaluated against the same untouched snapshot, fails
+        # on the same field -- the check observes the real divergence rather
+        # than one reconstructed independently of what `/dashboard` returned.
+        facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        assert facts["dashboard"]["financial_engine_values"]["cash_out"] == expected_cash_out
+        result = _evaluate_report_check("INV-019", facts["dashboard"])
+        assert result.status is InvariantStatus.FAIL
+        assert result.metadata["mismatches"]["cash_out"]["difference"] == Decimal("0.02")
+
+
+def test_report_publication_mutation_is_caught_by_inv020_and_the_real_endpoint(monkeypatch) -> None:
+    """Same requirement as the dashboard test above, for `/reports`/INV-020.
+
+    Mutates `report_month_monetary_publication` to publish `remaining_cap`
+    aliased from the wrong field (`cash_cap` instead of the real
+    `budget_remaining`) -- a realistic "wrong key mapping" bug, strictly
+    after the canonical monetary calculation already ran -- and proves the
+    real `/reports` response and INV-020 diverge together, against the same
+    untouched snapshot.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        household, profile, snapshot = _consistency_household(db)
+        user = User(
+            household_id=household.id,
+            name="Revisor",
+            username="revisor-report-publication",
+            password_hash="x",
+            is_admin=True,
+        )
+        db.add(user)
+        db.commit()
+
+        real_publication = financial_snapshots_module.report_month_monetary_publication
+        real_values = real_publication(snapshot)
+        expected_remaining_cap = real_values["remaining_cap"]
+        wrong_remaining_cap = real_values["cash_cap"]
+        assert expected_remaining_cap != wrong_remaining_cap
+
+        def _corrupted_publication(snapshot_arg):
+            values = dict(real_publication(snapshot_arg))
+            values["remaining_cap"] = values["cash_cap"]
+            return values
+
+        monkeypatch.setattr(
+            financial_snapshots_module, "report_month_monetary_publication", _corrupted_publication
+        )
+        import app.api as api_module
+
+        monkeypatch.setattr(api_module, "report_month_monetary_publication", _corrupted_publication)
+
+        # (1) The real endpoint's actual published contract diverges.
+        response = reports(end_month="2026-09", months=1, user=user, db=db)
+        assert Decimal(str(response["monthly"][0]["remaining_cap"])) == wrong_remaining_cap
+
+        # (2) INV-020, evaluated against the same untouched snapshot, fails
+        # on the same field.
+        facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        assert facts["report"]["financial_engine_values"]["remaining_cap"] == expected_remaining_cap
+        result = _evaluate_report_check("INV-020", facts["report"])
+        assert result.status is InvariantStatus.FAIL
+        assert "remaining_cap" in result.metadata["mismatches"]
 
 
 def _evaluate_projection_gate_check(invariant_id: str, facts: dict[str, object]):

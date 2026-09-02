@@ -825,6 +825,124 @@ def _savings_rate_engine_truth(operating_income: Decimal, operating_expenses: De
     return money(((operating_income - operating_expenses) / operating_income) * Decimal("100"))
 
 
+def dashboard_monetary_publication(
+    snapshot: FinancialSnapshot, *, profile: FinancialProfile
+) -> dict[str, Decimal]:
+    """The literal monetary key/value mapping `GET /dashboard` publishes in
+    its JSON response for `snapshot` -- the actual response-shaping step
+    (`cash_out`/`spending` both aliasing `operating_expenses`,
+    `cash_cap`/`remaining_cap` aliasing `budget_cap`/`budget_remaining`,
+    `cash_net` aliasing `operating_result`), not merely the pre-aliasing
+    inputs `dashboard_monetary_dataset` reads off the snapshot/profile.
+
+    Before this function existed, that key-aliasing lived inline inside
+    `dashboard()`'s own `return {...}`, invisible to INV-019 no matter what
+    `dashboard_monetary_dataset` returned -- a bug confined to that inline
+    mapping (wrong key, stray offset, hardcoded override) could not be
+    caught, because the invariant recomputed `dashboard_values` from
+    `dashboard_monetary_dataset` again instead of observing what `dashboard()`
+    actually published (see the engineering review on PR 7, Round 3:
+    "the invariant never captures or compares the endpoint's actual
+    serialized response"). `dashboard()` now returns this dict verbatim
+    (merged with its non-monetary fields, only a uniform `decimal_value()`
+    cast applied on top) instead of re-deriving each key inline, and
+    `dashboard_and_report_consistency_facts()` calls this exact function for
+    `dashboard_values` -- so a regression in this mapping changes the real
+    HTTP response *and* is exactly what INV-019 observes.
+    """
+
+    monetary = dashboard_monetary_dataset(snapshot, profile=profile)
+    return {
+        "spending": monetary["operating_expenses"],
+        "cash_in": monetary["operating_income"],
+        "cash_out": monetary["operating_expenses"],
+        "bank_cash_out": monetary["bank_cash_out"],
+        "card_spending": monetary["card_spend"],
+        "cash_net": monetary["operating_result"],
+        "cash_cap": monetary["budget_cap"],
+        "remaining_cap": monetary["budget_remaining"],
+        "investment_balance": monetary["investment_balance"],
+        "liquidity_balance": monetary["closing_liquidity_balance"],
+        "liquidity_closing_balance": monetary["closing_liquidity_balance"],
+        "liquidity_uncovered_deficit": monetary["closing_uncovered_deficit"],
+    }
+
+
+def _dashboard_financial_engine_truth(
+    snapshot: FinancialSnapshot, *, profile: FinancialProfile
+) -> dict[str, Decimal]:
+    """INV-019's independent "expected" side, keyed under the exact
+    publication names `dashboard_monetary_publication` uses.
+
+    Deliberately reads `_snapshot_monetary_fields`/`_profile_monetary_fields`
+    directly -- plain attribute selection off `snapshot`/`profile`, not the
+    publication mapping -- for the same reason `_savings_rate_engine_truth`
+    stays independent of `savings_rate_from_totals`: if the "expected" side
+    called `dashboard_monetary_publication`, a regression in that function
+    would move both sides identically and INV-019 would pass by
+    construction regardless of what `/dashboard` actually publishes.
+    """
+
+    engine = _snapshot_monetary_fields(snapshot)
+    profile_fields = _profile_monetary_fields(profile)
+    return {
+        "spending": engine["operating_expenses"],
+        "cash_in": engine["operating_income"],
+        "cash_out": engine["operating_expenses"],
+        "bank_cash_out": engine["bank_cash_out"],
+        "card_spending": engine["card_spend"],
+        "cash_net": engine["operating_result"],
+        "cash_cap": engine["budget_cap"],
+        "remaining_cap": engine["budget_remaining"],
+        "investment_balance": profile_fields["investment_balance"],
+        "liquidity_balance": engine["closing_liquidity_balance"],
+        "liquidity_closing_balance": engine["closing_liquidity_balance"],
+        "liquidity_uncovered_deficit": engine["closing_uncovered_deficit"],
+    }
+
+
+def report_month_monetary_publication(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """The literal monetary key/value mapping `GET /reports` publishes for
+    one month row of `snapshot`. Same contract and rationale as
+    `dashboard_monetary_publication` -- see its docstring -- kept as a
+    separate function because `/dashboard` and `/reports` are independent
+    consumers that could legitimately diverge in what they publish.
+    """
+
+    monetary = report_month_monetary_dataset(snapshot)
+    return {
+        "spending": monetary["operating_expenses"],
+        "cash_in": monetary["operating_income"],
+        "cash_out": monetary["operating_expenses"],
+        "bank_cash_out": monetary["bank_cash_out"],
+        "card_spending": monetary["card_spend"],
+        "cash_net": monetary["operating_result"],
+        "cash_cap": monetary["budget_cap"],
+        "remaining_cap": monetary["budget_remaining"],
+    }
+
+
+def _report_financial_engine_truth(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """INV-020's independent "expected" side for the non-`savings_rate`
+    fields, keyed under `report_month_monetary_publication`'s publication
+    names. See `_dashboard_financial_engine_truth`'s docstring for why this
+    reads `_snapshot_monetary_fields` directly instead of calling the
+    publication function.
+    """
+
+    engine = _snapshot_monetary_fields(snapshot)
+    return {
+        "spending": engine["operating_expenses"],
+        "cash_in": engine["operating_income"],
+        "cash_out": engine["operating_expenses"],
+        "bank_cash_out": engine["bank_cash_out"],
+        "card_spending": engine["card_spend"],
+        "cash_net": engine["operating_result"],
+        "cash_cap": engine["budget_cap"],
+        "remaining_cap": engine["budget_remaining"],
+    }
+
+
 def dashboard_and_report_consistency_facts(
     snapshot: FinancialSnapshot, *, profile: FinancialProfile
 ) -> dict[str, dict[str, dict[str, Decimal] | Decimal]]:
@@ -835,42 +953,48 @@ def dashboard_and_report_consistency_facts(
     `financial_engine_values`, because `/dashboard` and `/reports` do not
     publish exactly the same field set for a period: `/dashboard` adds
     `investment_balance` (a live `FinancialProfile` balance, not a snapshot
-    column) and a one-month `/reports` window adds `savings_rate`. Every
-    field in both sets is produced by calling the same functions
-    `app/api.py`'s `dashboard()`/`reports()` call to build their own
-    responses (see those functions' docstrings and
-    `dashboard_monetary_dataset`/`savings_rate_from_totals` above). Today all
-    sides agree because there genuinely is one computation path per field; if
-    a consumer starts computing any of these fields a different way, the
-    function it was supposed to call no longer matches what it actually
-    returns, and the corresponding check fails against that real gap instead
-    of a hardcoded copy. See `tests/test_financial_snapshots.py` for
-    regressions that patch the publication path (not the invariant) for each
-    covered field and prove FAIL.
+    column) and a one-month `/reports` window adds `savings_rate`.
+
+    `dashboard_values`/`report_values` come from
+    `dashboard_monetary_publication`/`report_month_monetary_publication` --
+    the exact functions `app/api.py`'s `dashboard()`/`reports()` call to
+    build the monetary keys of their own responses, verbatim, with no
+    per-field logic of their own left in the endpoint (see those functions'
+    docstrings). `financial_engine_values` comes from
+    `_dashboard_financial_engine_truth`/`_report_financial_engine_truth`,
+    which read the snapshot/profile columns directly and never call the
+    publication functions, so a regression in either publication mapping is
+    real evidence of a genuine divergence, not an artifact of comparing a
+    value to itself. See `tests/test_financial_snapshots.py` for regressions
+    that mutate each publication function (post-calculation, publication-only
+    mutations included) and prove both the live endpoint and the invariant
+    diverge together.
     """
 
     from app.services.financial_invariants import MONEY_TOLERANCE
 
-    engine_values = _snapshot_monetary_fields(snapshot)
-    dashboard_values = dict(dashboard_monetary_dataset(snapshot, profile=profile))
+    engine_totals = _snapshot_monetary_fields(snapshot)
     engine_savings_rate = _savings_rate_engine_truth(
         Decimal(snapshot.operating_income), Decimal(snapshot.operating_expenses)
     )
-    report_values = {
-        **dict(report_month_monetary_dataset(snapshot)),
-        "savings_rate": savings_rate_from_totals(
-            engine_values["operating_income"], engine_values["operating_expenses"]
-        ),
-    }
+    report_savings_rate = savings_rate_from_totals(
+        engine_totals["operating_income"], engine_totals["operating_expenses"]
+    )
     return {
         "dashboard": {
-            "financial_engine_values": {**engine_values, **_profile_monetary_fields(profile)},
-            "dashboard_values": dashboard_values,
+            "financial_engine_values": _dashboard_financial_engine_truth(snapshot, profile=profile),
+            "dashboard_values": dashboard_monetary_publication(snapshot, profile=profile),
             "monetary_tolerance": MONEY_TOLERANCE,
         },
         "report": {
-            "financial_engine_values": {**engine_values, "savings_rate": engine_savings_rate},
-            "report_values": report_values,
+            "financial_engine_values": {
+                **_report_financial_engine_truth(snapshot),
+                "savings_rate": engine_savings_rate,
+            },
+            "report_values": {
+                **report_month_monetary_publication(snapshot),
+                "savings_rate": report_savings_rate,
+            },
             "monetary_tolerance": MONEY_TOLERANCE,
         },
     }

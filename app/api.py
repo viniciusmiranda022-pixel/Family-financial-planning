@@ -111,9 +111,9 @@ from app.services.financial_invariants import InvariantContext, InvariantScope
 from app.services.financial_snapshots import (
     build_snapshot,
     dashboard_and_report_consistency_facts,
-    dashboard_monetary_dataset,
+    dashboard_monetary_publication,
     liquidity_transition_facts,
-    report_month_monetary_dataset,
+    report_month_monetary_publication,
     savings_rate_from_totals,
     serialize_snapshot,
     snapshot_lineage_facts,
@@ -4132,37 +4132,28 @@ def dashboard(
         item for item in _obligation_rows(db, user.household_id) if item["days_until_due"] <= 30
     ][:5]
     db.commit()
-    # `dashboard_monetary_dataset` is the same function INV-019 reads to
+    # `dashboard_monetary_publication` is the exact function INV-019 reads to
     # verify this response -- see its docstring and
-    # `dashboard_and_report_consistency_facts`. `investment_balance` comes
-    # from it too instead of reading `profile.investment_balance` inline, so
-    # this endpoint has no publication path for that figure INV-019 cannot see.
-    monetary = dashboard_monetary_dataset(snapshot, profile=profile)
-    cash_net = monetary["operating_result"]
+    # `dashboard_and_report_consistency_facts`. This endpoint spreads its
+    # return value verbatim (only the uniform `decimal_value()` cast applied
+    # on top) instead of re-deriving each key inline, so there is no
+    # endpoint-only mapping step left for INV-019 to be blind to -- see the
+    # engineering review on PR 7, Round 3.
+    publication = dashboard_monetary_publication(snapshot, profile=profile)
+    cash_net = publication["cash_net"]
     return {
         "month": month_key(start),
         "snapshot_id": snapshot.id,
         "snapshot_checksum": snapshot.checksum,
         "integrity_status": snapshot.integrity_status,
         "trusted_for_reports": snapshot.trusted_for_reports,
-        "spending": decimal_value(monetary["operating_expenses"]),
-        "cash_in": decimal_value(monetary["operating_income"]),
-        "cash_out": decimal_value(monetary["operating_expenses"]),
-        "bank_cash_out": decimal_value(monetary["bank_cash_out"]),
-        "card_spending": decimal_value(monetary["card_spend"]),
-        "cash_net": decimal_value(cash_net),
+        **{key: decimal_value(value) for key, value in publication.items()},
         "cash_flow_by_account": snapshot_payload["cash_flow_by_account"],
-        "cash_cap": decimal_value(monetary["budget_cap"]),
-        "remaining_cap": decimal_value(monetary["budget_remaining"]),
-        "investment_balance": decimal_value(monetary["investment_balance"]),
         "liquidity_name": profile.investment_name,
         "liquidity_starting_balance": decimal_value(snapshot.opening_liquidity_balance),
-        "liquidity_balance": decimal_value(monetary["closing_liquidity_balance"]),
-        "liquidity_closing_balance": decimal_value(monetary["closing_liquidity_balance"]),
         "liquidity_available": decimal_value(snapshot.distance_to_floor),
         "liquidity_deposit": decimal_value(snapshot_payload["liquidity_deposit"]),
         "liquidity_withdrawal": decimal_value(snapshot.liquidity_used),
-        "liquidity_uncovered_deficit": decimal_value(monetary["closing_uncovered_deficit"]),
         "liquidity_flow": decimal_value(cash_net),
         "liquidity_direction": ("deposit" if cash_net > 0 else "withdrawal" if cash_net < 0 else "balanced"),
         "emergency_floor": decimal_value(profile.emergency_floor),
@@ -4233,19 +4224,15 @@ def reports(
             category_totals[name] = category_totals.get(name, Decimal("0")) + Decimal(
                 str(category["amount"])
             )
-        # `report_month_monetary_dataset` is the same function INV-020 reads
-        # to verify this response -- see its docstring and
-        # `dashboard_and_report_consistency_facts`. `cash_cap`/`remaining_cap`
-        # come from it too instead of re-deriving `monthly_cash_cap - spending`
-        # locally, so this endpoint has no formula of its own for a figure
-        # the Financial Engine already computed on the snapshot.
-        monetary = report_month_monetary_dataset(snapshot)
-        spending = monetary["operating_expenses"]
-        cash_in = monetary["operating_income"]
-        cash_out = monetary["operating_expenses"]
-        bank_cash_out = monetary["bank_cash_out"]
-        card_spending = monetary["card_spend"]
-        cash_net = monetary["operating_result"]
+        # `report_month_monetary_publication` is the exact function INV-020
+        # reads to verify this response -- see its docstring and
+        # `dashboard_and_report_consistency_facts`. This row spreads its
+        # return value verbatim (only the uniform `decimal_value()` cast
+        # applied on top) instead of re-deriving each key inline, so there is
+        # no endpoint-only mapping step left for INV-020 to be blind to --
+        # see the engineering review on PR 7, Round 3.
+        publication = report_month_monetary_publication(snapshot)
+        spending = publication["spending"]
         change_percentage = None
         if (
             item["transaction_count"] > 0
@@ -4258,14 +4245,7 @@ def reports(
         serialized_months.append(
             {
                 "month": key,
-                "spending": decimal_value(spending),
-                "cash_in": decimal_value(cash_in),
-                "cash_out": decimal_value(cash_out),
-                "bank_cash_out": decimal_value(bank_cash_out),
-                "card_spending": decimal_value(card_spending),
-                "cash_net": decimal_value(cash_net),
-                "cash_cap": decimal_value(monetary["budget_cap"]),
-                "remaining_cap": decimal_value(monetary["budget_remaining"]),
+                **{key_name: decimal_value(value) for key_name, value in publication.items()},
                 "transaction_count": int(item["transaction_count"]),
                 "change_percentage": change_percentage,
                 "snapshot_id": snapshot.id,
