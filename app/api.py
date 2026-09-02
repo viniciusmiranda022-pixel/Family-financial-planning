@@ -87,6 +87,7 @@ from app.services.finance import (
     monthly_net_rate,
 )
 from app.services.financial_integrity import (
+    IntegrityCheck,
     IntegrityRunScope,
     IntegrityRunTrigger,
     build_baseline_checks,
@@ -95,7 +96,13 @@ from app.services.financial_integrity import (
     serialize_finding,
     serialize_run,
 )
-from app.services.financial_snapshots import build_snapshot, serialize_snapshot
+from app.services.financial_invariants import InvariantContext, InvariantScope
+from app.services.financial_snapshots import (
+    build_snapshot,
+    liquidity_transition_facts,
+    serialize_snapshot,
+    snapshot_lineage_facts,
+)
 from app.services.importer import (
     PARSER_CONTRACT_VERSION,
     ParsedTransaction,
@@ -104,6 +111,8 @@ from app.services.importer import (
     parse_payroll_document,
     transaction_fingerprint,
 )
+from app.services.projection_engine import PROJECTION_CALCULATION_VERSION
+from app.services.projection_validator import PROJECTION_TOLERANCE, validate_projection
 from app.services.reconciliation import (
     persist_reconciliation,
     reconcile_parsed_document,
@@ -3051,21 +3060,11 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
 def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     profile = profile_for(db, user.household_id)
     current_start = date.today().replace(day=1)
-    current_end = add_months(current_start, 1)
-    current_movements, _ignored = _consolidated_transactions(
+    current_snapshot = build_snapshot(
         db,
-        user.household_id,
-        current_start,
-        current_end,
-    )
-    current_flow = _operational_cash_flow(current_movements)
-    current_result = money(
-        Decimal(str(current_flow["cash_in"])) - Decimal(str(current_flow["cash_out"]))
-    )
-    current_liquidity = _liquidity_settlement(
-        Decimal(profile.investment_balance),
-        current_result,
-        Decimal(profile.emergency_floor),
+        household_id=user.household_id,
+        period=month_key(current_start),
+        generated_by=user.id,
     )
     end = profile.projection_end or date(date.today().year + 1, 12, 1)
     obligations_rows = db.scalars(
@@ -3090,20 +3089,96 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
         _, net = commission_net(item.gross_amount, item.tax_rate)
         commissions_input.append(ForecastCommission(item.expected_date, net, item.delay_days))
     rate = monthly_net_rate(profile.investment_gross_annual_rate, profile.investment_income_tax_rate)
-    rows = build_forecast(
-        ForecastInput(
-            start_month=add_months(date.today().replace(day=1), 1),
-            end_month=end,
-            starting_balance=current_liquidity["closing_balance"],
-            monthly_salary=profile.monthly_salary_net,
-            monthly_cash_cap=profile.monthly_cash_cap,
-            monthly_investment_rate=rate,
-            obligations=_forecast_obligations(list(obligations_rows)),
-            installments=_future_installments(db, user.household_id),
-            payroll_extras=payroll_extras,
-            commissions=tuple(commissions_input),
-        )
+    projection_input = ForecastInput(
+        start_month=add_months(date.today().replace(day=1), 1),
+        end_month=end,
+        starting_balance=Decimal(current_snapshot.closing_liquidity_balance),
+        monthly_salary=profile.monthly_salary_net,
+        monthly_cash_cap=profile.monthly_cash_cap,
+        monthly_investment_rate=rate,
+        obligations=_forecast_obligations(list(obligations_rows)),
+        installments=_future_installments(db, user.household_id),
+        payroll_extras=payroll_extras,
+        commissions=tuple(commissions_input),
+        starting_uncovered_deficit=Decimal(current_snapshot.closing_uncovered_deficit),
+        safety_floor=Decimal(profile.emergency_floor),
     )
+    rows = build_forecast(projection_input)
+    validation = validate_projection(projection_input, rows)
+    current_period = month_key(current_start)
+    projection_identity = f"projection:{user.household_id}:{current_period}"
+    # The projection trust gate is not `balance_evidence_trusted and
+    # validation.valid`: that pair only proves acceptable opening evidence and
+    # engine/validator parity, never the projection gate's required invariant
+    # coverage (INV-005, INV-006, INV-018, INV-022 -- `_trust_gate` in
+    # financial_integrity.py). A snapshot can fail lineage or liquidity
+    # closure and still reproduce identical engine/validator numbers, so this
+    # run evaluates the full required set against the current snapshot itself
+    # and lets the canonical `_trust_gate` decide, instead of substituting a
+    # more permissive ad hoc gate.
+    liquidity_facts = liquidity_transition_facts(current_snapshot)
+    lineage_facts = snapshot_lineage_facts(db, current_snapshot)
+    integrity_run, gate_results = execute_integrity_run(
+        db,
+        household_id=user.household_id,
+        scope=IntegrityRunScope.PROJECTION,
+        trigger=IntegrityRunTrigger.SYSTEM,
+        checks=(
+            IntegrityCheck(
+                "INV-018",
+                InvariantContext(
+                    facts={
+                        "financial_engine_values": validation.actual_values,
+                        "projection_validator_values": validation.expected_values,
+                        "monetary_tolerance": PROJECTION_TOLERANCE,
+                    },
+                    scope=InvariantScope.PROJECTION,
+                    entity_type="projection",
+                    entity_id=projection_identity,
+                    period=current_period,
+                ),
+            ),
+            IntegrityCheck(
+                "INV-005",
+                InvariantContext(
+                    facts=liquidity_facts,
+                    scope=InvariantScope.PROJECTION,
+                    entity_type="projection",
+                    entity_id=projection_identity,
+                    period=current_period,
+                ),
+            ),
+            IntegrityCheck(
+                "INV-006",
+                InvariantContext(
+                    facts=liquidity_facts,
+                    scope=InvariantScope.PROJECTION,
+                    entity_type="projection",
+                    entity_id=projection_identity,
+                    period=current_period,
+                ),
+            ),
+            IntegrityCheck(
+                "INV-022",
+                InvariantContext(
+                    facts=lineage_facts,
+                    scope=InvariantScope.PROJECTION,
+                    entity_type="projection",
+                    entity_id=projection_identity,
+                    period=current_period,
+                ),
+            ),
+        ),
+        created_by=user.id,
+        period=current_period,
+        scope_entity_type="projection",
+        scope_entity_id=projection_identity,
+        calculation_version=PROJECTION_CALCULATION_VERSION,
+    )
+    projection_gate_trusted = bool(integrity_run.summary.get("trusted_for_projection", False))
+    balance_evidence_trusted = bool(current_snapshot.payload.get("balance_evidence_trusted", False))
+    inv018_result = next(result for result in gate_results if result.invariant_id == "INV-018")
+    db.commit()
     serialized = [
         {key: decimal_value(value) if isinstance(value, Decimal) else value for key, value in row.items()}
         for row in rows
@@ -3113,12 +3188,29 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
         "monthly_net_investment_rate": float(rate),
         "rows": serialized,
         "summary": {
-            "starting_balance": decimal_value(current_liquidity["closing_balance"]),
-            "current_uncovered_deficit": decimal_value(current_liquidity["uncovered_deficit"]),
+            "starting_balance": decimal_value(current_snapshot.closing_liquidity_balance),
+            "current_uncovered_deficit": decimal_value(
+                current_snapshot.closing_uncovered_deficit
+            ),
             "final_delayed": delayed_balances[-1],
             "minimum_delayed": min(delayed_balances),
             "emergency_floor": decimal_value(profile.emergency_floor),
             "viable": min(delayed_balances) >= decimal_value(profile.emergency_floor),
+            "trusted_for_projection": bool(
+                balance_evidence_trusted and validation.valid and projection_gate_trusted
+            ),
+            "projection_formula_trusted": validation.valid,
+            "projection_invariant_gate_trusted": projection_gate_trusted,
+            "source_snapshot_trusted_for_projection": current_snapshot.trusted_for_projection,
+            "source_balance_evidence_trusted": balance_evidence_trusted,
+            "source_snapshot_integrity_status": current_snapshot.integrity_status,
+            "integrity_status": inv018_result.status.value,
+            "integrity_run_id": integrity_run.id,
+            "source_snapshot_id": current_snapshot.id,
+            "source_snapshot_checksum": current_snapshot.checksum,
+            "projection_calculation_version": PROJECTION_CALCULATION_VERSION,
+            "validator_tolerance": float(PROJECTION_TOLERANCE),
+            "validator_mismatches": len(validation.mismatches),
         },
     }
 

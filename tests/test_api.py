@@ -511,6 +511,32 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert by_month["2026-11"]["installments"] == 31.9
         assert by_month["2027-03"]["commission_delayed"] == 9400.0
 
+        # `trusted_for_projection` must reflect genuine, persisted coverage of
+        # every invariant the projection gate requires (INV-005, INV-006,
+        # INV-018, INV-022) -- not just accepted balance evidence plus
+        # engine/validator parity. This household only ever set its opening
+        # balance through the legacy profile fallback (never a manually
+        # confirmed observation), so `balance_evidence_trusted` is false here
+        # -- yet August already has real transactions with accounts and
+        # categories, so the invariant gate itself can genuinely pass. The
+        # overall gate must still report untrusted: balance evidence is an
+        # additional precondition, never a substitute for invariant coverage,
+        # and the reverse (invariants incomplete, balance evidence alone
+        # making the projection look trusted) was exactly PR 34's regression.
+        forecast_summary = forecast["summary"]
+        assert forecast_summary["source_balance_evidence_trusted"] is False
+        assert forecast_summary["projection_formula_trusted"] is True
+        assert forecast_summary["projection_invariant_gate_trusted"] is True
+        assert forecast_summary["trusted_for_projection"] is False
+        projection_run = client.get(
+            f"/api/integrity/runs/{forecast_summary['integrity_run_id']}"
+        ).json()
+        projection_checks = {
+            item["invariant_id"]: item["status"] for item in projection_run["summary"]["checks"]
+        }
+        assert {"INV-005", "INV-006", "INV-018", "INV-022"}.issubset(projection_checks)
+        assert set(projection_checks.values()) == {"pass"}
+
         restaurant_category = next(
             item for item in client.get("/api/categories").json() if item["name"] == "Restaurantes e delivery"
         )

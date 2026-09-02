@@ -19,6 +19,7 @@ from app.models import (
     AccountBalanceObservation,
     Category,
     Document,
+    DocumentReconciliation,
     FinancialProfile,
     FinancialSnapshot,
     FinancialSnapshotLineage,
@@ -77,8 +78,7 @@ def consolidated_transactions(
     workbook_signatures = {
         _expense_signature(transaction, account_type)
         for transaction, _category, account_type, document_type in raw_rows
-        if document_type == "financial_plan_workbook"
-        and transaction.canonical_status != "supporting"
+        if document_type == "financial_plan_workbook" and transaction.canonical_status != "supporting"
     }
     selected: list[tuple[Transaction, str]] = []
     ignored: list[Transaction] = []
@@ -104,9 +104,7 @@ def _obligation_occurs_in(item: Obligation, start: date, end: date) -> bool:
             return True
         if item.recurrence_months == 0:
             break
-        target = add_months(
-            item.due_date.replace(day=1), (occurrence + 1) * item.recurrence_months
-        )
+        target = add_months(item.due_date.replace(day=1), (occurrence + 1) * item.recurrence_months)
         due = target.replace(day=min(item.due_date.day, monthrange(target.year, target.month)[1]))
     return False
 
@@ -131,9 +129,7 @@ def _opening_balance(
     matching = tuple(
         account
         for account in investment_accounts
-        if profile_name
-        and profile_name
-        in normalize_description(f"{account.institution} {account.name}")
+        if profile_name and profile_name in normalize_description(f"{account.institution} {account.name}")
     )
     eligible = matching or (investment_accounts if len(investment_accounts) == 1 else ())
     observation = None
@@ -144,16 +140,25 @@ def _opening_balance(
             AccountBalanceObservation.invalidated_at.is_(None),
             AccountBalanceObservation.superseded_by_id.is_(None),
         )
-        statement = statement.where(
-            AccountBalanceObservation.as_of_date == period_start
-            if previous_snapshot is not None
-            else AccountBalanceObservation.as_of_date <= period_start
+        if previous_snapshot is not None:
+            previous_start = datetime.strptime(previous_snapshot.period, "%Y-%m").date()
+            statement = statement.where(
+                AccountBalanceObservation.as_of_date > previous_start,
+                AccountBalanceObservation.as_of_date <= period_start,
+            )
+        else:
+            statement = statement.where(AccountBalanceObservation.as_of_date <= period_start)
+        candidates = tuple(
+            db.scalars(
+                statement.order_by(
+                    AccountBalanceObservation.as_of_date.desc(),
+                    AccountBalanceObservation.created_at.desc(),
+                )
+            ).all()
         )
-        observation = db.scalar(
-            statement.order_by(
-                AccountBalanceObservation.as_of_date.desc(),
-                AccountBalanceObservation.created_at.desc(),
-            ).limit(1)
+        observation = next(
+            (item for item in candidates if _observation_is_trusted(db, item)),
+            None,
         )
     if observation is not None:
         return (
@@ -169,9 +174,7 @@ def _opening_balance(
             ),
             True,
         )
-    if previous_snapshot is not None and previous_snapshot.payload.get(
-        "balance_evidence_trusted", False
-    ):
+    if previous_snapshot is not None and previous_snapshot.payload.get("balance_evidence_trusted", False):
         return (
             money(previous_snapshot.closing_liquidity_balance),
             SnapshotSource(
@@ -197,6 +200,22 @@ def _opening_balance(
             money(profile.investment_balance),
         ),
         False,
+    )
+
+
+def _observation_is_trusted(db: Session, observation: AccountBalanceObservation) -> bool:
+    if observation.source == "manual_confirmed" and observation.confidence >= Decimal("1"):
+        return True
+    if observation.document_id is None or observation.confidence < Decimal("1"):
+        return False
+    return bool(
+        db.scalar(
+            select(DocumentReconciliation.id).where(
+                DocumentReconciliation.household_id == observation.household_id,
+                DocumentReconciliation.document_id == observation.document_id,
+                DocumentReconciliation.status == "reconciled",
+            )
+        )
     )
 
 
@@ -251,10 +270,7 @@ def _collect(
     )
     sources = [opening_source]
     opening_uncovered_deficit = Decimal("0")
-    if (
-        previous_snapshot is not None
-        and Decimal(previous_snapshot.closing_uncovered_deficit) > 0
-    ):
+    if previous_snapshot is not None and Decimal(previous_snapshot.closing_uncovered_deficit) > 0:
         opening_uncovered_deficit = money(previous_snapshot.closing_uncovered_deficit)
         sources.append(
             SnapshotSource(
@@ -325,9 +341,7 @@ def _collect(
             categories[category_name] = categories.get(category_name, Decimal("0")) - amount
             contribution = amount
         elif (
-            transaction.transaction_type in {"expense", "refund"}
-            and amount < 0
-            and not transaction.excluded
+            transaction.transaction_type in {"expense", "refund"} and amount < 0 and not transaction.excluded
         ):
             contribution = abs(amount)
             totals["expenses"] += contribution
@@ -453,11 +467,15 @@ def _collect(
     checksum = hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    return payload, sources, {
-        "checksum": checksum,
-        "integrity": integrity,
-        "observed_balance": observed_balance,
-    }
+    return (
+        payload,
+        sources,
+        {
+            "checksum": checksum,
+            "integrity": integrity,
+            "observed_balance": observed_balance,
+        },
+    )
 
 
 def _serialize_accounts(accounts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -510,16 +528,19 @@ def build_snapshot(
     )
     if current is not None and current.checksum == metadata["checksum"] and not force:
         return current
-    version = int(
-        db.scalar(
-            select(func.coalesce(func.max(FinancialSnapshot.version), 0)).where(
-                FinancialSnapshot.household_id == household_id,
-                FinancialSnapshot.period == period,
-                FinancialSnapshot.snapshot_kind == "actual",
+    version = (
+        int(
+            db.scalar(
+                select(func.coalesce(func.max(FinancialSnapshot.version), 0)).where(
+                    FinancialSnapshot.household_id == household_id,
+                    FinancialSnapshot.period == period,
+                    FinancialSnapshot.snapshot_kind == "actual",
+                )
             )
+            or 0
         )
-        or 0
-    ) + 1
+        + 1
+    )
     trace_id = str(uuid.uuid4())
     integrity = metadata["integrity"]
     trusted_balance = bool(metadata["observed_balance"])
@@ -538,20 +559,34 @@ def build_snapshot(
         generated_by=generated_by,
         trace_id=trace_id,
         **{
-            key: (
-                int(payload[key])
-                if key == "source_count"
-                else Decimal(str(payload[key]))
-            )
+            key: (int(payload[key]) if key == "source_count" else Decimal(str(payload[key])))
             for key in (
-                "operating_income", "operating_expenses", "operating_result",
-                "bank_cash_in", "bank_cash_out", "bank_cash_result", "investments",
-                "redemptions", "internal_transfers", "card_spend", "card_payments",
-                "refunds", "opening_liquidity_balance", "investment_yield",
-                "liquidity_used", "closing_liquidity_balance",
-                "opening_uncovered_deficit", "closing_uncovered_deficit", "safety_floor",
-                "distance_to_floor", "budget_cap", "budget_usage", "budget_remaining",
-                "commitments", "projected_balance", "source_count",
+                "operating_income",
+                "operating_expenses",
+                "operating_result",
+                "bank_cash_in",
+                "bank_cash_out",
+                "bank_cash_result",
+                "investments",
+                "redemptions",
+                "internal_transfers",
+                "card_spend",
+                "card_payments",
+                "refunds",
+                "opening_liquidity_balance",
+                "investment_yield",
+                "liquidity_used",
+                "closing_liquidity_balance",
+                "opening_uncovered_deficit",
+                "closing_uncovered_deficit",
+                "safety_floor",
+                "distance_to_floor",
+                "budget_cap",
+                "budget_usage",
+                "budget_remaining",
+                "commitments",
+                "projected_balance",
+                "source_count",
             )
         },
     )
@@ -578,6 +613,95 @@ def build_snapshot(
         current.superseded_by_id = snapshot.id
     db.flush()
     return snapshot
+
+
+def liquidity_transition_facts(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """Derive INV-005/INV-006 facts for an already-built snapshot.
+
+    `settle_liquidity` (the engine) zeroes the opening balance and pays down any
+    prior uncovered deficit before a positive result can rebuild liquidity, so a
+    period that carries debt cannot be replayed through the invariants' own
+    independent `calculate_liquidity_transition(opening, monthly_result)` -- that
+    function has no debt parameter at all.
+
+    A period that starts with `opening_uncovered_deficit > 0` always closes with
+    `opening_liquidity_balance == 0` (the engine forces it), and the two-step
+    "pay debt, then deposit the remainder" transition is algebraically identical
+    to a single step of `calculate_liquidity_transition(0, operating_result +
+    investment_yield - opening_uncovered_deficit)`: whatever is left over after
+    netting the period's result and yield against the carried debt is exactly
+    what either formula clamps at zero. Folding debt into the result this way
+    reproduces the engine's own closing/uncovered/liquidity_used figures only
+    when every max/min clamp in `settle_liquidity` was applied correctly, so a
+    regression in its debt-priority branch still surfaces as a mismatch here.
+    A period with no carried debt is unaffected: the fold is a no-op because
+    `opening_uncovered_deficit` is zero.
+    """
+
+    debt = money(snapshot.opening_uncovered_deficit)
+    opening = Decimal("0.00") if debt > 0 else money(snapshot.opening_liquidity_balance)
+    monthly_result = money(money(snapshot.operating_result) + money(snapshot.investment_yield) - debt)
+    return {
+        "opening_liquidity_balance": opening,
+        "monthly_operating_result": monthly_result,
+        "closing_liquidity_balance": money(snapshot.closing_liquidity_balance),
+        "uncovered_deficit": money(snapshot.closing_uncovered_deficit),
+        "liquidity_used": money(snapshot.liquidity_used),
+    }
+
+
+def snapshot_lineage_facts(db: Session, snapshot: FinancialSnapshot) -> dict[str, Any]:
+    """Derive INV-022 facts from the lineage rows persisted for `snapshot`.
+
+    Every row `build_snapshot` folded into the snapshot -- the opening evidence,
+    active obligations and every selected transaction -- was already persisted
+    to `financial_snapshot_lineage`, so this reads that trail back instead of
+    recomputing `_collect()`'s selection a second time.
+
+    `document_required` is left `False`: manual, non-imported transactions are
+    a supported source in this schema, so a period with no imported document at
+    all is not itself a lineage violation. Enforcing "every aggregate must cite
+    a document" is a separate, not-yet-normative decision left for a future
+    slice; see the PR's Technical Challenge / residual notes.
+    """
+
+    lineage_rows = tuple(
+        db.scalars(
+            select(FinancialSnapshotLineage).where(
+                FinancialSnapshotLineage.snapshot_id == snapshot.id
+            )
+        ).all()
+    )
+    source_ids = [f"{row.entity_type}:{row.entity_id}" for row in lineage_rows]
+    transaction_ids = sorted(
+        {row.entity_id for row in lineage_rows if row.entity_type == "transaction"}
+    )
+    document_ids = sorted({row.document_id for row in lineage_rows if row.document_id})
+    rule_ids = sorted({row.rule_id for row in lineage_rows if row.rule_id})
+    account_ids: set[str] = set()
+    category_ids: set[str] = set()
+    if transaction_ids:
+        for account_id, category_id in db.execute(
+            select(Transaction.account_id, Transaction.category_id).where(
+                Transaction.id.in_(transaction_ids)
+            )
+        ).all():
+            if account_id:
+                account_ids.add(account_id)
+            if category_id:
+                category_ids.add(category_id)
+    return {
+        "source_count": len(source_ids),
+        "source_ids": source_ids,
+        "transaction_ids": transaction_ids,
+        "document_ids": document_ids,
+        "document_required": False,
+        "rule_ids": rule_ids,
+        "account_ids": sorted(account_ids),
+        "category_ids": sorted(category_ids),
+        "calculation_version": snapshot.calculation_version,
+        "lineage_period": snapshot.period,
+    }
 
 
 def _lock_snapshot_key(db: Session, *, household_id: str, period: str) -> None:
