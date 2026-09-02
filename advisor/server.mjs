@@ -6,6 +6,8 @@ import { constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { getAuditMetrics, runAudit } from "./audit.mjs";
+
 const root = dirname(fileURLToPath(import.meta.url));
 const isWindows = process.platform === "win32";
 const runtimeRoot = isWindows
@@ -102,7 +104,8 @@ function parseCodexJson(output) {
   }
 }
 
-function runCodex(prompt, schemaFile) {
+function runCodex(prompt, schemaFile, overrideTimeoutMs) {
+  const effectiveTimeoutMs = Number(overrideTimeoutMs) > 0 ? Number(overrideTimeoutMs) : timeoutMs;
   return new Promise((resolve, reject) => {
     const args = [
       "--ask-for-approval",
@@ -134,7 +137,7 @@ function runCodex(prompt, schemaFile) {
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error("O Codex excedeu o tempo máximo da análise"));
-    }, timeoutMs);
+    }, effectiveTimeoutMs);
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
       if (stdout.length > 2_000_000) child.kill("SIGKILL");
@@ -209,6 +212,10 @@ const server = createServer(async (request, response) => {
       send(response, 401, { error: "Serviço não autorizado" });
       return;
     }
+    if (request.method === "GET" && request.url === "/v1/audit/metrics") {
+      send(response, 200, { provider: "codex", ...getAuditMetrics() });
+      return;
+    }
     if (!(await authAvailable())) {
       send(response, 503, { error: "Codex ainda não foi autenticado com o ChatGPT" });
       return;
@@ -228,6 +235,19 @@ const server = createServer(async (request, response) => {
       send(response, 200, { ...result, provider: "codex", model: modelLabel });
       return;
     }
+    if (request.url === "/v1/audit") {
+      const result = await runAudit({
+        payload,
+        provider: (prompt, schemaFile, options) => runCodex(prompt, schemaFile, options?.timeoutMs),
+        timeoutMs,
+      });
+      // A fallback result (`available: false`) is still HTTP 200: it is a
+      // valid, safe, schema-shaped answer -- "semantic audit unavailable"
+      // is a fact the caller must be able to read like any other field,
+      // never an exception that could be mishandled upstream.
+      send(response, 200, { ...result, provider: "codex", model: modelLabel });
+      return;
+    }
     send(response, 404, { error: "Rota não encontrada" });
   } catch (error) {
     send(response, 503, { error: String(error?.message || error).slice(0, 1500) });
@@ -239,3 +259,8 @@ await mkdir(sandboxDir, { recursive: true });
 server.listen(port, host, () => {
   process.stdout.write(`Codex advisor listening on ${host}:${port} (${process.platform})\n`);
 });
+
+// Exported only so advisor/test/server.test.mjs can exercise the real HTTP
+// routing/auth wiring end to end; production entry (`node server.mjs`)
+// never imports this from anywhere else.
+export default server;
