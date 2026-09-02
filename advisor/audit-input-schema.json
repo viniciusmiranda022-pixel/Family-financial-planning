@@ -1,0 +1,106 @@
+{
+  "$comment": "Dedicated, versioned request contract for POST /v1/audit. Every field here is an allowlist: the FastAPI backend must sanitize its own data down to exactly this shape (see app/services/audit_sanitizer.py) before it reaches this sidecar. additionalProperties is false everywhere so an accidental extra field (a stray path, an id, a raw description) is rejected instead of silently forwarded to the model.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "audit_type": {
+      "type": "string",
+      "enum": ["period_review", "projection_review", "reconciliation_review", "report_review"]
+    },
+    "period": {
+      "type": ["string", "null"],
+      "pattern": "^\\d{4}-(0[1-9]|1[0-2])$"
+    },
+    "trace_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "integrity_snapshot": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["blocked", "critical", "review_required", "attention", "healthy", "unknown"]
+        },
+        "score": { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+        "trusted_for_projection": { "type": "boolean" },
+        "trusted_for_reports": { "type": "boolean" },
+        "open_findings": { "type": "integer", "minimum": 0 },
+        "open_findings_by_severity": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "required": [
+        "status",
+        "score",
+        "trusted_for_projection",
+        "trusted_for_reports",
+        "open_findings"
+      ],
+      "additionalProperties": false
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "properties": {
+          "opaque_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "invariant_id": { "type": "string", "pattern": "^INV-\\d{3}$" },
+          "check_status": { "type": "string", "enum": ["pass", "fail", "warning", "unknown"] },
+          "severity": {
+            "type": "string",
+            "enum": ["info", "warning", "review", "critical", "block"]
+          },
+          "scope": { "type": "string", "maxLength": 40 },
+          "period": { "type": ["string", "null"], "maxLength": 7 },
+          "message": { "type": "string", "minLength": 1, "maxLength": 300 }
+        },
+        "required": ["opaque_id", "invariant_id", "check_status", "severity", "message"],
+        "additionalProperties": false
+      }
+    },
+    "category_breakdown": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "properties": {
+          "opaque_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "category": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "amount": { "type": "number" }
+        },
+        "required": ["opaque_id", "category", "amount"],
+        "additionalProperties": false
+      }
+    },
+    "financial_metrics": {
+      "type": "object",
+      "properties": {
+        "operating_income": { "type": ["number", "null"] },
+        "operating_expenses": { "type": ["number", "null"] },
+        "operating_result": { "type": ["number", "null"] },
+        "liquidity_balance": { "type": ["number", "null"] },
+        "distance_to_floor": { "type": ["number", "null"] },
+        "budget_usage": { "type": ["number", "null"] },
+        "budget_remaining": { "type": ["number", "null"] },
+        "closing_uncovered_deficit": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "pending_items": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "properties": {
+          "opaque_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "category": { "type": "string", "maxLength": 60 }
+        },
+        "required": ["opaque_id", "category"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema_version", "audit_type", "integrity_snapshot", "findings"],
+  "additionalProperties": false
+}

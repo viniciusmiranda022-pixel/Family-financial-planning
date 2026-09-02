@@ -1,0 +1,50 @@
+{
+  "$comment": "Dedicated, versioned OUTPUT contract for POST /v1/audit. This schema is the structural enforcement of the authority boundary described in docs/ARCHITECTURE.md: there is no status/score/gate/trusted_for_* field anywhere here, so the model has no field to put a verdict override into even if it tried. `severity` is capped at an advisory ceiling (info/review) -- it can never carry `critical` or `block`, which stay exclusive to the deterministic Financial Integrity Engine. additionalProperties is false throughout, so an attempt to smuggle an extra authority-shaped field is a schema violation, not a warning.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 800 },
+    "observations": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "reconciliation",
+              "projection",
+              "liquidity",
+              "duplicate",
+              "classification",
+              "budget",
+              "documentation",
+              "other"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "enum": ["observation", "hypothesis", "explanation", "recommendation"]
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["info", "review"]
+          },
+          "message": { "type": "string", "minLength": 1, "maxLength": 400 },
+          "evidence_ref": {
+            "type": "array",
+            "maxItems": 5,
+            "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+          },
+          "recommendation": { "type": "string", "maxLength": 300 }
+        },
+        "required": ["category", "type", "severity", "message"],
+        "additionalProperties": false
+      }
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "required": ["schema_version", "summary", "observations", "confidence"],
+  "additionalProperties": false
+}

@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
-from sqlalchemy import func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -50,6 +50,7 @@ from app.schemas import (
     ObligationRequest,
     PayrollRequest,
     ProfileRequest,
+    SemanticAuditRequest,
     SetupRequest,
     TransactionUpdate,
     UserCreateRequest,
@@ -68,6 +69,7 @@ from app.services.classification_learning import (
     serialize_classification_rule,
 )
 from app.services.classifier import normalize_description
+from app.services.codex_audit import run_semantic_audit
 from app.services.codex_client import CodexAdvisorClient
 from app.services.crypto import EncryptedDocumentStore
 from app.services.duplicates import (
@@ -146,6 +148,20 @@ DEFAULT_CATEGORIES = (
     ("Operação da chácara", "#15803D", Decimal("500"), True),
     ("Margem para imprevistos", "#475569", Decimal("900"), True),
     ("Revisar", "#F59E0B", None, False),
+)
+
+# `IntegrityFinding.severity` is a plain string column, so
+# `.order_by(IntegrityFinding.severity.desc())` sorts lexicographically
+# ("warning" > "review" > "info" > "critical" > "block"), not by real
+# severity rank. A query that also `.limit()`s (see the semantic-audit
+# endpoint below) could then silently keep WARNING/REVIEW findings over
+# BLOCK/CRITICAL ones. This expression orders by explicit rank instead;
+# shared by every ORDER BY on IntegrityFinding.severity in this module so
+# the ranking can't drift between call sites.
+_FINDING_SEVERITY_RANK = case(
+    {"block": 5, "critical": 4, "review": 3, "warning": 2, "info": 1},
+    value=IntegrityFinding.severity,
+    else_=0,
 )
 
 
@@ -1088,7 +1104,7 @@ def integrity_run_detail(
                 IntegrityFinding.household_id == user.household_id,
                 IntegrityFinding.id.in_(finding_ids),
             )
-            .order_by(IntegrityFinding.severity.desc(), IntegrityFinding.created_at)
+            .order_by(_FINDING_SEVERITY_RANK.desc(), IntegrityFinding.created_at)
         ).all()
         if finding_ids
         else []
@@ -1182,6 +1198,80 @@ def integrity_finding_detail(
     if not finding:
         raise HTTPException(status_code=404, detail="Finding não encontrado")
     return serialize_finding(finding)
+
+
+@router.post("/integrity/semantic-audit")
+def integrity_semantic_audit(
+    payload: SemanticAuditRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Consultative Codex Semantic Audit over the already-computed verdict.
+
+    Authority boundary (see docs/ARCHITECTURE.md): `integrity_status` below
+    is produced exactly the same way as `GET /integrity/status` and is never
+    read from, or influenced by, the Codex response. `semantic_audit` is a
+    strictly separate, structurally verdict-less block (see
+    `app.services.codex_audit.AuditOutcome`) that can only explain,
+    hypothesize about, or recommend review of that verdict -- it cannot
+    resolve findings, correct data, or change `status`/`score`/`trusted_for_*`.
+    An unavailable/timed-out/invalid Codex response degrades to
+    `semantic_audit.available = False` and never to a false "pass".
+    """
+
+    try:
+        integrity_status = consolidated_integrity_status(
+            db,
+            household_id=user.household_id,
+            period=payload.period,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    finding_filters = [
+        IntegrityFinding.household_id == user.household_id,
+        IntegrityFinding.status.in_(("open", "acknowledged")),
+    ]
+    if payload.period:
+        finding_filters.append(
+            or_(IntegrityFinding.period == payload.period, IntegrityFinding.period.is_(None))
+        )
+    findings = db.scalars(
+        select(IntegrityFinding)
+        .where(*finding_filters)
+        .order_by(_FINDING_SEVERITY_RANK.desc(), IntegrityFinding.last_seen_at.desc(), IntegrityFinding.id)
+        .limit(30)
+    ).all()
+
+    outcome = run_semantic_audit(
+        audit_type=payload.audit_type,
+        integrity_status=integrity_status,
+        findings=[serialize_finding(item) for item in findings],
+        period=payload.period,
+    )
+
+    audit(
+        db,
+        user,
+        "integrity.semantic_audit",
+        "financial_profile",
+        user.household_id,
+        {
+            "audit_type": payload.audit_type,
+            "period": payload.period,
+            "available": outcome.available,
+            "reason": outcome.reason,
+        },
+        source="codex_semantic_audit",
+    )
+    db.commit()
+
+    return {
+        "audit_type": payload.audit_type,
+        "period": payload.period,
+        "integrity_status": integrity_status,
+        "semantic_audit": outcome.to_dict(),
+    }
 
 
 @router.get("/users")
@@ -4338,18 +4428,24 @@ def advisor_chat(
             },
         }
         candidate = CodexAdvisorClient().analyze(codex_payload).payload
-        verdict_order = {"favorable": 0, "caution": 1, "not_recommended": 2}
         candidate_verdict = candidate.get("verdict") if candidate else None
-        verdict_allowed = candidate_verdict == status_name
-        if status_name in verdict_order and candidate_verdict in verdict_order:
-            verdict_allowed = verdict_order[candidate_verdict] >= verdict_order[status_name]
+        # PR 6 / INV-021: the deterministic verdict computed above is final.
+        # Codex may only *restate* it in nicer prose -- it can never move it,
+        # not even to a more conservative one. Requiring an exact match
+        # (rather than the previous "more conservative is allowed" order)
+        # closes the exact gap flagged in
+        # docs/INTEGRITY_IMPLEMENTATION_PLAN.md section 2.4/10.5: a Codex
+        # response was previously able to override `status_name` whenever it
+        # claimed a stricter verdict than the local engine, even though the
+        # documented contract said the verdict "remains exactly the same".
+        # `status_name` itself is never reassigned from `candidate` below.
+        verdict_matches = candidate_verdict == status_name
         if (
             candidate
-            and verdict_allowed
+            and verdict_matches
             and isinstance(candidate.get("answer"), str)
             and candidate["answer"].strip()
         ):
-            status_name = str(candidate_verdict)
             answer = candidate["answer"].strip()
             evidence = [str(item) for item in candidate.get("evidence", evidence)][:6]
             assumptions = [str(item) for item in candidate.get("assumptions", assumptions)][:6]

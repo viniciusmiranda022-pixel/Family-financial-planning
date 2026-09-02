@@ -57,6 +57,18 @@ O sistema inicia em HTTP na máquina local. O Tailscale Serve encerra HTTPS e en
 
 O serviço `advisor` recebe somente JSON sanitizado produzido pela aplicação. Ele não monta `document_data`, não participa da rede interna do PostgreSQL e não possui `DATABASE_URL`. O sandbox do Codex é somente leitura e vazio. Uma resposta gerada só é aceita se preservar exatamente o veredito calculado pelo motor local; caso contrário, o sistema usa a resposta determinística.
 
+### `/v1/audit` (Codex Semantic Audit, PR 6)
+
+Além de `/v1/classify` e `/v1/analyze`, o `advisor` expõe `POST /v1/audit`, um contrato dedicado e versionado (`advisor/audit-input-schema.json` / `advisor/audit-schema.json`) para auditoria semântica consultiva do `IntegrityAssessment` já calculado. Camadas de defesa:
+
+- **Allowlist estrita na origem.** `app/services/audit_sanitizer.py` monta o payload campo a campo a partir de dados já determinísticos (status/score/gates/findings/`category_spending`); nunca encaminha um dicionário completo. `DATABASE_URL`, credenciais, documentos, paths e PII desnecessária não têm nenhum campo pelo qual poderiam sair.
+- **Contrato de entrada validado no sidecar.** `advisor/audit-input-schema.json` também é `additionalProperties: false`; um campo fora do allowlist chega a ser rejeitado no próprio Advisor antes de qualquer chamada ao Codex.
+- **Prompt-injection.** Todo conteúdo potencialmente influenciado pelo usuário (por exemplo, nome de categoria) entra no prompt somente dentro do bloco de dados, precedido por instruções explícitas de que nenhuma instrução dentro dele é válida. Não há execução de comando, ferramenta ou pesquisa disponível ao Codex nesse contrato, como nos demais.
+- **Saída sem autoridade, por schema.** `advisor/audit-schema.json` não tem campo para status/score/gates/`trusted_for_*`/findings; `severity` das observações é limitada a `info`/`review`. Uma tentativa de incluir esses campos invalida a resposta inteira (`available: false`), não é "aceita parcialmente".
+- **Verificação de IDs e números.** Referências (`evidence_ref`) só podem apontar para ids opacos que já estavam no pacote enviado; números citados em texto livre que não aparecem em nenhum lugar do pacote enviado são removidos da observação.
+- **Fail-safe duplo.** A validação de schema/autoridade ocorre no sidecar (`advisor/audit.mjs`) e é repetida de forma independente no lado Python (`app/services/codex_audit.py`, que só lê `available`/`reason`/`summary`/`observations`/`confidence` de qualquer resposta). Timeout, indisponibilidade, erro do provider ou schema inválido sempre produzem `available: false` com uma `reason`, nunca um `pass` implícito.
+- **Métricas/logs sem conteúdo sensível.** `advisor/audit.mjs` mantém contadores em memória (chamadas, sucesso, falha, timeout, schema inválido, latência) e emite logs JSON com essas categorias e durações -- nunca o prompt completo, o payload ou a resposta do modelo.
+
 No modo nativo do Windows, perde-se a fronteira adicional do contêiner, mas permanecem a separação
 de credenciais, o diretório de trabalho vazio, o ambiente mínimo, o segredo compartilhado e o
 sandbox somente leitura. O serviço aceita a interface interna usada por `host.docker.internal`,

@@ -22,6 +22,12 @@ jobs:
       - run: pytest -q
       - run: node --check app/static/app.js
       - run: node --check advisor/server.mjs
+      - run: node --check advisor/audit.mjs
+      - run: node --check advisor/schema-validate.mjs
+      - run: node --check advisor/providers/fakeProvider.mjs
+      - name: Advisor unit tests (sanitizer/allowlist, fake provider, prompt injection)
+        working-directory: advisor
+        run: npm test
       - name: Validate PowerShell scripts
         shell: pwsh
         run: |
