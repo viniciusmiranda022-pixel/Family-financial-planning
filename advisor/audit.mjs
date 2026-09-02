@@ -74,55 +74,36 @@ function unknownEvidenceRefs(output, knownIds) {
 }
 
 /**
- * Digit sequences (length >= 3) that appear anywhere in the sanitized
- * input package -- the only numbers the model is allowed to cite back.
+ * Complete numeric lexemes that appear anywhere in the sanitized input
+ * package -- the only numbers the model is allowed to cite back.
  * This is a best-effort guard against the model inventing financial
  * figures inside free text, where no schema/enum can constrain content.
  * It cannot prove a cited number is used correctly, only that it was not
  * fabricated from nothing: it is a floor, not a substitute for the
  * deterministic engine.
  */
-function collectKnownDigitSequences(input) {
+function collectKnownNumberClaims(input) {
   const known = new Set();
   const text = JSON.stringify(input);
-  for (const match of text.matchAll(/\d{3,}/g)) known.add(match[0]);
+  for (const claim of extractNumberClaims(text)) known.add(claim);
   return known;
 }
 
-function extractDigitSequences(text) {
-  return Array.from(String(text || "").matchAll(/\d{3,}/g), (match) => match[0]);
-}
-
-function normalizeAuditText(text) {
-  return String(text || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-}
-
-function contradictsDeterministicVerdict(output, input) {
-  const status = String(input?.integrity_snapshot?.status || "unknown").toLowerCase();
-  const summary = normalizeAuditText(output.summary);
-  const text = normalizeAuditText(
-    [
-      output.summary,
-      ...(output.observations || []).flatMap((item) => [item.message, item.recommendation]),
-    ].join(" ")
+function extractNumberClaims(text) {
+  // Match complete numeric lexemes, including short household amounts and
+  // formatted decimals (99, 99.90, 1.234,56), while ignoring digits embedded
+  // in words/opaque identifiers. Exact lexeme matching is intentionally
+  // conservative: if the provider reformats a number, the claim is dropped
+  // rather than guessed equivalent.
+  return Array.from(
+    String(text || "").matchAll(/(?<![\p{L}\p{N}])[-+]?\d+(?:[.,]\d+)*(?![\p{L}\p{N}])/gu),
+    (match) => match[0]
   );
-  // The summary is the prominent, standalone statement callers display.
-  // Require it—not a buried observation—to carry the exact deterministic
-  // status token, so advisory prose cannot silently replace the verdict.
-  if (!summary.includes(normalizeAuditText(status))) return true;
-  if (status === "healthy") return false;
-  return [
-    /\btudo (esta )?aprovado\b/,
-    /\bsem (problemas?|pendencias?|riscos?|inconsistencias?)\b/,
-    /\bintegridade (aprovada|saudavel)\b/,
-    /\bdados? confiaveis?\b/,
-    /\beverything (is )?approved\b/,
-    /\ball clear\b/,
-    /\bno (issues?|risks?|problems?)\b/,
-  ].some((pattern) => pattern.test(text));
+}
+
+function deterministicAuditSummary(input) {
+  const status = String(input?.integrity_snapshot?.status || "unknown").toLowerCase();
+  return `Status determinístico ${status}. Auditoria semântica consultiva disponível; findings e gates do motor permanecem autoritativos.`;
 }
 
 /**
@@ -134,12 +115,12 @@ function contradictsDeterministicVerdict(output, input) {
  * other observation untrustworthy.
  */
 function stripInventedNumberClaims(output, input) {
-  const knownDigits = collectKnownDigitSequences(input);
+  const knownDigits = collectKnownNumberClaims(input);
   let strippedCount = 0;
   const observations = (output.observations || []).filter((observation) => {
     const candidateNumbers = [
-      ...extractDigitSequences(observation.message),
-      ...extractDigitSequences(observation.recommendation),
+      ...extractNumberClaims(observation.message),
+      ...extractNumberClaims(observation.recommendation),
     ];
     const invented = candidateNumbers.some((digits) => !knownDigits.has(digits));
     if (invented) strippedCount += 1;
@@ -149,8 +130,8 @@ function stripInventedNumberClaims(output, input) {
 }
 
 function summaryHasInventedNumber(output, input) {
-  const knownDigits = collectKnownDigitSequences(input);
-  return extractDigitSequences(output.summary).some((digits) => !knownDigits.has(digits));
+  const knownDigits = collectKnownNumberClaims(input);
+  return extractNumberClaims(output.summary).some((digits) => !knownDigits.has(digits));
 }
 
 // ---------------------------------------------------------------------
@@ -341,20 +322,6 @@ export async function runAudit({ payload, provider, timeoutMs }) {
     };
   }
 
-  if (contradictsDeterministicVerdict(raw, payload)) {
-    metrics.invalid_schema_total += 1;
-    metrics.failure_total += 1;
-    logAuditEvent("codex_audit.verdict_contradiction", { duration_ms: durationMs });
-    return {
-      available: false,
-      reason: "verdict_contradiction",
-      schema_version: AUDIT_SCHEMA_VERSION,
-      summary: null,
-      observations: [],
-      confidence: null,
-    };
-  }
-
   if (summaryHasInventedNumber(raw, payload)) {
     metrics.number_claims_stripped_total += 1;
     metrics.failure_total += 1;
@@ -385,7 +352,11 @@ export async function runAudit({ payload, provider, timeoutMs }) {
     available: true,
     reason: null,
     schema_version: sanitizedOutput.schema_version,
-    summary: sanitizedOutput.summary,
+    // Provider prose is never allowed to become the prominent verdict-like
+    // summary. The model summary is validated for fabricated numbers above,
+    // then replaced by deterministic text derived solely from engine input.
+    // This structural constraint cannot be bypassed with paraphrases.
+    summary: deterministicAuditSummary(payload),
     observations: sanitizedOutput.observations,
     confidence: sanitizedOutput.confidence,
   };

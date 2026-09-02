@@ -111,6 +111,10 @@ def test_success_response_is_parsed_into_observations() -> None:
     )
     assert outcome.available is True
     assert outcome.reason is None
+    assert outcome.summary == (
+        "Status determinístico attention. Auditoria semântica consultiva disponível; "
+        "findings e gates do motor permanecem autoritativos."
+    )
     assert outcome.confidence == 0.6
     assert outcome.model == "modelo-de-teste"
     assert len(outcome.observations) == 1
@@ -157,7 +161,7 @@ def test_malformed_response_shape_is_unavailable() -> None:
     assert outcome.reason == "invalid_schema"
 
 
-def test_attempt_to_smuggle_a_verdict_field_is_never_read() -> None:
+def test_attempt_to_smuggle_a_verdict_field_cannot_change_deterministic_summary() -> None:
     """Even if a defensive layer upstream were bypassed and a response
     carried status/score/trusted_for_* fields, `_coerce_outcome` never reads
     them: `AuditOutcome` has no such field to put them in."""
@@ -178,8 +182,13 @@ def test_attempt_to_smuggle_a_verdict_field_is_never_read() -> None:
     outcome = run_semantic_audit(
         audit_type="period_review", integrity_status=BASE_INTEGRITY_STATUS, client=client
     )
-    assert outcome.available is False
-    assert outcome.reason == "verdict_contradiction"
+    assert outcome.available is True
+    assert outcome.reason is None
+    assert outcome.summary == (
+        "Status determinístico attention. Auditoria semântica consultiva disponível; "
+        "findings e gates do motor permanecem autoritativos."
+    )
+    assert "aprovado" not in outcome.summary
     assert not hasattr(outcome, "status")
     assert not hasattr(outcome, "score")
     assert not hasattr(outcome, "trusted_for_projection")

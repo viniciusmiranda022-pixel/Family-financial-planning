@@ -223,6 +223,9 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         # The deterministic verdict is untouched by a well-formed Codex reply.
         assert available_payload["integrity_status"]["status"] == "critical"
         assert available_payload["semantic_audit"]["available"] is True
+        assert available_payload["semantic_audit"]["summary"].startswith(
+            "Status determinístico critical."
+        )
         assert available_payload["semantic_audit"]["confidence"] == 0.55
         assert len(available_payload["semantic_audit"]["observations"]) == 1
         assert available_payload["semantic_audit"]["observations"][0]["category"] == "duplicate"
@@ -258,8 +261,12 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         override_payload = semantic_audit_attempted_override.json()
         assert override_payload["integrity_status"]["status"] == "critical"
         assert override_payload["integrity_status"]["trusted_for_projection"] is False
-        assert override_payload["semantic_audit"]["available"] is False
-        assert override_payload["semantic_audit"]["reason"] == "verdict_contradiction"
+        assert override_payload["semantic_audit"]["available"] is True
+        assert override_payload["semantic_audit"]["reason"] is None
+        assert override_payload["semantic_audit"]["summary"].startswith(
+            "Status determinístico critical."
+        )
+        assert "Tudo certo" not in override_payload["semantic_audit"]["summary"]
         assert "status" not in override_payload["semantic_audit"]
         assert "score" not in override_payload["semantic_audit"]
         assert "trusted_for_projection" not in override_payload["semantic_audit"]

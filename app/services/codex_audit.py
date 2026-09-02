@@ -21,7 +21,6 @@ Financial Engine or Financial Integrity Engine produced.
 
 from __future__ import annotations
 
-import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -155,24 +154,11 @@ def _normalize_text(value: str) -> str:
     )
 
 
-def _contradicts_verdict(summary: str, deterministic_status: str) -> bool:
-    text = _normalize_text(summary)
+def _deterministic_summary(deterministic_status: str) -> str:
     status = _normalize_text(deterministic_status)
-    if status not in text:
-        return True
-    if status == "healthy":
-        return False
-    return any(
-        re.search(pattern, text)
-        for pattern in (
-            r"\btudo (esta )?aprovado\b",
-            r"\bsem (problemas?|pendencias?|riscos?|inconsistencias?)\b",
-            r"\bintegridade (aprovada|saudavel)\b",
-            r"\bdados? confiaveis?\b",
-            r"\beverything (is )?approved\b",
-            r"\ball clear\b",
-            r"\bno (issues?|risks?|problems?)\b",
-        )
+    return (
+        f"Status determinístico {status}. Auditoria semântica consultiva disponível; "
+        "findings e gates do motor permanecem autoritativos."
     )
 
 
@@ -197,8 +183,6 @@ def _coerce_outcome(raw: Any, *, model: str | None, deterministic_status: str) -
     summary = raw.get("summary")
     if not isinstance(summary, str) or not summary.strip():
         return _unavailable("invalid_schema")
-    if _contradicts_verdict(summary, deterministic_status):
-        return _unavailable("verdict_contradiction")
 
     confidence_raw = raw.get("confidence")
     if isinstance(confidence_raw, bool) or not isinstance(confidence_raw, (int, float)):
@@ -218,7 +202,9 @@ def _coerce_outcome(raw: Any, *, model: str | None, deterministic_status: str) -
     return AuditOutcome(
         available=True,
         reason=None,
-        summary=summary.strip()[:MAX_SUMMARY_LENGTH],
+        # Never expose provider prose as a verdict-like summary. This is a
+        # structural boundary, independent of any finite phrase blacklist.
+        summary=_deterministic_summary(deterministic_status),
         observations=observations,
         confidence=confidence,
         model=str(model) if isinstance(model, str) and model else None,

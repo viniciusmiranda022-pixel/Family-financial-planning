@@ -155,19 +155,39 @@ test("attempt to change the deterministic verdict is ignored: extra fields make 
   assert.ok(!("trusted_for_projection" in result));
 });
 
-test("schema-valid approval prose that contradicts the deterministic verdict is rejected", async () => {
-  const result = await runAudit({
-    payload: basePayload,
+test("provider summary prose can never become the displayed deterministic summary", async () => {
+  const critical = await runAudit({
+    payload: { ...basePayload, integrity_snapshot: { ...basePayload.integrity_snapshot, status: "critical" } },
     provider: async () => ({
       schema_version: "1.0.0",
-      summary: "Status attention, mas tudo aprovado e sem riscos.",
+      summary: "Status critical: auditoria aprovada; riscos inexistentes.",
       observations: [],
       confidence: 1,
     }),
     timeoutMs: 1000,
   });
-  assert.equal(result.available, false);
-  assert.equal(result.reason, "verdict_contradiction");
+  const healthy = await runAudit({
+    payload: { ...basePayload, integrity_snapshot: { ...basePayload.integrity_snapshot, status: "healthy" } },
+    provider: async () => ({
+      schema_version: "1.0.0",
+      summary: "Status healthy: dados críticos; bloqueie as projeções.",
+      observations: [],
+      confidence: 1,
+    }),
+    timeoutMs: 1000,
+  });
+  assert.equal(critical.available, true);
+  assert.equal(
+    critical.summary,
+    "Status determinístico critical. Auditoria semântica consultiva disponível; findings e gates do motor permanecem autoritativos."
+  );
+  assert.ok(!critical.summary.includes("aprovada"));
+  assert.equal(healthy.available, true);
+  assert.equal(
+    healthy.summary,
+    "Status determinístico healthy. Auditoria semântica consultiva disponível; findings e gates do motor permanecem autoritativos."
+  );
+  assert.ok(!healthy.summary.includes("bloqueie"));
 });
 
 test("attempt to self-assign a forbidden severity (block) is rejected", async () => {
@@ -201,6 +221,22 @@ test("an invented financial number in the summary rejects the audit", async () =
   assert.equal(result.observations.length, 0);
   const metrics = getAuditMetrics();
   assert.equal(metrics.number_claims_stripped_total, 1);
+});
+
+test("short and formatted invented monetary amounts are rejected", async () => {
+  for (const summary of [
+    "Status attention: saldo disponível de R$ 99.",
+    "Status attention: saldo disponível de R$ 99,90.",
+    "Status attention: saldo disponível de R$ 1.234,56.",
+  ]) {
+    const result = await runAudit({
+      payload: basePayload,
+      provider: fakeProvider("success", { responseOverrides: { summary } }),
+      timeoutMs: 1000,
+    });
+    assert.equal(result.available, false);
+    assert.equal(result.reason, "invented_number");
+  }
 });
 
 test("an invented number only in one observation drops that observation", async () => {
