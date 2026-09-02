@@ -704,27 +704,17 @@ def snapshot_lineage_facts(db: Session, snapshot: FinancialSnapshot) -> dict[str
     }
 
 
-def dashboard_and_report_consistency_facts(snapshot: FinancialSnapshot) -> dict[str, dict[str, Decimal] | Decimal]:
-    """Derive INV-019/INV-020 facts (`trusted_for_reports`) for `snapshot`.
-
-    `GET /dashboard` and `GET /reports` do not run a second, independent
-    calculation today: every monetary field either endpoint returns is read
-    directly off this same canonical `FinancialSnapshot` row (see
-    `app/api.py`'s `dashboard()`/`reports()`), so `dashboard_values` and
-    `report_values` are, by construction, the exact same numbers as
-    `financial_engine_values`. This is not "no evidence defaulted to pass":
-    it is the true, verifiable state of the current architecture (a single
-    computation path), made an explicit, executable, auditable fact instead
-    of an assumption. The moment either consumer starts computing any of
-    these fields a different way -- a duplicated formula, a manual override,
-    a stale cache -- this check starts genuinely failing, because it does
-    not re-derive the numbers a second time; it reads the one row both
-    endpoints read.
+def _snapshot_monetary_fields(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """The canonical monetary field selection off `snapshot`, keyed the way
+    `financial_engine_values`, `dashboard_values` and `report_values` compare
+    them for INV-019/INV-020. No arithmetic happens here -- this only reads
+    columns already computed by the Financial Engine (`build_snapshot`); it
+    is not itself "the formula", so `dashboard_monetary_dataset` and
+    `report_month_monetary_dataset` sharing it is not duplicated financial
+    logic, only a shared attribute selector.
     """
 
-    from app.services.financial_invariants import MONEY_TOLERANCE
-
-    engine_values = {
+    return {
         "operating_income": money(snapshot.operating_income),
         "operating_expenses": money(snapshot.operating_expenses),
         "operating_result": money(snapshot.operating_result),
@@ -735,10 +725,60 @@ def dashboard_and_report_consistency_facts(snapshot: FinancialSnapshot) -> dict[
         "budget_cap": money(snapshot.budget_cap),
         "budget_remaining": money(snapshot.budget_remaining),
     }
+
+
+def dashboard_monetary_dataset(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """The exact monetary dataset `GET /dashboard` publishes for `snapshot`.
+
+    `app/api.py`'s `dashboard()` calls this function -- not a copy of it --
+    to build every monetary field in its response. It is also the function
+    `dashboard_and_report_consistency_facts()` calls to fill `dashboard_values`,
+    so an INV-019 fact is genuine evidence about the endpoint's own output: if
+    `dashboard()` ever stops calling this function (a hardcoded override, a
+    stale cache, a parallel formula), its published numbers diverge from what
+    this function returns, and INV-019 starts failing against the real gap.
+    """
+
+    return _snapshot_monetary_fields(snapshot)
+
+
+def report_month_monetary_dataset(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """The exact monetary dataset `GET /reports` publishes for one month's
+    `snapshot` row. Same contract as `dashboard_monetary_dataset`, kept as a
+    separate function (rather than one shared call site) because `/dashboard`
+    and `/reports` are independent consumers that could legitimately diverge
+    in what they choose to publish for a period; today they publish the same
+    fields, and this function is the one both `reports()` and
+    `dashboard_and_report_consistency_facts()`'s `report_values` call.
+    """
+
+    return _snapshot_monetary_fields(snapshot)
+
+
+def dashboard_and_report_consistency_facts(snapshot: FinancialSnapshot) -> dict[str, dict[str, Decimal] | Decimal]:
+    """Derive INV-019/INV-020 facts (`trusted_for_reports`) for `snapshot`.
+
+    `financial_engine_values` is read straight off the canonical
+    `FinancialSnapshot` row. `dashboard_values`/`report_values` are **not**
+    fabricated as a copy of it here: they are produced by calling
+    `dashboard_monetary_dataset()`/`report_month_monetary_dataset()`, the
+    same functions `app/api.py`'s `dashboard()`/`reports()` call to build
+    their own responses (see those functions' docstrings). Today all three
+    agree because there genuinely is one computation path; if a consumer
+    starts computing any of these fields a different way, the function it
+    was supposed to call no longer matches what it actually returns, and
+    this check fails against that real gap instead of a hardcoded copy. See
+    `tests/test_financial_snapshots.py` for a regression that patches the
+    publication path (not the invariant) and proves this.
+    """
+
+    from app.services.financial_invariants import MONEY_TOLERANCE
+
+    engine_values = _snapshot_monetary_fields(snapshot)
     return {
         "financial_engine_values": engine_values,
-        "dashboard_values": dict(engine_values),
-        "report_values": dict(engine_values),
+        "dashboard_values": dict(dashboard_monetary_dataset(snapshot)),
+        "report_values": dict(report_month_monetary_dataset(snapshot)),
         "monetary_tolerance": MONEY_TOLERANCE,
     }
 

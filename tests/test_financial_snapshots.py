@@ -4,6 +4,7 @@ from decimal import Decimal
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+import app.services.financial_snapshots as financial_snapshots_module
 from app.api import reports
 from app.db import Base
 from app.models import (
@@ -21,6 +22,7 @@ from app.services.financial_invariants import InvariantContext, InvariantScope, 
 from app.services.financial_snapshots import (
     _observation_is_trusted,
     build_snapshot,
+    dashboard_and_report_consistency_facts,
     liquidity_transition_facts,
     snapshot_lineage_facts,
 )
@@ -392,6 +394,108 @@ def test_report_aggregates_snapshot_refunds_and_latest_balance_observation() -> 
         assert result["summary"]["liquidity_balance"] == 1000.0
         assert result["summary"]["liquidity_withdrawal"] == 80.0
         assert result["monthly"][-1]["snapshot_id"]
+
+
+def _evaluate_report_check(invariant_id: str, facts: dict[str, object]):
+    return evaluate_invariant(
+        invariant_id,
+        InvariantContext(
+            facts=facts,
+            scope=InvariantScope.REPORT,
+            entity_type="monthly_close",
+            entity_id="monthly-close:household-consistency:2026-09",
+            period="2026-09",
+            trace_id="trace-report-consistency-test",
+        ),
+    )
+
+
+def test_dashboard_and_report_consistency_facts_observe_the_real_publication_path(
+    monkeypatch,
+) -> None:
+    """INV-019/INV-020 must fail on a real divergence, not agree by construction.
+
+    `dashboard_and_report_consistency_facts()` builds `dashboard_values`/
+    `report_values` by calling `dashboard_monetary_dataset()`/
+    `report_month_monetary_dataset()` -- the exact functions `app/api.py`'s
+    `dashboard()`/`reports()` call to build their own responses (see those
+    functions' docstrings). This proves the check is wired to that
+    publication path rather than fabricating three copies of
+    `financial_engine_values` internally: patching only
+    `report_month_monetary_dataset` -- simulating `/reports` starting to
+    serialize a stale or independently-computed figure, with no change to
+    the financial rule or to the snapshot itself -- makes INV-020 FAIL,
+    while INV-019 (whose function was left untouched) stays PASS against the
+    same snapshot.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família Consistência Publicada")
+        db.add(household)
+        db.flush()
+        checking = Account(household_id=household.id, name="Conta Corrente", account_type="checking")
+        income_category = Category(household_id=household.id, name="Salário")
+        expense_category = Category(household_id=household.id, name="Mercado")
+        profile = FinancialProfile(
+            household_id=household.id,
+            investment_name="Reserva DI",
+            monthly_cash_cap=Decimal("1000"),
+        )
+        db.add_all([checking, income_category, expense_category, profile])
+        db.flush()
+        db.add_all(
+            [
+                _transaction(
+                    household,
+                    checking,
+                    income_category,
+                    booked_at=date(2026, 9, 3),
+                    amount="1500",
+                    transaction_type="income",
+                    suffix="1",
+                ),
+                _transaction(
+                    household,
+                    checking,
+                    expense_category,
+                    booked_at=date(2026, 9, 5),
+                    amount="-400",
+                    transaction_type="expense",
+                    suffix="2",
+                ),
+            ]
+        )
+        db.commit()
+
+        snapshot = build_snapshot(db, household_id=household.id, period="2026-09")
+
+        baseline_facts = dashboard_and_report_consistency_facts(snapshot)
+        assert baseline_facts["dashboard_values"] == baseline_facts["financial_engine_values"]
+        assert baseline_facts["report_values"] == baseline_facts["financial_engine_values"]
+        assert _evaluate_report_check("INV-019", baseline_facts).status is InvariantStatus.PASS
+        assert _evaluate_report_check("INV-020", baseline_facts).status is InvariantStatus.PASS
+
+        real_report_dataset = financial_snapshots_module.report_month_monetary_dataset
+
+        def _stale_report_dataset(snapshot_arg: FinancialSnapshot) -> dict[str, Decimal]:
+            values = dict(real_report_dataset(snapshot_arg))
+            values["operating_expenses"] = values["operating_expenses"] + Decimal("0.02")
+            return values
+
+        monkeypatch.setattr(
+            financial_snapshots_module, "report_month_monetary_dataset", _stale_report_dataset
+        )
+
+        divergent_facts = dashboard_and_report_consistency_facts(snapshot)
+        report_result = _evaluate_report_check("INV-020", divergent_facts)
+        assert report_result.status is InvariantStatus.FAIL
+        assert report_result.severity.value == "block"
+        assert report_result.difference == Decimal("0.02")
+        # Only report_month_monetary_dataset was patched -- INV-019 (dashboard)
+        # reads dashboard_monetary_dataset, untouched, and must stay PASS.
+        assert _evaluate_report_check("INV-019", divergent_facts).status is InvariantStatus.PASS
 
 
 def _evaluate_projection_gate_check(invariant_id: str, facts: dict[str, object]):
