@@ -44,9 +44,11 @@ from app.schemas import (
     CaptureConfirmRequest,
     CommissionRequest,
     DuplicateResolutionRequest,
+    FindingLifecycleRequest,
     IntegrityRunRequest,
     LoginRequest,
     ManualTransactionRequest,
+    MonthlyCloseReopenRequest,
     ObligationRequest,
     PayrollRequest,
     ProfileRequest,
@@ -89,19 +91,34 @@ from app.services.finance import (
     monthly_net_rate,
 )
 from app.services.financial_integrity import (
+    ACTIVE_FINDING_STATUSES,
+    FindingLifecycleError,
     IntegrityCheck,
     IntegrityRunScope,
     IntegrityRunTrigger,
+    acknowledge_finding,
     build_baseline_checks,
     consolidated_integrity_status,
     execute_integrity_run,
+    ignore_finding,
+    mark_finding_false_positive,
+    record_isolated_run_failure,
+    resolve_finding,
     serialize_finding,
     serialize_run,
 )
 from app.services.financial_invariants import InvariantContext, InvariantScope
+from app.services.financial_revision import current_household_financial_revision
 from app.services.financial_snapshots import (
+    account_cash_flow_rows,
     build_snapshot,
+    category_monetary_publication,
+    category_spending_rows,
+    dashboard_and_report_consistency_facts,
+    dashboard_monetary_publication,
     liquidity_transition_facts,
+    report_month_monetary_publication,
+    report_summary_monetary_publication,
     serialize_snapshot,
     snapshot_lineage_facts,
 )
@@ -112,6 +129,16 @@ from app.services.importer import (
     parse_document_contract,
     parse_payroll_document,
     transaction_fingerprint,
+)
+from app.services.monthly_close import (
+    MonthlyCloseGateError,
+    MonthlyCloseStateError,
+    assert_close_runnable,
+    get_monthly_close,
+    reopen_monthly_close,
+    serialize_monthly_close,
+    trust_monthly_close,
+    upsert_monthly_close_after_run,
 )
 from app.services.projection_engine import PROJECTION_CALCULATION_VERSION
 from app.services.projection_validator import PROJECTION_TOLERANCE, validate_projection
@@ -1147,6 +1174,15 @@ def integrity_findings(
         "resolved",
         "ignored",
         "false_positive",
+        # "active" = open OR acknowledged (`ACTIVE_FINDING_STATUSES`), not a
+        # real `IntegrityFinding.status` value. Lets a caller ask for every
+        # still-live finding in one request instead of one call per status --
+        # the UI's global BLOCK/CRITICAL panel needs exactly this so a
+        # material finding is never pushed out of view by the default
+        # pagination cap regardless of which terminal statuses also exist
+        # for the household. See the engineering review on PR 7 ("UI pode
+        # esconder BLOCK/CRITICAL ativo pelo cap de 100").
+        "active",
     }:
         raise HTTPException(status_code=422, detail="Status de finding inválido")
     if severity and severity not in {"info", "warning", "review", "critical", "block"}:
@@ -1158,7 +1194,9 @@ def integrity_findings(
             raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from exc
 
     filters = [IntegrityFinding.household_id == user.household_id]
-    if status_filter:
+    if status_filter == "active":
+        filters.append(IntegrityFinding.status.in_(ACTIVE_FINDING_STATUSES))
+    elif status_filter:
         filters.append(IntegrityFinding.status == status_filter)
     if severity:
         filters.append(IntegrityFinding.severity == severity)
@@ -1272,6 +1310,398 @@ def integrity_semantic_audit(
         "integrity_status": integrity_status,
         "semantic_audit": outcome.to_dict(),
     }
+
+
+def _finding_or_404(db: Session, user: User, finding_id: str) -> IntegrityFinding:
+    finding = db.scalar(
+        select(IntegrityFinding).where(
+            IntegrityFinding.id == finding_id,
+            IntegrityFinding.household_id == user.household_id,
+        )
+    )
+    if finding is None:
+        raise HTTPException(status_code=404, detail="Finding não encontrado")
+    return finding
+
+
+def _finding_lifecycle_action(
+    db: Session,
+    user: User,
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    *,
+    action: str,
+    apply,
+) -> dict:
+    finding = _finding_or_404(db, user, finding_id)
+    before_state = {"status": finding.status}
+    try:
+        apply(finding)
+    except FindingLifecycleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        f"integrity.finding.{action}",
+        "integrity_finding",
+        finding.id,
+        before_state=before_state,
+        after_state={"status": finding.status},
+        reason=payload.reason,
+        trace_id=finding.trace_id,
+        source="financial_integrity_engine",
+    )
+    db.commit()
+    db.refresh(finding)
+    return serialize_finding(finding)
+
+
+@router.post("/integrity/findings/{finding_id}/acknowledge")
+def acknowledge_integrity_finding(
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _finding_lifecycle_action(
+        db,
+        user,
+        finding_id,
+        payload,
+        action="acknowledge",
+        apply=lambda finding: acknowledge_finding(finding, user_id=user.id, reason=payload.reason),
+    )
+
+
+@router.post("/integrity/findings/{finding_id}/resolve")
+def resolve_integrity_finding(
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _finding_lifecycle_action(
+        db,
+        user,
+        finding_id,
+        payload,
+        action="resolve",
+        apply=lambda finding: resolve_finding(finding, user_id=user.id, reason=payload.reason),
+    )
+
+
+@router.post("/integrity/findings/{finding_id}/ignore")
+def ignore_integrity_finding(
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _finding_lifecycle_action(
+        db,
+        user,
+        finding_id,
+        payload,
+        action="ignore",
+        apply=lambda finding: ignore_finding(finding, user_id=user.id, reason=payload.reason),
+    )
+
+
+@router.post("/integrity/findings/{finding_id}/false-positive")
+def mark_integrity_finding_false_positive(
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _finding_lifecycle_action(
+        db,
+        user,
+        finding_id,
+        payload,
+        action="false-positive",
+        apply=lambda finding: mark_finding_false_positive(
+            finding, user_id=user.id, reason=payload.reason
+        ),
+    )
+
+
+_PERIOD_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def _validate_period(period: str) -> None:
+    # Stricter than `integrity_findings`' `datetime.strptime(period, "%Y-%m")`
+    # (which accepts non-zero-padded months like "2026-8"): this value is fed
+    # straight into `consolidated_integrity_status` -> `_period_bounds`,
+    # which uses `date.fromisoformat` and would otherwise raise an unhandled
+    # 500 instead of a clean 422.
+    if not _PERIOD_PATTERN.match(period):
+        raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from None
+
+
+@router.get("/monthly-closes/{period}")
+def monthly_close_status(
+    period: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _validate_period(period)
+    close = get_monthly_close(db, household_id=user.household_id, period=period)
+    return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
+
+
+@router.post("/monthly-closes/{period}/run")
+def run_monthly_close(
+    period: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Execute a fresh period-scoped integrity run and refresh the canonical snapshot.
+
+    Deliberately does not decide `trusted` -- see `POST .../trust`. Unlike
+    `POST /integrity/runs`, this endpoint rebuilds the period's canonical
+    `FinancialSnapshot` *before* calling `execute_integrity_run` (the gate
+    checks below need it), so a failed run cannot simply commit its own
+    `failed` row the way `create_integrity_run` does -- that would also
+    commit the already-flushed snapshot rebuild (and any predecessor
+    supersession), despite the close having failed. On failure this instead
+    rolls back the whole transaction and records the failure audit trail in
+    isolation via `record_isolated_run_failure` -- see that function's
+    docstring and the engineering review on PR 7. If anything after a
+    *successful* run fails unexpectedly (e.g. the monthly close upsert), no
+    explicit commit happens here, so the session close implicitly rolls back
+    the whole request -- a close run is all-or-nothing either way.
+    """
+
+    _require_admin(user)
+    _validate_period(period)
+    # `assert_close_runnable` takes the household-wide revision barrier
+    # (`lock_household_financial_revision`) as its very first action, before
+    # reading `close.status` -- not the other way around. See its docstring
+    # for the run→trust/trust→run interleaving that ordering closes (PR 7,
+    # Round 11: a `trust`/`reopen` that used to be able to commit invisibly
+    # between a stale status read here and a barrier acquired only
+    # afterward). The same barrier stays held for the rest of this request:
+    # on PostgreSQL it blocks a concurrent mutation from committing (and
+    # thus from being partially reflected across `period_snapshot`/the
+    # projection/consistency checks below), and blocks a concurrent
+    # `trust`/`reopen` from even reading `close.status`, until this run's
+    # transaction ends. The settled revision (captured further below, after
+    # this run's own `IntegrityRun`/`IntegrityFinding` writes) is persisted
+    # onto the close so `trust_monthly_close` can require its own freshly
+    # locked revision to still match it -- see
+    # `MonthlyFinancialClose.financial_revision`'s docstring and the
+    # engineering review on PR 7, Round 8.
+    try:
+        assert_close_runnable(db, household_id=user.household_id, period=period)
+    except MonthlyCloseStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    duplicate_checks = build_baseline_checks(
+        db, household_id=user.household_id, scope=IntegrityRunScope.PERIOD, period=period
+    )
+    # A monthly close's `run` must be able to reach the deterministic
+    # coverage `_trust_gate()` requires for `trusted_for_projection`
+    # (INV-005, INV-006, INV-018, INV-022), not just INV-014. Reusing
+    # `_build_projection_gate_checks` -- the exact same builder GET /forecast
+    # uses -- proves the just-closed period's snapshot is a trustworthy seed
+    # for the next month's projection, over one real month instead of the
+    # full display horizon a forecast view needs. Without this, `run ->
+    # trust` could never reach `trusted` through the real endpoint: see the
+    # engineering review that blocked this PR on exactly that gap.
+    profile = profile_for(db, user.household_id)
+    period_start = date.fromisoformat(f"{period}-01")
+    period_snapshot = build_snapshot(
+        db, household_id=user.household_id, period=period, generated_by=user.id
+    )
+    close_entity_id = f"monthly-close:{user.household_id}:{period}"
+    projection_checks, _rows, _validation = _build_projection_gate_checks(
+        db,
+        household_id=user.household_id,
+        profile=profile,
+        snapshot=period_snapshot,
+        start_month=add_months(period_start, 1),
+        end_month=add_months(period_start, 1),
+        check_period=period,
+        entity_type="monthly_close",
+        entity_id=close_entity_id,
+    )
+    # `trusted_for_reports` needs its own required coverage (INV-019, INV-020;
+    # INV-022 is already evaluated above and satisfies both gates at once --
+    # see `_trust_gate`). Each invariant gets its own fact set (`"dashboard"`
+    # for INV-019, `"report"` for INV-020) because `/dashboard` and
+    # `/reports` do not publish the exact same field set -- see
+    # `dashboard_and_report_consistency_facts`' docstring for why comparing
+    # the snapshot to itself is the true state of the current architecture
+    # rather than invented evidence.
+    consistency_facts = dashboard_and_report_consistency_facts(period_snapshot, profile=profile)
+    report_checks = (
+        IntegrityCheck(
+            "INV-019",
+            InvariantContext(
+                facts=consistency_facts["dashboard"],
+                scope=InvariantScope.REPORT,
+                entity_type="monthly_close",
+                entity_id=close_entity_id,
+                period=period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-020",
+            InvariantContext(
+                facts=consistency_facts["report"],
+                scope=InvariantScope.REPORT,
+                entity_type="monthly_close",
+                entity_id=close_entity_id,
+                period=period,
+            ),
+        ),
+    )
+    checks = duplicate_checks + projection_checks + report_checks
+    try:
+        run, _results = execute_integrity_run(
+            db,
+            household_id=user.household_id,
+            scope=IntegrityRunScope.PERIOD,
+            trigger=IntegrityRunTrigger.CLOSE,
+            checks=checks,
+            created_by=user.id,
+            period=period,
+        )
+    except Exception as exc:
+        # `period_snapshot` above was built (and may have superseded its
+        # predecessor) *before* this try block, in the same uncommitted
+        # transaction `execute_integrity_run` itself flushed a `failed` run
+        # row into. Committing here (as before the engineering review caught
+        # it) would persist that snapshot rebuild too, despite the close
+        # having failed -- see the review comment ("Falha em
+        # execute_integrity_run pode persistir snapshot pré-run"). Roll back
+        # everything from this request first, then record the failure audit
+        # trail in isolation, so a failed close never leaves any canonical
+        # fact (snapshot, finding) behind.
+        db.rollback()
+        record_isolated_run_failure(
+            db,
+            household_id=user.household_id,
+            scope=IntegrityRunScope.PERIOD,
+            trigger=IntegrityRunTrigger.CLOSE,
+            period=period,
+            created_by=user.id,
+            error=exc,
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=500,
+            detail="A execução do fechamento falhou sem alterar snapshot ou estado anterior",
+        ) from exc
+
+    snapshot = build_snapshot(
+        db, household_id=user.household_id, period=period, generated_by=user.id, force=True
+    )
+    # The settled revision, still under the barrier locked above: it already
+    # includes this run's own `IntegrityRun`/`IntegrityFinding` writes (both
+    # are `FINANCIAL_REVISION_MODELS`), so a `trust` attempt right after this
+    # commits sees the same value here and passes; any further financial
+    # mutation before `trust` moves it and `trust_monthly_close` rejects the
+    # stale run. See `MonthlyFinancialClose.financial_revision`'s docstring.
+    run_financial_revision = current_household_financial_revision(db, household_id=user.household_id)
+    close = upsert_monthly_close_after_run(
+        db,
+        household_id=user.household_id,
+        period=period,
+        snapshot_id=snapshot.id,
+        integrity_run_id=run.id,
+        financial_revision=run_financial_revision,
+    )
+    audit(
+        db,
+        user,
+        "monthly_close.run",
+        "monthly_financial_close",
+        close.id,
+        {"period": period},
+        after_state={
+            "status": close.status,
+            "snapshot_id": close.snapshot_id,
+            "integrity_run_id": close.integrity_run_id,
+        },
+        trace_id=run.trace_id,
+        source="financial_integrity_engine",
+    )
+    db.commit()
+    db.refresh(close)
+    return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
+
+
+@router.post("/monthly-closes/{period}/trust")
+def trust_monthly_close_endpoint(
+    period: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    _validate_period(period)
+    before = get_monthly_close(db, household_id=user.household_id, period=period)
+    before_state = {"status": before.status} if before else {"status": "open"}
+    try:
+        close = trust_monthly_close(db, household_id=user.household_id, period=period, user_id=user.id)
+    except MonthlyCloseGateError as exc:
+        raise HTTPException(
+            status_code=422, detail={"message": str(exc), "reasons": list(exc.reasons)}
+        ) from exc
+    except MonthlyCloseStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    audit(
+        db,
+        user,
+        "monthly_close.trust",
+        "monthly_financial_close",
+        close.id,
+        before_state=before_state,
+        after_state={
+            "status": close.status,
+            "closed_at": close.closed_at.isoformat() if close.closed_at else None,
+        },
+        source="financial_integrity_engine",
+    )
+    db.commit()
+    db.refresh(close)
+    return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
+
+
+@router.post("/monthly-closes/{period}/reopen")
+def reopen_monthly_close_endpoint(
+    period: str,
+    payload: MonthlyCloseReopenRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    _validate_period(period)
+    before = get_monthly_close(db, household_id=user.household_id, period=period)
+    before_state = {"status": before.status} if before else {"status": "open"}
+    try:
+        close = reopen_monthly_close(
+            db, household_id=user.household_id, period=period, user_id=user.id, reason=payload.reason
+        )
+    except MonthlyCloseStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    audit(
+        db,
+        user,
+        "monthly_close.reopen",
+        "monthly_financial_close",
+        close.id,
+        before_state=before_state,
+        after_state={"status": close.status},
+        reason=payload.reason,
+        source="financial_integrity_engine",
+    )
+    db.commit()
+    db.refresh(close)
+    return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
 
 
 @router.get("/users")
@@ -3146,28 +3576,43 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
     return values
 
 
-@router.get("/forecast")
-def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
-    profile = profile_for(db, user.household_id)
-    current_start = date.today().replace(day=1)
-    current_snapshot = build_snapshot(
-        db,
-        household_id=user.household_id,
-        period=month_key(current_start),
-        generated_by=user.id,
-    )
-    end = profile.projection_end or date(date.today().year + 1, 12, 1)
+def _build_projection_gate_checks(
+    db: Session,
+    *,
+    household_id: str,
+    profile: FinancialProfile,
+    snapshot: FinancialSnapshot,
+    start_month: date,
+    end_month: date,
+    check_period: str,
+    entity_type: str,
+    entity_id: str,
+) -> tuple[tuple[IntegrityCheck, ...], list[dict], object]:
+    """Run the canonical Projection Engine + independent Validator over
+    `[start_month, end_month]` starting from `snapshot`'s closing position and
+    derive the deterministic checks that gate `trusted_for_projection`
+    (INV-005, INV-006, INV-018, INV-022).
+
+    Shared by `GET /forecast` (full display horizon) and
+    `POST /monthly-closes/{period}/run` (a minimal one-month check proving
+    the just-closed period is a trustworthy seed for the next one) so the
+    projection trust gate is never evaluated two different ways -- see the
+    engineering review on PR 7 that blocked `run -> trust` from ever reaching
+    a real `trusted` state because the monthly close never ran this coverage
+    at all.
+    """
+
     obligations_rows = db.scalars(
-        select(Obligation).where(Obligation.household_id == user.household_id, Obligation.active.is_(True))
+        select(Obligation).where(Obligation.household_id == household_id, Obligation.active.is_(True))
     ).all()
     commission_rows = db.scalars(
         select(Commission).where(
-            Commission.household_id == user.household_id, Commission.status != "cancelled"
+            Commission.household_id == household_id, Commission.status != "cancelled"
         )
     ).all()
     payroll_rows = db.scalars(
         select(PayrollRecord).where(
-            PayrollRecord.household_id == user.household_id, PayrollRecord.payroll_kind != "regular"
+            PayrollRecord.household_id == household_id, PayrollRecord.payroll_kind != "regular"
         )
     ).all()
     payroll_extras: dict[str, Decimal] = {}
@@ -3180,21 +3625,83 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
         commissions_input.append(ForecastCommission(item.expected_date, net, item.delay_days))
     rate = monthly_net_rate(profile.investment_gross_annual_rate, profile.investment_income_tax_rate)
     projection_input = ForecastInput(
-        start_month=add_months(date.today().replace(day=1), 1),
-        end_month=end,
-        starting_balance=Decimal(current_snapshot.closing_liquidity_balance),
+        start_month=start_month,
+        end_month=end_month,
+        starting_balance=Decimal(snapshot.closing_liquidity_balance),
         monthly_salary=profile.monthly_salary_net,
         monthly_cash_cap=profile.monthly_cash_cap,
         monthly_investment_rate=rate,
         obligations=_forecast_obligations(list(obligations_rows)),
-        installments=_future_installments(db, user.household_id),
+        installments=_future_installments(db, household_id),
         payroll_extras=payroll_extras,
         commissions=tuple(commissions_input),
-        starting_uncovered_deficit=Decimal(current_snapshot.closing_uncovered_deficit),
+        starting_uncovered_deficit=Decimal(snapshot.closing_uncovered_deficit),
         safety_floor=Decimal(profile.emergency_floor),
     )
     rows = build_forecast(projection_input)
     validation = validate_projection(projection_input, rows)
+    liquidity_facts = liquidity_transition_facts(snapshot)
+    lineage_facts = snapshot_lineage_facts(db, snapshot)
+    checks = (
+        IntegrityCheck(
+            "INV-018",
+            InvariantContext(
+                facts={
+                    "financial_engine_values": validation.actual_values,
+                    "projection_validator_values": validation.expected_values,
+                    "monetary_tolerance": PROJECTION_TOLERANCE,
+                },
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-005",
+            InvariantContext(
+                facts=liquidity_facts,
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-006",
+            InvariantContext(
+                facts=liquidity_facts,
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-022",
+            InvariantContext(
+                facts=lineage_facts,
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+    )
+    return checks, rows, validation
+
+
+@router.get("/forecast")
+def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    profile = profile_for(db, user.household_id)
+    current_start = date.today().replace(day=1)
+    current_snapshot = build_snapshot(
+        db,
+        household_id=user.household_id,
+        period=month_key(current_start),
+        generated_by=user.id,
+    )
+    end = profile.projection_end or date(date.today().year + 1, 12, 1)
     current_period = month_key(current_start)
     projection_identity = f"projection:{user.household_id}:{current_period}"
     # The projection trust gate is not `balance_evidence_trusted and
@@ -3206,65 +3713,30 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
     # run evaluates the full required set against the current snapshot itself
     # and lets the canonical `_trust_gate` decide, instead of substituting a
     # more permissive ad hoc gate.
-    liquidity_facts = liquidity_transition_facts(current_snapshot)
-    lineage_facts = snapshot_lineage_facts(db, current_snapshot)
+    checks, rows, validation = _build_projection_gate_checks(
+        db,
+        household_id=user.household_id,
+        profile=profile,
+        snapshot=current_snapshot,
+        start_month=add_months(date.today().replace(day=1), 1),
+        end_month=end,
+        check_period=current_period,
+        entity_type="projection",
+        entity_id=projection_identity,
+    )
     integrity_run, gate_results = execute_integrity_run(
         db,
         household_id=user.household_id,
         scope=IntegrityRunScope.PROJECTION,
         trigger=IntegrityRunTrigger.SYSTEM,
-        checks=(
-            IntegrityCheck(
-                "INV-018",
-                InvariantContext(
-                    facts={
-                        "financial_engine_values": validation.actual_values,
-                        "projection_validator_values": validation.expected_values,
-                        "monetary_tolerance": PROJECTION_TOLERANCE,
-                    },
-                    scope=InvariantScope.PROJECTION,
-                    entity_type="projection",
-                    entity_id=projection_identity,
-                    period=current_period,
-                ),
-            ),
-            IntegrityCheck(
-                "INV-005",
-                InvariantContext(
-                    facts=liquidity_facts,
-                    scope=InvariantScope.PROJECTION,
-                    entity_type="projection",
-                    entity_id=projection_identity,
-                    period=current_period,
-                ),
-            ),
-            IntegrityCheck(
-                "INV-006",
-                InvariantContext(
-                    facts=liquidity_facts,
-                    scope=InvariantScope.PROJECTION,
-                    entity_type="projection",
-                    entity_id=projection_identity,
-                    period=current_period,
-                ),
-            ),
-            IntegrityCheck(
-                "INV-022",
-                InvariantContext(
-                    facts=lineage_facts,
-                    scope=InvariantScope.PROJECTION,
-                    entity_type="projection",
-                    entity_id=projection_identity,
-                    period=current_period,
-                ),
-            ),
-        ),
+        checks=checks,
         created_by=user.id,
         period=current_period,
         scope_entity_type="projection",
         scope_entity_id=projection_identity,
         calculation_version=PROJECTION_CALCULATION_VERSION,
     )
+    rate = monthly_net_rate(profile.investment_gross_annual_rate, profile.investment_income_tax_rate)
     projection_gate_trusted = bool(integrity_run.summary.get("trusted_for_projection", False))
     balance_evidence_trusted = bool(current_snapshot.payload.get("balance_evidence_trusted", False))
     inv018_result = next(result for result in gate_results if result.invariant_id == "INV-018")
@@ -3677,6 +4149,33 @@ def dashboard(
             Transaction.booked_at < end,
         )
     )
+    # `future_commissions_gross` is a live query against `Commission` rows
+    # with `expected_date` in the current window and `status != "cancelled"`
+    # -- not a Financial Engine/snapshot output. It is deliberately excluded
+    # from `dashboard_monetary_publication`/INV-019: unlike a snapshot
+    # column, this figure can change between two reads of the *same*,
+    # already-generated snapshot (a commission gets cancelled or
+    # rescheduled a moment later), so folding it into the INV-019 gate would
+    # either falsely certify a value the snapshot never fixed, or make
+    # `trusted_for_reports` flap on data that isn't a financial fact
+    # `build_snapshot` recorded. See the engineering review on PR 7, Round 6:
+    # "classify explicitly ... do not present as certified by
+    # snapshot/INV-019; preserve the contract without inventing or freezing
+    # a financial fact."
+    #
+    # Round 7: a bare top-level `future_commissions_gross` scalar sat beside
+    # `snapshot_id`/`snapshot_checksum`/`trusted_for_reports` with nothing in
+    # the response itself telling a consumer it is the odd one out -- see
+    # the engineering review on PR 7, Round 7: "cannot remain a first-level
+    # monetary field ... without marking". Nothing in this codebase (no
+    # frontend, no test outside this endpoint's own) reads the flat key, so
+    # there is no compatible consumer to preserve a deprecation shim for;
+    # it is dropped and replaced by `noncanonical.future_commissions_gross`,
+    # an explicitly-labelled object carrying `source`/`freshness`/
+    # `certified_by`/`as_of` so a consumer cannot mistake it for a
+    # snapshot-backed, INV-019-covered figure. If a future slice needs this
+    # value certified, the fix belongs in the Financial Engine (a real
+    # snapshot column), not in loosening what `noncanonical` means.
     future_commission = db.scalar(
         select(func.coalesce(func.sum(Commission.gross_amount), 0)).where(
             Commission.household_id == user.household_id,
@@ -3684,44 +4183,65 @@ def dashboard(
             Commission.status != "cancelled",
         )
     )
-    benefit = profile.food_allowance + profile.meal_allowance_daily * profile.workdays_month
     obligation_alerts = [
         item for item in _obligation_rows(db, user.household_id) if item["days_until_due"] <= 30
     ][:5]
     db.commit()
-    cash_net = Decimal(snapshot.operating_result)
+    # `dashboard_monetary_publication` is the exact function INV-019 reads to
+    # verify this response -- see its docstring and
+    # `dashboard_and_report_consistency_facts`. This endpoint spreads its
+    # return value verbatim (only the uniform `decimal_value()` cast applied
+    # on top) instead of re-deriving each key inline, so there is no
+    # endpoint-only mapping step left for INV-019 to be blind to -- see the
+    # engineering review on PR 7, Round 3. `liquidity_starting_balance`,
+    # `liquidity_available`, `liquidity_deposit`, `liquidity_withdrawal`
+    # (Round 5), and `liquidity_flow`/`emergency_floor`/`food_benefits`
+    # (Round 6) used to be built here from `snapshot`/`snapshot_payload`/
+    # `profile` directly, outside this dict -- now they all come from
+    # `publication` too, so INV-019's `dashboard_and_report_consistency_facts`
+    # (which reads the exact same function) observes them as well.
+    publication = dashboard_monetary_publication(snapshot, profile=profile)
     return {
         "month": month_key(start),
         "snapshot_id": snapshot.id,
         "snapshot_checksum": snapshot.checksum,
         "integrity_status": snapshot.integrity_status,
         "trusted_for_reports": snapshot.trusted_for_reports,
-        "spending": decimal_value(snapshot.operating_expenses),
-        "cash_in": decimal_value(snapshot.operating_income),
-        "cash_out": decimal_value(snapshot.operating_expenses),
-        "bank_cash_out": decimal_value(snapshot.bank_cash_out),
-        "card_spending": decimal_value(snapshot.card_spend),
-        "cash_net": decimal_value(cash_net),
-        "cash_flow_by_account": snapshot_payload["cash_flow_by_account"],
-        "cash_cap": decimal_value(snapshot.budget_cap),
-        "remaining_cap": decimal_value(snapshot.budget_remaining),
-        "investment_balance": decimal_value(profile.investment_balance),
+        **{key: decimal_value(value) for key, value in publication.items()},
+        # `cash_flow_by_account`/`category_spending` are non-scalar (row
+        # lists), so they cannot join the flat `publication` dict above --
+        # `account_cash_flow_rows`/`category_spending_rows` are still the
+        # exact functions `dashboard_and_report_consistency_facts()`
+        # flattens into the INV-019 facts it observes (see their
+        # docstrings), so this endpoint calling them (not `snapshot.payload`
+        # inline) keeps the same verbatim-publication guarantee.
+        "cash_flow_by_account": account_cash_flow_rows(snapshot),
         "liquidity_name": profile.investment_name,
-        "liquidity_starting_balance": decimal_value(snapshot.opening_liquidity_balance),
-        "liquidity_balance": decimal_value(snapshot.closing_liquidity_balance),
-        "liquidity_closing_balance": decimal_value(snapshot.closing_liquidity_balance),
-        "liquidity_available": decimal_value(snapshot.distance_to_floor),
-        "liquidity_deposit": decimal_value(snapshot_payload["liquidity_deposit"]),
-        "liquidity_withdrawal": decimal_value(snapshot.liquidity_used),
-        "liquidity_uncovered_deficit": decimal_value(snapshot.closing_uncovered_deficit),
-        "liquidity_flow": decimal_value(cash_net),
-        "liquidity_direction": ("deposit" if cash_net > 0 else "withdrawal" if cash_net < 0 else "balanced"),
-        "emergency_floor": decimal_value(profile.emergency_floor),
-        "food_benefits": decimal_value(benefit),
+        "liquidity_direction": (
+            "deposit"
+            if publication["liquidity_flow"] > 0
+            else "withdrawal"
+            if publication["liquidity_flow"] < 0
+            else "balanced"
+        ),
         "review_count": int(review_count or 0),
         "duplicates_ignored": snapshot_payload["duplicates_ignored"],
-        "category_spending": snapshot_payload["category_spending"],
-        "future_commissions_gross": decimal_value(future_commission),
+        "category_spending": category_spending_rows(snapshot),
+        # Explicitly-labelled section for monetary figures the response
+        # publishes but that are *not* snapshot-backed / INV-019-covered
+        # facts -- see the comment above `future_commission`'s query. Every
+        # entry here must carry enough metadata (`source`, `freshness`,
+        # `certified_by`) for a consumer to tell it apart from the
+        # `trusted_for_reports`-gated fields above.
+        "noncanonical": {
+            "future_commissions_gross": {
+                "value": decimal_value(future_commission),
+                "source": "live_query",
+                "freshness": "live",
+                "certified_by": None,
+                "as_of": datetime.now(UTC).isoformat(),
+            },
+        },
         "obligation_alerts": obligation_alerts,
     }
 
@@ -3779,17 +4299,27 @@ def reports(
         )
         report_snapshots.append(snapshot)
         duplicates_ignored += int(snapshot.payload.get("duplicates_ignored", 0))
-        for category in snapshot.payload.get("category_spending", []):
+        # `category_spending_rows` is the exact function `/dashboard`
+        # publishes verbatim and INV-019 observes -- summing its rows here
+        # (instead of reading `snapshot.payload["category_spending"]`
+        # directly) means a regression in that function now surfaces in
+        # `/reports`' own `categories` totals too, closing the INV-020 gap
+        # the engineering review named on PR 7, Round 7 ("nested amounts of
+        # categories ... continues coming direct from snapshot.payload").
+        for category in category_spending_rows(snapshot):
             name = str(category["category"])
             category_totals[name] = category_totals.get(name, Decimal("0")) + Decimal(
                 str(category["amount"])
             )
-        spending = money(snapshot.operating_expenses)
-        cash_in = money(snapshot.operating_income)
-        cash_out = money(snapshot.operating_expenses)
-        bank_cash_out = money(snapshot.bank_cash_out)
-        card_spending = money(snapshot.card_spend)
-        cash_net = money(snapshot.operating_result)
+        # `report_month_monetary_publication` is the exact function INV-020
+        # reads to verify this response -- see its docstring and
+        # `dashboard_and_report_consistency_facts`. This row spreads its
+        # return value verbatim (only the uniform `decimal_value()` cast
+        # applied on top) instead of re-deriving each key inline, so there is
+        # no endpoint-only mapping step left for INV-020 to be blind to --
+        # see the engineering review on PR 7, Round 3.
+        publication = report_month_monetary_publication(snapshot)
+        spending = publication["spending"]
         change_percentage = None
         if (
             item["transaction_count"] > 0
@@ -3802,14 +4332,7 @@ def reports(
         serialized_months.append(
             {
                 "month": key,
-                "spending": decimal_value(spending),
-                "cash_in": decimal_value(cash_in),
-                "cash_out": decimal_value(cash_out),
-                "bank_cash_out": decimal_value(bank_cash_out),
-                "card_spending": decimal_value(card_spending),
-                "cash_net": decimal_value(cash_net),
-                "cash_cap": decimal_value(profile.monthly_cash_cap),
-                "remaining_cap": decimal_value(money(profile.monthly_cash_cap - spending)),
+                **{key_name: decimal_value(value) for key_name, value in publication.items()},
                 "transaction_count": int(item["transaction_count"]),
                 "change_percentage": change_percentage,
                 "snapshot_id": snapshot.id,
@@ -3840,11 +4363,21 @@ def reports(
         item.name: item.color
         for item in db.scalars(select(Category).where(Category.household_id == user.household_id)).all()
     }
+    # `category_monetary_publication` is the exact function INV-020 reads
+    # (via `report_categories_publication_facts`) to verify `amount`/
+    # `average` for a one-month window -- see its docstring and the
+    # engineering review on PR 7, Round 8 ("categories[].average" was
+    # previously an endpoint-only division INV-020 could not see). Spread
+    # verbatim instead of computing `average` as a separate literal.
     categories = [
         {
             "category": name,
-            "amount": decimal_value(money(amount)),
-            "average": decimal_value(money(amount / average_denominator)),
+            **{
+                key: decimal_value(value)
+                for key, value in category_monetary_publication(
+                    amount, average_denominator=average_denominator
+                ).items()
+            },
             "share": float(money((amount / total_spending) * Decimal("100"))) if total_spending > 0 else 0,
             "color": category_colors.get(name, "#64748B"),
         }
@@ -3864,14 +4397,45 @@ def reports(
     total_liquidity_used = money(
         sum((Decimal(item.liquidity_used) for item in report_snapshots), Decimal("0"))
     )
-    savings_rate = (
-        money(((total_cash_in - total_cash_out) / total_cash_in) * Decimal("100"))
-        if total_cash_in > 0
-        else Decimal("0")
+    # `report_summary_monetary_publication` is the exact function INV-020
+    # reads to verify a one-month window's `summary` -- every canonical
+    # total/average/liquidity field, not `savings_rate` alone (PR 7, Round
+    # 7), and now `highest_spending`/`lowest_spending` too (PR 7, Round 8:
+    # these used to be assigned as separate literals below, past this
+    # contract) -- see its docstring and
+    # `dashboard_and_report_consistency_facts`. `summary` below spreads its
+    # return value verbatim instead of assigning any of these keys as its
+    # own literal, so there is no endpoint-only assembly step left for
+    # INV-020 to be blind to -- see the engineering review on PR 7, Round 7:
+    # "all canonical monetary values derived from snapshot/profile that are
+    # published by /reports must be represented by side-effect-free
+    # publication builders consumed verbatim by the endpoint".
+    summary_publication = report_summary_monetary_publication(
+        total_spending=total_spending,
+        average_spending=average_spending,
+        total_cash_in=total_cash_in,
+        total_cash_out=total_cash_out,
+        total_bank_cash_out=total_bank_cash_out,
+        total_card_spending=total_card_spending,
+        cash_net=total_result,
+        liquidity_starting_balance=first_snapshot.opening_liquidity_balance,
+        liquidity_balance=last_snapshot.closing_liquidity_balance,
+        emergency_floor=profile.emergency_floor,
+        liquidity_available=last_snapshot.distance_to_floor,
+        liquidity_deposit=total_liquidity_deposit,
+        liquidity_withdrawal=total_liquidity_used,
+        liquidity_uncovered_deficit=last_snapshot.closing_uncovered_deficit,
+        highest_spending=highest_month["spending"],
+        lowest_spending=lowest_month["spending"],
     )
     account_totals: dict[str, dict[str, object]] = {}
     for snapshot in report_snapshots:
-        for account in snapshot.payload.get("cash_flow_by_account", []):
+        # `account_cash_flow_rows` is the exact function `/dashboard`
+        # publishes verbatim and INV-019 observes -- see the matching
+        # comment above the `categories` loop for why summing its rows
+        # (instead of `snapshot.payload["cash_flow_by_account"]` directly)
+        # closes the INV-020 gap for `/reports`' own `accounts` totals.
+        for account in account_cash_flow_rows(snapshot):
             key = str(account.get("account_id") or "unidentified")
             total = account_totals.setdefault(
                 key,
@@ -3922,25 +4486,7 @@ def reports(
         "covered_months": covered_months,
         "duplicates_ignored": duplicates_ignored,
         "summary": {
-            "total_spending": decimal_value(total_spending),
-            "average_spending": decimal_value(average_spending),
-            "total_cash_in": decimal_value(total_cash_in),
-            "total_cash_out": decimal_value(total_cash_out),
-            "total_bank_cash_out": decimal_value(total_bank_cash_out),
-            "total_card_spending": decimal_value(total_card_spending),
-            "cash_net": decimal_value(total_result),
             "liquidity_name": profile.investment_name,
-            "liquidity_starting_balance": decimal_value(first_snapshot.opening_liquidity_balance),
-            "liquidity_balance": decimal_value(last_snapshot.closing_liquidity_balance),
-            "liquidity_closing_balance": decimal_value(last_snapshot.closing_liquidity_balance),
-            "emergency_floor": decimal_value(profile.emergency_floor),
-            "liquidity_available": decimal_value(last_snapshot.distance_to_floor),
-            "liquidity_deposit": decimal_value(total_liquidity_deposit),
-            "liquidity_withdrawal": decimal_value(total_liquidity_used),
-            "liquidity_uncovered_deficit": decimal_value(
-                last_snapshot.closing_uncovered_deficit
-            ),
-            "liquidity_flow": decimal_value(total_result),
             "liquidity_direction": (
                 "deposit"
                 if total_cash_in > total_cash_out
@@ -3948,11 +4494,9 @@ def reports(
                 if total_cash_out > total_cash_in
                 else "balanced"
             ),
-            "savings_rate": decimal_value(savings_rate),
+            **{key: decimal_value(value) for key, value in summary_publication.items()},
             "highest_month": highest_month["month"],
-            "highest_spending": highest_month["spending"],
             "lowest_month": lowest_month["month"],
-            "lowest_spending": lowest_month["spending"],
             "last_change_percentage": last_change,
         },
         "monthly": serialized_months,

@@ -62,10 +62,15 @@
   exige três confirmações mais aceite administrativo;
 - auditor semântico Codex (`POST /v1/audit` no sidecar `advisor`, allowlist, defesa contra prompt
   injection, saída sem autoridade sobre status/score/gates/findings, fallback seguro e métricas --
-  ver `docs/ARCHITECTURE.md`) entregue como PR 6; pendente revisão do engenheiro responsável antes
-  do merge;
-- próximos incrementos: UI de Integridade e safety gates completos de CI (PostgreSQL/Alembic no
-  pipeline, property tests financeiros e backfill controlado).
+  ver `docs/ARCHITECTURE.md`) entregue como PR 6;
+- tela/menu de Integridade (atrás de `INTEGRITY_UI_ENABLED`), lifecycle humano de findings
+  (`acknowledge`/`resolve`/`ignore`/`false-positive`, com motivo obrigatório e audit trail, sem alterar
+  dados financeiros automaticamente), banner global persistente para BLOCK, reconciliação de
+  documentos visível e Monthly Financial Close (`open`/`review_required`/`trusted`, com `run`/`trust`/
+  `reopen` como ações separadas e gates determinísticos) entregues como PR 7; pendente revisão do
+  engenheiro responsável antes do merge;
+- próximos incrementos: safety gates completos de CI (PostgreSQL/Alembic no pipeline, property tests
+  financeiros e backfill controlado) na PR 8.
 
 ## Fase 3 — Próximas evoluções
 

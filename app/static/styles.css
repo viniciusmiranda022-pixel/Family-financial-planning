@@ -84,6 +84,14 @@ input:focus, select:focus, textarea:focus { border-color: var(--teal); box-shado
 .view.active { display: block; }
 @keyframes reveal { from { opacity: .3; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
+.integrity-banner { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 15px; padding: 12px 16px; border-radius: 12px; background: var(--red); color: #fff; font-weight: 800; font-size: 13px; }
+.integrity-banner .text-button { color: #fff; text-decoration: underline; }
+.inline-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.inline-controls input, .inline-controls select { padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; }
+.finding-detail-row { display: grid; grid-template-columns: 200px 1fr; gap: 6px 14px; padding: 6px 0; border-bottom: 1px solid #edf1f4; font-size: 13px; }
+.finding-detail-row dt { color: var(--muted); font-weight: 700; }
+.finding-detail-row dd { margin: 0; }
+.codex-note { margin-top: 14px; padding: 12px; border-radius: 10px; background: #f3f1ff; border: 1px solid #e3dcfb; font-size: 12px; }
 .period-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 17px; padding: 14px 17px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
 .period-toolbar .step-label { display: block; margin-bottom: 3px; }
 .period-toolbar strong { color: var(--navy); font-size: 16px; }
@@ -169,6 +177,11 @@ tr:last-child td { border-bottom: 0; }
 .status-chip.obligation-scheduled { color: var(--navy-2); background: var(--soft-blue); }
 .status-chip.obligation-soon { color: #8a5a10; background: var(--soft-amber); }
 .status-chip.obligation-urgent, .status-chip.obligation-overdue { color: var(--red); background: #feeceb; }
+.status-chip.severity-block { color: #fff; background: var(--red); }
+.status-chip.severity-critical { color: var(--red); background: #feeceb; }
+.status-chip.severity-review { color: #8a5a10; background: var(--soft-amber); }
+.status-chip.severity-warning { color: var(--navy-2); background: var(--soft-blue); }
+.status-chip.severity-info { color: var(--muted); background: #eef2f4; }
 .danger-button, .text-action { border: 0; border-radius: 8px; padding: 7px 9px; font-size: 10px; font-weight: 800; white-space: nowrap; }
 .danger-button { color: var(--red); background: #feeceb; }
 .text-action { color: var(--navy-2); background: var(--soft-blue); }
@@ -425,6 +438,10 @@ tr:last-child td { border-bottom: 0; }
   .panel-heading { align-items: stretch; flex-direction: column; gap: 11px; margin-bottom: 14px; }
   .panel-heading h2 { font-size: 20px; }
   .panel-heading > button, .panel-heading > .secondary { width: 100%; min-height: 44px; }
+  .inline-controls { flex-direction: column; align-items: stretch; width: 100%; }
+  .inline-controls input, .inline-controls select, .inline-controls button { width: 100%; min-height: 44px; }
+  .integrity-banner { flex-direction: column; align-items: stretch; text-align: center; }
+  .finding-detail-row { grid-template-columns: 1fr; }
   .financial-pulse-grid { grid-template-columns: 1fr; }
   .mini-chart-card { grid-column: 1; }
   .quick-insight-card { min-height: 112px; }

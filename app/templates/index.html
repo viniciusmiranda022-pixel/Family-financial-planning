@@ -8,7 +8,7 @@
   <link rel="icon" href="/static/logo.svg?v={{ asset_version }}" type="image/svg+xml">
   <link rel="stylesheet" href="/static/styles.css?v={{ asset_version }}">
 </head>
-<body data-configured="{{ 'true' if configured else 'false' }}" data-app-version="{{ asset_version }}">
+<body data-configured="{{ 'true' if configured else 'false' }}" data-app-version="{{ asset_version }}" data-integrity-ui-enabled="{{ 'true' if integrity_ui_enabled else 'false' }}">
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <main id="auth-shell" class="auth-shell">
@@ -62,6 +62,7 @@
         <button data-view="income"><span>+</span>Rendas</button>
         <button data-view="planning"><span>↗</span>Planejamento</button>
         <button data-view="advisor"><span>✦</span>Consultor</button>
+        <button data-view="integrity" id="nav-integrity" class="hidden"><span>◈</span>Integridade <b id="nav-integrity-badge" class="badge hidden">!</b></button>
         <button data-view="users" id="nav-users" class="hidden"><span>♙</span>Acessos</button>
         <button data-view="settings"><span>⚙</span>Configurações</button>
       </nav>
@@ -72,6 +73,10 @@
     </aside>
 
     <main class="content">
+      <div id="integrity-banner" class="integrity-banner hidden" role="alert">
+        <span id="integrity-banner-text"></span>
+        <button data-view="integrity" class="text-button">Ver integridade</button>
+      </div>
       <header class="topbar">
         <div><p class="eyebrow">PLANEJAMENTO FINANCEIRO FAMILIAR</p><h1 id="page-title">Visão geral</h1></div>
         <div class="privacy-chip"><span></span> Dados no servidor local</div>
@@ -391,6 +396,74 @@
             </form>
           </article>
         </div>
+      </section>
+
+      <section id="view-integrity" class="view">
+        <article class="panel">
+          <div class="panel-heading">
+            <div><span class="step-label">FINANCIAL INTEGRITY ENGINE</span><h2>Status de integridade</h2><small>Score e gates são calculados apenas pelo motor determinístico. O Codex nunca altera estes números.</small></div>
+            <button id="integrity-run-full" class="primary" type="button">Executar auditoria completa</button>
+          </div>
+          <div class="kpi-grid" id="integrity-summary-cards"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div><span class="step-label">FECHAMENTO MENSAL</span><h2>Monthly Financial Close</h2><small>Executar checks, confiar (trusted) e reabrir são ações separadas e deliberadas.</small></div>
+            <div class="inline-controls">
+              <input type="month" id="close-period">
+              <button id="close-run" class="secondary" type="button">Executar fechamento</button>
+              <button id="close-trust" class="primary" type="button">Marcar trusted</button>
+              <button id="close-reopen" class="danger-button" type="button">Reabrir</button>
+            </div>
+          </div>
+          <div id="close-status"></div>
+        </article>
+
+        <article class="panel hidden" id="findings-active-panel">
+          <div class="panel-heading"><div><span class="step-label">SEMPRE VISÍVEL</span><h2>BLOCK / CRITICAL ativos</h2><small>Independe dos filtros e da paginação abaixo -- nenhum finding material fica escondido.</small></div></div>
+          <div id="findings-active-list" class="review-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">FINDINGS</span><h2>Achados determinísticos</h2></div></div>
+          <div class="inline-controls">
+            <select id="finding-filter-status">
+              <option value="">Status: todos</option>
+              <option value="open">Aberto</option>
+              <option value="acknowledged">Reconhecido</option>
+              <option value="resolved">Resolvido</option>
+              <option value="ignored">Ignorado</option>
+              <option value="false_positive">Falso positivo</option>
+            </select>
+            <select id="finding-filter-severity">
+              <option value="">Severidade: todas</option>
+              <option value="block">Block</option>
+              <option value="critical">Critical</option>
+              <option value="review">Review</option>
+              <option value="warning">Warning</option>
+              <option value="info">Info</option>
+            </select>
+            <input type="month" id="finding-filter-period">
+            <button id="finding-filter-apply" class="secondary" type="button">Filtrar</button>
+          </div>
+          <div id="findings-list" class="review-list"></div>
+          <div class="inline-controls" id="findings-pagination">
+            <button id="findings-page-prev" class="text-action" type="button">« Anterior</button>
+            <small id="findings-page-info"></small>
+            <button id="findings-page-next" class="text-action" type="button">Próxima »</button>
+          </div>
+        </article>
+
+        <article class="panel hidden" id="finding-detail-panel">
+          <div class="panel-heading"><div><span class="step-label">DETALHE</span><h2>Finding selecionado</h2></div><button id="finding-detail-close" class="text-button" type="button">Fechar</button></div>
+          <div id="finding-detail-body"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">DOCUMENTOS</span><h2>Reconciliação</h2><small>Diferença entre o total declarado no documento e o total reconstruído a partir dos lançamentos.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Documento</th><th>Status</th><th>Declarado</th><th>Reconstruído</th><th>Diferença</th></tr></thead><tbody id="reconciliation-table"></tbody></table></div>
+        </article>
       </section>
 
       <section id="view-users" class="view">

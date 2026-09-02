@@ -15,10 +15,11 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.db import Base
 
@@ -379,6 +380,7 @@ class IntegrityFinding(Base, TimestampMixin):
     acknowledged_by: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    acknowledgement_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolved_by: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -685,3 +687,199 @@ class FinancialSnapshotLineage(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class MonthlyFinancialClose(Base, TimestampMixin):
+    """Human-driven monthly close lifecycle over an already-computed snapshot/run.
+
+    This table never recomputes financial facts: it only records which
+    `FinancialSnapshot` and `IntegrityRun` a household reviewed for a period,
+    and the human decision (`trusted`) or reversal (`reopened_*`) built on top
+    of them. See docs/INTEGRITY_IMPLEMENTATION_PLAN.md section 8.8.
+
+    `financial_revision` (PR 7, Round 8) is the household's
+    `HouseholdFinancialRevision.revision` value as of the end of the last
+    successful `POST .../run` for this period -- captured under the same
+    revision barrier `trust_monthly_close` uses
+    (`lock_household_financial_revision`), after `run`'s own
+    `IntegrityRun`/`IntegrityFinding` writes. `trust_monthly_close` requires
+    this to still equal the barrier's current value before accepting
+    `trusted`: comparing `close.snapshot_id` to a freshly rebuilt snapshot
+    alone (the Round 6 fix) only detects a mutation that changed *this
+    period's* recomputed snapshot. A mutation to a source `run` also
+    depends on but that does not change this period's snapshot -- e.g.
+    editing `installment_total` on a transaction booked in an *earlier*
+    period, which changes `_future_installments()`'s next-month projection
+    without touching the closed period's own snapshot -- would otherwise
+    leave both the snapshot identity check and the old run's stored
+    `healthy` status silently satisfied. See the engineering review on PR 7,
+    Round 8: "Persist the revision used by /run on the close/run and
+    require it to equal the locked revision before trusting."　Nullable:
+    a close created before this column existed (every pre-migration
+    `review_required` row -- migration `0008` is additive and does not
+    backfill) or one manufactured directly by a test that bypasses the real
+    `run` endpoint has no recorded value. Since the Round 10 fix,
+    `trust_monthly_close` treats `None` as missing evidence and fails closed
+    -- any *new* promotion from `review_required` requires a real `run` to
+    capture a revision first; it is not treated as "not applicable". A close
+    already sitting at `trusted` (created under the earlier, more permissive
+    behavior) is never retroactively invalidated by this: `trust_monthly_close`
+    only ever evaluates this column while promoting a `review_required`
+    close, never against an already-`trusted` one. See the engineering
+    review on PR 7, Round 10: "Unknown provenance must fail closed... a NULL
+    revision should add a gate reason requiring a fresh /run, not mean 'not
+    applicable'."
+    """
+
+    __tablename__ = "monthly_financial_closes"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id", "period", name="uq_monthly_financial_close_household_period"
+        ),
+        Index("ix_monthly_financial_closes_household_status", "household_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    period: Mapped[str] = mapped_column(String(7), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("financial_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    integrity_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("integrity_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    financial_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reopened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reopened_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class HouseholdFinancialRevision(Base):
+    """Monotonic per-household revision counter, bumped inside the *same*
+    transaction as every mutation to a Financial-Engine input (see the
+    event listener below).
+
+    `run_monthly_close`, `trust_monthly_close` and `reopen_monthly_close`
+    (`app/services/monthly_close.py`, `app/api.py`; helpers in
+    `app/services/financial_revision.py`) all read/lock this row, as their
+    very first action, to close two distinct windows:
+
+    1. The TOCTOU window between recomputing a period's canonical
+       `FinancialSnapshot` and committing `trusted` -- see the engineering
+       review on PR 7, Round 7: "The trust transition must be serialized
+       with every financial source mutation that can affect the snapshot
+       ... or use a monotonic source revision validated inside the same
+       transactional barrier. The production guarantee must be real on
+       PostgreSQL; SQLite may use a deterministic test-equivalent path but
+       must not be presented as equivalent locking semantics."
+    2. The race between the monthly close lifecycle's own transitions --
+       `run`, `trust` and `reopen` concurrently acting on the same
+       (household, period) close -- see the engineering review on PR 7,
+       Round 11: taking this same row as the first action of all three,
+       before any of them reads `close.status`, means whichever gets here
+       first for a household fully completes its own transition (state
+       check through final write and commit) before either of the other
+       two can even read that status. Before this fix, `run_monthly_close`
+       read `close.status` *before* acquiring this lock; a `trust` that
+       committed in that window was invisible to it, and the run's own
+       unconditional final write silently downgraded a just-`trusted`
+       close back to `review_required` with no `reopen` reason, no
+       `reopened_by` and no audit trail for the demotion.
+
+    On PostgreSQL, `SELECT ... FOR UPDATE` against this row
+    (`lock_household_financial_revision`) takes the same row-level write
+    lock the upsert below takes, blocking any concurrent mutation's own
+    bump of the same row -- and any concurrent `run`/`trust`/`reopen` on
+    the same household's monthly closes -- until the lock-holding
+    transaction commits or rolls back. SQLite (tests) has no real
+    cross-connection row lock; there, `trust_monthly_close` still compares
+    the revision value read at the start of the transaction against the
+    value read again right before the `trusted` write, inside the same
+    transaction, and `assert_close_runnable`/`upsert_monthly_close_after_run`
+    re-validate `close.status` immediately before each final write -- a
+    deterministic, testable stand-in for the guarantees the PostgreSQL lock
+    provides unconditionally.
+    """
+
+    __tablename__ = "household_financial_revisions"
+
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), primary_key=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+# Every model whose rows feed either (a) `app/services/financial_snapshots.py`'s
+# `_collect()` (what a period's `FinancialSnapshot` recomputes to) or (b) a
+# deterministic gate `trust_monthly_close` relies on without recomputing --
+# `consolidated_integrity_status()` (reads `IntegrityRun`/`IntegrityFinding`)
+# and `_build_projection_gate_checks()`/INV-018 (reads `Commission`/
+# `PayrollRecord` for the projection's commission/extra-payroll inputs). A
+# mutation to any of these can change what the period's snapshot or its
+# integrity/projection gates would recompute to, so each one must bump
+# `HouseholdFinancialRevision`. Kept next to the model (not buried in
+# `app/services/financial_revision.py`) so adding a new snapshot-input or
+# gate-input model elsewhere in this file is a one-line, code-reviewable
+# decision about whether it belongs here, not a separate cross-module wiring
+# step easy to forget -- see the engineering review on PR 7, Round 7 ("source
+# mutation endpoints do not share the snapshot advisory lock") and Round 8
+# ("Fresh evidence in the Round 8 barrier is that this model list omits
+# IntegrityRun and IntegrityFinding ... and also omits Commission and
+# PayrollRecord").
+FINANCIAL_REVISION_MODELS: tuple[type, ...] = (
+    Transaction,
+    Account,
+    AccountBalanceObservation,
+    Obligation,
+    FinancialProfile,
+    DocumentReconciliation,
+    Category,
+    Document,
+    Commission,
+    PayrollRecord,
+    IntegrityRun,
+    IntegrityFinding,
+)
+
+
+@event.listens_for(Session, "before_flush")
+def _bump_financial_revision_on_source_mutation(session: Session, flush_context, instances) -> None:
+    """Bump `HouseholdFinancialRevision` for every household touched by this
+    flush's new/dirty/deleted `FINANCIAL_REVISION_MODELS` rows, inside the
+    same flush -- see `HouseholdFinancialRevision`'s docstring.
+
+    A `Session`-level hook, not a bump call added by hand to each mutating
+    endpoint: an endpoint written later that touches any
+    `FINANCIAL_REVISION_MODELS` row is covered automatically instead of
+    depending on every future author remembering to call one, which is
+    exactly the kind of gap the engineering review on PR 7, Round 7 found.
+
+    Imports `bump_household_financial_revision` locally to avoid a circular
+    import (`app.services.financial_revision` imports
+    `HouseholdFinancialRevision` from this module); by the time a flush can
+    happen, both modules are already fully loaded.
+    """
+
+    del flush_context, instances
+    from app.services.financial_revision import bump_household_financial_revision
+
+    household_ids: set[str] = set()
+    for obj in (*session.new, *session.dirty, *session.deleted):
+        if isinstance(obj, FINANCIAL_REVISION_MODELS):
+            household_id = getattr(obj, "household_id", None)
+            if household_id:
+                household_ids.add(household_id)
+    for household_id in household_ids:
+        bump_household_financial_revision(session, household_id=household_id)

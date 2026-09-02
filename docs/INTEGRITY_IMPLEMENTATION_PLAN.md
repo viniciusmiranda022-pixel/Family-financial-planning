@@ -698,6 +698,23 @@ O campo `booked_at` permanece inicialmente para compatibilidade, com adaptação
 - adicionar `before_state`, `after_state`, `reason`, `trace_id`, `source` e `request_id`;
 - manter `details` para compatibilidade histórica.
 
+### 8.11 `household_financial_revisions`
+
+```text
+household_id PK
+revision Integer, default 0
+updated_at
+```
+
+Contador monotônico por household, incrementado na mesma transação de qualquer mutação em uma fonte financeira do Financial Engine (`transactions`, `accounts`, `account_balance_observations`, `obligations`, `financial_profiles`, `document_reconciliations`, `categories`, `documents`) via listener de sessão (`before_flush`), não por chamadas manuais espalhadas pelos endpoints.
+
+`POST /api/monthly-closes/{period}/run`, `POST .../trust` e `POST .../reopen` usam esta linha como barreira transacional única e compartilhada, adquirida como a *primeira* ação de cada uma das três — antes de ler `status` do fechamento, não depois — contra dois problemas distintos:
+
+1. TOCTOU entre recalcular o snapshot canônico do período e persistir `trusted` (Round 7): em PostgreSQL, `SELECT ... FOR UPDATE` bloqueia qualquer mutação concorrente de fonte financeira que tente incrementar a mesma linha até o commit/rollback da transação de trust; a revisão capturada no início é comparada novamente imediatamente antes da escrita final de `trusted`, o que barra qualquer mutação que tenha conseguido se intercalar.
+2. Corrida entre as próprias transições do lifecycle — `run`, `trust` e `reopen` concorrentes sobre o mesmo fechamento (Round 11): como as três tomam a mesma linha como primeira ação, qualquer uma que a adquira primeiro para um household conclui inteiramente sua própria seção de leitura de estado até a escrita final e commit antes que outra consiga sequer ler `status`. Antes dessa correção, `run` lia `status` *antes* de adquirir a barreira; um `trust` que commitasse nesse intervalo ficava invisível para o `run`, que prosseguia com suposições obsoletas e, ao final, sobrescrevia incondicionalmente `status = "review_required"` — rebaixando silenciosamente um fechamento recém-`trusted`, sem motivo de `reopen`, sem `reopened_by` e sem trilha de auditoria para a demoção.
+
+Garantia real em PostgreSQL; em SQLite/testes, sem lock real entre conexões, a comparação de revisão isolada (e, para o problema 2, a revalidação de `status` imediatamente antes de cada escrita final) é o mecanismo determinístico equivalente — ver `app/services/financial_revision.py` e `app/services/monthly_close.py` (`assert_close_runnable`, `upsert_monthly_close_after_run`).
+
 ---
 
 ## 9. APIs propostas

@@ -193,6 +193,8 @@ EXPECTED_0004_TABLES = {
     "duplicate_groups",
 }
 EXPECTED_0005_TABLES = {"financial_snapshots", "financial_snapshot_lineage"}
+EXPECTED_0006_TABLES = {"monthly_financial_closes"}
+EXPECTED_0007_TABLES = {"household_financial_revisions"}
 
 EXPECTED_0004_TRANSACTION_COLUMNS = {
     "occurred_at",
@@ -257,10 +259,34 @@ EXPECTED_INTEGRITY_FINDING_COLUMNS = {
     "occurrence_count",
     "acknowledged_at",
     "acknowledged_by",
+    "acknowledgement_reason",
     "resolved_at",
     "resolved_by",
     "resolution_reason",
     "created_at",
+    "updated_at",
+}
+
+EXPECTED_MONTHLY_FINANCIAL_CLOSE_COLUMNS = {
+    "id",
+    "household_id",
+    "period",
+    "status",
+    "snapshot_id",
+    "integrity_run_id",
+    "closed_at",
+    "closed_by",
+    "reopened_at",
+    "reopened_by",
+    "reason",
+    "created_at",
+    "updated_at",
+    "financial_revision",
+}
+
+EXPECTED_HOUSEHOLD_FINANCIAL_REVISION_COLUMNS = {
+    "household_id",
+    "revision",
     "updated_at",
 }
 
@@ -308,6 +334,8 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         *EXPECTED_0003_TABLES,
             *EXPECTED_0004_TABLES,
             *EXPECTED_0005_TABLES,
+            *EXPECTED_0006_TABLES,
+            *EXPECTED_0007_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -376,6 +404,22 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_financial_snapshot_lineage_snapshot_id",
         "ix_financial_snapshot_lineage_trace_id",
     }
+    assert {
+        column["name"] for column in inspector.get_columns("monthly_financial_closes")
+    } == EXPECTED_MONTHLY_FINANCIAL_CLOSE_COLUMNS
+    assert {
+        index["name"] for index in inspector.get_indexes("monthly_financial_closes")
+    } == {
+        "ix_monthly_financial_closes_household_id",
+        "ix_monthly_financial_closes_period",
+        "ix_monthly_financial_closes_status",
+        "ix_monthly_financial_closes_snapshot_id",
+        "ix_monthly_financial_closes_integrity_run_id",
+        "ix_monthly_financial_closes_household_status",
+    }
+    assert {
+        column["name"] for column in inspector.get_columns("household_financial_revisions")
+    } == EXPECTED_HOUSEHOLD_FINANCIAL_REVISION_COLUMNS
     engine.dispose()
 
     command.downgrade(config, "0001")
@@ -410,6 +454,9 @@ def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     assert "CREATE TABLE classification_rules" in sql
     assert "CREATE TABLE financial_snapshots" in sql
     assert "CREATE TABLE financial_snapshot_lineage" in sql
+    assert "CREATE TABLE monthly_financial_closes" in sql
+    assert "CREATE TABLE household_financial_revisions" in sql
+    assert "ALTER TABLE integrity_findings ADD COLUMN acknowledgement_reason TEXT" in sql
     assert "ALTER TABLE audit_events ADD COLUMN before_state JSONB" in sql
     assert "CREATE TABLE transactions" in sql
     assert "INSERT INTO alembic_version" in sql
@@ -459,7 +506,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0005"
+        ).scalar_one() == "0008"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -485,6 +532,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0005"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0008"
     engine.dispose()
     get_settings.cache_clear()

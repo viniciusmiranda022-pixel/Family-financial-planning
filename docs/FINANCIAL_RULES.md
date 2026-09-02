@@ -82,23 +82,66 @@
 - Findings não aprovados são persistidos por fingerprint. Reincidência atualiza `last_seen_at` e o
   contador sem criar cópia nem apagar o primeiro registro.
 - Ciclo de vida de `integrity_findings.status`: `open` (evidência não aprovada, ativo) e
-  `acknowledged` (ciência humana registrada, ainda ativo) contam para `consolidated_integrity_status`
-  e para os gates; `superseded` é um estado determinístico e automático — a reavaliação mais recente
-  do mesmo fingerprint retornou `PASS` — que remove o finding dos gates ativos sem preencher
-  `resolved_at`/`resolved_by`/`resolution_reason`, que ficam reservados para a ação humana explícita
-  de `POST /findings/{id}/resolve` (ainda não implementada nesta fatia); `ignored` e `false_positive`
-  seguem a mesma reserva para ações humanas futuras. Um finding `superseded` cuja condição volte a
-  falhar é reaberto automaticamente para `open` (nunca direto para um estado terminal reservado a
-  ação humana), preservando `first_seen_at` e incrementando `occurrence_count`; a transição fica
-  registrada em `metadata_json`. Isso evita tanto o finding eternamente `open` após uma resolução
-  legítima (evidência obsoleta) quanto o finding preso em `superseded` durante uma reincidência real
-  (falsa confiança) — ambos contradizem a regra de que ausência de evidência não vira `pass`.
-- Findings não resolvem nem corrigem dados automaticamente. A correção continua no fluxo próprio e
-  deve ser ligada à trilha de auditoria.
+  `acknowledged` (ciência humana registrada via `POST /findings/{id}/acknowledge`, ainda ativo) contam
+  para `consolidated_integrity_status` e para os gates; `superseded` é um estado determinístico e
+  automático — a reavaliação mais recente do mesmo fingerprint retornou `PASS` — que remove o finding
+  dos gates ativos sem preencher `resolved_at`/`resolved_by`/`resolution_reason`, que ficam reservados
+  para a ação humana explícita de `POST /findings/{id}/resolve`; `ignored`
+  (`POST /findings/{id}/ignore`) e `false_positive` (`POST /findings/{id}/false-positive`) seguem a
+  mesma reserva de `resolved_at`/`resolved_by`/`resolution_reason` para suas próprias ações humanas —
+  o campo distingue qual decisão foi tomada, não uma coluna por ação. `acknowledge` tem seu próprio
+  campo de motivo, `acknowledgement_reason`, já que ela não é terminal. As quatro ações exigem motivo
+  obrigatório (mínimo 3 caracteres) e só partem de `open`/`acknowledged` (nunca de `superseded` ou de
+  um estado terminal já decidido); reconhecer de novo um finding já `acknowledged` também é rejeitado
+  — é uma decisão única, não uma nota atualizável. Um finding `superseded`, `resolved`, `ignored` ou
+  `false_positive` cuja condição volte a falhar é reaberto automaticamente para `open` (nunca direto
+  para outro estado terminal), preservando `first_seen_at` e incrementando `occurrence_count`; a
+  transição fica registrada em `metadata_json`. Isso evita tanto o finding eternamente `open` após uma
+  resolução legítima (evidência obsoleta) quanto o finding preso em estado terminal durante uma
+  reincidência real (falsa confiança) — ambos contradizem a regra de que ausência de evidência não
+  vira `pass`.
+- Findings não resolvem nem corrigem dados automaticamente: as quatro ações de lifecycle alteram
+  somente as colunas de status/motivo/responsável do próprio finding, nunca `Transaction`, `Document`,
+  snapshot ou qualquer outro fato financeiro. A correção continua no fluxo próprio (por exemplo,
+  `PATCH /transactions/{id}`) e deve ser ligada à trilha de auditoria.
 - `trusted_for_projection` e `trusted_for_reports` são gates específicos e começam fechados quando
   não existe evidência aplicável; eles não são inferidos apenas do score geral.
 - O Codex não participa do cálculo do score, status, finding determinístico ou gate de confiança.
-- A interface permanece oculta por padrão em `INTEGRITY_UI_ENABLED=false` até a etapa dedicada de UX.
+- A interface de Integridade (menu, tela, findings, lifecycle, banner BLOCK e Monthly Financial Close)
+  existe a partir do PR 7, mas permanece oculta por padrão: só é exibida quando o administrador define
+  `INTEGRITY_UI_ENABLED=true`.
+
+### Monthly Financial Close
+
+- `monthly_financial_closes` guarda o estado de fechamento por `household_id`/`period`:
+  `open` (nenhuma execução vinculada ainda), `review_required` (há um `snapshot_id`/`integrity_run_id`
+  vinculados, mas ainda não confiado ou reaberto) e `trusted` (confiado explicitamente).
+- `POST /monthly-closes/{period}/run`, `POST .../trust` e `POST .../reopen` são ações deliberadas e
+  separadas: executar checks nunca promove automaticamente para `trusted`, mesmo quando o resultado é
+  limpo — a confirmação humana é sempre um passo explícito à parte.
+- `run` executa uma nova `IntegrityRun` de escopo `period` (gatilho `close`) e reconstrói o
+  `FinancialSnapshot` canônico do período, depois vincula `snapshot_id`/`integrity_run_id` e deixa o
+  fechamento em `review_required`. Se a execução de integridade falhar, o próprio run fica `failed` e é
+  persistido para auditoria (mesmo comportamento de `POST /integrity/runs`); se algo falhar depois disso
+  a operação inteira é desfeita — não existe estado em que o fechamento aponte para um snapshot/run que
+  não corresponde à execução mais recente.
+- `trust` só é aceito quando: (1) o `FinancialSnapshot` vinculado ainda é o `current` do período (dados
+  não mudaram desde o último `run`); (2) `consolidated_integrity_status` do período está em `healthy`
+  ou `attention` (nunca `unknown`, `review_required`, `critical` ou `blocked`); e (3) o snapshot atual
+  tem `trusted_for_reports` e `trusted_for_projection` verdadeiros. Qualquer pendência bloqueia com um
+  motivo explícito por item, sem mudar o estado do fechamento.
+- `reopen` só é aceito a partir de `trusted`, exige motivo e preserva todo o histórico: `closed_at`,
+  `closed_by`, o `snapshot_id` e o `integrity_run_id` anteriores nunca são apagados; apenas
+  `reopened_at`/`reopened_by`/`reason` são preenchidos e o estado volta para `review_required`.
+- Nenhuma dessas ações apaga ou reescreve `Transaction`, `Document`, `FinancialSnapshot`,
+  `IntegrityFinding` ou `DocumentReconciliation` anteriores.
+- `run`, `trust` e `reopen` tomam, cada um como sua primeira ação, a mesma barreira
+  (`household_financial_revisions`, seção 8.11 do plano de integridade) antes de ler o `status` atual do
+  fechamento. Isso serializa as três ações concorrentes entre si por household: quem adquire a barreira
+  primeiro conclui sua própria transição (leitura de estado até a escrita final e commit) antes que
+  qualquer uma das outras duas consiga sequer ler `status`. Sem essa ordem, um `run` que terminasse depois
+  de um `trust` concorrente já commitado sobrescreveria `trusted` de volta para `review_required` sem
+  passar por `reopen` — sem motivo, sem `reopened_by` e sem trilha de auditoria da demoção.
 
 ## Reconciliação, duplicidades e anomalias
 

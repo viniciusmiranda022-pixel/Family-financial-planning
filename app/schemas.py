@@ -221,3 +221,17 @@ class DuplicateResolutionRequest(BaseModel):
         if self.resolution == "duplicate" and not self.canonical_transaction_id:
             raise ValueError("Resolução como duplicidade exige a fonte canônica")
         return self
+
+
+class FindingLifecycleRequest(BaseModel):
+    """Body shared by acknowledge/resolve/ignore/false-positive finding actions.
+
+    `reason` is mandatory for every one of these human lifecycle actions (PR 7
+    Work Order item 4: "com motivo obrigatório e audit trail").
+    """
+
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class MonthlyCloseReopenRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)

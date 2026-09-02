@@ -39,7 +39,11 @@ def index(request: Request) -> HTMLResponse:
     response = templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={"configured": configured, "asset_version": APP_VERSION},
+        context={
+            "configured": configured,
+            "asset_version": APP_VERSION,
+            "integrity_ui_enabled": settings.integrity_ui_enabled,
+        },
     )
     response.headers["Cache-Control"] = "no-store"
     return response
