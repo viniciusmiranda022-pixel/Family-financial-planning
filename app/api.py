@@ -3100,6 +3100,7 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
     )
     rows = build_forecast(projection_input)
     validation = validate_projection(projection_input, rows)
+    projection_identity = f"projection:{user.household_id}:{month_key(current_start)}"
     integrity_run, validation_results = execute_integrity_run(
         db,
         household_id=user.household_id,
@@ -3116,15 +3117,15 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
                     },
                     scope=InvariantScope.PROJECTION,
                     entity_type="projection",
-                    entity_id=current_snapshot.id,
+                    entity_id=projection_identity,
                     period=month_key(current_start),
                 ),
             ),
         ),
         created_by=user.id,
         period=month_key(current_start),
-        scope_entity_type="financial_snapshot",
-        scope_entity_id=current_snapshot.id,
+        scope_entity_type="projection",
+        scope_entity_id=projection_identity,
         calculation_version=PROJECTION_CALCULATION_VERSION,
     )
     db.commit()
@@ -3146,9 +3147,14 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
             "emergency_floor": decimal_value(profile.emergency_floor),
             "viable": min(delayed_balances) >= decimal_value(profile.emergency_floor),
             "trusted_for_projection": bool(
-                current_snapshot.trusted_for_projection
+                current_snapshot.payload.get("balance_evidence_trusted", False)
                 and validation.valid
             ),
+            "source_snapshot_trusted_for_projection": current_snapshot.trusted_for_projection,
+            "source_balance_evidence_trusted": bool(
+                current_snapshot.payload.get("balance_evidence_trusted", False)
+            ),
+            "source_snapshot_integrity_status": current_snapshot.integrity_status,
             "integrity_status": validation_results[0].status.value,
             "integrity_run_id": integrity_run.id,
             "source_snapshot_id": current_snapshot.id,
