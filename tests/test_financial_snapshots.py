@@ -179,6 +179,15 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
         assert duplicate_lineage is not None
         assert duplicate_lineage.source_role == "excluded"
         assert duplicate_lineage.contribution is None
+        payment_lineage = db.scalar(
+            select(FinancialSnapshotLineage).where(
+                FinancialSnapshotLineage.snapshot_id == august.id,
+                FinancialSnapshotLineage.metric_key == "card_payments",
+            )
+        )
+        assert payment_lineage is not None
+        assert payment_lineage.source_role == "canonical"
+        assert payment_lineage.contribution == Decimal("100.00")
 
         same = build_snapshot(db, household_id=household.id, period="2026-08")
         assert same.id == august.id

@@ -294,14 +294,17 @@ def _collect(
             pending_duplicates += 1
             role = "excluded"
         elif category_name == "Transferência patrimonial":
+            role = "canonical"
             metric = "investments" if amount < 0 else "redemptions"
             totals[metric] += abs(amount)
             contribution = abs(amount)
         elif category_name == "Transferência interna":
+            role = "canonical"
             metric = "internal_transfers"
             totals[metric] += abs(amount)
             contribution = abs(amount)
         elif category_name == "Conciliação" or transaction.transaction_type == "reconciliation":
+            role = "canonical"
             metric = "card_payments"
             totals[metric] += abs(amount)
             contribution = abs(amount)
@@ -492,6 +495,7 @@ def build_snapshot(
         period=period,
         generated_by=generated_by,
     )
+    _lock_snapshot_key(db, household_id=household_id, period=period)
     payload, sources, metadata = _collect(db, household_id, period)
     current = db.scalar(
         select(FinancialSnapshot)
@@ -574,6 +578,20 @@ def build_snapshot(
         current.superseded_by_id = snapshot.id
     db.flush()
     return snapshot
+
+
+def _lock_snapshot_key(db: Session, *, household_id: str, period: str) -> None:
+    """Serialize same-period builds on PostgreSQL without touching source rows."""
+
+    bind = db.get_bind()
+    if bind.dialect.name == "postgresql":
+        db.execute(
+            select(
+                func.pg_advisory_xact_lock(
+                    func.hashtext(f"financial-snapshot:{household_id}:{period}:actual")
+                )
+            )
+        )
 
 
 def _ensure_immediate_predecessor(
