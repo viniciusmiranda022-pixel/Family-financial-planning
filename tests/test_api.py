@@ -198,7 +198,9 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                         "available": True,
                         "reason": None,
                         "schema_version": "1.0.0",
-                        "summary": "O finding de duplicidade já cobre a única inconsistência aberta.",
+                        "summary": (
+                            "Status critical: o finding de duplicidade já cobre a inconsistência aberta."
+                        ),
                         "confidence": 0.55,
                         "observations": [
                             {
@@ -256,6 +258,8 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         override_payload = semantic_audit_attempted_override.json()
         assert override_payload["integrity_status"]["status"] == "critical"
         assert override_payload["integrity_status"]["trusted_for_projection"] is False
+        assert override_payload["semantic_audit"]["available"] is False
+        assert override_payload["semantic_audit"]["reason"] == "verdict_contradiction"
         assert "status" not in override_payload["semantic_audit"]
         assert "score" not in override_payload["semantic_audit"]
         assert "trusted_for_projection" not in override_payload["semantic_audit"]

@@ -25,7 +25,7 @@ export function fakeProvider(scenario, options = {}) {
       case "success":
         return {
           schema_version: "1.0.0",
-          summary: "Nenhuma inconsistência adicional identificada além dos findings existentes.",
+          summary: "Status attention: nenhuma inconsistência adicional além dos findings existentes.",
           observations: [
             {
               category: "liquidity",
@@ -104,7 +104,7 @@ export function fakeProvider(scenario, options = {}) {
       case "invented_number":
         return {
           schema_version: "1.0.0",
-          summary: "O saldo real é R$ 999999,99, bem diferente do reportado.",
+          summary: "Status attention: o saldo real é R$ 999999,99, bem diferente do reportado.",
           observations: [
             {
               category: "liquidity",

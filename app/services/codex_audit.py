@@ -21,6 +21,8 @@ Financial Engine or Financial Integrity Engine produced.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -145,7 +147,36 @@ def _coerce_observation(raw: Any) -> AuditObservation | None:
     )
 
 
-def _coerce_outcome(raw: Any, *, model: str | None) -> AuditOutcome:
+def _normalize_text(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFD", value).lower()
+        if unicodedata.category(character) != "Mn"
+    )
+
+
+def _contradicts_verdict(summary: str, deterministic_status: str) -> bool:
+    text = _normalize_text(summary)
+    status = _normalize_text(deterministic_status)
+    if status not in text:
+        return True
+    if status == "healthy":
+        return False
+    return any(
+        re.search(pattern, text)
+        for pattern in (
+            r"\btudo (esta )?aprovado\b",
+            r"\bsem (problemas?|pendencias?|riscos?|inconsistencias?)\b",
+            r"\bintegridade (aprovada|saudavel)\b",
+            r"\bdados? confiaveis?\b",
+            r"\beverything (is )?approved\b",
+            r"\ball clear\b",
+            r"\bno (issues?|risks?|problems?)\b",
+        )
+    )
+
+
+def _coerce_outcome(raw: Any, *, model: str | None, deterministic_status: str) -> AuditOutcome:
     """Turn a raw sidecar response into an `AuditOutcome`.
 
     This is intentionally the only function in the codebase allowed to read
@@ -166,6 +197,8 @@ def _coerce_outcome(raw: Any, *, model: str | None) -> AuditOutcome:
     summary = raw.get("summary")
     if not isinstance(summary, str) or not summary.strip():
         return _unavailable("invalid_schema")
+    if _contradicts_verdict(summary, deterministic_status):
+        return _unavailable("verdict_contradiction")
 
     confidence_raw = raw.get("confidence")
     if isinstance(confidence_raw, bool) or not isinstance(confidence_raw, (int, float)):
@@ -230,9 +263,16 @@ def run_semantic_audit(
     except AuditSanitizationError:
         return _unavailable("invalid_input")
 
-    result = audit_client.audit(payload)
+    try:
+        result = audit_client.audit(payload)
+    except Exception:
+        return _unavailable("provider_unreachable")
     if result.payload is None:
         return _unavailable("provider_unreachable")
 
     model = result.payload.get("model") if isinstance(result.payload, Mapping) else None
-    return _coerce_outcome(result.payload, model=model)
+    return _coerce_outcome(
+        result.payload,
+        model=model,
+        deterministic_status=str(integrity_status.get("status") or "unknown"),
+    )

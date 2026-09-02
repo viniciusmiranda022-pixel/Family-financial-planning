@@ -155,6 +155,21 @@ test("attempt to change the deterministic verdict is ignored: extra fields make 
   assert.ok(!("trusted_for_projection" in result));
 });
 
+test("schema-valid approval prose that contradicts the deterministic verdict is rejected", async () => {
+  const result = await runAudit({
+    payload: basePayload,
+    provider: async () => ({
+      schema_version: "1.0.0",
+      summary: "Status attention, mas tudo aprovado e sem riscos.",
+      observations: [],
+      confidence: 1,
+    }),
+    timeoutMs: 1000,
+  });
+  assert.equal(result.available, false);
+  assert.equal(result.reason, "verdict_contradiction");
+});
+
 test("attempt to self-assign a forbidden severity (block) is rejected", async () => {
   const result = await runAudit({
     payload: basePayload,
@@ -175,19 +190,39 @@ test("evidence_ref pointing at an id outside the input package is rejected", asy
   assert.equal(result.reason, "unknown_evidence_ref");
 });
 
-test("an invented financial number is stripped from the surviving observations", async () => {
+test("an invented financial number in the summary rejects the audit", async () => {
   const result = await runAudit({
     payload: basePayload,
     provider: fakeProvider("invented_number"),
     timeoutMs: 1000,
   });
-  // The schema-level response was valid, so the audit is "available", but
-  // the one observation that cited a number absent from the input package
-  // must not survive into the result.
-  assert.equal(result.available, true);
+  assert.equal(result.available, false);
+  assert.equal(result.reason, "invented_number");
   assert.equal(result.observations.length, 0);
   const metrics = getAuditMetrics();
   assert.equal(metrics.number_claims_stripped_total, 1);
+});
+
+test("an invented number only in one observation drops that observation", async () => {
+  const result = await runAudit({
+    payload: basePayload,
+    provider: fakeProvider("success", {
+      responseOverrides: {
+        summary: "Status attention: revisão sem alegações numéricas adicionais.",
+        observations: [
+          {
+            category: "liquidity",
+            type: "hypothesis",
+            severity: "review",
+            message: "Saldo estimado em 999999.",
+          },
+        ],
+      },
+    }),
+    timeoutMs: 1000,
+  });
+  assert.equal(result.available, true);
+  assert.equal(result.observations.length, 0);
 });
 
 test("a request payload outside the allowlisted input schema is rejected before any provider call", async () => {

@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -1225,7 +1225,14 @@ def integrity_semantic_audit(
     findings = db.scalars(
         select(IntegrityFinding)
         .where(*finding_filters)
-        .order_by(IntegrityFinding.severity.desc(), IntegrityFinding.last_seen_at.desc())
+        .order_by(
+            case(
+                {"block": 5, "critical": 4, "review": 3, "warning": 2, "info": 1},
+                value=IntegrityFinding.severity,
+                else_=0,
+            ).desc(),
+            IntegrityFinding.last_seen_at.desc(),
+        )
         .limit(30)
     ).all()
 

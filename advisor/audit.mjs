@@ -93,6 +93,38 @@ function extractDigitSequences(text) {
   return Array.from(String(text || "").matchAll(/\d{3,}/g), (match) => match[0]);
 }
 
+function normalizeAuditText(text) {
+  return String(text || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function contradictsDeterministicVerdict(output, input) {
+  const status = String(input?.integrity_snapshot?.status || "unknown").toLowerCase();
+  const summary = normalizeAuditText(output.summary);
+  const text = normalizeAuditText(
+    [
+      output.summary,
+      ...(output.observations || []).flatMap((item) => [item.message, item.recommendation]),
+    ].join(" ")
+  );
+  // The summary is the prominent, standalone statement callers display.
+  // Require it—not a buried observation—to carry the exact deterministic
+  // status token, so advisory prose cannot silently replace the verdict.
+  if (!summary.includes(normalizeAuditText(status))) return true;
+  if (status === "healthy") return false;
+  return [
+    /\btudo (esta )?aprovado\b/,
+    /\bsem (problemas?|pendencias?|riscos?|inconsistencias?)\b/,
+    /\bintegridade (aprovada|saudavel)\b/,
+    /\bdados? confiaveis?\b/,
+    /\beverything (is )?approved\b/,
+    /\ball clear\b/,
+    /\bno (issues?|risks?|problems?)\b/,
+  ].some((pattern) => pattern.test(text));
+}
+
 /**
  * Drop any observation whose message/recommendation cites a number not
  * present anywhere in the sanitized input. Returns a new output object;
@@ -114,6 +146,11 @@ function stripInventedNumberClaims(output, input) {
     return !invented;
   });
   return { output: { ...output, observations }, strippedCount };
+}
+
+function summaryHasInventedNumber(output, input) {
+  const knownDigits = collectKnownDigitSequences(input);
+  return extractDigitSequences(output.summary).some((digits) => !knownDigits.has(digits));
 }
 
 // ---------------------------------------------------------------------
@@ -192,6 +229,8 @@ export function buildAuditPrompt(payload) {
     "Cite apenas ids presentes no próprio pacote em evidence_ref; nunca invente um id.",
     "Cite apenas números literalmente presentes no pacote; nunca invente ou estime um valor monetário.",
     "severity é somente 'info' ou 'review'; você nunca usa 'critical' ou 'block'.",
+    "O summary deve citar literalmente o token de status recebido em integrity_snapshot.status e não pode",
+    "afirmar aprovação, ausência de riscos ou confiabilidade quando esse status não for 'healthy'.",
     "Responda em português do Brasil, de forma objetiva e curta.",
     `DADOS_JSON=${JSON.stringify(payload)}`,
   ].join("\n");
@@ -295,6 +334,34 @@ export async function runAudit({ payload, provider, timeoutMs }) {
     return {
       available: false,
       reason: "unknown_evidence_ref",
+      schema_version: AUDIT_SCHEMA_VERSION,
+      summary: null,
+      observations: [],
+      confidence: null,
+    };
+  }
+
+  if (contradictsDeterministicVerdict(raw, payload)) {
+    metrics.invalid_schema_total += 1;
+    metrics.failure_total += 1;
+    logAuditEvent("codex_audit.verdict_contradiction", { duration_ms: durationMs });
+    return {
+      available: false,
+      reason: "verdict_contradiction",
+      schema_version: AUDIT_SCHEMA_VERSION,
+      summary: null,
+      observations: [],
+      confidence: null,
+    };
+  }
+
+  if (summaryHasInventedNumber(raw, payload)) {
+    metrics.number_claims_stripped_total += 1;
+    metrics.failure_total += 1;
+    logAuditEvent("codex_audit.invented_summary_number", { duration_ms: durationMs });
+    return {
+      available: false,
+      reason: "invented_number",
       schema_version: AUDIT_SCHEMA_VERSION,
       summary: null,
       observations: [],

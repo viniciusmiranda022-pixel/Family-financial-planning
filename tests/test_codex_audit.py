@@ -37,6 +37,7 @@ def test_codex_audit_modules_have_no_database_or_http_server_access() -> None:
             assert "app.db" not in line
             assert "app.models" not in line
 
+
 BASE_INTEGRITY_STATUS = {
     "status": "attention",
     "score": 88.5,
@@ -65,6 +66,15 @@ class FakeCodexClient:
         return CodexResult(self.response)
 
 
+class RaisingCodexClient:
+    """Client double for unexpected transport/configuration exceptions."""
+
+    configured = True
+
+    def audit(self, payload: dict) -> CodexResult:
+        raise ValueError("invalid advisor URL")
+
+
 def test_codex_disabled_returns_unavailable_without_calling_the_client() -> None:
     client = FakeCodexClient(response={"available": True}, configured_value=False)
     outcome = run_semantic_audit(
@@ -81,7 +91,7 @@ def test_success_response_is_parsed_into_observations() -> None:
             "available": True,
             "reason": None,
             "schema_version": "1.0.0",
-            "summary": "Nenhuma inconsistência adicional identificada.",
+            "summary": "Status attention: nenhuma inconsistência adicional identificada.",
             "confidence": 0.6,
             "observations": [
                 {
@@ -126,8 +136,20 @@ def test_transport_error_is_unavailable_never_raises() -> None:
     assert outcome.reason == "provider_unreachable"
 
 
+def test_unexpected_client_exception_is_unavailable_never_raises() -> None:
+    outcome = run_semantic_audit(
+        audit_type="period_review",
+        integrity_status=BASE_INTEGRITY_STATUS,
+        client=RaisingCodexClient(),
+    )
+    assert outcome.available is False
+    assert outcome.reason == "provider_unreachable"
+
+
 def test_malformed_response_shape_is_unavailable() -> None:
-    client = FakeCodexClient(response={"available": True, "summary": None, "observations": [], "confidence": 0.5})
+    client = FakeCodexClient(
+        response={"available": True, "summary": None, "observations": [], "confidence": 0.5}
+    )
     outcome = run_semantic_audit(
         audit_type="period_review", integrity_status=BASE_INTEGRITY_STATUS, client=client
     )
@@ -156,7 +178,8 @@ def test_attempt_to_smuggle_a_verdict_field_is_never_read() -> None:
     outcome = run_semantic_audit(
         audit_type="period_review", integrity_status=BASE_INTEGRITY_STATUS, client=client
     )
-    assert outcome.available is True
+    assert outcome.available is False
+    assert outcome.reason == "verdict_contradiction"
     assert not hasattr(outcome, "status")
     assert not hasattr(outcome, "score")
     assert not hasattr(outcome, "trusted_for_projection")
@@ -178,7 +201,7 @@ def test_observation_with_disallowed_severity_is_dropped_not_upgraded() -> None:
     client = FakeCodexClient(
         response={
             "available": True,
-            "summary": "Resumo.",
+            "summary": "Status attention: resumo.",
             "confidence": 0.5,
             "observations": [
                 {
@@ -206,7 +229,12 @@ def test_observation_with_disallowed_severity_is_dropped_not_upgraded() -> None:
 
 def test_the_payload_sent_to_the_client_never_contains_the_household_id_or_secrets() -> None:
     client = FakeCodexClient(
-        response={"available": True, "summary": "ok", "confidence": 0.4, "observations": []}
+        response={
+            "available": True,
+            "summary": "Status attention: ok",
+            "confidence": 0.4,
+            "observations": [],
+        }
     )
     run_semantic_audit(
         audit_type="period_review",
