@@ -46,6 +46,7 @@ const pageNames = {
   income: "Rendas",
   planning: "Planejamento",
   advisor: "Consultor financeiro",
+  integrity: "Integridade",
   users: "Acessos",
   settings: "Configurações",
 };
@@ -84,7 +85,11 @@ async function api(path, options = {}) {
       ? payload.detail
       : Array.isArray(payload.detail)
         ? payload.detail.map((item) => item.msg).filter(Boolean).join("; ")
-        : "Não foi possível concluir a operação";
+        : payload.detail && Array.isArray(payload.detail.reasons)
+          // Structured gate-failure detail, e.g. POST .../monthly-closes/{period}/trust:
+          // {"message": "...", "reasons": ["...", "..."]}.
+          ? [payload.detail.message, ...payload.detail.reasons].filter(Boolean).join("; ")
+          : "Não foi possível concluir a operação";
     throw new Error(detail);
   }
   return payload;
@@ -131,13 +136,19 @@ function showAuth(configured) {
   document.querySelector("#setup-form").classList.toggle("hidden", configured);
 }
 
+function integrityUiEnabled() {
+  return document.body.dataset.integrityUiEnabled === "true";
+}
+
 async function showApp() {
   document.querySelector("#auth-shell").classList.add("hidden");
   document.querySelector("#app-shell").classList.remove("hidden");
   document.querySelector("#current-user").textContent = state.user.name;
   document.querySelector("#nav-users").classList.toggle("hidden", !state.user.is_admin);
+  document.querySelector("#nav-integrity").classList.toggle("hidden", !integrityUiEnabled());
   await Promise.all([loadAccounts(), loadCategories()]);
   await navigate("dashboard");
+  if (integrityUiEnabled()) await refreshIntegrityBanner();
 }
 
 async function bootstrap() {
@@ -167,10 +178,14 @@ async function navigate(view) {
     income: loadIncome,
     planning: loadForecast,
     advisor: loadAdvisor,
+    integrity: loadIntegrity,
     users: loadUsers,
     settings: loadProfile,
   };
   try { await loaders[view]?.(); } catch (error) { toast(error.message, true); }
+  if (integrityUiEnabled() && view !== "integrity") {
+    try { await refreshIntegrityBanner(); } catch (_) { /* banner is best-effort */ }
+  }
 }
 
 async function loadAccounts() {
@@ -1137,6 +1152,207 @@ async function loadUsers() {
   }));
 }
 
+function currentMonthKey() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function amountOrDash(value) {
+  return value === null || value === undefined ? "—" : money.format(Number(value));
+}
+
+function severityLabel(severity) {
+  return { block: "Block", critical: "Critical", review: "Review", warning: "Warning", info: "Info" }[severity] || severity;
+}
+
+function findingStatusLabel(statusValue) {
+  return {
+    open: "Aberto",
+    acknowledged: "Reconhecido",
+    resolved: "Resolvido",
+    ignored: "Ignorado",
+    false_positive: "Falso positivo",
+    superseded: "Superado",
+  }[statusValue] || statusValue;
+}
+
+// The Integrity screen and the global BLOCK banner only ever render fields
+// already produced by the Financial Integrity Engine (status/score/trust
+// gates/findings) -- see docs/FINANCIAL_RULES.md and
+// docs/ARCHITECTURE.md principle 2. Nothing here recomputes a financial
+// figure; the UI is a read/act surface over `/api/integrity/*` and
+// `/api/monthly-closes/*`.
+async function refreshIntegrityBanner() {
+  const banner = document.querySelector("#integrity-banner");
+  try {
+    const status = await api("/integrity/status");
+    if (status.status === "blocked") {
+      document.querySelector("#integrity-banner-text").textContent =
+        `Integridade financeira: BLOCK ativo (${status.open_findings || 0} finding(s) aberto(s)). Os números ainda podem ser corrigidos; nada foi escondido.`;
+      banner.classList.remove("hidden");
+      document.querySelector("#nav-integrity-badge").classList.remove("hidden");
+    } else {
+      banner.classList.add("hidden");
+      document.querySelector("#nav-integrity-badge").classList.add("hidden");
+    }
+  } catch (_) {
+    // Best-effort: never let the banner check break navigation.
+  }
+}
+
+function renderIntegritySummaryCards(status) {
+  const scoreText = status.score === null || status.score === undefined ? "—" : `${Number(status.score).toFixed(1)}%`;
+  const lastRun = status.last_run && status.last_run.completed_at
+    ? dateFormat.format(new Date(status.last_run.completed_at))
+    : "Nunca executado";
+  document.querySelector("#integrity-summary-cards").innerHTML = `
+    <div class="kpi ${status.status === "blocked" || status.status === "critical" ? "over-budget" : ""}">
+      <span>Status consolidado</span>
+      <strong><span class="status-chip severity-${status.status === "blocked" ? "block" : status.status === "critical" ? "critical" : status.status === "review_required" ? "review" : status.status === "attention" ? "warning" : status.status === "unknown" ? "info" : ""}">${escapeHtml(status.status)}</span></strong>
+      <small>Score: ${scoreText} • Última execução: ${escapeHtml(lastRun)}</small>
+    </div>
+    <div class="kpi">
+      <span>Confiança de projeção</span>
+      <strong>${status.trusted_for_projection ? "Confiável" : "Não confiável"}</strong>
+      <small>Gate determinístico de INV-005/006/018/022</small>
+    </div>
+    <div class="kpi">
+      <span>Confiança de relatórios</span>
+      <strong>${status.trusted_for_reports ? "Confiável" : "Não confiável"}</strong>
+      <small>Gate determinístico de INV-019/020/022</small>
+    </div>
+    <div class="kpi">
+      <span>Findings abertos</span>
+      <strong>${status.open_findings || 0}</strong>
+      <small>${Object.entries(status.open_findings_by_severity || {}).map(([key, value]) => `${severityLabel(key)}: ${value}`).join(" • ") || "Nenhum"}</small>
+    </div>
+  `;
+}
+
+async function loadIntegrity() {
+  if (!document.querySelector("#close-period").value) {
+    document.querySelector("#close-period").value = currentMonthKey();
+  }
+  const status = await api("/integrity/status");
+  renderIntegritySummaryCards(status);
+  await refreshIntegrityBanner();
+  await Promise.all([loadMonthlyClose(), loadFindings(), loadReconciliations()]);
+}
+
+function renderMonthlyClose(close) {
+  const statusLabel = { open: "Aberto", review_required: "Revisão necessária", trusted: "Trusted" }[close.status] || close.status;
+  const pending = close.pending;
+  const reasons = [];
+  if (!pending.eligible_for_trust) {
+    if (!["healthy", "attention"].includes(pending.integrity_status)) {
+      reasons.push(`status de integridade '${escapeHtml(pending.integrity_status)}'`);
+    }
+    if (!pending.current_snapshot_trusted_for_reports || !pending.current_snapshot_trusted_for_projection) {
+      reasons.push("snapshot atual sem trusted_for_reports/trusted_for_projection");
+    }
+    if (!pending.current_snapshot_id) reasons.push("nenhum snapshot atual para o período");
+  }
+  document.querySelector("#close-status").innerHTML = `
+    <div class="quality-item">
+      <div><span class="quality-dot ${close.status === "trusted" ? "" : "warn"}"></span><div>
+        <strong>${escapeHtml(statusLabel)}</strong>
+        <small>${close.closed_at ? `Fechado em ${dateFormat.format(new Date(close.closed_at))}` : "Ainda não fechado"}${close.reopened_at ? ` • Reaberto em ${dateFormat.format(new Date(close.reopened_at))} (${escapeHtml(close.reason || "")})` : ""}</small>
+      </div></div>
+      <span class="status-chip ${close.status === "trusted" ? "ok" : "warn"}">${pending.open_findings || 0} finding(s) aberto(s)</span>
+    </div>
+    ${reasons.length ? `<p class="empty" style="text-align:left;padding:12px 0;">Pendências para trusted: ${reasons.join("; ")}.</p>` : ""}
+  `;
+}
+
+async function loadMonthlyClose() {
+  const period = document.querySelector("#close-period").value || currentMonthKey();
+  const close = await api(`/monthly-closes/${period}`);
+  renderMonthlyClose(close);
+}
+
+async function loadFindings() {
+  const params = new URLSearchParams();
+  const statusFilter = document.querySelector("#finding-filter-status").value;
+  const severityFilter = document.querySelector("#finding-filter-severity").value;
+  const periodFilter = document.querySelector("#finding-filter-period").value;
+  if (statusFilter) params.set("status", statusFilter);
+  if (severityFilter) params.set("severity", severityFilter);
+  if (periodFilter) params.set("period", periodFilter);
+  params.set("limit", "100");
+  const data = await api(`/integrity/findings?${params.toString()}`);
+  const list = document.querySelector("#findings-list");
+  list.innerHTML = data.items.length ? data.items.map((item) => `
+    <article class="review-card" data-finding-id="${escapeHtml(item.id)}">
+      <div class="review-icon">${item.severity === "block" || item.severity === "critical" ? "!" : "i"}</div>
+      <div class="review-content">
+        <h3>${escapeHtml(item.title)} <span class="status-chip severity-${escapeHtml(item.severity)}">${severityLabel(item.severity)}</span> <span class="status-chip muted">${findingStatusLabel(item.status)}</span></h3>
+        <p>${escapeHtml(item.invariant_id)} • ${escapeHtml(item.period || "sem período")} • ${item.occurrence_count}x${item.last_seen_at ? ` • última vez ${dateFormat.format(new Date(item.last_seen_at))}` : ""}</p>
+        <div class="review-controls">
+          <button class="text-action view-finding-detail" data-id="${escapeHtml(item.id)}">Detalhe</button>
+          ${item.status === "open" ? `<button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="acknowledge" data-label="reconhecer">Reconhecer</button>` : ""}
+          ${item.status === "open" || item.status === "acknowledged" ? `
+            <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="resolve" data-label="resolver">Resolver</button>
+            <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="ignore" data-label="ignorar">Ignorar</button>
+            <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="false-positive" data-label="marcar falso positivo">Falso positivo</button>
+          ` : ""}
+        </div>
+      </div>
+    </article>
+  `).join("") : '<p class="empty">Nenhum finding para os filtros selecionados.</p>';
+  document.querySelectorAll(".view-finding-detail").forEach((button) => button.addEventListener("click", () => showFindingDetail(button.dataset.id)));
+  document.querySelectorAll(".finding-action").forEach((button) => button.addEventListener("click", () => findingLifecycleAction(button.dataset.id, button.dataset.action, button.dataset.label)));
+}
+
+async function showFindingDetail(id) {
+  const item = await api(`/integrity/findings/${id}`);
+  const panel = document.querySelector("#finding-detail-panel");
+  panel.classList.remove("hidden");
+  document.querySelector("#finding-detail-body").innerHTML = `
+    <div class="finding-detail-row"><dt>Problema</dt><dd>${escapeHtml(item.title)} — ${escapeHtml(item.message)}</dd></div>
+    <div class="finding-detail-row"><dt>Invariant / regra</dt><dd>${escapeHtml(item.invariant_id)} • versão ${escapeHtml(item.financial_rules_version)}</dd></div>
+    <div class="finding-detail-row"><dt>Severidade / status</dt><dd><span class="status-chip severity-${escapeHtml(item.severity)}">${severityLabel(item.severity)}</span> <span class="status-chip muted">${findingStatusLabel(item.status)}</span></dd></div>
+    <div class="finding-detail-row"><dt>Esperado / encontrado</dt><dd>${amountOrDash(item.expected_amount)} / ${amountOrDash(item.actual_amount)}${item.difference_amount !== null ? ` (diferença ${amountOrDash(item.difference_amount)})` : ""}</dd></div>
+    <div class="finding-detail-row"><dt>Entidade</dt><dd>${escapeHtml(item.entity_type)} • ${escapeHtml(item.entity_id || "—")} • ${escapeHtml(item.period || "sem período")}</dd></div>
+    <div class="finding-detail-row"><dt>Lineage / trace</dt><dd>run ${escapeHtml(item.run_id)} • trace ${escapeHtml(item.trace_id)}</dd></div>
+    <div class="finding-detail-row"><dt>Histórico</dt><dd>1ª ocorrência ${dateFormat.format(new Date(item.first_seen_at))} • última ${dateFormat.format(new Date(item.last_seen_at))} • ${item.occurrence_count}x</dd></div>
+    <div class="finding-detail-row"><dt>Ação recomendada</dt><dd>${escapeHtml(item.recommended_action || "—")}</dd></div>
+    ${item.acknowledged_at ? `<div class="finding-detail-row"><dt>Reconhecido</dt><dd>${dateFormat.format(new Date(item.acknowledged_at))} — ${escapeHtml(item.acknowledgement_reason || "")}</dd></div>` : ""}
+    ${item.resolved_at ? `<div class="finding-detail-row"><dt>Resolução</dt><dd>${dateFormat.format(new Date(item.resolved_at))} — ${escapeHtml(item.resolution_reason || "")}</dd></div>` : ""}
+    <p class="codex-note">Observação do Codex é opcional, consultiva e nunca altera este resultado determinístico -- ela nunca substitui o cálculo acima nem pode elevar sua severidade para BLOCK.</p>
+  `;
+}
+
+async function findingLifecycleAction(id, action, label) {
+  const reason = window.prompt(`Motivo para ${label} este finding (obrigatório):`);
+  if (reason === null) return;
+  if (reason.trim().length < 3) { toast("Motivo deve ter ao menos 3 caracteres", true); return; }
+  try {
+    await api(`/integrity/findings/${id}/${action}`, { method: "POST", body: JSON.stringify({ reason: reason.trim() }) });
+    toast("Decisão registrada com motivo e trilha de auditoria");
+    await loadFindings();
+    await loadIntegrity();
+    document.querySelector("#finding-detail-panel").classList.add("hidden");
+  } catch (error) { toast(error.message, true); }
+}
+
+async function loadReconciliations() {
+  const documents = await api("/imports");
+  const recent = documents.slice(0, 20);
+  const rows = await Promise.all(recent.map(async (item) => {
+    try { return { item, reconciliation: await api(`/imports/${item.id}/reconciliation`) }; }
+    catch (_) { return { item, reconciliation: null }; }
+  }));
+  document.querySelector("#reconciliation-table").innerHTML = rows.length ? rows.map(({ item, reconciliation }) => `
+    <tr>
+      <td data-label="Documento">${escapeHtml(item.name)}</td>
+      <td data-label="Status"><span class="status-chip ${reconciliation && reconciliation.status === "reconciled" ? "ok" : reconciliation && reconciliation.status === "not_reconciled" ? "warn" : "muted"}">${escapeHtml(reconciliation ? reconciliation.status : "unknown")}</span></td>
+      <td data-label="Declarado">${reconciliation ? amountOrDash(reconciliation.declared_total) : "—"}</td>
+      <td data-label="Reconstruído">${reconciliation ? amountOrDash(reconciliation.reconstructed_total) : "—"}</td>
+      <td data-label="Diferença">${reconciliation ? amountOrDash(reconciliation.difference) : "—"}</td>
+    </tr>
+  `).join("") : emptyRow(5, "Nenhum documento importado ainda");
+}
+
 function drawForecast(rows, floor) {
   const canvas = document.querySelector("#forecast-chart");
   const ratio = window.devicePixelRatio || 1;
@@ -1407,6 +1623,44 @@ document.querySelector("#profile-form").addEventListener("submit", async (event)
   try { await api("/profile", { method: "PUT", body: JSON.stringify(formJson(event.target, numeric)) }); toast("Premissas salvas"); await loadDashboard(); }
   catch (error) { toast(error.message, true); }
 });
+document.querySelectorAll('#integrity-banner [data-view="integrity"]').forEach((button) => button.addEventListener("click", () => navigate("integrity")));
+document.querySelector("#integrity-run-full").addEventListener("click", async () => {
+  try {
+    await api("/integrity/runs", { method: "POST", body: JSON.stringify({ scope: "global" }) });
+    toast("Auditoria completa executada");
+    await loadIntegrity();
+  } catch (error) { toast(error.message, true); }
+});
+document.querySelector("#close-period").addEventListener("change", () => loadMonthlyClose().catch((error) => toast(error.message, true)));
+document.querySelector("#close-run").addEventListener("click", async () => {
+  const period = document.querySelector("#close-period").value || currentMonthKey();
+  try {
+    await api(`/monthly-closes/${period}/run`, { method: "POST" });
+    toast("Fechamento executado; revise os findings antes de confiar");
+    await loadIntegrity();
+  } catch (error) { toast(error.message, true); }
+});
+document.querySelector("#close-trust").addEventListener("click", async () => {
+  const period = document.querySelector("#close-period").value || currentMonthKey();
+  try {
+    await api(`/monthly-closes/${period}/trust`, { method: "POST" });
+    toast("Fechamento marcado como trusted");
+    await loadIntegrity();
+  } catch (error) { toast(error.message, true); }
+});
+document.querySelector("#close-reopen").addEventListener("click", async () => {
+  const period = document.querySelector("#close-period").value || currentMonthKey();
+  const reason = window.prompt("Motivo para reabrir o fechamento (obrigatório):");
+  if (reason === null) return;
+  if (reason.trim().length < 3) { toast("Motivo deve ter ao menos 3 caracteres", true); return; }
+  try {
+    await api(`/monthly-closes/${period}/reopen`, { method: "POST", body: JSON.stringify({ reason: reason.trim() }) });
+    toast("Fechamento reaberto; snapshot e findings anteriores foram preservados");
+    await loadIntegrity();
+  } catch (error) { toast(error.message, true); }
+});
+document.querySelector("#finding-filter-apply").addEventListener("click", () => loadFindings().catch((error) => toast(error.message, true)));
+document.querySelector("#finding-detail-close").addEventListener("click", () => document.querySelector("#finding-detail-panel").classList.add("hidden"));
 
 let responsiveTableFrame = null;
 const responsiveTableObserver = new MutationObserver(() => {
