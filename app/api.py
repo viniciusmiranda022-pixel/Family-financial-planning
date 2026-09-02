@@ -108,9 +108,14 @@ from app.services.financial_integrity import (
     serialize_run,
 )
 from app.services.financial_invariants import InvariantContext, InvariantScope
+from app.services.financial_revision import (
+    current_household_financial_revision,
+    lock_household_financial_revision,
+)
 from app.services.financial_snapshots import (
     account_cash_flow_rows,
     build_snapshot,
+    category_monetary_publication,
     category_spending_rows,
     dashboard_and_report_consistency_facts,
     dashboard_monetary_publication,
@@ -1478,6 +1483,19 @@ def run_monthly_close(
     except MonthlyCloseStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    # Take the same revision barrier `trust_monthly_close` uses, before
+    # reading any financial source this run's checks depend on -- on
+    # PostgreSQL this blocks a concurrent mutation from committing (and thus
+    # from being partially reflected across `period_snapshot`/the
+    # projection/consistency checks below) until this run's transaction
+    # ends, the same guarantee `trust_monthly_close` relies on for its own
+    # rebuild. The settled revision (captured further below, after this
+    # run's own `IntegrityRun`/`IntegrityFinding` writes) is persisted onto
+    # the close so `trust_monthly_close` can require its own freshly locked
+    # revision to still match it -- see `MonthlyFinancialClose.financial_revision`'s
+    # docstring and the engineering review on PR 7, Round 8.
+    lock_household_financial_revision(db, household_id=user.household_id)
+
     duplicate_checks = build_baseline_checks(
         db, household_id=user.household_id, scope=IntegrityRunScope.PERIOD, period=period
     )
@@ -1579,12 +1597,20 @@ def run_monthly_close(
     snapshot = build_snapshot(
         db, household_id=user.household_id, period=period, generated_by=user.id, force=True
     )
+    # The settled revision, still under the barrier locked above: it already
+    # includes this run's own `IntegrityRun`/`IntegrityFinding` writes (both
+    # are `FINANCIAL_REVISION_MODELS`), so a `trust` attempt right after this
+    # commits sees the same value here and passes; any further financial
+    # mutation before `trust` moves it and `trust_monthly_close` rejects the
+    # stale run. See `MonthlyFinancialClose.financial_revision`'s docstring.
+    run_financial_revision = current_household_financial_revision(db, household_id=user.household_id)
     close = upsert_monthly_close_after_run(
         db,
         household_id=user.household_id,
         period=period,
         snapshot_id=snapshot.id,
         integrity_run_id=run.id,
+        financial_revision=run_financial_revision,
     )
     audit(
         db,
@@ -4336,11 +4362,21 @@ def reports(
         item.name: item.color
         for item in db.scalars(select(Category).where(Category.household_id == user.household_id)).all()
     }
+    # `category_monetary_publication` is the exact function INV-020 reads
+    # (via `report_categories_publication_facts`) to verify `amount`/
+    # `average` for a one-month window -- see its docstring and the
+    # engineering review on PR 7, Round 8 ("categories[].average" was
+    # previously an endpoint-only division INV-020 could not see). Spread
+    # verbatim instead of computing `average` as a separate literal.
     categories = [
         {
             "category": name,
-            "amount": decimal_value(money(amount)),
-            "average": decimal_value(money(amount / average_denominator)),
+            **{
+                key: decimal_value(value)
+                for key, value in category_monetary_publication(
+                    amount, average_denominator=average_denominator
+                ).items()
+            },
             "share": float(money((amount / total_spending) * Decimal("100"))) if total_spending > 0 else 0,
             "color": category_colors.get(name, "#64748B"),
         }
@@ -4363,14 +4399,16 @@ def reports(
     # `report_summary_monetary_publication` is the exact function INV-020
     # reads to verify a one-month window's `summary` -- every canonical
     # total/average/liquidity field, not `savings_rate` alone (PR 7, Round
-    # 7) -- see its docstring and `dashboard_and_report_consistency_facts`.
-    # `summary` below spreads its return value verbatim instead of assigning
-    # any of these keys as its own literal, so there is no endpoint-only
-    # assembly step left for INV-020 to be blind to -- see the engineering
-    # review on PR 7, Round 7: "all canonical monetary values derived from
-    # snapshot/profile that are published by /reports must be represented
-    # by side-effect-free publication builders consumed verbatim by the
-    # endpoint".
+    # 7), and now `highest_spending`/`lowest_spending` too (PR 7, Round 8:
+    # these used to be assigned as separate literals below, past this
+    # contract) -- see its docstring and
+    # `dashboard_and_report_consistency_facts`. `summary` below spreads its
+    # return value verbatim instead of assigning any of these keys as its
+    # own literal, so there is no endpoint-only assembly step left for
+    # INV-020 to be blind to -- see the engineering review on PR 7, Round 7:
+    # "all canonical monetary values derived from snapshot/profile that are
+    # published by /reports must be represented by side-effect-free
+    # publication builders consumed verbatim by the endpoint".
     summary_publication = report_summary_monetary_publication(
         total_spending=total_spending,
         average_spending=average_spending,
@@ -4386,6 +4424,8 @@ def reports(
         liquidity_deposit=total_liquidity_deposit,
         liquidity_withdrawal=total_liquidity_used,
         liquidity_uncovered_deficit=last_snapshot.closing_uncovered_deficit,
+        highest_spending=highest_month["spending"],
+        lowest_spending=lowest_month["spending"],
     )
     account_totals: dict[str, dict[str, object]] = {}
     for snapshot in report_snapshots:
@@ -4455,9 +4495,7 @@ def reports(
             ),
             **{key: decimal_value(value) for key, value in summary_publication.items()},
             "highest_month": highest_month["month"],
-            "highest_spending": highest_month["spending"],
             "lowest_month": lowest_month["month"],
-            "lowest_spending": lowest_month["spending"],
             "last_change_percentage": last_change,
         },
         "monthly": serialized_months,

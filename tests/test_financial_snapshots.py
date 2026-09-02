@@ -1488,6 +1488,151 @@ def test_report_accounts_gap_is_caught_by_inv020_and_the_real_endpoint(monkeypat
         assert result.metadata["mismatches"][fact_key]["difference"] == Decimal("9.00")
 
 
+def test_report_summary_highest_lowest_spending_mutation_is_caught_by_inv020_and_the_real_endpoint(
+    monkeypatch,
+) -> None:
+    """PR 7, Round 8: `reports()` used to assign
+    `summary["highest_spending"]`/`summary["lowest_spending"]` as its own
+    literals (`highest_month["spending"]`/`lowest_month["spending"]`) after
+    the `report_summary_monetary_publication` spread, past the contract
+    INV-020 observes -- numerically a no-op for a one-month window (there is
+    only one month to be both the highest and the lowest), but still an
+    unobserved endpoint-only alias (see the engineering review on PR 7,
+    Round 8: "Igualdade numérica por coincidência na janela de um mês não
+    certifica a atribuição publicada").
+
+    Mutates only `highest_spending`/`lowest_spending` inside
+    `report_summary_monetary_publication`, strictly after the canonical
+    calculation, and proves both halves: the real `/reports` response
+    diverges on exactly those two fields, and INV-020 fails on the same
+    fields against the untouched snapshot, while `spending`/`total_spending`
+    (the fields the alias used to numerically coincide with) stay correct.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        household, profile, snapshot = _consistency_household(db)
+        user = User(
+            household_id=household.id,
+            name="Revisor",
+            username="revisor-report-highest-lowest",
+            password_hash="x",
+            is_admin=True,
+        )
+        db.add(user)
+        db.commit()
+
+        expected_spending = financial_snapshots_module._report_summary_engine_truth(
+            snapshot, profile=profile
+        )["highest_spending"]
+
+        real_summary_publication = financial_snapshots_module.report_summary_monetary_publication
+
+        def _corrupted_summary_publication(**kwargs):
+            values = dict(real_summary_publication(**kwargs))
+            values["highest_spending"] = values["highest_spending"] + Decimal("7.00")
+            values["lowest_spending"] = values["lowest_spending"] + Decimal("7.00")
+            return values
+
+        monkeypatch.setattr(
+            financial_snapshots_module, "report_summary_monetary_publication", _corrupted_summary_publication
+        )
+        import app.api as api_module
+
+        monkeypatch.setattr(
+            api_module, "report_summary_monetary_publication", _corrupted_summary_publication
+        )
+
+        # (1) The real endpoint's actual published highest/lowest spending
+        # diverge, while `spending`/`total_spending` (untouched) do not.
+        response = reports(end_month="2026-09", months=1, user=user, db=db)
+        assert Decimal(str(response["summary"]["highest_spending"])) == expected_spending + Decimal("7.00")
+        assert Decimal(str(response["summary"]["lowest_spending"])) == expected_spending + Decimal("7.00")
+        assert Decimal(str(response["summary"]["total_spending"])) == expected_spending
+
+        # (2) INV-020, evaluated against the same untouched snapshot, fails
+        # on both mutated fields -- the "expected" side never calls the
+        # mutated builder.
+        facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        assert facts["report"]["financial_engine_values"]["highest_spending"] == expected_spending
+        assert facts["report"]["financial_engine_values"]["lowest_spending"] == expected_spending
+        result = _evaluate_report_check("INV-020", facts["report"])
+        assert result.status is InvariantStatus.FAIL
+        assert result.metadata["mismatches"]["highest_spending"]["difference"] == Decimal("7.00")
+        assert result.metadata["mismatches"]["lowest_spending"]["difference"] == Decimal("7.00")
+
+
+def test_report_categories_average_mutation_is_caught_by_inv020_and_the_real_endpoint(monkeypatch) -> None:
+    """PR 7, Round 8: `reports()` used to compute `categories[].average` as
+    its own private-local division (`amount / average_denominator`) inline
+    in the `categories` list comprehension, outside anything INV-020
+    observed -- numerically a no-op for a one-month window
+    (`average_denominator == 1`), but still an unobserved endpoint-only
+    division step.
+
+    Mutates only the `average` half of `category_monetary_publication`'s
+    return value, strictly after the canonical division already ran, and
+    proves both halves: the real `/reports` response diverges on that
+    category's `average` only (`amount` stays correct), and INV-020 fails on
+    the corresponding flattened `categories.<category>.average` fact against
+    the untouched snapshot.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        household, profile, snapshot = _consistency_household(db)
+        user = User(
+            household_id=household.id,
+            name="Revisor",
+            username="revisor-report-categories-average",
+            password_hash="x",
+            is_admin=True,
+        )
+        db.add(user)
+        db.commit()
+
+        real_rows = financial_snapshots_module.category_spending_rows(snapshot)
+        assert real_rows
+        category_key = str(real_rows[0]["category"])
+        expected_amount = Decimal(str(real_rows[0]["amount"]))
+
+        real_category_publication = financial_snapshots_module.category_monetary_publication
+
+        def _corrupted_category_publication(amount, *, average_denominator):
+            values = dict(real_category_publication(amount, average_denominator=average_denominator))
+            values["average"] = values["average"] + Decimal("3.00")
+            return values
+
+        monkeypatch.setattr(
+            financial_snapshots_module, "category_monetary_publication", _corrupted_category_publication
+        )
+        import app.api as api_module
+
+        monkeypatch.setattr(api_module, "category_monetary_publication", _corrupted_category_publication)
+
+        # (1) The real endpoint's actual published `average` diverges;
+        # `amount` (untouched) does not.
+        response = reports(end_month="2026-09", months=1, user=user, db=db)
+        response_category = next(
+            item for item in response["categories"] if item["category"] == category_key
+        )
+        assert Decimal(str(response_category["amount"])) == expected_amount
+        assert Decimal(str(response_category["average"])) == expected_amount + Decimal("3.00")
+
+        # (2) INV-020, evaluated against the same untouched snapshot, fails
+        # on the corresponding flattened `average` fact -- the independent
+        # engine-truth side reimplements the division and never calls the
+        # mutated function.
+        facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        fact_key = f"categories.{category_key}.average"
+        assert facts["report"]["financial_engine_values"][fact_key] == expected_amount
+        result = _evaluate_report_check("INV-020", facts["report"])
+        assert result.status is InvariantStatus.FAIL
+        assert result.metadata["mismatches"][fact_key]["difference"] == Decimal("3.00")
+
+
 def _evaluate_projection_gate_check(invariant_id: str, facts: dict[str, object]):
     return evaluate_invariant(
         invariant_id,

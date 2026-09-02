@@ -1183,6 +1183,8 @@ def report_summary_monetary_publication(
     liquidity_deposit: Decimal,
     liquidity_withdrawal: Decimal,
     liquidity_uncovered_deficit: Decimal,
+    highest_spending: Decimal,
+    lowest_spending: Decimal,
 ) -> dict[str, Decimal]:
     """The literal monetary contract `GET /reports` publishes inside
     `summary` -- every canonical monetary total/average/liquidity field the
@@ -1219,6 +1221,16 @@ def report_summary_monetary_publication(
     close's single closed period -- every parameter reduces to that one
     snapshot's own columns (no cross-month summation to offset them), so a
     bug confined to this assembly step still corrupts both sides together.
+
+    `highest_spending`/`lowest_spending` (PR 7, Round 8) close the last gap
+    the engineering review named: `reports()` used to assign
+    `summary["highest_spending"] = highest_month["spending"]` (and the
+    `lowest_*` counterpart) as its own literal, straight past this
+    publication contract -- a numerically-accidental equality for a
+    one-month window (there is only one month to be both the highest and
+    the lowest), but still an endpoint-only alias/offset INV-020 could not
+    see. `reports()` now passes the already-selected highest/lowest month's
+    published `spending` in here instead of assigning either key itself.
     """
 
     return {
@@ -1239,6 +1251,8 @@ def report_summary_monetary_publication(
         "liquidity_uncovered_deficit": money(liquidity_uncovered_deficit),
         "liquidity_flow": money(cash_net),
         "savings_rate": savings_rate_from_totals(total_cash_in, total_cash_out),
+        "highest_spending": money(highest_spending),
+        "lowest_spending": money(lowest_spending),
     }
 
 
@@ -1258,6 +1272,13 @@ def _report_summary_engine_truth(
     `_snapshot_monetary_fields` directly instead of calling the publication
     function, and `profile.emergency_floor` directly instead of
     `_profile_monetary_fields` (PR 7, Round 7).
+
+    `highest_spending`/`lowest_spending` (PR 7, Round 8): for the single
+    snapshot this function ever evaluates, the "highest" and "lowest"
+    month of a one-month window are the same month, so both reduce to that
+    snapshot's own `operating_expenses` -- read directly here, independent
+    of `reports()`'s own highest/lowest month *selection* logic (which only
+    matters, and is only exercised, across a real multi-month window).
     """
 
     engine = _snapshot_monetary_fields(snapshot)
@@ -1284,45 +1305,103 @@ def _report_summary_engine_truth(
         "liquidity_uncovered_deficit": engine["closing_uncovered_deficit"],
         "liquidity_flow": engine["operating_result"],
         "savings_rate": engine_savings_rate,
+        "highest_spending": engine["operating_expenses"],
+        "lowest_spending": engine["operating_expenses"],
     }
 
 
-def report_categories_publication_facts(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
-    """Flatten `category_spending_rows(snapshot)` into `categories.<category>.amount`
-    facts for `report_values` -- the per-category monetary amounts `/reports`
+def category_monetary_publication(amount: Decimal, *, average_denominator: Decimal) -> dict[str, Decimal]:
+    """The literal `amount`/`average` pair `GET /reports` publishes for one
+    entry of its `categories` array.
+
+    Added post-review (PR 7, Round 8): `reports()` used to compute
+    `"average": amount / average_denominator` as its own inline literal
+    inside the `categories` list comprehension, outside anything INV-020
+    observed -- for a one-month window this is numerically a no-op
+    (`average_denominator == 1`, so `average == amount`), but the endpoint
+    still owned an unobserved division step: a wrong denominator, a swapped
+    operand or a stray offset there would corrupt the real response with
+    INV-020 blind to it. `reports()` now calls this function for every
+    category and spreads its return value verbatim instead of computing
+    `average` itself.
+
+    `average_denominator` is taken as already-computed, not derived here,
+    because it depends on how many months in the window had any activity --
+    a property of `reports()`'s window, not of one category's amount.
+    """
+
+    denominator = average_denominator if average_denominator > 0 else Decimal("1")
+    return {
+        "amount": money(amount),
+        "average": money(amount / denominator),
+    }
+
+
+def report_categories_publication_facts(
+    snapshot: FinancialSnapshot, *, average_denominator: Decimal = Decimal("1")
+) -> dict[str, Decimal]:
+    """Flatten `category_spending_rows(snapshot)` into
+    `categories.<category>.amount`/`categories.<category>.average` facts for
+    `report_values` -- the per-category monetary amounts `/reports`
     aggregates into its `categories` array, previously outside anything
     INV-020 observed (PR 7, Round 7 review: "nested amounts of categories
-    and cash_flow_by_account" still assembled outside the observed contract).
+    and cash_flow_by_account" still assembled outside the observed
+    contract; PR 7, Round 8: "categories[].average" specifically).
 
     `reports()` now sums this exact function's rows across its window
     instead of reading `snapshot.payload["category_spending"]` directly, so
     a regression in `category_spending_rows` -- the same function
     `/dashboard`/INV-019 already observe -- now surfaces in `/reports`/
-    INV-020 too. For the one-month window `dashboard_and_report_consistency_facts()`
-    checks (matching a monthly close's single closed period), summing across
-    the window is a no-op over this one snapshot's own rows.
+    INV-020 too. `average` comes from `category_monetary_publication`, the
+    same function `reports()` calls for its own `categories[].average` --
+    see that function's docstring for why a divergence there is real
+    evidence, not a value compared to itself, once paired with the
+    independent `_report_categories_engine_truth` below.
+
+    `average_denominator` defaults to `1`: for the one-month window
+    `dashboard_and_report_consistency_facts()` checks (matching a monthly
+    close's single closed period), summing across the window is a no-op
+    over this one snapshot's own rows, and there is exactly one covered
+    month, so `average_denominator` is `1` by construction.
     """
 
     fields: dict[str, Decimal] = {}
     for row in category_spending_rows(snapshot):
         category_key = str(row.get("category") or "unidentified")
-        fields[f"categories.{category_key}.amount"] = money(Decimal(str(row.get("amount", 0))))
+        publication = category_monetary_publication(
+            money(Decimal(str(row.get("amount", 0)))), average_denominator=average_denominator
+        )
+        fields[f"categories.{category_key}.amount"] = publication["amount"]
+        fields[f"categories.{category_key}.average"] = publication["average"]
     return fields
 
 
-def _report_categories_engine_truth(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+def _report_categories_engine_truth(
+    snapshot: FinancialSnapshot, *, average_denominator: Decimal = Decimal("1")
+) -> dict[str, Decimal]:
     """INV-020's independent "expected" side for `categories`. Reads
     `snapshot.payload["category_spending"]` directly through its own
     separately hand-written loop, instead of calling
     `report_categories_publication_facts` -- mirrors
     `_dashboard_category_spending_engine_truth`; see that function's
     docstring for why this is not shared code.
+
+    `average` is computed with its own division here (not
+    `category_monetary_publication`, the function `reports()`/the
+    publication side call) -- the same reason `_savings_rate_engine_truth`
+    stays independent of `savings_rate_from_totals`: sharing the divide
+    would let a regression confined to that one function move both sides
+    identically, and INV-020 would keep passing regardless of what
+    `/reports` actually publishes.
     """
 
+    denominator = average_denominator if average_denominator > 0 else Decimal("1")
     fields: dict[str, Decimal] = {}
     for row in snapshot.payload.get("category_spending", []):
         category_key = str(row.get("category") or "unidentified")
-        fields[f"categories.{category_key}.amount"] = money(Decimal(str(row.get("amount", 0))))
+        amount = money(Decimal(str(row.get("amount", 0))))
+        fields[f"categories.{category_key}.amount"] = amount
+        fields[f"categories.{category_key}.average"] = money(amount / denominator)
     return fields
 
 
@@ -1433,6 +1512,12 @@ def dashboard_and_report_consistency_facts(
         liquidity_deposit=money(Decimal(str(snapshot.payload["liquidity_deposit"]))),
         liquidity_withdrawal=money(snapshot.liquidity_used),
         liquidity_uncovered_deficit=money(snapshot.closing_uncovered_deficit),
+        # For the single-month window this fact set represents, the
+        # "highest" and "lowest" spending month is this same month -- see
+        # `report_summary_monetary_publication`'s and
+        # `_report_summary_engine_truth`'s docstrings (PR 7, Round 8).
+        highest_spending=report_publication["spending"],
+        lowest_spending=report_publication["spending"],
     )
     return {
         "dashboard": {
