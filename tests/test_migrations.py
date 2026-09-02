@@ -290,6 +290,27 @@ EXPECTED_HOUSEHOLD_FINANCIAL_REVISION_COLUMNS = {
     "updated_at",
 }
 
+EXPECTED_0009_TABLES = {"backfill_runs"}
+
+EXPECTED_BACKFILL_RUN_COLUMNS = {
+    "id",
+    "status",
+    "dry_run",
+    "household_scope",
+    "period_from",
+    "period_to",
+    "financial_rules_version",
+    "calculation_version",
+    "app_version",
+    "started_at",
+    "completed_at",
+    "duration_ms",
+    "summary",
+    "error_code",
+    "trace_id",
+    "triggered_by",
+}
+
 
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
@@ -336,6 +357,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0005_TABLES,
             *EXPECTED_0006_TABLES,
             *EXPECTED_0007_TABLES,
+            *EXPECTED_0009_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -420,6 +442,13 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
     assert {
         column["name"] for column in inspector.get_columns("household_financial_revisions")
     } == EXPECTED_HOUSEHOLD_FINANCIAL_REVISION_COLUMNS
+    assert {
+        column["name"] for column in inspector.get_columns("backfill_runs")
+    } == EXPECTED_BACKFILL_RUN_COLUMNS
+    assert {index["name"] for index in inspector.get_indexes("backfill_runs")} == {
+        "ix_backfill_runs_status",
+        "ix_backfill_runs_trace_id",
+    }
     engine.dispose()
 
     command.downgrade(config, "0001")
@@ -456,6 +485,7 @@ def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     assert "CREATE TABLE financial_snapshot_lineage" in sql
     assert "CREATE TABLE monthly_financial_closes" in sql
     assert "CREATE TABLE household_financial_revisions" in sql
+    assert "CREATE TABLE backfill_runs" in sql
     assert "ALTER TABLE integrity_findings ADD COLUMN acknowledgement_reason TEXT" in sql
     assert "ALTER TABLE audit_events ADD COLUMN before_state JSONB" in sql
     assert "CREATE TABLE transactions" in sql
@@ -506,7 +536,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0008"
+        ).scalar_one() == "0009"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -532,6 +562,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0008"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0009"
     engine.dispose()
     get_settings.cache_clear()
