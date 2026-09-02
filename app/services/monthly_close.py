@@ -164,9 +164,29 @@ def upsert_monthly_close_after_run(
     fix, `trust_monthly_close` treats a `None` revision as missing evidence
     and fails closed on any subsequent `trust` attempt, requiring a real
     `run` first -- it is no longer "no comparison at trust time".
+
+    PR 7, Round 11: re-checks `status != "trusted"` immediately before
+    writing, even though `run_monthly_close` (`app/api.py`) already calls
+    `assert_close_runnable` -- which now takes the same household-wide
+    barrier this function's caller must be holding -- as its very first
+    action, before doing any other work. This is defense in depth, not the
+    primary guarantee: on PostgreSQL the barrier already makes this
+    condition impossible to hit by the time a well-behaved caller reaches
+    here (see `assert_close_runnable`'s docstring); on SQLite, where the
+    lock is a no-op, and for any future caller that reaches this function
+    without going through `assert_close_runnable` first, this re-check is
+    what actually stops a `trusted` close from being silently downgraded to
+    `review_required` -- with no `reopen` reason, no `reopened_by` and no
+    audit transition of its own -- instead of raising. See the engineering
+    review on PR 7, Round 11: "upsert deve falhar fechado se o estado
+    mudou."
     """
 
     close = get_monthly_close(db, household_id=household_id, period=period)
+    if close is not None and close.status == "trusted":
+        raise MonthlyCloseStateError(
+            "Fechamento já está trusted; reabra (reopen) antes de registrar um novo run."
+        )
     if close is None:
         close = MonthlyFinancialClose(household_id=household_id, period=period, status="open")
         db.add(close)
@@ -178,32 +198,69 @@ def upsert_monthly_close_after_run(
     return close
 
 
-def assert_close_runnable(db: Session, *, household_id: str, period: str) -> None:
+def assert_close_runnable(db: Session, *, household_id: str, period: str) -> MonthlyFinancialClose | None:
+    """Raise if `period` cannot be (re-)run; return its current close row
+    (`None` if it has never run) otherwise.
+
+    PR 7, Round 11: takes the same household-wide revision barrier
+    `trust_monthly_close` and `reopen_monthly_close` take
+    (`lock_household_financial_revision`) *before* reading `close.status`,
+    not after. Before this fix, `run_monthly_close` (`app/api.py`) read
+    `close.status` here first and only acquired the barrier afterward, then
+    held it through its own snapshot rebuild, integrity run and the final
+    `upsert_monthly_close_after_run` write. A `trust` (or `reopen`) that
+    committed strictly between that stale read and the barrier acquisition
+    was invisible to it: the run proceeded to completion on stale
+    assumptions and `upsert_monthly_close_after_run` unconditionally forced
+    `status = "review_required"`, silently downgrading a close `trust` had
+    *just* set to `trusted` -- with no `reopen` reason, no `reopened_by`,
+    no audit trail for the demotion. The symmetric interleaving existed too:
+    `trust_monthly_close` used to read `close.status` before taking its own
+    barrier. See the engineering review on PR 7, Round 11:
+    "run_monthly_close() executa assert_close_runnable() antes de adquirir
+    lock_household_financial_revision() ... serializar state validation +
+    transition de Monthly Close sob a mesma barreira, re-ler/travar o close
+    depois da aquisição ... cobrir deterministicamente as duas ordens
+    run→trust e trust→run."
+
+    Taking the barrier first, here, closes both interleavings: on
+    PostgreSQL, `trust_monthly_close` and `reopen_monthly_close` take the
+    exact same row lock as their own first action, so whichever of
+    {run, trust, reopen} acquires it first for a given household runs its
+    entire state-check-through-final-write section -- including its commit
+    -- before any other of the three can even read `close.status`; there is
+    no window left in which to act on stale state. On SQLite (tests), where
+    this lock is a no-op, `upsert_monthly_close_after_run`'s own re-check
+    right before writing is the deterministic equivalent -- see its
+    docstring.
+    """
+
+    lock_household_financial_revision(db, household_id=household_id)
     close = get_monthly_close(db, household_id=household_id, period=period)
     if close is not None and close.status == "trusted":
         raise MonthlyCloseStateError(
             "Fechamento já está trusted; reabra (reopen) antes de executar novamente."
         )
+    return close
 
 
 def trust_monthly_close(
     db: Session, *, household_id: str, period: str, user_id: str
 ) -> MonthlyFinancialClose:
-    close = get_monthly_close(db, household_id=household_id, period=period)
-    if close is None or close.status == "open":
-        raise MonthlyCloseStateError(
-            "Execute o fechamento (POST .../run) antes de marcar como trusted."
-        )
-    if close.status == "trusted":
-        raise MonthlyCloseStateError("Fechamento já está trusted.")
-
-    reasons: list[str] = []
-
-    # Serialize this trust transition with every financial-source mutation
-    # that can affect the period's snapshot -- see
-    # `HouseholdFinancialRevision`'s docstring (`app/models.py`) and the
-    # engineering review on PR 7, Round 7: "source mutation endpoints do not
-    # share the snapshot advisory lock ... a concurrent transaction can
+    # Take the household-wide revision barrier *before* reading
+    # `close.status`, not after (PR 7, Round 11) -- see
+    # `assert_close_runnable`'s docstring for the run→trust and trust→run
+    # interleavings this ordering closes. `run_monthly_close` and
+    # `reopen_monthly_close` take the exact same row lock as their own first
+    # action, so whichever of {run, trust, reopen} gets here first for this
+    # household fully completes (state check through final write and
+    # commit) before either of the other two can even read `close.status`.
+    #
+    # This is also the barrier that serializes this trust transition with
+    # every financial-source mutation that can affect the period's snapshot
+    # -- see `HouseholdFinancialRevision`'s docstring (`app/models.py`) and
+    # the engineering review on PR 7, Round 7: "source mutation endpoints do
+    # not share the snapshot advisory lock ... a concurrent transaction can
     # commit after snapshot source reads but before close.status='trusted'
     # commits." On PostgreSQL, this blocks until any in-flight mutation
     # transaction for this household commits or rolls back (and blocks any
@@ -216,6 +273,16 @@ def trust_monthly_close(
     # enforcement mechanism on SQLite, where the lock above is a no-op --
     # see `lock_household_financial_revision`'s docstring.
     revision_at_lock = lock_household_financial_revision(db, household_id=household_id)
+
+    close = get_monthly_close(db, household_id=household_id, period=period)
+    if close is None or close.status == "open":
+        raise MonthlyCloseStateError(
+            "Execute o fechamento (POST .../run) antes de marcar como trusted."
+        )
+    if close.status == "trusted":
+        raise MonthlyCloseStateError("Fechamento já está trusted.")
+
+    reasons: list[str] = []
 
     # Require the revision this close's *run* observed to still match the
     # one just locked -- closes the gap the revision barrier above and the
@@ -328,6 +395,13 @@ def trust_monthly_close(
 def reopen_monthly_close(
     db: Session, *, household_id: str, period: str, user_id: str, reason: str
 ) -> MonthlyFinancialClose:
+    # Same household-wide barrier `run`/`trust` take, taken first here too
+    # (PR 7, Round 11) -- see `assert_close_runnable`'s docstring. Without
+    # this, a `reopen` racing a concurrent `run`/`trust` could read a stale
+    # `close.status` and either reject a legitimately-just-trusted close or
+    # -- on PostgreSQL, once this call blocks correctly -- observe a state
+    # that already changed underneath it.
+    lock_household_financial_revision(db, household_id=household_id)
     close = get_monthly_close(db, household_id=household_id, period=period)
     if close is None or close.status != "trusted":
         raise MonthlyCloseStateError("Somente um fechamento trusted pode ser reaberto.")

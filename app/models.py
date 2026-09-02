@@ -768,28 +768,46 @@ class HouseholdFinancialRevision(Base):
     transaction as every mutation to a Financial-Engine input (see the
     event listener below).
 
-    `trust_monthly_close` (`app/services/monthly_close.py`, helpers in
-    `app/services/financial_revision.py`) reads/locks this row to close the
-    TOCTOU window between recomputing a period's canonical
-    `FinancialSnapshot` and committing `trusted` -- see the engineering
-    review on PR 7, Round 7: "The trust transition must be serialized with
-    every financial source mutation that can affect the snapshot ... or use
-    a monotonic source revision validated inside the same transactional
-    barrier. The production guarantee must be real on PostgreSQL; SQLite may
-    use a deterministic test-equivalent path but must not be presented as
-    equivalent locking semantics."
+    `run_monthly_close`, `trust_monthly_close` and `reopen_monthly_close`
+    (`app/services/monthly_close.py`, `app/api.py`; helpers in
+    `app/services/financial_revision.py`) all read/lock this row, as their
+    very first action, to close two distinct windows:
+
+    1. The TOCTOU window between recomputing a period's canonical
+       `FinancialSnapshot` and committing `trusted` -- see the engineering
+       review on PR 7, Round 7: "The trust transition must be serialized
+       with every financial source mutation that can affect the snapshot
+       ... or use a monotonic source revision validated inside the same
+       transactional barrier. The production guarantee must be real on
+       PostgreSQL; SQLite may use a deterministic test-equivalent path but
+       must not be presented as equivalent locking semantics."
+    2. The race between the monthly close lifecycle's own transitions --
+       `run`, `trust` and `reopen` concurrently acting on the same
+       (household, period) close -- see the engineering review on PR 7,
+       Round 11: taking this same row as the first action of all three,
+       before any of them reads `close.status`, means whichever gets here
+       first for a household fully completes its own transition (state
+       check through final write and commit) before either of the other
+       two can even read that status. Before this fix, `run_monthly_close`
+       read `close.status` *before* acquiring this lock; a `trust` that
+       committed in that window was invisible to it, and the run's own
+       unconditional final write silently downgraded a just-`trusted`
+       close back to `review_required` with no `reopen` reason, no
+       `reopened_by` and no audit trail for the demotion.
 
     On PostgreSQL, `SELECT ... FOR UPDATE` against this row
     (`lock_household_financial_revision`) takes the same row-level write
     lock the upsert below takes, blocking any concurrent mutation's own
-    bump of the same row until the trust transaction commits or rolls
-    back -- so no source mutation can commit strictly between the snapshot
-    rebuild and the `trusted` write. SQLite (tests) has no real
+    bump of the same row -- and any concurrent `run`/`trust`/`reopen` on
+    the same household's monthly closes -- until the lock-holding
+    transaction commits or rolls back. SQLite (tests) has no real
     cross-connection row lock; there, `trust_monthly_close` still compares
     the revision value read at the start of the transaction against the
     value read again right before the `trusted` write, inside the same
-    transaction -- a deterministic, testable stand-in for the guarantee the
-    PostgreSQL lock provides unconditionally.
+    transaction, and `assert_close_runnable`/`upsert_monthly_close_after_run`
+    re-validate `close.status` immediately before each final write -- a
+    deterministic, testable stand-in for the guarantees the PostgreSQL lock
+    provides unconditionally.
     """
 
     __tablename__ = "household_financial_revisions"

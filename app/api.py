@@ -108,10 +108,7 @@ from app.services.financial_integrity import (
     serialize_run,
 )
 from app.services.financial_invariants import InvariantContext, InvariantScope
-from app.services.financial_revision import (
-    current_household_financial_revision,
-    lock_household_financial_revision,
-)
+from app.services.financial_revision import current_household_financial_revision
 from app.services.financial_snapshots import (
     account_cash_flow_rows,
     build_snapshot,
@@ -1478,23 +1475,27 @@ def run_monthly_close(
 
     _require_admin(user)
     _validate_period(period)
+    # `assert_close_runnable` takes the household-wide revision barrier
+    # (`lock_household_financial_revision`) as its very first action, before
+    # reading `close.status` -- not the other way around. See its docstring
+    # for the run→trust/trust→run interleaving that ordering closes (PR 7,
+    # Round 11: a `trust`/`reopen` that used to be able to commit invisibly
+    # between a stale status read here and a barrier acquired only
+    # afterward). The same barrier stays held for the rest of this request:
+    # on PostgreSQL it blocks a concurrent mutation from committing (and
+    # thus from being partially reflected across `period_snapshot`/the
+    # projection/consistency checks below), and blocks a concurrent
+    # `trust`/`reopen` from even reading `close.status`, until this run's
+    # transaction ends. The settled revision (captured further below, after
+    # this run's own `IntegrityRun`/`IntegrityFinding` writes) is persisted
+    # onto the close so `trust_monthly_close` can require its own freshly
+    # locked revision to still match it -- see
+    # `MonthlyFinancialClose.financial_revision`'s docstring and the
+    # engineering review on PR 7, Round 8.
     try:
         assert_close_runnable(db, household_id=user.household_id, period=period)
     except MonthlyCloseStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    # Take the same revision barrier `trust_monthly_close` uses, before
-    # reading any financial source this run's checks depend on -- on
-    # PostgreSQL this blocks a concurrent mutation from committing (and thus
-    # from being partially reflected across `period_snapshot`/the
-    # projection/consistency checks below) until this run's transaction
-    # ends, the same guarantee `trust_monthly_close` relies on for its own
-    # rebuild. The settled revision (captured further below, after this
-    # run's own `IntegrityRun`/`IntegrityFinding` writes) is persisted onto
-    # the close so `trust_monthly_close` can require its own freshly locked
-    # revision to still match it -- see `MonthlyFinancialClose.financial_revision`'s
-    # docstring and the engineering review on PR 7, Round 8.
-    lock_household_financial_revision(db, household_id=user.household_id)
 
     duplicate_checks = build_baseline_checks(
         db, household_id=user.household_id, scope=IntegrityRunScope.PERIOD, period=period

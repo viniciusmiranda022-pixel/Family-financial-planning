@@ -392,6 +392,120 @@ def test_concurrent_source_mutation_between_lock_and_commit_blocks_trust(monkeyp
         assert close.status == "review_required"
 
 
+def test_run_upsert_fails_closed_when_a_concurrent_trust_won_the_race() -> None:
+    """PR 7, Round 11 (run→trust ordering): a `run` that already validated
+    `assert_close_runnable` before a concurrent `trust` fully committed must
+    not silently downgrade the now-`trusted` close when its own belated
+    `upsert_monthly_close_after_run` finally runs.
+
+    Before this fix, `run_monthly_close` (`app/api.py`) called
+    `assert_close_runnable` *before* acquiring
+    `lock_household_financial_revision`. A `trust` that committed strictly
+    in that window was invisible to the stale `assert_close_runnable`
+    check, so the run proceeded to completion and its own
+    `upsert_monthly_close_after_run` unconditionally forced
+    `status = "review_required"` -- overwriting `trusted` with no `reopen`
+    reason, no `reopened_by` and no audit trail for the demotion.
+
+    Deterministically simulates the interleaving in a single session:
+    `assert_close_runnable` is called first, exactly as `run_monthly_close`
+    does before any of its own expensive work, on a period that has never
+    run. Then, standing in for a concurrent request that fully completes in
+    between, a complete run+trust cycle is driven to `trusted` here. Only
+    then does the original "run" reach its own final write.
+    """
+
+    with _engine_session() as db:
+        household, user = _household_and_user(db)
+
+        # The "run" starts: same first action as `run_monthly_close`.
+        assert assert_close_runnable(db, household_id=household.id, period=PERIOD) is None
+
+        # A concurrent request fully completes a run+trust cycle in
+        # between -- standing in for another session's transaction
+        # committing while the "run" above is still doing its own
+        # (expensive, uninterrupted-in-real-life) work.
+        run = _completed_period_run(db, household_id=household.id, summary=_healthy_summary())
+        snapshot = _snapshot(db, household_id=household.id, trusted=True)
+        run_financial_revision = lock_household_financial_revision(db, household_id=household.id)
+        upsert_monthly_close_after_run(
+            db,
+            household_id=household.id,
+            period=PERIOD,
+            snapshot_id=snapshot.id,
+            integrity_run_id=run.id,
+            financial_revision=run_financial_revision,
+        )
+        trusted = trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
+        assert trusted.status == "trusted"
+
+        # The original "run" now reaches its own final write -- it must be
+        # rejected, not silently downgrade the just-`trusted` close.
+        with pytest.raises(MonthlyCloseStateError):
+            upsert_monthly_close_after_run(
+                db,
+                household_id=household.id,
+                period=PERIOD,
+                snapshot_id=snapshot.id,
+                integrity_run_id=run.id,
+                financial_revision=run_financial_revision,
+            )
+
+        untouched = get_monthly_close(db, household_id=household.id, period=PERIOD)
+        assert untouched.status == "trusted"
+        assert untouched.closed_by == user.id
+
+
+def test_trust_reads_close_after_the_barrier_not_before(monkeypatch) -> None:
+    """PR 7, Round 11 (trust→run ordering): `trust_monthly_close` must read
+    `close` *after* taking the household barrier, not before -- otherwise a
+    `run` that fully completes strictly between a stale pre-lock read and a
+    barrier acquired only afterward is invisible to the state check.
+
+    Deterministically simulates the interleaving by making the barrier
+    acquisition itself (`lock_household_financial_revision`) run a complete
+    concurrent `run` cycle as a side effect before returning -- standing in
+    for another session's `run` committing at that exact instant. This
+    household has never run before the patched call: under the pre-Round-11
+    ordering (`close` read *before* the lock), `trust_monthly_close` would
+    have raised `MonthlyCloseStateError` from `close is None` immediately,
+    without ever calling the lock function the concurrent run is injected
+    through -- so this test fails under that ordering. Under the fix, the
+    lock is called first, the concurrent run happens as part of it, and
+    `trust_monthly_close`'s own read of `close` -- taken only after this
+    call returns -- observes the just-linked `review_required` close and
+    proceeds through the real gates to `trusted`.
+    """
+
+    with _engine_session() as db:
+        household, user = _household_and_user(db)
+
+        import app.services.monthly_close as monthly_close_module
+
+        real_lock = monthly_close_module.lock_household_financial_revision
+
+        def _lock_after_concurrent_run(db_arg, **kwargs):
+            run = _completed_period_run(db_arg, household_id=household.id, summary=_healthy_summary())
+            snapshot = _snapshot(db_arg, household_id=household.id, trusted=True)
+            revision = real_lock(db_arg, **kwargs)
+            upsert_monthly_close_after_run(
+                db_arg,
+                household_id=household.id,
+                period=PERIOD,
+                snapshot_id=snapshot.id,
+                integrity_run_id=run.id,
+                financial_revision=revision,
+            )
+            return revision
+
+        monkeypatch.setattr(
+            monthly_close_module, "lock_household_financial_revision", _lock_after_concurrent_run
+        )
+
+        close = trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
+        assert close.status == "trusted"
+
+
 def test_trust_succeeds_when_healthy_and_snapshot_trusted() -> None:
     with _engine_session() as db:
         household, user = _household_and_user(db)

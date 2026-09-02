@@ -135,6 +135,13 @@
   `reopened_at`/`reopened_by`/`reason` são preenchidos e o estado volta para `review_required`.
 - Nenhuma dessas ações apaga ou reescreve `Transaction`, `Document`, `FinancialSnapshot`,
   `IntegrityFinding` ou `DocumentReconciliation` anteriores.
+- `run`, `trust` e `reopen` tomam, cada um como sua primeira ação, a mesma barreira
+  (`household_financial_revisions`, seção 8.11 do plano de integridade) antes de ler o `status` atual do
+  fechamento. Isso serializa as três ações concorrentes entre si por household: quem adquire a barreira
+  primeiro conclui sua própria transição (leitura de estado até a escrita final e commit) antes que
+  qualquer uma das outras duas consiga sequer ler `status`. Sem essa ordem, um `run` que terminasse depois
+  de um `trust` concorrente já commitado sobrescreveria `trusted` de volta para `review_required` sem
+  passar por `reopen` — sem motivo, sem `reopened_by` e sem trilha de auditoria da demoção.
 
 ## Reconciliação, duplicidades e anomalias
 
