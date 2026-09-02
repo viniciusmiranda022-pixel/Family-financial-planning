@@ -150,6 +150,20 @@ DEFAULT_CATEGORIES = (
     ("Revisar", "#F59E0B", None, False),
 )
 
+# `IntegrityFinding.severity` is a plain string column, so
+# `.order_by(IntegrityFinding.severity.desc())` sorts lexicographically
+# ("warning" > "review" > "info" > "critical" > "block"), not by real
+# severity rank. A query that also `.limit()`s (see the semantic-audit
+# endpoint below) could then silently keep WARNING/REVIEW findings over
+# BLOCK/CRITICAL ones. This expression orders by explicit rank instead;
+# shared by every ORDER BY on IntegrityFinding.severity in this module so
+# the ranking can't drift between call sites.
+_FINDING_SEVERITY_RANK = case(
+    {"block": 5, "critical": 4, "review": 3, "warning": 2, "info": 1},
+    value=IntegrityFinding.severity,
+    else_=0,
+)
+
 
 def decimal_value(value: Decimal | None) -> float:
     return float(value or 0)
@@ -1090,7 +1104,7 @@ def integrity_run_detail(
                 IntegrityFinding.household_id == user.household_id,
                 IntegrityFinding.id.in_(finding_ids),
             )
-            .order_by(IntegrityFinding.severity.desc(), IntegrityFinding.created_at)
+            .order_by(_FINDING_SEVERITY_RANK.desc(), IntegrityFinding.created_at)
         ).all()
         if finding_ids
         else []
@@ -1225,14 +1239,7 @@ def integrity_semantic_audit(
     findings = db.scalars(
         select(IntegrityFinding)
         .where(*finding_filters)
-        .order_by(
-            case(
-                {"block": 5, "critical": 4, "review": 3, "warning": 2, "info": 1},
-                value=IntegrityFinding.severity,
-                else_=0,
-            ).desc(),
-            IntegrityFinding.last_seen_at.desc(),
-        )
+        .order_by(_FINDING_SEVERITY_RANK.desc(), IntegrityFinding.last_seen_at.desc(), IntegrityFinding.id)
         .limit(30)
     ).all()
 

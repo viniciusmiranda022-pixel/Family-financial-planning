@@ -149,6 +149,62 @@ def test_build_audit_payload_enforces_findings_cap() -> None:
     assert len(payload["findings"]) == 30
 
 
+def test_build_audit_payload_never_drops_block_or_critical_findings_for_lower_severity_ones() -> None:
+    """A lexicographic string sort on `severity` would rank "warning" above
+    "critical"/"block" (alphabetically: block < critical < ... < warning),
+    so a truncation to MAX_FINDINGS driven by that sort could silently drop
+    the most severe findings. Prove that 40 warnings (well over the cap)
+    never crowd out 2 block/critical findings."""
+
+    many_findings = [
+        _finding(id=f"warning-{index}", severity="warning", message=f"Aviso {index}")
+        for index in range(40)
+    ] + [
+        _finding(id="critical-1", severity="critical", message="Achado crítico."),
+        _finding(id="block-1", severity="block", message="Achado bloqueante."),
+    ]
+    payload = build_audit_payload(
+        audit_type="period_review",
+        integrity_status=BASE_INTEGRITY_STATUS,
+        findings=many_findings,
+    )
+    assert len(payload["findings"]) == 30
+    severities = [item["severity"] for item in payload["findings"]]
+    assert severities[0] == "block"
+    assert severities[1] == "critical"
+    opaque_ids = {item["opaque_id"] for item in payload["findings"]}
+    assert "block-1" in opaque_ids
+    assert "critical-1" in opaque_ids
+
+
+def test_build_audit_payload_orders_findings_by_severity_rank_deterministically() -> None:
+    """Same-severity findings are ordered by opaque_id, not arrival order,
+    so a rerun over the same underlying findings in a different fetch order
+    produces the exact same payload -- required for auditability."""
+
+    forward = [
+        _finding(id="finding-b", severity="review"),
+        _finding(id="finding-a", severity="review"),
+        _finding(id="finding-c", severity="block"),
+    ]
+    reversed_input = list(reversed(forward))
+
+    payload_forward = build_audit_payload(
+        audit_type="period_review", integrity_status=BASE_INTEGRITY_STATUS, findings=forward
+    )
+    payload_reversed = build_audit_payload(
+        audit_type="period_review", integrity_status=BASE_INTEGRITY_STATUS, findings=reversed_input
+    )
+    assert [item["opaque_id"] for item in payload_forward["findings"]] == [
+        item["opaque_id"] for item in payload_reversed["findings"]
+    ]
+    assert [item["opaque_id"] for item in payload_forward["findings"]] == [
+        "finding-c",
+        "finding-a",
+        "finding-b",
+    ]
+
+
 def test_build_audit_payload_handles_prompt_injection_text_as_inert_data() -> None:
     """A category name is user-controlled free text (Category.name). This
     proves the sanitizer neither crashes nor grants it special meaning: the

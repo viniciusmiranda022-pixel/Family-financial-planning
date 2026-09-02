@@ -58,6 +58,14 @@ MAX_MESSAGE_LENGTH = 300
 MAX_CATEGORY_LENGTH = 80
 MAX_TRACE_ID_LENGTH = 64
 
+# Explicit severity rank, most severe first -- mirrors the ordering already
+# encoded in app.services.financial_integrity.SEVERITY_WEIGHTS (not imported
+# directly: that module pulls in SQLAlchemy, and this one is deliberately
+# free of DB/HTTP imports -- see module docstring). Used only to decide
+# which findings survive the MAX_FINDINGS cap below; never to change a
+# finding's own severity value.
+_SEVERITY_RANK = {"block": 0, "critical": 1, "review": 2, "warning": 3, "info": 4}
+
 _INVARIANT_ID_PATTERN = re.compile(r"^INV-\d{3}$")
 _PERIOD_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
@@ -216,6 +224,38 @@ def _sanitize_finding(finding: Mapping[str, Any]) -> dict[str, Any] | None:
     return sanitized
 
 
+def _rank_and_cap_findings(findings: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the MAX_FINDINGS most severe findings, most severe first.
+
+    Ordering by explicit rank (block > critical > review > warning > info)
+    rather than the findings' arrival order or a plain string sort is
+    required so a truncation to MAX_FINDINGS can never silently drop a
+    BLOCK/CRITICAL finding in favor of a WARNING/REVIEW one -- a lexical
+    sort on the severity string ("warning" > "review" > "info" > "critical"
+    > "block" alphabetically) would do exactly that. `opaque_id` breaks ties
+    between same-severity findings so the result is fully deterministic
+    (stable across reruns and process restarts) rather than only
+    order-preserving.
+
+    This is a second, independent enforcement of the same ranking
+    app/api.py's `_FINDING_SEVERITY_RANK` applies at the database query
+    that is this module's only current caller: that call site already
+    fetches at most MAX_FINDINGS rows in the right order, so this rarely
+    changes anything in production today. It exists because
+    `build_audit_payload` is documented and unit-tested as a
+    caller-independent, pure transform (see its docstring) -- a future or
+    different caller that passes more than MAX_FINDINGS findings, in any
+    order, must not be able to reintroduce this defect just because it
+    forgot to pre-sort/pre-cap them itself.
+    """
+
+    def sort_key(finding: Mapping[str, Any]) -> tuple[int, str]:
+        rank = _SEVERITY_RANK.get(finding.get("severity"), len(_SEVERITY_RANK))
+        return (rank, str(finding.get("opaque_id") or ""))
+
+    return sorted(findings, key=sort_key)[:MAX_FINDINGS]
+
+
 def _sanitize_category_breakdown(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     sanitized = []
     for index, item in enumerate(items[:MAX_CATEGORY_ITEMS]):
@@ -283,9 +323,12 @@ def build_audit_payload(
     if period is not None and not _PERIOD_PATTERN.match(period):
         raise AuditSanitizationError(f"invalid period: {period!r}")
 
-    sanitized_findings = [
-        item for item in (_sanitize_finding(finding) for finding in findings[:MAX_FINDINGS]) if item
-    ]
+    # Sanitize every finding first (not just the first MAX_FINDINGS in
+    # arrival order), then rank by severity and cap -- otherwise a valid,
+    # severe finding could be discarded by an early raw-order slice before
+    # it ever reached ranking, and a less severe one kept in its place.
+    all_sanitized = [item for item in (_sanitize_finding(finding) for finding in findings) if item]
+    sanitized_findings = _rank_and_cap_findings(all_sanitized)
 
     payload: dict[str, Any] = {
         "schema_version": AUDIT_SCHEMA_VERSION,
