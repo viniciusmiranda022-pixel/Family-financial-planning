@@ -168,6 +168,20 @@ def test_monthly_close_lifecycle_and_finding_actions() -> None:
             assert findings["total"] == 1
             finding_id = findings["items"][0]["id"]
 
+            # `status=active` (open OR acknowledged) is what the UI's global
+            # BLOCK/CRITICAL panel relies on to stay visible regardless of
+            # the paginated list's own filters -- see the engineering review
+            # on PR 7 ("UI pode esconder BLOCK/CRITICAL ativo pelo cap de
+            # 100"). Rejects anything but the documented literal values.
+            assert client.get(
+                "/api/integrity/findings", params={"status": "not-a-real-status"}
+            ).status_code == 422
+            active_critical = client.get(
+                "/api/integrity/findings",
+                params={"status": "active", "severity": "critical", "period": PERIOD},
+            ).json()
+            assert finding_id in {item["id"] for item in active_critical["items"]}
+
             assert client.post(
                 f"/api/integrity/findings/{finding_id}/acknowledge", json={}
             ).status_code == 422
@@ -190,6 +204,14 @@ def test_monthly_close_lifecycle_and_finding_actions() -> None:
             assert client.post(
                 f"/api/integrity/findings/{finding_id}/resolve", json={"reason": "segunda tentativa"}
             ).status_code == 409
+
+            # A `resolved` finding is terminal, not "active" -- it must drop
+            # out of the always-visible BLOCK/CRITICAL panel's query too.
+            active_after_resolve = client.get(
+                "/api/integrity/findings",
+                params={"status": "active", "severity": "critical", "period": PERIOD},
+            ).json()
+            assert finding_id not in {item["id"] for item in active_after_resolve["items"]}
 
             with _TestSessionLocal() as db:
                 transaction = db.get(Transaction, duplicate_id)

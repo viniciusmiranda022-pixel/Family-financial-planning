@@ -91,6 +91,7 @@ from app.services.finance import (
     monthly_net_rate,
 )
 from app.services.financial_integrity import (
+    ACTIVE_FINDING_STATUSES,
     FindingLifecycleError,
     IntegrityCheck,
     IntegrityRunScope,
@@ -112,6 +113,7 @@ from app.services.financial_snapshots import (
     dashboard_monetary_dataset,
     liquidity_transition_facts,
     report_month_monetary_dataset,
+    savings_rate_from_totals,
     serialize_snapshot,
     snapshot_lineage_facts,
 )
@@ -1167,6 +1169,15 @@ def integrity_findings(
         "resolved",
         "ignored",
         "false_positive",
+        # "active" = open OR acknowledged (`ACTIVE_FINDING_STATUSES`), not a
+        # real `IntegrityFinding.status` value. Lets a caller ask for every
+        # still-live finding in one request instead of one call per status --
+        # the UI's global BLOCK/CRITICAL panel needs exactly this so a
+        # material finding is never pushed out of view by the default
+        # pagination cap regardless of which terminal statuses also exist
+        # for the household. See the engineering review on PR 7 ("UI pode
+        # esconder BLOCK/CRITICAL ativo pelo cap de 100").
+        "active",
     }:
         raise HTTPException(status_code=422, detail="Status de finding inválido")
     if severity and severity not in {"info", "warning", "review", "critical", "block"}:
@@ -1178,7 +1189,9 @@ def integrity_findings(
             raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from exc
 
     filters = [IntegrityFinding.household_id == user.household_id]
-    if status_filter:
+    if status_filter == "active":
+        filters.append(IntegrityFinding.status.in_(ACTIVE_FINDING_STATUSES))
+    elif status_filter:
         filters.append(IntegrityFinding.status == status_filter)
     if severity:
         filters.append(IntegrityFinding.severity == severity)
@@ -1487,15 +1500,18 @@ def run_monthly_close(
     )
     # `trusted_for_reports` needs its own required coverage (INV-019, INV-020;
     # INV-022 is already evaluated above and satisfies both gates at once --
-    # see `_trust_gate`). See `dashboard_and_report_consistency_facts`'
-    # docstring for why comparing the snapshot to itself is the true state of
-    # the current architecture rather than invented evidence.
-    consistency_facts = dashboard_and_report_consistency_facts(period_snapshot)
+    # see `_trust_gate`). Each invariant gets its own fact set (`"dashboard"`
+    # for INV-019, `"report"` for INV-020) because `/dashboard` and
+    # `/reports` do not publish the exact same field set -- see
+    # `dashboard_and_report_consistency_facts`' docstring for why comparing
+    # the snapshot to itself is the true state of the current architecture
+    # rather than invented evidence.
+    consistency_facts = dashboard_and_report_consistency_facts(period_snapshot, profile=profile)
     report_checks = (
         IntegrityCheck(
             "INV-019",
             InvariantContext(
-                facts=consistency_facts,
+                facts=consistency_facts["dashboard"],
                 scope=InvariantScope.REPORT,
                 entity_type="monthly_close",
                 entity_id=close_entity_id,
@@ -1505,7 +1521,7 @@ def run_monthly_close(
         IntegrityCheck(
             "INV-020",
             InvariantContext(
-                facts=consistency_facts,
+                facts=consistency_facts["report"],
                 scope=InvariantScope.REPORT,
                 entity_type="monthly_close",
                 entity_id=close_entity_id,
@@ -4091,8 +4107,10 @@ def dashboard(
     db.commit()
     # `dashboard_monetary_dataset` is the same function INV-019 reads to
     # verify this response -- see its docstring and
-    # `dashboard_and_report_consistency_facts`.
-    monetary = dashboard_monetary_dataset(snapshot)
+    # `dashboard_and_report_consistency_facts`. `investment_balance` comes
+    # from it too instead of reading `profile.investment_balance` inline, so
+    # this endpoint has no publication path for that figure INV-019 cannot see.
+    monetary = dashboard_monetary_dataset(snapshot, profile=profile)
     cash_net = monetary["operating_result"]
     return {
         "month": month_key(start),
@@ -4109,7 +4127,7 @@ def dashboard(
         "cash_flow_by_account": snapshot_payload["cash_flow_by_account"],
         "cash_cap": decimal_value(monetary["budget_cap"]),
         "remaining_cap": decimal_value(monetary["budget_remaining"]),
-        "investment_balance": decimal_value(profile.investment_balance),
+        "investment_balance": decimal_value(monetary["investment_balance"]),
         "liquidity_name": profile.investment_name,
         "liquidity_starting_balance": decimal_value(snapshot.opening_liquidity_balance),
         "liquidity_balance": decimal_value(monetary["closing_liquidity_balance"]),
@@ -4275,11 +4293,11 @@ def reports(
     total_liquidity_used = money(
         sum((Decimal(item.liquidity_used) for item in report_snapshots), Decimal("0"))
     )
-    savings_rate = (
-        money(((total_cash_in - total_cash_out) / total_cash_in) * Decimal("100"))
-        if total_cash_in > 0
-        else Decimal("0")
-    )
+    # `savings_rate_from_totals` is the same function INV-020 reads to verify
+    # a one-month window's `savings_rate` -- see its docstring and
+    # `dashboard_and_report_consistency_facts`. Previously computed inline
+    # here only, with zero invariant coverage.
+    savings_rate = savings_rate_from_totals(total_cash_in, total_cash_out)
     account_totals: dict[str, dict[str, object]] = {}
     for snapshot in report_snapshots:
         for account in snapshot.payload.get("cash_flow_by_account", []):

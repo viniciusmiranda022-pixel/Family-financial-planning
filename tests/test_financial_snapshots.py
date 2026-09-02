@@ -410,6 +410,48 @@ def _evaluate_report_check(invariant_id: str, facts: dict[str, object]):
     )
 
 
+def _consistency_household(db: Session) -> tuple[Household, FinancialProfile, FinancialSnapshot]:
+    household = Household(name="Família Consistência Publicada")
+    db.add(household)
+    db.flush()
+    checking = Account(household_id=household.id, name="Conta Corrente", account_type="checking")
+    income_category = Category(household_id=household.id, name="Salário")
+    expense_category = Category(household_id=household.id, name="Mercado")
+    profile = FinancialProfile(
+        household_id=household.id,
+        investment_name="Reserva DI",
+        monthly_cash_cap=Decimal("1000"),
+        investment_balance=Decimal("5000.00"),
+    )
+    db.add_all([checking, income_category, expense_category, profile])
+    db.flush()
+    db.add_all(
+        [
+            _transaction(
+                household,
+                checking,
+                income_category,
+                booked_at=date(2026, 9, 3),
+                amount="1500",
+                transaction_type="income",
+                suffix="1",
+            ),
+            _transaction(
+                household,
+                checking,
+                expense_category,
+                booked_at=date(2026, 9, 5),
+                amount="-400",
+                transaction_type="expense",
+                suffix="2",
+            ),
+        ]
+    )
+    db.commit()
+    snapshot = build_snapshot(db, household_id=household.id, period="2026-09")
+    return household, profile, snapshot
+
+
 def test_dashboard_and_report_consistency_facts_observe_the_real_publication_path(
     monkeypatch,
 ) -> None:
@@ -432,50 +474,19 @@ def test_dashboard_and_report_consistency_facts_observe_the_real_publication_pat
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        household = Household(name="Família Consistência Publicada")
-        db.add(household)
-        db.flush()
-        checking = Account(household_id=household.id, name="Conta Corrente", account_type="checking")
-        income_category = Category(household_id=household.id, name="Salário")
-        expense_category = Category(household_id=household.id, name="Mercado")
-        profile = FinancialProfile(
-            household_id=household.id,
-            investment_name="Reserva DI",
-            monthly_cash_cap=Decimal("1000"),
-        )
-        db.add_all([checking, income_category, expense_category, profile])
-        db.flush()
-        db.add_all(
-            [
-                _transaction(
-                    household,
-                    checking,
-                    income_category,
-                    booked_at=date(2026, 9, 3),
-                    amount="1500",
-                    transaction_type="income",
-                    suffix="1",
-                ),
-                _transaction(
-                    household,
-                    checking,
-                    expense_category,
-                    booked_at=date(2026, 9, 5),
-                    amount="-400",
-                    transaction_type="expense",
-                    suffix="2",
-                ),
-            ]
-        )
-        db.commit()
+        _household, profile, snapshot = _consistency_household(db)
 
-        snapshot = build_snapshot(db, household_id=household.id, period="2026-09")
-
-        baseline_facts = dashboard_and_report_consistency_facts(snapshot)
-        assert baseline_facts["dashboard_values"] == baseline_facts["financial_engine_values"]
-        assert baseline_facts["report_values"] == baseline_facts["financial_engine_values"]
-        assert _evaluate_report_check("INV-019", baseline_facts).status is InvariantStatus.PASS
-        assert _evaluate_report_check("INV-020", baseline_facts).status is InvariantStatus.PASS
+        baseline_facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        assert (
+            baseline_facts["dashboard"]["dashboard_values"]
+            == baseline_facts["dashboard"]["financial_engine_values"]
+        )
+        assert (
+            baseline_facts["report"]["report_values"]
+            == baseline_facts["report"]["financial_engine_values"]
+        )
+        assert _evaluate_report_check("INV-019", baseline_facts["dashboard"]).status is InvariantStatus.PASS
+        assert _evaluate_report_check("INV-020", baseline_facts["report"]).status is InvariantStatus.PASS
 
         real_report_dataset = financial_snapshots_module.report_month_monetary_dataset
 
@@ -488,14 +499,146 @@ def test_dashboard_and_report_consistency_facts_observe_the_real_publication_pat
             financial_snapshots_module, "report_month_monetary_dataset", _stale_report_dataset
         )
 
-        divergent_facts = dashboard_and_report_consistency_facts(snapshot)
-        report_result = _evaluate_report_check("INV-020", divergent_facts)
+        divergent_facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        report_result = _evaluate_report_check("INV-020", divergent_facts["report"])
         assert report_result.status is InvariantStatus.FAIL
         assert report_result.severity.value == "block"
         assert report_result.difference == Decimal("0.02")
         # Only report_month_monetary_dataset was patched -- INV-019 (dashboard)
         # reads dashboard_monetary_dataset, untouched, and must stay PASS.
-        assert _evaluate_report_check("INV-019", divergent_facts).status is InvariantStatus.PASS
+        assert (
+            _evaluate_report_check("INV-019", divergent_facts["dashboard"]).status
+            is InvariantStatus.PASS
+        )
+
+
+def test_inv019_catches_a_dashboard_investment_balance_divergence(monkeypatch) -> None:
+    """INV-019 must cover `investment_balance`, not just the snapshot-derived fields.
+
+    Before PR 7's post-review correction, `dashboard()` read
+    `profile.investment_balance` directly and `_snapshot_monetary_fields`
+    never included it, so `dashboard_and_report_consistency_facts` had no
+    fact about it at all -- a `dashboard()` regression that published a wrong
+    `investment_balance` would sail through `trusted_for_reports=true`. This
+    patches `dashboard_monetary_dataset` (the function both `dashboard()` and
+    this fact builder call) to publish a wrong `investment_balance` and
+    proves INV-019 now catches it.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        _household, profile, snapshot = _consistency_household(db)
+
+        baseline_facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        assert baseline_facts["dashboard"]["financial_engine_values"]["investment_balance"] == Decimal(
+            "5000.00"
+        )
+        assert _evaluate_report_check("INV-019", baseline_facts["dashboard"]).status is InvariantStatus.PASS
+
+        real_dashboard_dataset = financial_snapshots_module.dashboard_monetary_dataset
+
+        def _stale_dashboard_dataset(
+            snapshot_arg: FinancialSnapshot, *, profile: FinancialProfile
+        ) -> dict[str, Decimal]:
+            values = dict(real_dashboard_dataset(snapshot_arg, profile=profile))
+            values["investment_balance"] = values["investment_balance"] + Decimal("500.00")
+            return values
+
+        monkeypatch.setattr(
+            financial_snapshots_module, "dashboard_monetary_dataset", _stale_dashboard_dataset
+        )
+
+        divergent_facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        result = _evaluate_report_check("INV-019", divergent_facts["dashboard"])
+        assert result.status is InvariantStatus.FAIL
+        assert result.metadata["mismatches"]["investment_balance"]["difference"] == Decimal("500.00")
+
+
+def test_inv020_catches_a_reports_savings_rate_divergence(monkeypatch) -> None:
+    """INV-020 must cover `savings_rate`, not just the snapshot-derived fields.
+
+    Before PR 7's post-review correction, `reports()` computed `savings_rate`
+    with its own inline formula and no invariant read it at all (see the
+    engineering review on PR 7: "reports independently calculates
+    savings_rate"). This patches `savings_rate_from_totals` (the function
+    both `reports()` and this fact builder now call) to publish a wrong
+    value and proves INV-020 catches it.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        _household, profile, snapshot = _consistency_household(db)
+
+        baseline_facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        expected_rate = financial_snapshots_module.savings_rate_from_totals(
+            Decimal(snapshot.operating_income), Decimal(snapshot.operating_expenses)
+        )
+        assert baseline_facts["report"]["report_values"]["savings_rate"] == expected_rate
+        assert _evaluate_report_check("INV-020", baseline_facts["report"]).status is InvariantStatus.PASS
+
+        real_savings_rate = financial_snapshots_module.savings_rate_from_totals
+
+        def _stale_savings_rate(total_cash_in: Decimal, total_cash_out: Decimal) -> Decimal:
+            return real_savings_rate(total_cash_in, total_cash_out) + Decimal("1.00")
+
+        monkeypatch.setattr(
+            financial_snapshots_module, "savings_rate_from_totals", _stale_savings_rate
+        )
+
+        divergent_facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        result = _evaluate_report_check("INV-020", divergent_facts["report"])
+        assert result.status is InvariantStatus.FAIL
+        assert result.metadata["mismatches"]["savings_rate"]["difference"] == Decimal("1.00")
+        # Only the report side computes savings_rate -- INV-019 (dashboard)
+        # has no such fact and must stay unaffected/PASS.
+        assert (
+            _evaluate_report_check("INV-019", divergent_facts["dashboard"]).status
+            is InvariantStatus.PASS
+        )
+
+
+def test_reports_endpoint_uses_the_shared_savings_rate_function(monkeypatch) -> None:
+    """`GET /reports` itself must call `savings_rate_from_totals`, not an inline copy.
+
+    Complements the two facts-level tests above (which exercise the
+    invariant in isolation) by proving the live endpoint's publication path
+    is genuinely wired to the shared function the engineering review asked
+    for: patch `savings_rate_from_totals` as imported into `app.api` and
+    show the real HTTP response changes.
+    """
+
+    import app.api as api_module
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        household, _profile, _snapshot = _consistency_household(db)
+        user = User(
+            household_id=household.id,
+            name="Revisor",
+            username="revisor-savings-rate",
+            password_hash="x",
+            is_admin=True,
+        )
+        db.add(user)
+        db.commit()
+
+        real_savings_rate = api_module.savings_rate_from_totals
+        monkeypatch.setattr(
+            api_module,
+            "savings_rate_from_totals",
+            lambda total_cash_in, total_cash_out: real_savings_rate(total_cash_in, total_cash_out)
+            + Decimal("7.00"),
+        )
+
+        result = reports(end_month="2026-09", months=1, user=user, db=db)
+        expected = real_savings_rate(
+            Decimal(str(result["summary"]["total_cash_in"])),
+            Decimal(str(result["summary"]["total_cash_out"])),
+        )
+        assert Decimal(str(result["summary"]["savings_rate"])) == expected + Decimal("7.00")
 
 
 def _evaluate_projection_gate_check(invariant_id: str, facts: dict[str, object]):

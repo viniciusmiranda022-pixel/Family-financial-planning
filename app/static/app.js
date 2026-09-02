@@ -1236,7 +1236,67 @@ async function loadIntegrity() {
   const status = await api("/integrity/status");
   renderIntegritySummaryCards(status);
   await refreshIntegrityBanner();
-  await Promise.all([loadMonthlyClose(), loadFindings(), loadReconciliations()]);
+  await Promise.all([
+    loadMonthlyClose(),
+    loadActiveCriticalFindings(),
+    loadFindings(),
+    loadReconciliations(),
+  ]);
+}
+
+function findingCardHtml(item) {
+  return `
+    <article class="review-card" data-finding-id="${escapeHtml(item.id)}">
+      <div class="review-icon">${item.severity === "block" || item.severity === "critical" ? "!" : "i"}</div>
+      <div class="review-content">
+        <h3>${escapeHtml(item.title)} <span class="status-chip severity-${escapeHtml(item.severity)}">${severityLabel(item.severity)}</span> <span class="status-chip muted">${findingStatusLabel(item.status)}</span></h3>
+        <p>${escapeHtml(item.invariant_id)} • ${escapeHtml(item.period || "sem período")} • ${item.occurrence_count}x${item.last_seen_at ? ` • última vez ${dateFormat.format(new Date(item.last_seen_at))}` : ""}</p>
+        <div class="review-controls">
+          <button class="text-action view-finding-detail" data-id="${escapeHtml(item.id)}">Detalhe</button>
+          ${item.status === "open" ? `<button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="acknowledge" data-label="reconhecer">Reconhecer</button>` : ""}
+          ${item.status === "open" || item.status === "acknowledged" ? `
+            <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="resolve" data-label="resolver">Resolver</button>
+            <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="ignore" data-label="ignorar">Ignorar</button>
+            <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="false-positive" data-label="marcar falso positivo">Falso positivo</button>
+          ` : ""}
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function bindFindingCardActions(container) {
+  container.querySelectorAll(".view-finding-detail").forEach((button) => button.addEventListener("click", () => showFindingDetail(button.dataset.id)));
+  container.querySelectorAll(".finding-action").forEach((button) => button.addEventListener("click", () => findingLifecycleAction(button.dataset.id, button.dataset.action, button.dataset.label)));
+}
+
+// Always visible, independent of the filtered/paginated list below: fetches
+// every active (open/acknowledged) BLOCK and CRITICAL finding directly by
+// severity so a material finding can never be pushed out of sight by the
+// default page cap or by a status/severity filter someone left applied --
+// see the engineering review on PR 7 ("UI pode esconder BLOCK/CRITICAL
+// ativo pelo cap de 100").
+async function loadActiveCriticalFindings() {
+  const panel = document.querySelector("#findings-active-panel");
+  const list = document.querySelector("#findings-active-list");
+  const [blockData, criticalData] = await Promise.all([
+    api("/integrity/findings?status=active&severity=block&limit=200"),
+    api("/integrity/findings?status=active&severity=critical&limit=200"),
+  ]);
+  const seen = new Set();
+  const items = [...blockData.items, ...criticalData.items].filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+  if (!items.length) {
+    panel.classList.add("hidden");
+    list.innerHTML = "";
+    return;
+  }
+  panel.classList.remove("hidden");
+  list.innerHTML = items.map(findingCardHtml).join("");
+  bindFindingCardActions(list);
 }
 
 function renderMonthlyClose(close) {
@@ -1270,7 +1330,15 @@ async function loadMonthlyClose() {
   renderMonthlyClose(close);
 }
 
-async function loadFindings() {
+// The filtered/paginated view. `loadActiveCriticalFindings()` above is the
+// one guaranteeing BLOCK/CRITICAL visibility -- this list's page cap is
+// safe to keep small since it is no longer the only place a material
+// finding can be seen or acted on.
+let findingsPage = 1;
+const FINDINGS_PAGE_SIZE = 20;
+
+async function loadFindings(page = findingsPage) {
+  findingsPage = Math.max(1, page);
   const params = new URLSearchParams();
   const statusFilter = document.querySelector("#finding-filter-status").value;
   const severityFilter = document.querySelector("#finding-filter-severity").value;
@@ -1278,29 +1346,20 @@ async function loadFindings() {
   if (statusFilter) params.set("status", statusFilter);
   if (severityFilter) params.set("severity", severityFilter);
   if (periodFilter) params.set("period", periodFilter);
-  params.set("limit", "100");
+  params.set("page", String(findingsPage));
+  params.set("limit", String(FINDINGS_PAGE_SIZE));
   const data = await api(`/integrity/findings?${params.toString()}`);
   const list = document.querySelector("#findings-list");
-  list.innerHTML = data.items.length ? data.items.map((item) => `
-    <article class="review-card" data-finding-id="${escapeHtml(item.id)}">
-      <div class="review-icon">${item.severity === "block" || item.severity === "critical" ? "!" : "i"}</div>
-      <div class="review-content">
-        <h3>${escapeHtml(item.title)} <span class="status-chip severity-${escapeHtml(item.severity)}">${severityLabel(item.severity)}</span> <span class="status-chip muted">${findingStatusLabel(item.status)}</span></h3>
-        <p>${escapeHtml(item.invariant_id)} • ${escapeHtml(item.period || "sem período")} • ${item.occurrence_count}x${item.last_seen_at ? ` • última vez ${dateFormat.format(new Date(item.last_seen_at))}` : ""}</p>
-        <div class="review-controls">
-          <button class="text-action view-finding-detail" data-id="${escapeHtml(item.id)}">Detalhe</button>
-          ${item.status === "open" ? `<button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="acknowledge" data-label="reconhecer">Reconhecer</button>` : ""}
-          ${item.status === "open" || item.status === "acknowledged" ? `
-            <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="resolve" data-label="resolver">Resolver</button>
-            <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="ignore" data-label="ignorar">Ignorar</button>
-            <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="false-positive" data-label="marcar falso positivo">Falso positivo</button>
-          ` : ""}
-        </div>
-      </div>
-    </article>
-  `).join("") : '<p class="empty">Nenhum finding para os filtros selecionados.</p>';
-  document.querySelectorAll(".view-finding-detail").forEach((button) => button.addEventListener("click", () => showFindingDetail(button.dataset.id)));
-  document.querySelectorAll(".finding-action").forEach((button) => button.addEventListener("click", () => findingLifecycleAction(button.dataset.id, button.dataset.action, button.dataset.label)));
+  list.innerHTML = data.items.length
+    ? data.items.map(findingCardHtml).join("")
+    : '<p class="empty">Nenhum finding para os filtros selecionados.</p>';
+  bindFindingCardActions(list);
+
+  const totalPages = Math.max(1, Math.ceil(data.total / data.limit));
+  document.querySelector("#findings-page-info").textContent =
+    data.total > 0 ? `Página ${data.page} de ${totalPages} • ${data.total} finding(s)` : "Nenhum finding";
+  document.querySelector("#findings-page-prev").disabled = data.page <= 1;
+  document.querySelector("#findings-page-next").disabled = data.page >= totalPages;
 }
 
 async function showFindingDetail(id) {
@@ -1659,7 +1718,9 @@ document.querySelector("#close-reopen").addEventListener("click", async () => {
     await loadIntegrity();
   } catch (error) { toast(error.message, true); }
 });
-document.querySelector("#finding-filter-apply").addEventListener("click", () => loadFindings().catch((error) => toast(error.message, true)));
+document.querySelector("#finding-filter-apply").addEventListener("click", () => loadFindings(1).catch((error) => toast(error.message, true)));
+document.querySelector("#findings-page-prev").addEventListener("click", () => loadFindings(findingsPage - 1).catch((error) => toast(error.message, true)));
+document.querySelector("#findings-page-next").addEventListener("click", () => loadFindings(findingsPage + 1).catch((error) => toast(error.message, true)));
 document.querySelector("#finding-detail-close").addEventListener("click", () => document.querySelector("#finding-detail-panel").classList.add("hidden"));
 
 let responsiveTableFrame = null;

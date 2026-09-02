@@ -220,12 +220,22 @@ def _observation_is_trusted(db: Session, observation: AccountBalanceObservation)
 
 
 def _source_hash(sources: list[SnapshotSource], profile: FinancialProfile) -> str:
+    # `money(...)` before `str(...)` on every Decimal here, not a bare
+    # `str(profile.monthly_cash_cap)` -- an un-round-tripped Python-side
+    # Decimal (e.g. the column's `default=0`, still `Decimal("0")` in the
+    # same session that created the row) and a freshly `SELECT`ed one from
+    # PostgreSQL/SQLite (`Decimal("0.00")`, scaled per `Numeric(14, 2)`)
+    # otherwise stringify to different text for the exact same value. That
+    # made `build_snapshot`'s checksum -- and therefore `trust_monthly_close`
+    # -- spuriously see "changed data" purely from which session first
+    # touched `profile`, not from any real mutation. See the regression this
+    # broke in `tests/test_monthly_close_api.py`.
     payload = {
         "profile": {
             "id": profile.id,
             "updated_at": profile.updated_at.isoformat() if profile.updated_at else None,
-            "cash_cap": str(profile.monthly_cash_cap),
-            "floor": str(profile.emergency_floor),
+            "cash_cap": str(money(profile.monthly_cash_cap)),
+            "floor": str(money(profile.emergency_floor)),
         },
         "sources": [
             {
@@ -235,7 +245,7 @@ def _source_hash(sources: list[SnapshotSource], profile: FinancialProfile) -> st
                 "source_role": item.source_role,
                 "rule_id": item.rule_id,
                 "metric_key": item.metric_key,
-                "contribution": str(item.contribution) if item.contribution is not None else None,
+                "contribution": str(money(item.contribution)) if item.contribution is not None else None,
             }
             for item in sources
         ],
@@ -727,19 +737,40 @@ def _snapshot_monetary_fields(snapshot: FinancialSnapshot) -> dict[str, Decimal]
     }
 
 
-def dashboard_monetary_dataset(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+def _profile_monetary_fields(profile: FinancialProfile) -> dict[str, Decimal]:
+    """The canonical monetary field selection off `profile` that `/dashboard`
+    also publishes.
+
+    `investment_balance` is not produced by `build_snapshot` -- it is a
+    running balance `FinancialProfile` carries directly, mutated by
+    transaction/transfer/commission endpoints as they happen -- so it cannot
+    live in `_snapshot_monetary_fields` (which only reads columns the
+    Financial Engine wrote onto a `FinancialSnapshot` row). It gets its own
+    single-field selector instead, shared by `dashboard_monetary_dataset` and
+    the INV-019 fact builder below, so both read the exact same attribute.
+    """
+
+    return {"investment_balance": money(profile.investment_balance)}
+
+
+def dashboard_monetary_dataset(
+    snapshot: FinancialSnapshot, *, profile: FinancialProfile
+) -> dict[str, Decimal]:
     """The exact monetary dataset `GET /dashboard` publishes for `snapshot`.
 
     `app/api.py`'s `dashboard()` calls this function -- not a copy of it --
-    to build every monetary field in its response. It is also the function
-    `dashboard_and_report_consistency_facts()` calls to fill `dashboard_values`,
-    so an INV-019 fact is genuine evidence about the endpoint's own output: if
-    `dashboard()` ever stops calling this function (a hardcoded override, a
-    stale cache, a parallel formula), its published numbers diverge from what
-    this function returns, and INV-019 starts failing against the real gap.
+    to build every monetary field in its response, `investment_balance`
+    included (previously read inline straight off `profile`, uncovered by
+    any invariant -- see the engineering review on PR 7). It is also the
+    function `dashboard_and_report_consistency_facts()` calls to fill
+    `dashboard_values`, so an INV-019 fact is genuine evidence about the
+    endpoint's own output: if `dashboard()` ever stops calling this function
+    (a hardcoded override, a stale cache, a parallel formula), its published
+    numbers diverge from what this function returns, and INV-019 starts
+    failing against the real gap.
     """
 
-    return _snapshot_monetary_fields(snapshot)
+    return {**_snapshot_monetary_fields(snapshot), **_profile_monetary_fields(profile)}
 
 
 def report_month_monetary_dataset(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
@@ -755,31 +786,93 @@ def report_month_monetary_dataset(snapshot: FinancialSnapshot) -> dict[str, Deci
     return _snapshot_monetary_fields(snapshot)
 
 
-def dashboard_and_report_consistency_facts(snapshot: FinancialSnapshot) -> dict[str, dict[str, Decimal] | Decimal]:
+def savings_rate_from_totals(total_cash_in: Decimal, total_cash_out: Decimal) -> Decimal:
+    """The exact `savings_rate` formula `GET /reports` publishes for a window.
+
+    Previously computed inline inside `reports()` only, with zero INV-020
+    coverage (see the engineering review on PR 7: "reports independently
+    calculates savings_rate"). Extracted as a pure function so `reports()`
+    and `dashboard_and_report_consistency_facts()` call the identical
+    computation instead of `reports()` keeping its own private copy. For a
+    one-month window (the shape `dashboard_and_report_consistency_facts`
+    checks, matching a monthly close's single closed period) this reduces to
+    that month's own `operating_income`/`operating_expenses`, so it is not a
+    parallel financial formula -- it is the one formula `reports()` already
+    used, now shared instead of duplicated.
+    """
+
+    if total_cash_in <= 0:
+        return Decimal("0.00")
+    return money(((total_cash_in - total_cash_out) / total_cash_in) * Decimal("100"))
+
+
+def _savings_rate_engine_truth(operating_income: Decimal, operating_expenses: Decimal) -> Decimal:
+    """INV-020's own, independently-coded `savings_rate` expectation.
+
+    Deliberately does **not** call `savings_rate_from_totals` -- the function
+    `reports()` calls to publish the figure -- for the same reason INV-018
+    evaluates the Projection Engine against an independently-coded
+    Projection Validator instead of comparing a value to itself: if the
+    "expected" side called the exact function under test, a regression in
+    that function (or in what `reports()` passes into it) would move both
+    sides identically and the check would always PASS by construction. The
+    formula is intentionally identical to `savings_rate_from_totals`' today;
+    what matters is that it is a second, independent implementation.
+    """
+
+    if operating_income <= 0:
+        return Decimal("0.00")
+    return money(((operating_income - operating_expenses) / operating_income) * Decimal("100"))
+
+
+def dashboard_and_report_consistency_facts(
+    snapshot: FinancialSnapshot, *, profile: FinancialProfile
+) -> dict[str, dict[str, dict[str, Decimal] | Decimal]]:
     """Derive INV-019/INV-020 facts (`trusted_for_reports`) for `snapshot`.
 
-    `financial_engine_values` is read straight off the canonical
-    `FinancialSnapshot` row. `dashboard_values`/`report_values` are **not**
-    fabricated as a copy of it here: they are produced by calling
-    `dashboard_monetary_dataset()`/`report_month_monetary_dataset()`, the
-    same functions `app/api.py`'s `dashboard()`/`reports()` call to build
-    their own responses (see those functions' docstrings). Today all three
-    agree because there genuinely is one computation path; if a consumer
-    starts computing any of these fields a different way, the function it
-    was supposed to call no longer matches what it actually returns, and
-    this check fails against that real gap instead of a hardcoded copy. See
-    `tests/test_financial_snapshots.py` for a regression that patches the
-    publication path (not the invariant) and proves this.
+    Returns one independent fact set per invariant (`"dashboard"` for
+    INV-019, `"report"` for INV-020) instead of one shared
+    `financial_engine_values`, because `/dashboard` and `/reports` do not
+    publish exactly the same field set for a period: `/dashboard` adds
+    `investment_balance` (a live `FinancialProfile` balance, not a snapshot
+    column) and a one-month `/reports` window adds `savings_rate`. Every
+    field in both sets is produced by calling the same functions
+    `app/api.py`'s `dashboard()`/`reports()` call to build their own
+    responses (see those functions' docstrings and
+    `dashboard_monetary_dataset`/`savings_rate_from_totals` above). Today all
+    sides agree because there genuinely is one computation path per field; if
+    a consumer starts computing any of these fields a different way, the
+    function it was supposed to call no longer matches what it actually
+    returns, and the corresponding check fails against that real gap instead
+    of a hardcoded copy. See `tests/test_financial_snapshots.py` for
+    regressions that patch the publication path (not the invariant) for each
+    covered field and prove FAIL.
     """
 
     from app.services.financial_invariants import MONEY_TOLERANCE
 
     engine_values = _snapshot_monetary_fields(snapshot)
+    dashboard_values = dict(dashboard_monetary_dataset(snapshot, profile=profile))
+    engine_savings_rate = _savings_rate_engine_truth(
+        Decimal(snapshot.operating_income), Decimal(snapshot.operating_expenses)
+    )
+    report_values = {
+        **dict(report_month_monetary_dataset(snapshot)),
+        "savings_rate": savings_rate_from_totals(
+            engine_values["operating_income"], engine_values["operating_expenses"]
+        ),
+    }
     return {
-        "financial_engine_values": engine_values,
-        "dashboard_values": dict(dashboard_monetary_dataset(snapshot)),
-        "report_values": dict(report_month_monetary_dataset(snapshot)),
-        "monetary_tolerance": MONEY_TOLERANCE,
+        "dashboard": {
+            "financial_engine_values": {**engine_values, **_profile_monetary_fields(profile)},
+            "dashboard_values": dashboard_values,
+            "monetary_tolerance": MONEY_TOLERANCE,
+        },
+        "report": {
+            "financial_engine_values": {**engine_values, "savings_rate": engine_savings_rate},
+            "report_values": report_values,
+            "monetary_tolerance": MONEY_TOLERANCE,
+        },
     }
 
 

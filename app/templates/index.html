@@ -420,6 +420,11 @@
           <div id="close-status"></div>
         </article>
 
+        <article class="panel hidden" id="findings-active-panel">
+          <div class="panel-heading"><div><span class="step-label">SEMPRE VISÍVEL</span><h2>BLOCK / CRITICAL ativos</h2><small>Independe dos filtros e da paginação abaixo -- nenhum finding material fica escondido.</small></div></div>
+          <div id="findings-active-list" class="review-list"></div>
+        </article>
+
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">FINDINGS</span><h2>Achados determinísticos</h2></div></div>
           <div class="inline-controls">
@@ -443,6 +448,11 @@
             <button id="finding-filter-apply" class="secondary" type="button">Filtrar</button>
           </div>
           <div id="findings-list" class="review-list"></div>
+          <div class="inline-controls" id="findings-pagination">
+            <button id="findings-page-prev" class="text-action" type="button">« Anterior</button>
+            <small id="findings-page-info"></small>
+            <button id="findings-page-next" class="text-action" type="button">Próxima »</button>
+          </div>
         </article>
 
         <article class="panel hidden" id="finding-detail-panel">
