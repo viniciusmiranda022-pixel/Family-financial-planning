@@ -32,7 +32,15 @@ os.environ.setdefault("DATA_DIR", f"/tmp/ffp-monthly-close-api-data-{uuid.uuid4(
 import app.api as api_module  # noqa: E402
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Category, FinancialSnapshot, Household, IntegrityRun, Transaction, User  # noqa: E402
+from app.models import (  # noqa: E402
+    Category,
+    Commission,
+    FinancialSnapshot,
+    Household,
+    IntegrityRun,
+    Transaction,
+    User,
+)
 from app.security import hash_password  # noqa: E402
 
 PERIOD = "2026-08"
@@ -395,6 +403,134 @@ def test_monthly_close_reaches_trusted_for_a_real_clean_period() -> None:
             assert rerun.json()["pending"]["integrity_status"] == "critical"
             assert rerun.json()["pending"]["eligible_for_trust"] is False
             assert client.post(f"/api/monthly-closes/{PERIOD}/trust").status_code == 422
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_future_commissions_gross_stays_noncanonical_after_trust() -> None:
+    """PR 7, Round 7: a live figure must never get folded into a `trusted` close.
+
+    `future_commissions_gross` is a live `Commission` query, not a Financial
+    Engine/snapshot output (see the comment above its query in `dashboard()`).
+    This drives a household through a genuinely clean `run -> trust`, then
+    adds a `Commission` whose `expected_date` falls inside the now-trusted
+    period and re-reads `/dashboard`: the close must stay `trusted` (the new
+    commission cannot retroactively change what the snapshot certified), and
+    the response must publish the live figure only inside the explicitly
+    uncertified `noncanonical` object -- never as a bare top-level key beside
+    `trusted_for_reports`/`snapshot_checksum` (see the engineering review on
+    PR 7, Round 7: "cannot remain a first-level monetary field ... without
+    marking").
+    """
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        _create_household_admin(
+            household_name="Família Comissão Futura",
+            username="admin-close-commission",
+            password="senha-local-segura",
+        )
+        with TestClient(app) as client:
+            login = client.post(
+                "/api/auth/login",
+                json={"username": "admin-close-commission", "password": "senha-local-segura"},
+            )
+            assert login.status_code == 200
+
+            investment = client.post(
+                "/api/accounts",
+                json={
+                    "name": "Reserva DI",
+                    "institution": "Banco XP",
+                    "account_type": "investment",
+                    "owner_label": "Família",
+                },
+            )
+            assert investment.status_code == 201
+
+            checking = client.post(
+                "/api/accounts",
+                json={
+                    "name": "Conta corrente",
+                    "institution": "Banco XP",
+                    "account_type": "checking",
+                    "owner_label": "Família",
+                },
+            )
+            assert checking.status_code == 201
+
+            balance = client.post(
+                "/api/account-balances",
+                json={
+                    "account_id": investment.json()["id"],
+                    "amount": "1000.00",
+                    "as_of_date": f"{PERIOD}-01",
+                    "observation_type": "opening",
+                },
+            )
+            assert balance.status_code == 201
+
+            with _TestSessionLocal() as db:
+                household = db.scalar(
+                    select(Household).where(Household.name == "Família Comissão Futura")
+                )
+                income_category = Category(household_id=household.id, name="Receitas")
+                db.add(income_category)
+                db.flush()
+                db.add(
+                    Transaction(
+                        household_id=household.id,
+                        account_id=checking.json()["id"],
+                        category_id=income_category.id,
+                        booked_at=date(2026, 8, 10),
+                        description="Salário",
+                        normalized_description="SALARIO",
+                        amount=Decimal("500.00"),
+                        transaction_type="income",
+                        owner_label="Família",
+                        fingerprint="j" * 64,
+                        possible_duplicate=False,
+                        excluded=False,
+                        reviewed=True,
+                    )
+                )
+                db.commit()
+
+            assert client.post(f"/api/monthly-closes/{PERIOD}/run").status_code == 200
+            trust_response = client.post(f"/api/monthly-closes/{PERIOD}/trust")
+            assert trust_response.status_code == 200
+            assert trust_response.json()["status"] == "trusted"
+
+            with _TestSessionLocal() as db:
+                household = db.scalar(
+                    select(Household).where(Household.name == "Família Comissão Futura")
+                )
+                db.add(
+                    Commission(
+                        household_id=household.id,
+                        description="Comissão pendente",
+                        expected_date=date(2026, 8, 20),
+                        gross_amount=Decimal("777.00"),
+                        status="expected",
+                    )
+                )
+                db.commit()
+
+            dashboard_response = client.get(f"/api/dashboard?month={PERIOD}")
+            assert dashboard_response.status_code == 200
+            payload = dashboard_response.json()
+            assert "future_commissions_gross" not in payload
+            noncanonical = payload["noncanonical"]["future_commissions_gross"]
+            assert Decimal(str(noncanonical["value"])) == Decimal("777.00")
+            assert noncanonical["source"] == "live_query"
+            assert noncanonical["certified_by"] is None
+            assert payload["trusted_for_reports"] is True
+
+            # The live commission must not retroactively disturb the close
+            # already certified from the untouched snapshot.
+            still_trusted = client.get(f"/api/monthly-closes/{PERIOD}")
+            assert still_trusted.status_code == 200
+            assert still_trusted.json()["status"] == "trusted"
     finally:
         app.dependency_overrides.pop(get_db, None)
 

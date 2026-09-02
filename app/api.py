@@ -4134,8 +4134,21 @@ def dashboard(
     # `build_snapshot` recorded. See the engineering review on PR 7, Round 6:
     # "classify explicitly ... do not present as certified by
     # snapshot/INV-019; preserve the contract without inventing or freezing
-    # a financial fact." It stays a plain, uncertified live read; the
-    # response contract keeps the key unchanged.
+    # a financial fact."
+    #
+    # Round 7: a bare top-level `future_commissions_gross` scalar sat beside
+    # `snapshot_id`/`snapshot_checksum`/`trusted_for_reports` with nothing in
+    # the response itself telling a consumer it is the odd one out -- see
+    # the engineering review on PR 7, Round 7: "cannot remain a first-level
+    # monetary field ... without marking". Nothing in this codebase (no
+    # frontend, no test outside this endpoint's own) reads the flat key, so
+    # there is no compatible consumer to preserve a deprecation shim for;
+    # it is dropped and replaced by `noncanonical.future_commissions_gross`,
+    # an explicitly-labelled object carrying `source`/`freshness`/
+    # `certified_by`/`as_of` so a consumer cannot mistake it for a
+    # snapshot-backed, INV-019-covered figure. If a future slice needs this
+    # value certified, the fix belongs in the Financial Engine (a real
+    # snapshot column), not in loosening what `noncanonical` means.
     future_commission = db.scalar(
         select(func.coalesce(func.sum(Commission.gross_amount), 0)).where(
             Commission.household_id == user.household_id,
@@ -4187,7 +4200,21 @@ def dashboard(
         "review_count": int(review_count or 0),
         "duplicates_ignored": snapshot_payload["duplicates_ignored"],
         "category_spending": category_spending_rows(snapshot),
-        "future_commissions_gross": decimal_value(future_commission),
+        # Explicitly-labelled section for monetary figures the response
+        # publishes but that are *not* snapshot-backed / INV-019-covered
+        # facts -- see the comment above `future_commission`'s query. Every
+        # entry here must carry enough metadata (`source`, `freshness`,
+        # `certified_by`) for a consumer to tell it apart from the
+        # `trusted_for_reports`-gated fields above.
+        "noncanonical": {
+            "future_commissions_gross": {
+                "value": decimal_value(future_commission),
+                "source": "live_query",
+                "freshness": "live",
+                "certified_by": None,
+                "as_of": datetime.now(UTC).isoformat(),
+            },
+        },
         "obligation_alerts": obligation_alerts,
     }
 
@@ -4245,7 +4272,14 @@ def reports(
         )
         report_snapshots.append(snapshot)
         duplicates_ignored += int(snapshot.payload.get("duplicates_ignored", 0))
-        for category in snapshot.payload.get("category_spending", []):
+        # `category_spending_rows` is the exact function `/dashboard`
+        # publishes verbatim and INV-019 observes -- summing its rows here
+        # (instead of reading `snapshot.payload["category_spending"]`
+        # directly) means a regression in that function now surfaces in
+        # `/reports`' own `categories` totals too, closing the INV-020 gap
+        # the engineering review named on PR 7, Round 7 ("nested amounts of
+        # categories ... continues coming direct from snapshot.payload").
+        for category in category_spending_rows(snapshot):
             name = str(category["category"])
             category_totals[name] = category_totals.get(name, Decimal("0")) + Decimal(
                 str(category["amount"])
@@ -4327,20 +4361,40 @@ def reports(
         sum((Decimal(item.liquidity_used) for item in report_snapshots), Decimal("0"))
     )
     # `report_summary_monetary_publication` is the exact function INV-020
-    # reads to verify a one-month window's `summary.savings_rate` -- see its
-    # docstring and `dashboard_and_report_consistency_facts`. `summary`
-    # below spreads its return value verbatim (Round 6) instead of assigning
-    # `"savings_rate": decimal_value(savings_rate)` as its own literal, so
-    # there is no endpoint-only assembly step left for INV-020 to be blind
-    # to -- see the engineering review on PR 7, Round 6: "the endpoint
-    # continues building savings_rate = savings_rate_from_totals(...) and
-    # inserting summary['savings_rate'] separately".
+    # reads to verify a one-month window's `summary` -- every canonical
+    # total/average/liquidity field, not `savings_rate` alone (PR 7, Round
+    # 7) -- see its docstring and `dashboard_and_report_consistency_facts`.
+    # `summary` below spreads its return value verbatim instead of assigning
+    # any of these keys as its own literal, so there is no endpoint-only
+    # assembly step left for INV-020 to be blind to -- see the engineering
+    # review on PR 7, Round 7: "all canonical monetary values derived from
+    # snapshot/profile that are published by /reports must be represented
+    # by side-effect-free publication builders consumed verbatim by the
+    # endpoint".
     summary_publication = report_summary_monetary_publication(
-        total_cash_in=total_cash_in, total_cash_out=total_cash_out
+        total_spending=total_spending,
+        average_spending=average_spending,
+        total_cash_in=total_cash_in,
+        total_cash_out=total_cash_out,
+        total_bank_cash_out=total_bank_cash_out,
+        total_card_spending=total_card_spending,
+        cash_net=total_result,
+        liquidity_starting_balance=first_snapshot.opening_liquidity_balance,
+        liquidity_balance=last_snapshot.closing_liquidity_balance,
+        emergency_floor=profile.emergency_floor,
+        liquidity_available=last_snapshot.distance_to_floor,
+        liquidity_deposit=total_liquidity_deposit,
+        liquidity_withdrawal=total_liquidity_used,
+        liquidity_uncovered_deficit=last_snapshot.closing_uncovered_deficit,
     )
     account_totals: dict[str, dict[str, object]] = {}
     for snapshot in report_snapshots:
-        for account in snapshot.payload.get("cash_flow_by_account", []):
+        # `account_cash_flow_rows` is the exact function `/dashboard`
+        # publishes verbatim and INV-019 observes -- see the matching
+        # comment above the `categories` loop for why summing its rows
+        # (instead of `snapshot.payload["cash_flow_by_account"]` directly)
+        # closes the INV-020 gap for `/reports`' own `accounts` totals.
+        for account in account_cash_flow_rows(snapshot):
             key = str(account.get("account_id") or "unidentified")
             total = account_totals.setdefault(
                 key,
@@ -4391,25 +4445,7 @@ def reports(
         "covered_months": covered_months,
         "duplicates_ignored": duplicates_ignored,
         "summary": {
-            "total_spending": decimal_value(total_spending),
-            "average_spending": decimal_value(average_spending),
-            "total_cash_in": decimal_value(total_cash_in),
-            "total_cash_out": decimal_value(total_cash_out),
-            "total_bank_cash_out": decimal_value(total_bank_cash_out),
-            "total_card_spending": decimal_value(total_card_spending),
-            "cash_net": decimal_value(total_result),
             "liquidity_name": profile.investment_name,
-            "liquidity_starting_balance": decimal_value(first_snapshot.opening_liquidity_balance),
-            "liquidity_balance": decimal_value(last_snapshot.closing_liquidity_balance),
-            "liquidity_closing_balance": decimal_value(last_snapshot.closing_liquidity_balance),
-            "emergency_floor": decimal_value(profile.emergency_floor),
-            "liquidity_available": decimal_value(last_snapshot.distance_to_floor),
-            "liquidity_deposit": decimal_value(total_liquidity_deposit),
-            "liquidity_withdrawal": decimal_value(total_liquidity_used),
-            "liquidity_uncovered_deficit": decimal_value(
-                last_snapshot.closing_uncovered_deficit
-            ),
-            "liquidity_flow": decimal_value(total_result),
             "liquidity_direction": (
                 "deposit"
                 if total_cash_in > total_cash_out

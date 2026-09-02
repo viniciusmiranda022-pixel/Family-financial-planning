@@ -749,8 +749,8 @@ def _snapshot_monetary_fields(snapshot: FinancialSnapshot) -> dict[str, Decimal]
 
 
 def _profile_monetary_fields(profile: FinancialProfile) -> dict[str, Decimal]:
-    """The canonical monetary field selection off `profile` that `/dashboard`
-    also publishes.
+    """The canonical monetary field selection off `profile` for the
+    `dashboard_monetary_dataset` **publication** side only.
 
     `investment_balance` and `emergency_floor` are not produced by
     `build_snapshot` -- they are plain `FinancialProfile` columns
@@ -758,18 +758,24 @@ def _profile_monetary_fields(profile: FinancialProfile) -> dict[str, Decimal]:
     commission endpoints as they happen; `emergency_floor` the household's
     configured safety-floor target) -- so neither lives in
     `_snapshot_monetary_fields` (which only reads columns the Financial
-    Engine wrote onto a `FinancialSnapshot` row). They get their own
-    selector instead, shared by `dashboard_monetary_dataset` and the
-    INV-019 fact builder below, so both read the exact same attributes --
-    plain column selection, not response-shaping logic, so sharing it does
-    not create the circularity `dashboard_monetary_publication` avoids (see
-    its docstring).
+    Engine wrote onto a `FinancialSnapshot` row).
 
     `emergency_floor` was added post-review (PR 7, Round 6): `/dashboard`
     was publishing it straight off `profile.emergency_floor` inline in
     `app/api.py`'s `dashboard()`, outside anything INV-019 observed -- see
     the engineering review on PR 7, Round 6: "canonical snapshot outputs
     ... such as ... emergency_floor ... remain shaped separately".
+
+    Round 7: this used to also be called by `_dashboard_financial_engine_truth`
+    below for the "expected" side, on the theory that plain attribute
+    selection (not response-shaping logic) was safe to share. The
+    engineering review on PR 7, Round 7 rejected that: a bug confined to
+    this one selector (the wrong attribute, a swapped key) would move the
+    publication and "expected" sides identically, and INV-019 would keep
+    passing regardless of what `/dashboard` actually published --
+    circularity by a different name. `_dashboard_financial_engine_truth`
+    now reads `profile.investment_balance`/`profile.emergency_floor`
+    directly instead of calling this function -- see its docstring.
     """
 
     return {
@@ -1064,18 +1070,28 @@ def _dashboard_financial_engine_truth(
     """INV-019's independent "expected" side, keyed under the exact
     publication names `dashboard_monetary_publication` uses.
 
-    Deliberately reads `_snapshot_monetary_fields`/`_profile_monetary_fields`
-    directly -- plain attribute selection off `snapshot`/`profile`, not the
-    publication mapping -- for the same reason `_savings_rate_engine_truth`
-    stays independent of `savings_rate_from_totals`: if the "expected" side
-    called `dashboard_monetary_publication`, a regression in that function
-    would move both sides identically and INV-019 would pass by
-    construction regardless of what `/dashboard` actually publishes.
+    Deliberately reads `_snapshot_monetary_fields` directly -- plain
+    attribute selection off `snapshot`, not the publication mapping -- for
+    the same reason `_savings_rate_engine_truth` stays independent of
+    `savings_rate_from_totals`: if the "expected" side called
+    `dashboard_monetary_publication`, a regression in that function would
+    move both sides identically and INV-019 would pass by construction
+    regardless of what `/dashboard` actually publishes.
+
+    `investment_balance`/`emergency_floor` are read directly off `profile`
+    here (`money(profile.investment_balance)`/`money(profile.emergency_floor)`),
+    not via `_profile_monetary_fields(profile)` -- see that function's
+    docstring (PR 7, Round 7): `_profile_monetary_fields` also feeds the
+    publication side (`dashboard_monetary_dataset`), so a bug confined to
+    that one selector would move both sides identically and be invisible to
+    INV-019, the same failure mode `independent_food_benefits` below already
+    guards against for `food_benefits`.
     """
 
     engine = _snapshot_monetary_fields(snapshot)
-    profile_fields = _profile_monetary_fields(profile)
     payload_fields = _snapshot_payload_monetary_fields(snapshot)
+    independent_investment_balance = money(profile.investment_balance)
+    independent_emergency_floor = money(profile.emergency_floor)
     # `food_benefits` is intentionally re-derived here with its own copy of
     # the formula, not `food_benefits_from_profile(profile)` -- see that
     # function's docstring, and `_savings_rate_engine_truth`'s, for why: a
@@ -1095,7 +1111,7 @@ def _dashboard_financial_engine_truth(
         "cash_net": engine["operating_result"],
         "cash_cap": engine["budget_cap"],
         "remaining_cap": engine["budget_remaining"],
-        "investment_balance": profile_fields["investment_balance"],
+        "investment_balance": independent_investment_balance,
         "liquidity_balance": engine["closing_liquidity_balance"],
         "liquidity_closing_balance": engine["closing_liquidity_balance"],
         "liquidity_uncovered_deficit": engine["closing_uncovered_deficit"],
@@ -1104,7 +1120,7 @@ def _dashboard_financial_engine_truth(
         "liquidity_deposit": payload_fields["liquidity_deposit"],
         "liquidity_withdrawal": engine["liquidity_used"],
         "liquidity_flow": engine["operating_result"],
-        "emergency_floor": profile_fields["emergency_floor"],
+        "emergency_floor": independent_emergency_floor,
         "food_benefits": independent_food_benefits,
     }
 
@@ -1152,41 +1168,196 @@ def _report_financial_engine_truth(snapshot: FinancialSnapshot) -> dict[str, Dec
 
 
 def report_summary_monetary_publication(
-    *, total_cash_in: Decimal, total_cash_out: Decimal
+    *,
+    total_spending: Decimal,
+    average_spending: Decimal,
+    total_cash_in: Decimal,
+    total_cash_out: Decimal,
+    total_bank_cash_out: Decimal,
+    total_card_spending: Decimal,
+    cash_net: Decimal,
+    liquidity_starting_balance: Decimal,
+    liquidity_balance: Decimal,
+    emergency_floor: Decimal,
+    liquidity_available: Decimal,
+    liquidity_deposit: Decimal,
+    liquidity_withdrawal: Decimal,
+    liquidity_uncovered_deficit: Decimal,
 ) -> dict[str, Decimal]:
     """The literal monetary contract `GET /reports` publishes inside
-    `summary` for `savings_rate`.
+    `summary` -- every canonical monetary total/average/liquidity field the
+    window's `summary` object carries, not `savings_rate` alone.
 
-    Added post-review (PR 7, Round 6): `reports()` used to compute
-    `savings_rate = savings_rate_from_totals(total_cash_in, total_cash_out)`
-    as a private local and assign `summary["savings_rate"]` from it as a
-    separate literal in its own `return {...}` -- so a regression confined
-    to that one assignment (a stale override, the wrong local, a value
-    swapped in after the totals were computed) would corrupt the real
-    response with no change to `report_month_monetary_publication()`,
-    `savings_rate_from_totals()`, or the invariant, which had no way to
-    observe `reports()`'s own summary-assembly step at all. See the
-    engineering review on PR 7, Round 6: "the endpoint continues building
-    savings_rate = savings_rate_from_totals(...) and inserting
-    summary['savings_rate'] separately... a builder of the summary's
-    monetary contract... consumed verbatim by the endpoint" is required.
+    Originally (PR 7, Round 6) covered only `savings_rate`: `reports()` used
+    to compute `savings_rate = savings_rate_from_totals(...)` as a private
+    local and assign `summary["savings_rate"]` from it as a separate
+    literal in its own `return {...}`, with every other summary total
+    (`total_spending`, `total_cash_in`, the liquidity fields, ...) built the
+    same way -- a private local assigned straight into the literal, none of
+    it observed by INV-020. A regression confined to any one of those
+    assignments (a stale override, the wrong local, a value swapped in
+    after the totals were computed) would corrupt the real response with
+    nothing for the invariant to catch. See the engineering review on PR 7,
+    Round 7: "all canonical monetary values derived from snapshot/profile
+    that are published by /reports must be represented by side-effect-free
+    publication builders consumed verbatim by the endpoint".
 
     `reports()` now spreads this dict verbatim into `summary` instead of
-    assigning `summary["savings_rate"]` itself, so there is no endpoint-only
-    assembly step left between `total_cash_in`/`total_cash_out` and the real
-    HTTP response for INV-020 to be blind to. `total_cash_in`/`total_cash_out`
-    are taken as parameters (not read off `snapshot` here) because `summary`
-    covers whatever window `/reports` was asked for (one to twelve months);
-    for the one-month window `dashboard_and_report_consistency_facts()`
-    checks -- matching a monthly close's single closed period -- it passes
-    in `report_month_monetary_publication(snapshot)`'s own `cash_in`/
-    `cash_out`, which is exactly what `reports()`'s own `total_cash_in`/
-    `total_cash_out` reduce to for `months=1` (no cross-month summation to
-    offset them), so a bug confined to that per-month publication mapping
-    still corrupts both sides together, same as before this fix.
+    assigning any of these keys itself, so there is no endpoint-only
+    assembly step left between the already-computed totals/snapshot columns
+    and the real HTTP response for INV-020 to be blind to.
+
+    Every parameter is taken as already-computed (not read off a single
+    `snapshot` here) because `summary` covers whatever window `/reports`
+    was asked for (one to twelve months) -- `total_spending`/`total_cash_in`/
+    etc. are `reports()`'s own per-window sums, `liquidity_starting_balance`/
+    `liquidity_deposit`/etc. come from its own opening/closing snapshot
+    selection and window totals ("Multi-month reports may compose the same
+    per-month contract rather than inventing separate facts" -- the same
+    engineering review). For the one-month window
+    `dashboard_and_report_consistency_facts()` checks -- matching a monthly
+    close's single closed period -- every parameter reduces to that one
+    snapshot's own columns (no cross-month summation to offset them), so a
+    bug confined to this assembly step still corrupts both sides together.
     """
 
-    return {"savings_rate": savings_rate_from_totals(total_cash_in, total_cash_out)}
+    return {
+        "total_spending": money(total_spending),
+        "average_spending": money(average_spending),
+        "total_cash_in": money(total_cash_in),
+        "total_cash_out": money(total_cash_out),
+        "total_bank_cash_out": money(total_bank_cash_out),
+        "total_card_spending": money(total_card_spending),
+        "cash_net": money(cash_net),
+        "liquidity_starting_balance": money(liquidity_starting_balance),
+        "liquidity_balance": money(liquidity_balance),
+        "liquidity_closing_balance": money(liquidity_balance),
+        "emergency_floor": money(emergency_floor),
+        "liquidity_available": money(liquidity_available),
+        "liquidity_deposit": money(liquidity_deposit),
+        "liquidity_withdrawal": money(liquidity_withdrawal),
+        "liquidity_uncovered_deficit": money(liquidity_uncovered_deficit),
+        "liquidity_flow": money(cash_net),
+        "savings_rate": savings_rate_from_totals(total_cash_in, total_cash_out),
+    }
+
+
+def _report_summary_engine_truth(
+    snapshot: FinancialSnapshot, *, profile: FinancialProfile
+) -> dict[str, Decimal]:
+    """INV-020's independent "expected" side for `summary`, keyed under
+    `report_summary_monetary_publication`'s publication names.
+
+    Only ever evaluated for the one-month window
+    `dashboard_and_report_consistency_facts()` checks (matching a monthly
+    close's single closed period), so -- unlike the publication side, which
+    must stay generic over `reports()`'s one-to-twelve-month window -- this
+    reads `snapshot`/`profile` columns directly instead of taking
+    pre-aggregated totals as parameters. See
+    `_dashboard_financial_engine_truth`'s docstring for why this reads
+    `_snapshot_monetary_fields` directly instead of calling the publication
+    function, and `profile.emergency_floor` directly instead of
+    `_profile_monetary_fields` (PR 7, Round 7).
+    """
+
+    engine = _snapshot_monetary_fields(snapshot)
+    payload_fields = _snapshot_payload_monetary_fields(snapshot)
+    independent_emergency_floor = money(profile.emergency_floor)
+    engine_savings_rate = _savings_rate_engine_truth(
+        Decimal(snapshot.operating_income), Decimal(snapshot.operating_expenses)
+    )
+    return {
+        "total_spending": engine["operating_expenses"],
+        "average_spending": engine["operating_expenses"],
+        "total_cash_in": engine["operating_income"],
+        "total_cash_out": engine["operating_expenses"],
+        "total_bank_cash_out": engine["bank_cash_out"],
+        "total_card_spending": engine["card_spend"],
+        "cash_net": engine["operating_result"],
+        "liquidity_starting_balance": engine["opening_liquidity_balance"],
+        "liquidity_balance": engine["closing_liquidity_balance"],
+        "liquidity_closing_balance": engine["closing_liquidity_balance"],
+        "emergency_floor": independent_emergency_floor,
+        "liquidity_available": engine["distance_to_floor"],
+        "liquidity_deposit": payload_fields["liquidity_deposit"],
+        "liquidity_withdrawal": engine["liquidity_used"],
+        "liquidity_uncovered_deficit": engine["closing_uncovered_deficit"],
+        "liquidity_flow": engine["operating_result"],
+        "savings_rate": engine_savings_rate,
+    }
+
+
+def report_categories_publication_facts(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """Flatten `category_spending_rows(snapshot)` into `categories.<category>.amount`
+    facts for `report_values` -- the per-category monetary amounts `/reports`
+    aggregates into its `categories` array, previously outside anything
+    INV-020 observed (PR 7, Round 7 review: "nested amounts of categories
+    and cash_flow_by_account" still assembled outside the observed contract).
+
+    `reports()` now sums this exact function's rows across its window
+    instead of reading `snapshot.payload["category_spending"]` directly, so
+    a regression in `category_spending_rows` -- the same function
+    `/dashboard`/INV-019 already observe -- now surfaces in `/reports`/
+    INV-020 too. For the one-month window `dashboard_and_report_consistency_facts()`
+    checks (matching a monthly close's single closed period), summing across
+    the window is a no-op over this one snapshot's own rows.
+    """
+
+    fields: dict[str, Decimal] = {}
+    for row in category_spending_rows(snapshot):
+        category_key = str(row.get("category") or "unidentified")
+        fields[f"categories.{category_key}.amount"] = money(Decimal(str(row.get("amount", 0))))
+    return fields
+
+
+def _report_categories_engine_truth(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """INV-020's independent "expected" side for `categories`. Reads
+    `snapshot.payload["category_spending"]` directly through its own
+    separately hand-written loop, instead of calling
+    `report_categories_publication_facts` -- mirrors
+    `_dashboard_category_spending_engine_truth`; see that function's
+    docstring for why this is not shared code.
+    """
+
+    fields: dict[str, Decimal] = {}
+    for row in snapshot.payload.get("category_spending", []):
+        category_key = str(row.get("category") or "unidentified")
+        fields[f"categories.{category_key}.amount"] = money(Decimal(str(row.get("amount", 0))))
+    return fields
+
+
+def report_accounts_publication_facts(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """Flatten `account_cash_flow_rows(snapshot)` into `accounts.<account_id>.<metric>`
+    facts for `report_values` -- the per-account monetary amounts `/reports`
+    aggregates into its `accounts` array. Mirrors
+    `report_categories_publication_facts` above for the same reason (PR 7,
+    Round 7): `reports()` now sums this exact function's rows across its
+    window instead of reading `snapshot.payload["cash_flow_by_account"]`
+    directly.
+    """
+
+    fields: dict[str, Decimal] = {}
+    for row in account_cash_flow_rows(snapshot):
+        account_key = str(row.get("account_id") or "unidentified")
+        for metric in _ACCOUNT_CASH_FLOW_METRICS:
+            fields[f"accounts.{account_key}.{metric}"] = money(Decimal(str(row.get(metric, 0))))
+    return fields
+
+
+def _report_accounts_engine_truth(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """INV-020's independent "expected" side for `accounts`. Reads
+    `snapshot.payload["cash_flow_by_account"]` directly, instead of calling
+    `report_accounts_publication_facts` -- mirrors
+    `_dashboard_account_cash_flow_engine_truth`; see that function's
+    docstring for why this is not shared code.
+    """
+
+    fields: dict[str, Decimal] = {}
+    for row in snapshot.payload.get("cash_flow_by_account", []):
+        account_key = str(row.get("account_id") or "unidentified")
+        for metric in _ACCOUNT_CASH_FLOW_METRICS:
+            fields[f"accounts.{account_key}.{metric}"] = money(Decimal(str(row.get(metric, 0))))
+    return fields
 
 
 def dashboard_and_report_consistency_facts(
@@ -1220,31 +1391,48 @@ def dashboard_and_report_consistency_facts(
     mutations included) and prove both the live endpoint and the invariant
     diverge together.
 
-    `report_values["savings_rate"]` (PR 7, Round 5/6) is computed by calling
-    `report_summary_monetary_publication()` -- the exact function `reports()`
-    now spreads verbatim into `summary` -- passing in
-    `report_month_monetary_publication(snapshot)`'s own `cash_in`/`cash_out`
-    as the one-month window's totals; see that function's docstring for why
-    this reduces to `reports()`'s own `total_cash_in`/`total_cash_out` for
-    `months=1`, matching a monthly close's single closed period.
-    `financial_engine_values["savings_rate"]` stays independent
-    (`_savings_rate_engine_truth`, reading `snapshot` columns directly).
+    `report_values` (PR 7, Round 7) also folds in the *complete* one-month
+    `summary` contract via `report_summary_monetary_publication()` -- the
+    exact function `reports()` now spreads verbatim into `summary`, covering
+    every total/average/liquidity field, not `savings_rate` alone -- passing
+    in `snapshot`'s own columns and `profile.emergency_floor` as the
+    one-month window's inputs; see that function's docstring for why this
+    reduces to `reports()`'s own per-window totals for `months=1`, matching
+    a monthly close's single closed period.
+    `financial_engine_values`'s matching keys stay independent
+    (`_report_summary_engine_truth`, reading `snapshot`/`profile` columns
+    directly, never `report_summary_monetary_publication`).
 
     `dashboard_values`/`financial_engine_values` also each fold in
     `category_spending.<category>.amount` facts (PR 7, Round 6), flattened
     from the exact per-category rows `/dashboard` publishes verbatim under
     `category_spending` (`_dashboard_category_spending_publication_facts`),
     the same pattern as `cash_flow_by_account.<account_id>.<metric>` above.
+    `report_values`/`financial_engine_values` (PR 7, Round 7) mirror this
+    for `/reports`' own `categories`/`accounts` arrays
+    (`report_categories_publication_facts`/`report_accounts_publication_facts`
+    on the publication side, `_report_categories_engine_truth`/
+    `_report_accounts_engine_truth` on the independent side).
     """
 
     from app.services.financial_invariants import MONEY_TOLERANCE
 
-    engine_savings_rate = _savings_rate_engine_truth(
-        Decimal(snapshot.operating_income), Decimal(snapshot.operating_expenses)
-    )
     report_publication = report_month_monetary_publication(snapshot)
     report_summary_publication = report_summary_monetary_publication(
-        total_cash_in=report_publication["cash_in"], total_cash_out=report_publication["cash_out"]
+        total_spending=report_publication["spending"],
+        average_spending=report_publication["spending"],
+        total_cash_in=report_publication["cash_in"],
+        total_cash_out=report_publication["cash_out"],
+        total_bank_cash_out=report_publication["bank_cash_out"],
+        total_card_spending=report_publication["card_spending"],
+        cash_net=report_publication["cash_net"],
+        liquidity_starting_balance=money(snapshot.opening_liquidity_balance),
+        liquidity_balance=money(snapshot.closing_liquidity_balance),
+        emergency_floor=money(profile.emergency_floor),
+        liquidity_available=money(snapshot.distance_to_floor),
+        liquidity_deposit=money(Decimal(str(snapshot.payload["liquidity_deposit"]))),
+        liquidity_withdrawal=money(snapshot.liquidity_used),
+        liquidity_uncovered_deficit=money(snapshot.closing_uncovered_deficit),
     )
     return {
         "dashboard": {
@@ -1263,11 +1451,15 @@ def dashboard_and_report_consistency_facts(
         "report": {
             "financial_engine_values": {
                 **_report_financial_engine_truth(snapshot),
-                "savings_rate": engine_savings_rate,
+                **_report_summary_engine_truth(snapshot, profile=profile),
+                **_report_categories_engine_truth(snapshot),
+                **_report_accounts_engine_truth(snapshot),
             },
             "report_values": {
                 **report_publication,
                 **report_summary_publication,
+                **report_categories_publication_facts(snapshot),
+                **report_accounts_publication_facts(snapshot),
             },
             "monetary_tolerance": MONEY_TOLERANCE,
         },
