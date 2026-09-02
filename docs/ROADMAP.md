@@ -60,8 +60,12 @@
   limpeza destrutiva;
 - primeira baseline robusta de anomalias restrita a meses reconciliados e aprendizado local que
   exige três confirmações mais aceite administrativo;
-- próximos incrementos: snapshot canônico, validador de
-  projeção, auditor Codex, UI de Integridade e safety gates completos de CI.
+- auditor semântico Codex (`POST /v1/audit` no sidecar `advisor`, allowlist, defesa contra prompt
+  injection, saída sem autoridade sobre status/score/gates/findings, fallback seguro e métricas --
+  ver `docs/ARCHITECTURE.md`) entregue como PR 6; pendente revisão do engenheiro responsável antes
+  do merge;
+- próximos incrementos: UI de Integridade e safety gates completos de CI (PostgreSQL/Alembic no
+  pipeline, property tests financeiros e backfill controlado).
 
 ## Fase 3 — Próximas evoluções
 

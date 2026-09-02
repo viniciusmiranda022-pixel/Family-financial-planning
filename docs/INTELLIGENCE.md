@@ -14,14 +14,15 @@ Fotos, áudios e documentos originais são criptografados no volume local. O sis
 
 ## Onde o Codex participa
 
-O Codex é opcional e tem duas funções delimitadas:
+O Codex é opcional e tem três funções delimitadas:
 
-1. sugerir categoria para uma frase ambígua quando as regras locais têm baixa confiança;
-2. explicar em linguagem natural o resultado calculado pelo consultor local.
+1. sugerir categoria para uma frase ambígua quando as regras locais têm baixa confiança (`/v1/classify`);
+2. explicar em linguagem natural o resultado calculado pelo consultor local (`/v1/analyze`);
+3. auditoria semântica consultiva sobre o status/score/findings já calculados pelo Financial Integrity Engine (`/v1/audit`, `POST /api/integrity/semantic-audit` -- ver `docs/ARCHITECTURE.md` e `docs/SECURITY.md`).
 
-O contêiner `advisor` não possui `DATABASE_URL`, volume do PostgreSQL nem volume dos documentos. A aplicação envia para ele apenas a pergunta, um resumo financeiro agregado e o veredito determinístico. O Codex não pode mudar o veredito, criar lançamentos ou executar pagamentos.
+O contêiner `advisor` não possui `DATABASE_URL`, volume do PostgreSQL nem volume dos documentos. A aplicação envia para ele apenas a pergunta (ou, na auditoria, um pacote de status/findings já sanitizado por allowlist) e o veredito determinístico. O Codex não pode mudar o veredito, criar lançamentos, resolver findings, corrigir dados ou executar pagamentos -- na auditoria semântica isso é reforçado estruturalmente: o schema de saída de `/v1/audit` não tem nenhum campo de status/score/gate, apenas observações consultivas (`observação`/`hipótese`/`explicação`/`recomendação`) com severidade limitada a `info`/`review`.
 
-Se o Codex estiver desconectado ou indisponível, a captura e o consultor continuam usando as regras locais.
+Se o Codex estiver desconectado, indisponível, expirar por timeout ou responder fora do schema, a captura, o consultor e a auditoria de integridade continuam usando as regras locais; a auditoria semântica aparece como indisponível (`semantic_audit.available = false`), nunca como aprovação.
 
 ## Autenticação usando a assinatura do ChatGPT no Windows
 
