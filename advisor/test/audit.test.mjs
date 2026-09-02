@@ -261,6 +261,50 @@ test("an invented number only in one observation drops that observation", async 
   assert.equal(result.observations.length, 0);
 });
 
+test("scientific notation is treated as an invented numeric claim", async () => {
+  const result = await runAudit({
+    payload: basePayload,
+    provider: fakeProvider("success", {
+      responseOverrides: {
+        summary: "Status attention: revisão consultiva.",
+        observations: [
+          {
+            category: "liquidity",
+            type: "hypothesis",
+            severity: "review",
+            message: "Saldo estimado em 1e9.",
+          },
+        ],
+      },
+    }),
+    timeoutMs: 1000,
+  });
+  assert.equal(result.available, true);
+  assert.equal(result.observations.length, 0);
+});
+
+test("digits in identifiers never authorize a financial numeric claim", async () => {
+  const result = await runAudit({
+    payload: { ...basePayload, trace_id: "trace-777" },
+    provider: fakeProvider("success", {
+      responseOverrides: {
+        summary: "Status attention: revisão consultiva.",
+        observations: [
+          {
+            category: "liquidity",
+            type: "hypothesis",
+            severity: "review",
+            message: "Saldo disponível de R$ 777.",
+          },
+        ],
+      },
+    }),
+    timeoutMs: 1000,
+  });
+  assert.equal(result.available, true);
+  assert.equal(result.observations.length, 0);
+});
+
 test("a request payload outside the allowlisted input schema is rejected before any provider call", async () => {
   let providerCalled = false;
   const result = await runAudit({

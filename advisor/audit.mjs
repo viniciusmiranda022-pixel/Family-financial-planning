@@ -84,8 +84,24 @@ function unknownEvidenceRefs(output, knownIds) {
  */
 function collectKnownNumberClaims(input) {
   const known = new Set();
-  const text = JSON.stringify(input);
-  for (const claim of extractNumberClaims(text)) known.add(claim);
+  const addValue = (value) => {
+    if (typeof value === "number" && Number.isFinite(value)) known.add(String(value));
+  };
+  const addText = (value) => {
+    for (const claim of extractNumberClaims(value)) known.add(claim);
+  };
+
+  // Deliberately enumerate financial/count-bearing fields. Never scan the
+  // serialized package wholesale: trace/opaque/invariant ids and periods can
+  // contain digits but are not evidence for a financial numeric claim.
+  addValue(input?.integrity_snapshot?.score);
+  addValue(input?.integrity_snapshot?.open_findings);
+  for (const value of Object.values(input?.integrity_snapshot?.open_findings_by_severity || {})) {
+    addValue(value);
+  }
+  for (const finding of input?.findings || []) addText(finding?.message);
+  for (const item of input?.category_breakdown || []) addValue(item?.amount);
+  for (const value of Object.values(input?.financial_metrics || {})) addValue(value);
   return known;
 }
 
@@ -96,7 +112,9 @@ function extractNumberClaims(text) {
   // conservative: if the provider reformats a number, the claim is dropped
   // rather than guessed equivalent.
   return Array.from(
-    String(text || "").matchAll(/(?<![\p{L}\p{N}])[-+]?\d+(?:[.,]\d+)*(?![\p{L}\p{N}])/gu),
+    String(text || "").matchAll(
+      /(?<![\p{L}\p{N}])[-+]?\d+(?:[.,]\d+)*(?:[eE][-+]?\d+)?(?![\p{L}\p{N}])/gu
+    ),
     (match) => match[0]
   );
 }
