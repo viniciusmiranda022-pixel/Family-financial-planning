@@ -29,9 +29,10 @@ os.environ.setdefault("SECRET_KEY", "monthly-close-api-test-secret-that-is-long-
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-monthly-close-api-data-{uuid.uuid4().hex}")
 
+import app.api as api_module  # noqa: E402
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Category, Household, Transaction, User  # noqa: E402
+from app.models import Category, FinancialSnapshot, Household, IntegrityRun, Transaction, User  # noqa: E402
 from app.security import hash_password  # noqa: E402
 
 PERIOD = "2026-08"
@@ -394,5 +395,174 @@ def test_monthly_close_reaches_trusted_for_a_real_clean_period() -> None:
             assert rerun.json()["pending"]["integrity_status"] == "critical"
             assert rerun.json()["pending"]["eligible_for_trust"] is False
             assert client.post(f"/api/monthly-closes/{PERIOD}/trust").status_code == 422
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_run_failure_leaves_no_snapshot_trace_but_still_records_the_failed_run(monkeypatch) -> None:
+    """A failed `run` must not persist the snapshot rebuild it made along the way.
+
+    `run_monthly_close` rebuilds the period's canonical `FinancialSnapshot`
+    *before* calling `execute_integrity_run` (the projection/report gate
+    checks need it). Before the engineering review caught this, if
+    `execute_integrity_run` then raised, the `except` branch committed the
+    whole transaction anyway "for the audit trail" -- silently persisting
+    that snapshot rebuild (and any predecessor supersession) despite the
+    close having failed. This forces `execute_integrity_run` to raise on a
+    real household with a real, already-current snapshot, and proves: (a)
+    the period's `current` snapshot is byte-for-byte the same row afterwards
+    (no new version, no supersession), and (b) a `failed` `IntegrityRun` was
+    still committed for the audit trail.
+    """
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        _create_household_admin(
+            household_name="Família Falha de Fechamento",
+            username="admin-close-failure",
+            password="senha-local-segura",
+        )
+        with TestClient(app) as client:
+            login = client.post(
+                "/api/auth/login",
+                json={"username": "admin-close-failure", "password": "senha-local-segura"},
+            )
+            assert login.status_code == 200
+
+            account = client.post(
+                "/api/accounts",
+                json={
+                    "name": "Conta corrente",
+                    "institution": "Banco XP",
+                    "account_type": "checking",
+                    "owner_label": "Família",
+                },
+            )
+            assert account.status_code == 201
+
+            with _TestSessionLocal() as db:
+                household = db.scalar(
+                    select(Household).where(Household.name == "Família Falha de Fechamento")
+                )
+                income_category = Category(household_id=household.id, name="Receitas")
+                db.add(income_category)
+                db.flush()
+                db.add(
+                    Transaction(
+                        household_id=household.id,
+                        account_id=account.json()["id"],
+                        category_id=income_category.id,
+                        booked_at=date(2026, 8, 10),
+                        description="Salário",
+                        normalized_description="SALARIO",
+                        amount=Decimal("500.00"),
+                        transaction_type="income",
+                        owner_label="Família",
+                        fingerprint="j" * 64,
+                        possible_duplicate=False,
+                        excluded=False,
+                        reviewed=True,
+                    )
+                )
+                db.commit()
+
+            # A first, successful run establishes a real "before" snapshot.
+            first_run = client.post(f"/api/monthly-closes/{PERIOD}/run")
+            assert first_run.status_code == 200
+            with _TestSessionLocal() as db:
+                before_snapshot = db.scalar(
+                    select(FinancialSnapshot).where(
+                        FinancialSnapshot.household_id == household.id,
+                        FinancialSnapshot.period == PERIOD,
+                        FinancialSnapshot.status == "current",
+                    )
+                )
+                assert before_snapshot is not None
+                before_id, before_version, before_checksum = (
+                    before_snapshot.id,
+                    before_snapshot.version,
+                    before_snapshot.checksum,
+                )
+                runs_before = db.scalars(
+                    select(IntegrityRun).where(IntegrityRun.household_id == household.id)
+                ).all()
+                run_count_before = len(runs_before)
+                # The first successful `run` above already legitimately left
+                # one `superseded` row behind (its own forced rebuild bumps
+                # the version even on a clean re-check) -- the assertion
+                # below must be that this count does not *grow*, not that it
+                # is zero.
+                superseded_count_before = len(
+                    db.scalars(
+                        select(FinancialSnapshot).where(
+                            FinancialSnapshot.household_id == household.id,
+                            FinancialSnapshot.period == PERIOD,
+                            FinancialSnapshot.status == "superseded",
+                        )
+                    ).all()
+                )
+
+            # A second transaction changes the period's data, so the next
+            # `run` would legitimately rebuild a new snapshot version -- and
+            # then `execute_integrity_run` itself fails.
+            with _TestSessionLocal() as db:
+                db.add(
+                    Transaction(
+                        household_id=household.id,
+                        account_id=account.json()["id"],
+                        category_id=income_category.id,
+                        booked_at=date(2026, 8, 20),
+                        description="Reembolso",
+                        normalized_description="REEMBOLSO",
+                        amount=Decimal("50.00"),
+                        transaction_type="income",
+                        owner_label="Família",
+                        fingerprint="k" * 64,
+                        possible_duplicate=False,
+                        excluded=False,
+                        reviewed=True,
+                    )
+                )
+                db.commit()
+
+            def _boom(*_args, **_kwargs):
+                raise RuntimeError("simulated integrity run failure")
+
+            monkeypatch.setattr(api_module, "execute_integrity_run", _boom)
+
+            failed_run = client.post(f"/api/monthly-closes/{PERIOD}/run")
+            assert failed_run.status_code == 500
+
+            with _TestSessionLocal() as db:
+                after_snapshot = db.scalar(
+                    select(FinancialSnapshot).where(
+                        FinancialSnapshot.household_id == household.id,
+                        FinancialSnapshot.period == PERIOD,
+                        FinancialSnapshot.status == "current",
+                    )
+                )
+                # No new version, no supersession -- the failed run's
+                # in-flight snapshot rebuild never survived.
+                assert after_snapshot.id == before_id
+                assert after_snapshot.version == before_version
+                assert after_snapshot.checksum == before_checksum
+                superseded_count_after = len(
+                    db.scalars(
+                        select(FinancialSnapshot).where(
+                            FinancialSnapshot.household_id == household.id,
+                            FinancialSnapshot.period == PERIOD,
+                            FinancialSnapshot.status == "superseded",
+                        )
+                    ).all()
+                )
+                assert superseded_count_after == superseded_count_before
+
+                runs_after = db.scalars(
+                    select(IntegrityRun).where(IntegrityRun.household_id == household.id)
+                ).all()
+                assert len(runs_after) == run_count_before + 1
+                failed_row = max(runs_after, key=lambda item: item.started_at)
+                assert failed_row.status == "failed"
+                assert failed_row.error_code == "RuntimeError"
     finally:
         app.dependency_overrides.pop(get_db, None)

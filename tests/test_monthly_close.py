@@ -10,7 +10,8 @@ monthly-close scenario instead.
 
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 
 from cryptography.fernet import Fernet
 from sqlalchemy import create_engine
@@ -25,12 +26,17 @@ import pytest  # noqa: E402
 
 from app.db import Base  # noqa: E402
 from app.models import (  # noqa: E402
+    Account,
+    Category,
+    FinancialProfile,
     FinancialSnapshot,
     Household,
     IntegrityFinding,
     IntegrityRun,
+    Transaction,
     User,
 )
+from app.services.financial_snapshots import build_snapshot  # noqa: E402
 from app.services.monthly_close import (  # noqa: E402
     MonthlyCloseGateError,
     MonthlyCloseStateError,
@@ -54,6 +60,13 @@ def _household_and_user(db: Session) -> tuple[Household, User]:
         password_hash="x",
         is_admin=True,
     )
+    # `trust_monthly_close` now recomputes the period's canonical snapshot
+    # (`build_snapshot`) before comparing it to `close.snapshot_id` -- see
+    # the engineering review on PR 7 ("trust pode aceitar snapshot stale
+    # após mutação de fonte"). `_collect` requires a `FinancialProfile` to
+    # exist for the household, so every test in this file needs one, even
+    # the ones only exercising gate arithmetic on manufactured findings/runs.
+    db.add(FinancialProfile(household_id=household.id))
     db.add(user)
     db.flush()
     return household, user
@@ -91,21 +104,43 @@ def _healthy_summary() -> dict:
 
 
 def _snapshot(db: Session, *, household_id: str, trusted: bool) -> FinancialSnapshot:
-    snapshot = FinancialSnapshot(
-        household_id=household_id,
-        period=PERIOD,
-        version=1,
-        checksum=uuid.uuid4().hex,
-        calculation_version="test",
-        financial_rules_version="2026.09.1",
-        integrity_status="healthy" if trusted else "unknown",
-        trusted_for_reports=trusted,
-        trusted_for_projection=trusted,
-        trace_id=str(uuid.uuid4()),
-    )
-    db.add(snapshot)
+    """A real, `build_snapshot`-produced "current" row for `PERIOD`, with its
+    trust flags overridden to the scenario under test.
+
+    Must come from the real `build_snapshot` (not a hand-built row with a
+    random `checksum`) because `trust_monthly_close` now calls
+    `build_snapshot` again internally: a manufactured checksum would never
+    match a genuine recompute, so `trust` would always see "a newer snapshot
+    exists" and block every test in this file regardless of scenario. As
+    long as nothing in the household's source data changes between this call
+    and `trust_monthly_close`'s own recompute, `build_snapshot` is a
+    checksum-stable no-op and returns this exact row (same identity-mapped
+    object), so the flag overrides below survive untouched.
+    """
+
+    snapshot = build_snapshot(db, household_id=household_id, period=PERIOD)
+    snapshot.integrity_status = "healthy" if trusted else "unknown"
+    snapshot.trusted_for_reports = trusted
+    snapshot.trusted_for_projection = trusted
     db.flush()
     return snapshot
+
+
+def _transaction(
+    household_id: str, account: Account, category: Category, *, booked_at: date, amount: str, suffix: str
+) -> Transaction:
+    return Transaction(
+        household_id=household_id,
+        account_id=account.id,
+        category_id=category.id,
+        booked_at=booked_at,
+        description=f"Movimento {suffix}",
+        normalized_description=f"MOVIMENTO {suffix}",
+        amount=Decimal(amount),
+        transaction_type="expense" if Decimal(amount) < 0 else "income",
+        fingerprint=suffix.rjust(64, "0"),
+        canonical_status="canonical",
+    )
 
 
 def _engine_session():
@@ -212,6 +247,8 @@ def test_trust_blocked_by_unknown_status() -> None:
 
 
 def test_trust_blocked_by_stale_snapshot() -> None:
+    """A newer snapshot version, already rebuilt by some other read, must block trust."""
+
     with _engine_session() as db:
         household, user = _household_and_user(db)
         run = _completed_period_run(db, household_id=household.id, summary=_healthy_summary())
@@ -223,22 +260,63 @@ def test_trust_blocked_by_stale_snapshot() -> None:
             snapshot_id=stale_snapshot.id,
             integrity_run_id=run.id,
         )
-        # A newer snapshot version supersedes the linked one without the
-        # close being re-run.
-        stale_snapshot.status = "superseded"
-        newer_snapshot = FinancialSnapshot(
+        # Some other read (e.g. `GET /dashboard`) already rebuilt a newer
+        # "current" snapshot for the period -- simulated directly here since
+        # `test_run_mutate_source_then_trust_is_blocked` below covers the
+        # equivalent case where `trust` itself must be the one to detect it.
+        account = Account(household_id=household.id, name="Conta Corrente", account_type="checking")
+        category = Category(household_id=household.id, name="Mercado")
+        db.add_all([account, category])
+        db.flush()
+        db.add(
+            _transaction(
+                household.id, account, category, booked_at=date(2026, 8, 10), amount="-50.00", suffix="1"
+            )
+        )
+        db.flush()
+        build_snapshot(db, household_id=household.id, period=PERIOD)
+
+        with pytest.raises(MonthlyCloseGateError) as excinfo:
+            trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
+        assert any("mudaram" in reason for reason in excinfo.value.reasons)
+
+
+def test_run_mutate_source_then_trust_is_blocked() -> None:
+    """`trust` itself must detect a source mutation, not just a snapshot already rebuilt elsewhere.
+
+    Before the PR 7 post-review correction, `trust_monthly_close` only
+    compared `close.snapshot_id` to whatever `FinancialSnapshot` row already
+    happened to be `current` -- a pure read, with no recompute of its own.
+    If a transaction was created/edited/deleted after `run` and *no*
+    intervening endpoint rebuilt the snapshot, the stale `current` row's id
+    still matched `close.snapshot_id`, and `trust` could not tell the data
+    had moved. See the engineering review on PR 7 ("trust pode aceitar
+    snapshot stale após mutação de fonte").
+    """
+
+    with _engine_session() as db:
+        household, user = _household_and_user(db)
+        run = _completed_period_run(db, household_id=household.id, summary=_healthy_summary())
+        snapshot = _snapshot(db, household_id=household.id, trusted=True)
+        upsert_monthly_close_after_run(
+            db,
             household_id=household.id,
             period=PERIOD,
-            version=2,
-            checksum=uuid.uuid4().hex,
-            calculation_version="test",
-            financial_rules_version="2026.09.1",
-            integrity_status="healthy",
-            trusted_for_reports=True,
-            trusted_for_projection=True,
-            trace_id=str(uuid.uuid4()),
+            snapshot_id=snapshot.id,
+            integrity_run_id=run.id,
         )
-        db.add(newer_snapshot)
+
+        # A source mutation happens -- a new transaction is booked for the
+        # already-closed period -- with no rebuild in between.
+        account = Account(household_id=household.id, name="Conta Corrente", account_type="checking")
+        category = Category(household_id=household.id, name="Mercado")
+        db.add_all([account, category])
+        db.flush()
+        db.add(
+            _transaction(
+                household.id, account, category, booked_at=date(2026, 8, 12), amount="-75.00", suffix="2"
+            )
+        )
         db.flush()
 
         with pytest.raises(MonthlyCloseGateError) as excinfo:

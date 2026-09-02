@@ -287,6 +287,74 @@ def execute_integrity_run(
         raise
 
 
+def record_isolated_run_failure(
+    db: Session,
+    *,
+    household_id: str,
+    scope: IntegrityRunScope | str,
+    trigger: IntegrityRunTrigger | str,
+    error: BaseException,
+    period: str | None = None,
+    created_by: str | None = None,
+    scope_entity_type: str | None = None,
+    scope_entity_id: str | None = None,
+    calculation_version: str = FINANCIAL_RULES_VERSION,
+) -> IntegrityRun:
+    """Persist a standalone `failed` `IntegrityRun` audit row in `db`.
+
+    Use this only after the caller has already rolled back every other
+    pending change in `db`. Some callers (`POST /monthly-closes/{period}/run`)
+    mutate a canonical fact -- rebuild `FinancialSnapshot` -- *before*
+    calling `execute_integrity_run`, so that if the run itself then raises,
+    `execute_integrity_run`'s own `except` branch marks its `run` row
+    `failed` but only *flushes* it, in the same uncommitted transaction as
+    the pre-run snapshot rebuild. Committing at that point (as PR 7 did
+    before the engineering review caught it) persists both together: a
+    failed close ends up silently promoting/superseding a canonical
+    snapshot. The correct sequence is `db.rollback()` (discarding the
+    snapshot mutation *and* the `failed` run `execute_integrity_run` tried to
+    persist) followed by this function, which records a fresh, isolated
+    failure audit row the caller then commits alone -- guaranteeing a failed
+    run always leaves an audit trail without ever risking a financial fact
+    surviving from the same failed attempt. See the engineering review on
+    PR 7 ("Falha em execute_integrity_run pode persistir snapshot pré-run")
+    and its regression test.
+    """
+
+    from app.models import IntegrityRun
+
+    run_scope = IntegrityRunScope(str(scope))
+    run_trigger = IntegrityRunTrigger(str(trigger))
+    trace_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    run = IntegrityRun(
+        household_id=household_id,
+        scope=run_scope.value,
+        scope_entity_type=scope_entity_type,
+        scope_entity_id=scope_entity_id,
+        period=period,
+        status="failed",
+        trigger=run_trigger.value,
+        financial_rules_version=FINANCIAL_RULES_VERSION,
+        calculation_version=calculation_version,
+        started_at=now,
+        completed_at=now,
+        duration_ms=0,
+        error_code=type(error).__name__[:80],
+        summary={
+            "status": "unknown",
+            "score": None,
+            "error": "integrity_run_failed",
+            "trace_id": trace_id,
+        },
+        trace_id=trace_id,
+        created_by=created_by,
+    )
+    db.add(run)
+    db.flush()
+    return run
+
+
 DUPLICATE_FINGERPRINT_CONFIDENCE = Decimal("1.00")
 
 

@@ -1,13 +1,18 @@
 """Human-driven monthly close lifecycle over an already-computed snapshot/run.
 
-This module never recomputes a financial fact. `run_monthly_close_execute`
-delegates entirely to `financial_integrity.execute_integrity_run` and
-`financial_snapshots.build_snapshot`; `trust_monthly_close` only reads
-already-canonical fields (`consolidated_integrity_status`, the current
-snapshot's `trusted_for_*` flags) to decide whether the deterministic gates
-required by docs/INTEGRITY_IMPLEMENTATION_PLAN.md section 9.4 and the PR 7
-Work Order are satisfied. See docs/INTEGRITY_IMPLEMENTATION_PLAN.md section
-8.8 for the `monthly_financial_closes` contract.
+This module never invents or alters a financial fact -- every number it acts
+on comes from `financial_integrity.execute_integrity_run` and
+`financial_snapshots.build_snapshot`, the same deterministic engines every
+other consumer uses. `trust_monthly_close` does call `build_snapshot` itself
+(a checksum-stable, idempotent recompute -- see its call site below), but
+only to detect whether the period's source data moved since `run`; it never
+applies a different formula or accepts a fact `build_snapshot` did not
+produce. The decision itself still reads only already-canonical fields
+(`consolidated_integrity_status`, the current snapshot's `trusted_for_*`
+flags) to decide whether the deterministic gates required by
+docs/INTEGRITY_IMPLEMENTATION_PLAN.md section 9.4 and the PR 7 Work Order are
+satisfied. See docs/INTEGRITY_IMPLEMENTATION_PLAN.md section 8.8 for the
+`monthly_financial_closes` contract.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from app.models import FinancialSnapshot, MonthlyFinancialClose
 from app.services.financial_integrity import consolidated_integrity_status
+from app.services.financial_snapshots import build_snapshot
 
 MONTHLY_CLOSE_STATUSES = ("open", "review_required", "trusted")
 
@@ -175,10 +181,25 @@ def trust_monthly_close(
         raise MonthlyCloseStateError("Fechamento já está trusted.")
 
     reasons: list[str] = []
-    current_snapshot = _current_snapshot(db, household_id=household_id, period=period)
-    if current_snapshot is None:
-        reasons.append("Nenhum snapshot financeiro atual para o período.")
-    elif close.snapshot_id != current_snapshot.id:
+    # Recompute the period's canonical snapshot before trusting it -- exactly
+    # what `GET /dashboard`/`GET /reports` already do on every read via
+    # `build_snapshot`. This is a no-op (returns the existing `current` row,
+    # no new version) when nothing about the period's source data changed
+    # since `run`. If a transaction, document, import or profile mutation
+    # happened after `run` and before `trust` with no intervening rebuild,
+    # comparing `close.snapshot_id` to a merely-read `_current_snapshot()`
+    # would miss it entirely: nothing had rebuilt the "current" row yet, so
+    # it would still equal `close.snapshot_id` despite the underlying data
+    # having moved. Recomputing here is what actually detects that gap --
+    # the checksum changes, a new `current` snapshot is created, and the
+    # identity check below blocks `trust` on stale data instead of only
+    # catching a divergence some unrelated read already happened to surface.
+    # See the engineering review on PR 7 ("trust pode aceitar snapshot stale
+    # após mutação de fonte") and its regression test.
+    current_snapshot = build_snapshot(
+        db, household_id=household_id, period=period, generated_by=user_id
+    )
+    if close.snapshot_id != current_snapshot.id:
         reasons.append(
             "Os dados do período mudaram desde a última execução "
             "(existe um snapshot mais recente); execute o fechamento novamente."
@@ -189,9 +210,7 @@ def trust_monthly_close(
         reasons.append(
             f"Status de integridade do período é '{status_now['status']}', incompatível com trusted."
         )
-    if current_snapshot is not None and not (
-        current_snapshot.trusted_for_reports and current_snapshot.trusted_for_projection
-    ):
+    if not (current_snapshot.trusted_for_reports and current_snapshot.trusted_for_projection):
         reasons.append(
             "O snapshot atual não está com trusted_for_reports e trusted_for_projection habilitados."
         )

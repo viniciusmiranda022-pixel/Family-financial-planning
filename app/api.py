@@ -102,6 +102,7 @@ from app.services.financial_integrity import (
     execute_integrity_run,
     ignore_finding,
     mark_finding_false_positive,
+    record_isolated_run_failure,
     resolve_finding,
     serialize_finding,
     serialize_run,
@@ -1453,13 +1454,19 @@ def run_monthly_close(
 ) -> dict:
     """Execute a fresh period-scoped integrity run and refresh the canonical snapshot.
 
-    Deliberately does not decide `trusted` -- see `POST .../trust`. If the
-    integrity run itself fails, this mirrors `POST /integrity/runs`: the
-    run's own `failed` status is committed for the audit trail and nothing
-    else (snapshot, monthly close row) is touched. If anything after a
-    *successful* run fails unexpectedly (e.g. snapshot build), no explicit
-    commit happens here, so the session close implicitly rolls back the
-    whole request -- a close run is all-or-nothing.
+    Deliberately does not decide `trusted` -- see `POST .../trust`. Unlike
+    `POST /integrity/runs`, this endpoint rebuilds the period's canonical
+    `FinancialSnapshot` *before* calling `execute_integrity_run` (the gate
+    checks below need it), so a failed run cannot simply commit its own
+    `failed` row the way `create_integrity_run` does -- that would also
+    commit the already-flushed snapshot rebuild (and any predecessor
+    supersession), despite the close having failed. On failure this instead
+    rolls back the whole transaction and records the failure audit trail in
+    isolation via `record_isolated_run_failure` -- see that function's
+    docstring and the engineering review on PR 7. If anything after a
+    *successful* run fails unexpectedly (e.g. the monthly close upsert), no
+    explicit commit happens here, so the session close implicitly rolls back
+    the whole request -- a close run is all-or-nothing either way.
     """
 
     _require_admin(user)
@@ -1541,6 +1548,26 @@ def run_monthly_close(
             period=period,
         )
     except Exception as exc:
+        # `period_snapshot` above was built (and may have superseded its
+        # predecessor) *before* this try block, in the same uncommitted
+        # transaction `execute_integrity_run` itself flushed a `failed` run
+        # row into. Committing here (as before the engineering review caught
+        # it) would persist that snapshot rebuild too, despite the close
+        # having failed -- see the review comment ("Falha em
+        # execute_integrity_run pode persistir snapshot pré-run"). Roll back
+        # everything from this request first, then record the failure audit
+        # trail in isolation, so a failed close never leaves any canonical
+        # fact (snapshot, finding) behind.
+        db.rollback()
+        record_isolated_run_failure(
+            db,
+            household_id=user.household_id,
+            scope=IntegrityRunScope.PERIOD,
+            trigger=IntegrityRunTrigger.CLOSE,
+            period=period,
+            created_by=user.id,
+            error=exc,
+        )
         db.commit()
         raise HTTPException(
             status_code=500,
