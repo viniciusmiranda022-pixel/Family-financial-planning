@@ -25,6 +25,10 @@ from sqlalchemy.orm import Session
 
 from app.models import FinancialSnapshot, MonthlyFinancialClose
 from app.services.financial_integrity import consolidated_integrity_status
+from app.services.financial_revision import (
+    current_household_financial_revision,
+    lock_household_financial_revision,
+)
 from app.services.financial_snapshots import build_snapshot
 
 MONTHLY_CLOSE_STATUSES = ("open", "review_required", "trusted")
@@ -181,6 +185,25 @@ def trust_monthly_close(
         raise MonthlyCloseStateError("Fechamento já está trusted.")
 
     reasons: list[str] = []
+
+    # Serialize this trust transition with every financial-source mutation
+    # that can affect the period's snapshot -- see
+    # `HouseholdFinancialRevision`'s docstring (`app/models.py`) and the
+    # engineering review on PR 7, Round 7: "source mutation endpoints do not
+    # share the snapshot advisory lock ... a concurrent transaction can
+    # commit after snapshot source reads but before close.status='trusted'
+    # commits." On PostgreSQL, this blocks until any in-flight mutation
+    # transaction for this household commits or rolls back (and blocks any
+    # such mutation that starts afterward, until this transaction ends), so
+    # the rebuild below and the `trusted` write at the end of this function
+    # cannot be interleaved by a concurrent source mutation. `revision_at_lock`
+    # is compared again immediately before the final `trusted` write -- a
+    # same-transaction check that is a no-op-by-construction on PostgreSQL
+    # (nothing could have bumped it while the lock is held) and the actual
+    # enforcement mechanism on SQLite, where the lock above is a no-op --
+    # see `lock_household_financial_revision`'s docstring.
+    revision_at_lock = lock_household_financial_revision(db, household_id=household_id)
+
     # Recompute the period's canonical snapshot before trusting it -- exactly
     # what `GET /dashboard`/`GET /reports` already do on every read via
     # `build_snapshot`. This is a no-op (returns the existing `current` row,
@@ -213,6 +236,20 @@ def trust_monthly_close(
     if not (current_snapshot.trusted_for_reports and current_snapshot.trusted_for_projection):
         reasons.append(
             "O snapshot atual não está com trusted_for_reports e trusted_for_projection habilitados."
+        )
+
+    # Re-validate the barrier right before committing `trusted`: on
+    # PostgreSQL this can never actually differ (the lock above has been
+    # held continuously since before the rebuild, so no mutation could have
+    # bumped the revision in between); on SQLite/tests, where the lock is a
+    # no-op, this is the check that actually catches a mutation that slipped
+    # in during this function's own execution -- see
+    # `lock_household_financial_revision`'s docstring.
+    revision_now = current_household_financial_revision(db, household_id=household_id)
+    if revision_now != revision_at_lock:
+        reasons.append(
+            "Dados financeiros do household mudaram durante a validação de trusted; "
+            "execute o fechamento novamente."
         )
 
     if reasons:

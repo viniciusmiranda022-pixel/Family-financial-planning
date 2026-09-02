@@ -15,10 +15,11 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.db import Base
 
@@ -726,3 +727,95 @@ class MonthlyFinancialClose(Base, TimestampMixin):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class HouseholdFinancialRevision(Base):
+    """Monotonic per-household revision counter, bumped inside the *same*
+    transaction as every mutation to a Financial-Engine input (see the
+    event listener below).
+
+    `trust_monthly_close` (`app/services/monthly_close.py`, helpers in
+    `app/services/financial_revision.py`) reads/locks this row to close the
+    TOCTOU window between recomputing a period's canonical
+    `FinancialSnapshot` and committing `trusted` -- see the engineering
+    review on PR 7, Round 7: "The trust transition must be serialized with
+    every financial source mutation that can affect the snapshot ... or use
+    a monotonic source revision validated inside the same transactional
+    barrier. The production guarantee must be real on PostgreSQL; SQLite may
+    use a deterministic test-equivalent path but must not be presented as
+    equivalent locking semantics."
+
+    On PostgreSQL, `SELECT ... FOR UPDATE` against this row
+    (`lock_household_financial_revision`) takes the same row-level write
+    lock the upsert below takes, blocking any concurrent mutation's own
+    bump of the same row until the trust transaction commits or rolls
+    back -- so no source mutation can commit strictly between the snapshot
+    rebuild and the `trusted` write. SQLite (tests) has no real
+    cross-connection row lock; there, `trust_monthly_close` still compares
+    the revision value read at the start of the transaction against the
+    value read again right before the `trusted` write, inside the same
+    transaction -- a deterministic, testable stand-in for the guarantee the
+    PostgreSQL lock provides unconditionally.
+    """
+
+    __tablename__ = "household_financial_revisions"
+
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), primary_key=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+# Every model whose rows `app/services/financial_snapshots.py`'s `_collect()`
+# reads to build a period's `FinancialSnapshot` -- a mutation to any of
+# these can change what a period would recompute to, so each one must bump
+# `HouseholdFinancialRevision`. Kept next to the model (not buried in
+# `app/services/financial_revision.py`) so adding a new snapshot-input model
+# elsewhere in this file is a one-line, code-reviewable decision about
+# whether it belongs here, not a separate cross-module wiring step easy to
+# forget -- see the engineering review on PR 7, Round 7: "source mutation
+# endpoints do not share the snapshot advisory lock".
+FINANCIAL_REVISION_MODELS: tuple[type, ...] = (
+    Transaction,
+    Account,
+    AccountBalanceObservation,
+    Obligation,
+    FinancialProfile,
+    DocumentReconciliation,
+    Category,
+    Document,
+)
+
+
+@event.listens_for(Session, "before_flush")
+def _bump_financial_revision_on_source_mutation(session: Session, flush_context, instances) -> None:
+    """Bump `HouseholdFinancialRevision` for every household touched by this
+    flush's new/dirty/deleted `FINANCIAL_REVISION_MODELS` rows, inside the
+    same flush -- see `HouseholdFinancialRevision`'s docstring.
+
+    A `Session`-level hook, not a bump call added by hand to each mutating
+    endpoint: an endpoint written later that touches any
+    `FINANCIAL_REVISION_MODELS` row is covered automatically instead of
+    depending on every future author remembering to call one, which is
+    exactly the kind of gap the engineering review on PR 7, Round 7 found.
+
+    Imports `bump_household_financial_revision` locally to avoid a circular
+    import (`app.services.financial_revision` imports
+    `HouseholdFinancialRevision` from this module); by the time a flush can
+    happen, both modules are already fully loaded.
+    """
+
+    del flush_context, instances
+    from app.services.financial_revision import bump_household_financial_revision
+
+    household_ids: set[str] = set()
+    for obj in (*session.new, *session.dirty, *session.deleted):
+        if isinstance(obj, FINANCIAL_REVISION_MODELS):
+            household_id = getattr(obj, "household_id", None)
+            if household_id:
+                household_ids.add(household_id)
+    for household_id in household_ids:
+        bump_household_financial_revision(session, household_id=household_id)

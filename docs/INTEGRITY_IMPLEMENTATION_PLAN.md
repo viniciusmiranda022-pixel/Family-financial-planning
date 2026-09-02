@@ -698,6 +698,18 @@ O campo `booked_at` permanece inicialmente para compatibilidade, com adaptação
 - adicionar `before_state`, `after_state`, `reason`, `trace_id`, `source` e `request_id`;
 - manter `details` para compatibilidade histórica.
 
+### 8.11 `household_financial_revisions`
+
+```text
+household_id PK
+revision Integer, default 0
+updated_at
+```
+
+Contador monotônico por household, incrementado na mesma transação de qualquer mutação em uma fonte financeira do Financial Engine (`transactions`, `accounts`, `account_balance_observations`, `obligations`, `financial_profiles`, `document_reconciliations`, `categories`, `documents`) via listener de sessão (`before_flush`), não por chamadas manuais espalhadas pelos endpoints.
+
+`POST /api/monthly-closes/{period}/trust` usa esta linha como barreira transacional contra o TOCTOU entre recalcular o snapshot canônico do período e persistir `trusted`: em PostgreSQL, `SELECT ... FOR UPDATE` bloqueia qualquer mutação concorrente que tente incrementar a mesma linha até o commit/rollback da transação de trust; a revisão capturada no início é comparada novamente imediatamente antes da escrita final de `trusted`, o que barra qualquer mutação que tenha conseguido se intercalar (garantia real em PostgreSQL; em SQLite/testes, sem lock real entre conexões, a comparação de revisão isolada é o mecanismo determinístico equivalente — ver `app/services/financial_revision.py`).
+
 ---
 
 ## 9. APIs propostas

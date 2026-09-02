@@ -41,6 +41,7 @@ from app.services.monthly_close import (  # noqa: E402
     MonthlyCloseGateError,
     MonthlyCloseStateError,
     assert_close_runnable,
+    get_monthly_close,
     reopen_monthly_close,
     trust_monthly_close,
     upsert_monthly_close_after_run,
@@ -322,6 +323,67 @@ def test_run_mutate_source_then_trust_is_blocked() -> None:
         with pytest.raises(MonthlyCloseGateError) as excinfo:
             trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
         assert any("mudaram" in reason for reason in excinfo.value.reasons)
+
+
+def test_concurrent_source_mutation_between_lock_and_commit_blocks_trust(monkeypatch) -> None:
+    """A financial-source mutation that commits strictly between the
+    revision barrier being acquired and `trust`'s final `trusted` write must
+    block trust -- even when it happens to leave the recomputed snapshot's
+    own checksum/identity unchanged, the specific TOCTOU gap the Round 6
+    snapshot-identity check (`test_run_mutate_source_then_trust_is_blocked`
+    above) alone cannot close. See the engineering review on PR 7, Round 7:
+    "trust_monthly_close still has a PostgreSQL TOCTOU window ... A
+    concurrent transaction/profile/import/obligation write can commit after
+    snapshot source reads but before close.status='trusted' commits."
+
+    Deterministically simulates the interleaving in a single thread (the
+    same technique `test_persist_finding_recovers_from_concurrent_insert_race`
+    in `tests/test_integrity_engine.py` uses for a different race): patches
+    `build_snapshot` -- the exact point in `trust_monthly_close` that reads
+    the household's financial sources -- to bump the household's
+    `HouseholdFinancialRevision` as a side effect standing in for another
+    session's mutation committing at that instant, then calls through to the
+    real `build_snapshot`. `revision_at_lock` was already captured before
+    this call, so the simulated mutation is invisible to the snapshot
+    rebuild itself (same checksum/identity either way, so the Round 6 check
+    stays silent) but must still be caught by the revision re-check
+    immediately before the final `trusted` write.
+    """
+
+    with _engine_session() as db:
+        household, user = _household_and_user(db)
+        run = _completed_period_run(db, household_id=household.id, summary=_healthy_summary())
+        snapshot = _snapshot(db, household_id=household.id, trusted=True)
+        upsert_monthly_close_after_run(
+            db,
+            household_id=household.id,
+            period=PERIOD,
+            snapshot_id=snapshot.id,
+            integrity_run_id=run.id,
+        )
+
+        import app.services.monthly_close as monthly_close_module
+        from app.services.financial_revision import bump_household_financial_revision
+
+        real_build_snapshot = monthly_close_module.build_snapshot
+
+        def _build_snapshot_with_interleaved_mutation(db_arg, **kwargs):
+            bump_household_financial_revision(db_arg, household_id=household.id)
+            return real_build_snapshot(db_arg, **kwargs)
+
+        monkeypatch.setattr(
+            monthly_close_module, "build_snapshot", _build_snapshot_with_interleaved_mutation
+        )
+
+        with pytest.raises(MonthlyCloseGateError) as excinfo:
+            trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
+        assert any("mudaram durante a validação" in reason for reason in excinfo.value.reasons)
+
+        # The interleaved write must not leave `close.status` in some
+        # indeterminate state -- the close stays exactly as it was before
+        # this blocked attempt.
+        close = get_monthly_close(db, household_id=household.id, period=PERIOD)
+        assert close.status == "review_required"
 
 
 def test_trust_succeeds_when_healthy_and_snapshot_trusted() -> None:
