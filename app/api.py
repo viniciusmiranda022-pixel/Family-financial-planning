@@ -44,9 +44,11 @@ from app.schemas import (
     CaptureConfirmRequest,
     CommissionRequest,
     DuplicateResolutionRequest,
+    FindingLifecycleRequest,
     IntegrityRunRequest,
     LoginRequest,
     ManualTransactionRequest,
+    MonthlyCloseReopenRequest,
     ObligationRequest,
     PayrollRequest,
     ProfileRequest,
@@ -89,12 +91,17 @@ from app.services.finance import (
     monthly_net_rate,
 )
 from app.services.financial_integrity import (
+    FindingLifecycleError,
     IntegrityCheck,
     IntegrityRunScope,
     IntegrityRunTrigger,
+    acknowledge_finding,
     build_baseline_checks,
     consolidated_integrity_status,
     execute_integrity_run,
+    ignore_finding,
+    mark_finding_false_positive,
+    resolve_finding,
     serialize_finding,
     serialize_run,
 )
@@ -112,6 +119,16 @@ from app.services.importer import (
     parse_document_contract,
     parse_payroll_document,
     transaction_fingerprint,
+)
+from app.services.monthly_close import (
+    MonthlyCloseGateError,
+    MonthlyCloseStateError,
+    assert_close_runnable,
+    get_monthly_close,
+    reopen_monthly_close,
+    serialize_monthly_close,
+    trust_monthly_close,
+    upsert_monthly_close_after_run,
 )
 from app.services.projection_engine import PROJECTION_CALCULATION_VERSION
 from app.services.projection_validator import PROJECTION_TOLERANCE, validate_projection
@@ -1272,6 +1289,283 @@ def integrity_semantic_audit(
         "integrity_status": integrity_status,
         "semantic_audit": outcome.to_dict(),
     }
+
+
+def _finding_or_404(db: Session, user: User, finding_id: str) -> IntegrityFinding:
+    finding = db.scalar(
+        select(IntegrityFinding).where(
+            IntegrityFinding.id == finding_id,
+            IntegrityFinding.household_id == user.household_id,
+        )
+    )
+    if finding is None:
+        raise HTTPException(status_code=404, detail="Finding não encontrado")
+    return finding
+
+
+def _finding_lifecycle_action(
+    db: Session,
+    user: User,
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    *,
+    action: str,
+    apply,
+) -> dict:
+    finding = _finding_or_404(db, user, finding_id)
+    before_state = {"status": finding.status}
+    try:
+        apply(finding)
+    except FindingLifecycleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        f"integrity.finding.{action}",
+        "integrity_finding",
+        finding.id,
+        before_state=before_state,
+        after_state={"status": finding.status},
+        reason=payload.reason,
+        trace_id=finding.trace_id,
+        source="financial_integrity_engine",
+    )
+    db.commit()
+    db.refresh(finding)
+    return serialize_finding(finding)
+
+
+@router.post("/integrity/findings/{finding_id}/acknowledge")
+def acknowledge_integrity_finding(
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _finding_lifecycle_action(
+        db,
+        user,
+        finding_id,
+        payload,
+        action="acknowledge",
+        apply=lambda finding: acknowledge_finding(finding, user_id=user.id, reason=payload.reason),
+    )
+
+
+@router.post("/integrity/findings/{finding_id}/resolve")
+def resolve_integrity_finding(
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _finding_lifecycle_action(
+        db,
+        user,
+        finding_id,
+        payload,
+        action="resolve",
+        apply=lambda finding: resolve_finding(finding, user_id=user.id, reason=payload.reason),
+    )
+
+
+@router.post("/integrity/findings/{finding_id}/ignore")
+def ignore_integrity_finding(
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _finding_lifecycle_action(
+        db,
+        user,
+        finding_id,
+        payload,
+        action="ignore",
+        apply=lambda finding: ignore_finding(finding, user_id=user.id, reason=payload.reason),
+    )
+
+
+@router.post("/integrity/findings/{finding_id}/false-positive")
+def mark_integrity_finding_false_positive(
+    finding_id: str,
+    payload: FindingLifecycleRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _finding_lifecycle_action(
+        db,
+        user,
+        finding_id,
+        payload,
+        action="false-positive",
+        apply=lambda finding: mark_finding_false_positive(
+            finding, user_id=user.id, reason=payload.reason
+        ),
+    )
+
+
+def _validate_period(period: str) -> None:
+    try:
+        datetime.strptime(period, "%Y-%m")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Mês deve usar o formato AAAA-MM") from exc
+
+
+@router.get("/monthly-closes/{period}")
+def monthly_close_status(
+    period: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _validate_period(period)
+    close = get_monthly_close(db, household_id=user.household_id, period=period)
+    return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
+
+
+@router.post("/monthly-closes/{period}/run")
+def run_monthly_close(
+    period: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Execute a fresh period-scoped integrity run and refresh the canonical snapshot.
+
+    Deliberately does not decide `trusted` -- see `POST .../trust`. If the
+    integrity run itself fails, this mirrors `POST /integrity/runs`: the
+    run's own `failed` status is committed for the audit trail and nothing
+    else (snapshot, monthly close row) is touched. If anything after a
+    *successful* run fails unexpectedly (e.g. snapshot build), no explicit
+    commit happens here, so the session close implicitly rolls back the
+    whole request -- a close run is all-or-nothing.
+    """
+
+    _require_admin(user)
+    _validate_period(period)
+    try:
+        assert_close_runnable(db, household_id=user.household_id, period=period)
+    except MonthlyCloseStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    checks = build_baseline_checks(
+        db, household_id=user.household_id, scope=IntegrityRunScope.PERIOD, period=period
+    )
+    try:
+        run, _results = execute_integrity_run(
+            db,
+            household_id=user.household_id,
+            scope=IntegrityRunScope.PERIOD,
+            trigger=IntegrityRunTrigger.CLOSE,
+            checks=checks,
+            created_by=user.id,
+            period=period,
+        )
+    except Exception as exc:
+        db.commit()
+        raise HTTPException(
+            status_code=500,
+            detail="A execução do fechamento falhou sem alterar snapshot ou estado anterior",
+        ) from exc
+
+    snapshot = build_snapshot(
+        db, household_id=user.household_id, period=period, generated_by=user.id, force=True
+    )
+    close = upsert_monthly_close_after_run(
+        db,
+        household_id=user.household_id,
+        period=period,
+        snapshot_id=snapshot.id,
+        integrity_run_id=run.id,
+    )
+    audit(
+        db,
+        user,
+        "monthly_close.run",
+        "monthly_financial_close",
+        close.id,
+        {"period": period},
+        after_state={
+            "status": close.status,
+            "snapshot_id": close.snapshot_id,
+            "integrity_run_id": close.integrity_run_id,
+        },
+        trace_id=run.trace_id,
+        source="financial_integrity_engine",
+    )
+    db.commit()
+    db.refresh(close)
+    return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
+
+
+@router.post("/monthly-closes/{period}/trust")
+def trust_monthly_close_endpoint(
+    period: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    _validate_period(period)
+    before = get_monthly_close(db, household_id=user.household_id, period=period)
+    before_state = {"status": before.status} if before else {"status": "open"}
+    try:
+        close = trust_monthly_close(db, household_id=user.household_id, period=period, user_id=user.id)
+    except MonthlyCloseGateError as exc:
+        raise HTTPException(
+            status_code=422, detail={"message": str(exc), "reasons": list(exc.reasons)}
+        ) from exc
+    except MonthlyCloseStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    audit(
+        db,
+        user,
+        "monthly_close.trust",
+        "monthly_financial_close",
+        close.id,
+        before_state=before_state,
+        after_state={
+            "status": close.status,
+            "closed_at": close.closed_at.isoformat() if close.closed_at else None,
+        },
+        source="financial_integrity_engine",
+    )
+    db.commit()
+    db.refresh(close)
+    return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
+
+
+@router.post("/monthly-closes/{period}/reopen")
+def reopen_monthly_close_endpoint(
+    period: str,
+    payload: MonthlyCloseReopenRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    _validate_period(period)
+    before = get_monthly_close(db, household_id=user.household_id, period=period)
+    before_state = {"status": before.status} if before else {"status": "open"}
+    try:
+        close = reopen_monthly_close(
+            db, household_id=user.household_id, period=period, user_id=user.id, reason=payload.reason
+        )
+    except MonthlyCloseStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    audit(
+        db,
+        user,
+        "monthly_close.reopen",
+        "monthly_financial_close",
+        close.id,
+        before_state=before_state,
+        after_state={"status": close.status},
+        reason=payload.reason,
+        source="financial_integrity_engine",
+    )
+    db.commit()
+    db.refresh(close)
+    return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
 
 
 @router.get("/users")

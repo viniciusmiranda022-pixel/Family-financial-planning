@@ -379,6 +379,7 @@ class IntegrityFinding(Base, TimestampMixin):
     acknowledged_by: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    acknowledgement_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolved_by: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -685,3 +686,43 @@ class FinancialSnapshotLineage(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class MonthlyFinancialClose(Base, TimestampMixin):
+    """Human-driven monthly close lifecycle over an already-computed snapshot/run.
+
+    This table never recomputes financial facts: it only records which
+    `FinancialSnapshot` and `IntegrityRun` a household reviewed for a period,
+    and the human decision (`trusted`) or reversal (`reopened_*`) built on top
+    of them. See docs/INTEGRITY_IMPLEMENTATION_PLAN.md section 8.8.
+    """
+
+    __tablename__ = "monthly_financial_closes"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id", "period", name="uq_monthly_financial_close_household_period"
+        ),
+        Index("ix_monthly_financial_closes_household_status", "household_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    period: Mapped[str] = mapped_column(String(7), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("financial_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    integrity_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("integrity_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reopened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reopened_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)

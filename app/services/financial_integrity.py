@@ -554,12 +554,70 @@ def serialize_finding(finding: IntegrityFinding) -> dict[str, Any]:
         "occurrence_count": finding.occurrence_count,
         "acknowledged_at": _iso(finding.acknowledged_at),
         "acknowledged_by": finding.acknowledged_by,
+        "acknowledgement_reason": finding.acknowledgement_reason,
         "resolved_at": _iso(finding.resolved_at),
         "resolved_by": finding.resolved_by,
         "resolution_reason": finding.resolution_reason,
         "created_at": _iso(finding.created_at),
         "updated_at": _iso(finding.updated_at),
     }
+
+
+class FindingLifecycleError(ValueError):
+    """Raised when a human lifecycle action is attempted from an invalid finding status."""
+
+
+def acknowledge_finding(finding: IntegrityFinding, *, user_id: str, reason: str) -> None:
+    """Record human acknowledgement. Finding stays active (counts for gates/status)."""
+
+    if finding.status not in ACTIVE_FINDING_STATUSES:
+        raise FindingLifecycleError(
+            f"Finding não pode ser reconhecido a partir do status '{finding.status}'."
+        )
+    finding.status = "acknowledged"
+    finding.acknowledged_at = datetime.now(UTC)
+    finding.acknowledged_by = user_id
+    finding.acknowledgement_reason = reason
+
+
+def _set_finding_terminal(
+    finding: IntegrityFinding, *, target_status: str, user_id: str, reason: str
+) -> None:
+    """Move an active finding to a human-owned terminal status.
+
+    Only `open`/`acknowledged` findings are eligible -- this never touches a
+    `superseded` finding (an automatic, deterministic fact, not a human
+    decision) nor an already-terminal one (resolve/ignore/false-positive are
+    one-way from here; a reincidence of the same fingerprint is the only
+    thing that reopens a terminal finding, and it does so automatically to
+    `open`, never to another terminal status -- see
+    `_apply_finding_reincidence`). This function never mutates `Transaction`,
+    `Document`, any snapshot or any other financial fact: only the finding's
+    own lifecycle columns, matching docs/FINANCIAL_RULES.md and the PR 7
+    Work Order ("resoluções não alteram automaticamente os dados
+    financeiros").
+    """
+
+    if finding.status not in ACTIVE_FINDING_STATUSES:
+        raise FindingLifecycleError(
+            f"Finding não pode ser marcado '{target_status}' a partir do status '{finding.status}'."
+        )
+    finding.status = target_status
+    finding.resolved_at = datetime.now(UTC)
+    finding.resolved_by = user_id
+    finding.resolution_reason = reason
+
+
+def resolve_finding(finding: IntegrityFinding, *, user_id: str, reason: str) -> None:
+    _set_finding_terminal(finding, target_status="resolved", user_id=user_id, reason=reason)
+
+
+def ignore_finding(finding: IntegrityFinding, *, user_id: str, reason: str) -> None:
+    _set_finding_terminal(finding, target_status="ignored", user_id=user_id, reason=reason)
+
+
+def mark_finding_false_positive(finding: IntegrityFinding, *, user_id: str, reason: str) -> None:
+    _set_finding_terminal(finding, target_status="false_positive", user_id=user_id, reason=reason)
 
 
 def _aggregate_results(results: Sequence[InvariantResult]) -> tuple[InvariantResult, ...]:
