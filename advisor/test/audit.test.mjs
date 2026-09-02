@@ -349,6 +349,67 @@ test("Unicode digits are removed from provider-authored prose", async () => {
   }
 });
 
+test("ideographic numerals are rejected even outside the Unicode Number category", async () => {
+  // "四" (four) and "十" (ten) are CJK Unified Ideographs -- General_Category
+  // Lo, not Nd/Nl/No -- so `\p{N}` alone does not match them, but Python's
+  // `str.isnumeric()` does. Both enforcement layers must reject the same set.
+  for (const numeral of ["四", "十"]) {
+    const summaryResult = await runAudit({
+      payload: basePayload,
+      provider: fakeProvider("success", {
+        responseOverrides: {
+          summary: `Status attention: saldo de ${numeral} contas revisado.`,
+          observations: [],
+        },
+      }),
+      timeoutMs: 1000,
+    });
+    assert.equal(summaryResult.available, false);
+    assert.equal(summaryResult.reason, "invented_number");
+
+    const messageResult = await runAudit({
+      payload: basePayload,
+      provider: fakeProvider("success", {
+        responseOverrides: {
+          summary: "Status attention: revisão consultiva.",
+          observations: [
+            {
+              category: "liquidity",
+              type: "hypothesis",
+              severity: "review",
+              message: `Saldo estimado em ${numeral} reais.`,
+            },
+          ],
+        },
+      }),
+      timeoutMs: 1000,
+    });
+    assert.equal(messageResult.available, true);
+    assert.equal(messageResult.observations.length, 0);
+
+    const recommendationResult = await runAudit({
+      payload: basePayload,
+      provider: fakeProvider("success", {
+        responseOverrides: {
+          summary: "Status attention: revisão consultiva.",
+          observations: [
+            {
+              category: "liquidity",
+              type: "hypothesis",
+              severity: "review",
+              message: "Hipótese qualitativa sem números.",
+              recommendation: `Revisar ${numeral} lançamentos.`,
+            },
+          ],
+        },
+      }),
+      timeoutMs: 1000,
+    });
+    assert.equal(recommendationResult.available, true);
+    assert.equal(recommendationResult.observations.length, 0);
+  }
+});
+
 test("a request payload outside the allowlisted input schema is rejected before any provider call", async () => {
   let providerCalled = false;
   const result = await runAudit({

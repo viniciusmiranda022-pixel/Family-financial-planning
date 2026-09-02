@@ -73,6 +73,61 @@ function unknownEvidenceRefs(output, knownIds) {
   return unknown;
 }
 
+// Codepoints that carry a Unicode numeric value (Numeric_Type=Numeric,
+// Digit or Decimal) but are NOT in the Number general category (Nd/Nl/No),
+// so `\p{N}` alone does not match them. In practice these are ideographic
+// numerals -- CJK characters such as "四" (four), "十" (ten), "億"
+// (hundred million) and their formal/financial variants ("壹", "貳", ...,
+// historically used to make handwritten Chinese amounts harder to tamper
+// with), plus a handful of rare compatibility/extension ideographs.
+//
+// This table is the Node-side mirror of the independent Python boundary in
+// app/services/codex_audit.py, which rejects the same characters via
+// `str.isnumeric()`. Both enforcement layers must reject exactly the same
+// set so neither is a weaker, bypassable copy of the other. Generated once
+// against CPython 3.12 (Unicode 15.0.0, matching .github/workflows/ci.yml)
+// with:
+//
+//   python3 -c "
+//   import unicodedata
+//   for cp in range(0x110000):
+//       ch = chr(cp)
+//       if ch.isnumeric() and unicodedata.category(ch) not in ('Nd', 'Nl', 'No'):
+//           print(hex(cp))
+//   "
+//
+// Re-run that script and update this table if the pinned Python version's
+// Unicode Character Database is ever upgraded.
+const IDEOGRAPHIC_NUMERAL_RANGES = [
+  [0x3405, 0x3405], [0x3483, 0x3483], [0x382a, 0x382a], [0x3b4d, 0x3b4d],
+  [0x4e00, 0x4e00], [0x4e03, 0x4e03], [0x4e07, 0x4e07], [0x4e09, 0x4e09],
+  [0x4e5d, 0x4e5d], [0x4e8c, 0x4e8c], [0x4e94, 0x4e94], [0x4e96, 0x4e96],
+  [0x4ebf, 0x4ec0], [0x4edf, 0x4edf], [0x4ee8, 0x4ee8], [0x4f0d, 0x4f0d],
+  [0x4f70, 0x4f70], [0x5104, 0x5104], [0x5146, 0x5146], [0x5169, 0x5169],
+  [0x516b, 0x516b], [0x516d, 0x516d], [0x5341, 0x5341], [0x5343, 0x5345],
+  [0x534c, 0x534c], [0x53c1, 0x53c4], [0x56db, 0x56db], [0x58f1, 0x58f1],
+  [0x58f9, 0x58f9], [0x5e7a, 0x5e7a], [0x5efe, 0x5eff], [0x5f0c, 0x5f0e],
+  [0x5f10, 0x5f10], [0x62fe, 0x62fe], [0x634c, 0x634c], [0x67d2, 0x67d2],
+  [0x6f06, 0x6f06], [0x7396, 0x7396], [0x767e, 0x767e], [0x8086, 0x8086],
+  [0x842c, 0x842c], [0x8cae, 0x8cae], [0x8cb3, 0x8cb3], [0x8d30, 0x8d30],
+  [0x9621, 0x9621], [0x9646, 0x9646], [0x964c, 0x964c], [0x9678, 0x9678],
+  [0x96f6, 0x96f6], [0xf96b, 0xf96b], [0xf973, 0xf973], [0xf978, 0xf978],
+  [0xf9b2, 0xf9b2], [0xf9d1, 0xf9d1], [0xf9d3, 0xf9d3], [0xf9fd, 0xf9fd],
+  [0x20001, 0x20001], [0x20064, 0x20064], [0x200e2, 0x200e2], [0x20121, 0x20121],
+  [0x2092a, 0x2092a], [0x20983, 0x20983], [0x2098c, 0x2098c], [0x2099c, 0x2099c],
+  [0x20aea, 0x20aea], [0x20afd, 0x20afd], [0x20b19, 0x20b19], [0x22390, 0x22390],
+  [0x22998, 0x22998], [0x23b1b, 0x23b1b], [0x2626d, 0x2626d], [0x2f890, 0x2f890],
+];
+
+const NUMBER_CATEGORY_RE = /\p{N}/u;
+
+function isIdeographicNumeral(codePoint) {
+  // Ranges are sorted, disjoint and short (~70 entries): a linear scan keeps
+  // this dependency-free and lets the table above stay the single, directly
+  // auditable source of truth, instead of a generated regex.
+  return IDEOGRAPHIC_NUMERAL_RANGES.some(([start, end]) => codePoint >= start && codePoint <= end);
+}
+
 /**
  * Numeric lexemes are forbidden in provider-authored prose. Exact presence
  * in the input is insufficient proof that a model used a figure with the
@@ -81,11 +136,22 @@ function unknownEvidenceRefs(output, knownIds) {
  * Codex observations refer to opaque evidence ids and stay qualitative.
  */
 function extractNumberClaims(text) {
-  // Any Unicode numeric character is sufficient to reject provider prose.
-  // This covers ASCII/scientific/formatted forms plus full-width, Arabic-
-  // Indic and other digits that render as numbers to a user. Evidence ids
-  // remain allowed in the structured evidence_ref field, never free text.
-  return Array.from(String(text || "").matchAll(/\p{N}/gu), (match) => match[0]);
+  // Any character with a Unicode numeric value is sufficient to reject
+  // provider prose: `\p{N}` covers ASCII/scientific/formatted digits plus
+  // full-width and Arabic-Indic forms (General_Category Nd/Nl/No), and
+  // `isIdeographicNumeral` covers numeral-valued characters outside that
+  // category (e.g. CJK "四"). Iterating with `for...of` walks by code point
+  // so astral-plane characters are matched whole, never as split surrogate
+  // halves. Evidence ids remain allowed in the structured evidence_ref
+  // field, never free text.
+  const claims = [];
+  for (const character of String(text || "")) {
+    const codePoint = character.codePointAt(0);
+    if (NUMBER_CATEGORY_RE.test(character) || isIdeographicNumeral(codePoint)) {
+      claims.push(character);
+    }
+  }
+  return claims;
 }
 
 function deterministicAuditSummary(input) {

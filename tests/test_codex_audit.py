@@ -241,6 +241,13 @@ def test_numeric_provider_prose_is_dropped_at_the_python_boundary() -> None:
         ("message", "Saldo de R$ 777."),
         ("message", "Saldo de R$ １２３."),
         ("recommendation", "Revisar ١٢٣ itens."),
+        # Ideographic numerals ("四" = four, category Lo) carry a Unicode
+        # numeric value that `str.isnumeric()` recognizes even though they
+        # are outside the Nd/Nl/No general categories. This boundary must
+        # reject the same characters as the Node sidecar's independent
+        # check in advisor/audit.mjs.
+        ("message", "Saldo estimado em 四 reais."),
+        ("recommendation", "Revisar 十 lançamentos."),
     ):
         observation = {
             "category": "liquidity",
