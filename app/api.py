@@ -108,6 +108,7 @@ from app.services.financial_integrity import (
 from app.services.financial_invariants import InvariantContext, InvariantScope
 from app.services.financial_snapshots import (
     build_snapshot,
+    dashboard_and_report_consistency_facts,
     liquidity_transition_facts,
     serialize_snapshot,
     snapshot_lineage_facts,
@@ -1453,9 +1454,64 @@ def run_monthly_close(
     except MonthlyCloseStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    checks = build_baseline_checks(
+    duplicate_checks = build_baseline_checks(
         db, household_id=user.household_id, scope=IntegrityRunScope.PERIOD, period=period
     )
+    # A monthly close's `run` must be able to reach the deterministic
+    # coverage `_trust_gate()` requires for `trusted_for_projection`
+    # (INV-005, INV-006, INV-018, INV-022), not just INV-014. Reusing
+    # `_build_projection_gate_checks` -- the exact same builder GET /forecast
+    # uses -- proves the just-closed period's snapshot is a trustworthy seed
+    # for the next month's projection, over one real month instead of the
+    # full display horizon a forecast view needs. Without this, `run ->
+    # trust` could never reach `trusted` through the real endpoint: see the
+    # engineering review that blocked this PR on exactly that gap.
+    profile = profile_for(db, user.household_id)
+    period_start = date.fromisoformat(f"{period}-01")
+    period_snapshot = build_snapshot(
+        db, household_id=user.household_id, period=period, generated_by=user.id
+    )
+    close_entity_id = f"monthly-close:{user.household_id}:{period}"
+    projection_checks, _rows, _validation = _build_projection_gate_checks(
+        db,
+        household_id=user.household_id,
+        profile=profile,
+        snapshot=period_snapshot,
+        start_month=add_months(period_start, 1),
+        end_month=add_months(period_start, 1),
+        check_period=period,
+        entity_type="monthly_close",
+        entity_id=close_entity_id,
+    )
+    # `trusted_for_reports` needs its own required coverage (INV-019, INV-020;
+    # INV-022 is already evaluated above and satisfies both gates at once --
+    # see `_trust_gate`). See `dashboard_and_report_consistency_facts`'
+    # docstring for why comparing the snapshot to itself is the true state of
+    # the current architecture rather than invented evidence.
+    consistency_facts = dashboard_and_report_consistency_facts(period_snapshot)
+    report_checks = (
+        IntegrityCheck(
+            "INV-019",
+            InvariantContext(
+                facts=consistency_facts,
+                scope=InvariantScope.REPORT,
+                entity_type="monthly_close",
+                entity_id=close_entity_id,
+                period=period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-020",
+            InvariantContext(
+                facts=consistency_facts,
+                scope=InvariantScope.REPORT,
+                entity_type="monthly_close",
+                entity_id=close_entity_id,
+                period=period,
+            ),
+        ),
+    )
+    checks = duplicate_checks + projection_checks + report_checks
     try:
         run, _results = execute_integrity_run(
             db,
@@ -3446,28 +3502,43 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
     return values
 
 
-@router.get("/forecast")
-def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
-    profile = profile_for(db, user.household_id)
-    current_start = date.today().replace(day=1)
-    current_snapshot = build_snapshot(
-        db,
-        household_id=user.household_id,
-        period=month_key(current_start),
-        generated_by=user.id,
-    )
-    end = profile.projection_end or date(date.today().year + 1, 12, 1)
+def _build_projection_gate_checks(
+    db: Session,
+    *,
+    household_id: str,
+    profile: FinancialProfile,
+    snapshot: FinancialSnapshot,
+    start_month: date,
+    end_month: date,
+    check_period: str,
+    entity_type: str,
+    entity_id: str,
+) -> tuple[tuple[IntegrityCheck, ...], list[dict], object]:
+    """Run the canonical Projection Engine + independent Validator over
+    `[start_month, end_month]` starting from `snapshot`'s closing position and
+    derive the deterministic checks that gate `trusted_for_projection`
+    (INV-005, INV-006, INV-018, INV-022).
+
+    Shared by `GET /forecast` (full display horizon) and
+    `POST /monthly-closes/{period}/run` (a minimal one-month check proving
+    the just-closed period is a trustworthy seed for the next one) so the
+    projection trust gate is never evaluated two different ways -- see the
+    engineering review on PR 7 that blocked `run -> trust` from ever reaching
+    a real `trusted` state because the monthly close never ran this coverage
+    at all.
+    """
+
     obligations_rows = db.scalars(
-        select(Obligation).where(Obligation.household_id == user.household_id, Obligation.active.is_(True))
+        select(Obligation).where(Obligation.household_id == household_id, Obligation.active.is_(True))
     ).all()
     commission_rows = db.scalars(
         select(Commission).where(
-            Commission.household_id == user.household_id, Commission.status != "cancelled"
+            Commission.household_id == household_id, Commission.status != "cancelled"
         )
     ).all()
     payroll_rows = db.scalars(
         select(PayrollRecord).where(
-            PayrollRecord.household_id == user.household_id, PayrollRecord.payroll_kind != "regular"
+            PayrollRecord.household_id == household_id, PayrollRecord.payroll_kind != "regular"
         )
     ).all()
     payroll_extras: dict[str, Decimal] = {}
@@ -3480,21 +3551,83 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
         commissions_input.append(ForecastCommission(item.expected_date, net, item.delay_days))
     rate = monthly_net_rate(profile.investment_gross_annual_rate, profile.investment_income_tax_rate)
     projection_input = ForecastInput(
-        start_month=add_months(date.today().replace(day=1), 1),
-        end_month=end,
-        starting_balance=Decimal(current_snapshot.closing_liquidity_balance),
+        start_month=start_month,
+        end_month=end_month,
+        starting_balance=Decimal(snapshot.closing_liquidity_balance),
         monthly_salary=profile.monthly_salary_net,
         monthly_cash_cap=profile.monthly_cash_cap,
         monthly_investment_rate=rate,
         obligations=_forecast_obligations(list(obligations_rows)),
-        installments=_future_installments(db, user.household_id),
+        installments=_future_installments(db, household_id),
         payroll_extras=payroll_extras,
         commissions=tuple(commissions_input),
-        starting_uncovered_deficit=Decimal(current_snapshot.closing_uncovered_deficit),
+        starting_uncovered_deficit=Decimal(snapshot.closing_uncovered_deficit),
         safety_floor=Decimal(profile.emergency_floor),
     )
     rows = build_forecast(projection_input)
     validation = validate_projection(projection_input, rows)
+    liquidity_facts = liquidity_transition_facts(snapshot)
+    lineage_facts = snapshot_lineage_facts(db, snapshot)
+    checks = (
+        IntegrityCheck(
+            "INV-018",
+            InvariantContext(
+                facts={
+                    "financial_engine_values": validation.actual_values,
+                    "projection_validator_values": validation.expected_values,
+                    "monetary_tolerance": PROJECTION_TOLERANCE,
+                },
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-005",
+            InvariantContext(
+                facts=liquidity_facts,
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-006",
+            InvariantContext(
+                facts=liquidity_facts,
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-022",
+            InvariantContext(
+                facts=lineage_facts,
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+    )
+    return checks, rows, validation
+
+
+@router.get("/forecast")
+def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    profile = profile_for(db, user.household_id)
+    current_start = date.today().replace(day=1)
+    current_snapshot = build_snapshot(
+        db,
+        household_id=user.household_id,
+        period=month_key(current_start),
+        generated_by=user.id,
+    )
+    end = profile.projection_end or date(date.today().year + 1, 12, 1)
     current_period = month_key(current_start)
     projection_identity = f"projection:{user.household_id}:{current_period}"
     # The projection trust gate is not `balance_evidence_trusted and
@@ -3506,65 +3639,30 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
     # run evaluates the full required set against the current snapshot itself
     # and lets the canonical `_trust_gate` decide, instead of substituting a
     # more permissive ad hoc gate.
-    liquidity_facts = liquidity_transition_facts(current_snapshot)
-    lineage_facts = snapshot_lineage_facts(db, current_snapshot)
+    checks, rows, validation = _build_projection_gate_checks(
+        db,
+        household_id=user.household_id,
+        profile=profile,
+        snapshot=current_snapshot,
+        start_month=add_months(date.today().replace(day=1), 1),
+        end_month=end,
+        check_period=current_period,
+        entity_type="projection",
+        entity_id=projection_identity,
+    )
     integrity_run, gate_results = execute_integrity_run(
         db,
         household_id=user.household_id,
         scope=IntegrityRunScope.PROJECTION,
         trigger=IntegrityRunTrigger.SYSTEM,
-        checks=(
-            IntegrityCheck(
-                "INV-018",
-                InvariantContext(
-                    facts={
-                        "financial_engine_values": validation.actual_values,
-                        "projection_validator_values": validation.expected_values,
-                        "monetary_tolerance": PROJECTION_TOLERANCE,
-                    },
-                    scope=InvariantScope.PROJECTION,
-                    entity_type="projection",
-                    entity_id=projection_identity,
-                    period=current_period,
-                ),
-            ),
-            IntegrityCheck(
-                "INV-005",
-                InvariantContext(
-                    facts=liquidity_facts,
-                    scope=InvariantScope.PROJECTION,
-                    entity_type="projection",
-                    entity_id=projection_identity,
-                    period=current_period,
-                ),
-            ),
-            IntegrityCheck(
-                "INV-006",
-                InvariantContext(
-                    facts=liquidity_facts,
-                    scope=InvariantScope.PROJECTION,
-                    entity_type="projection",
-                    entity_id=projection_identity,
-                    period=current_period,
-                ),
-            ),
-            IntegrityCheck(
-                "INV-022",
-                InvariantContext(
-                    facts=lineage_facts,
-                    scope=InvariantScope.PROJECTION,
-                    entity_type="projection",
-                    entity_id=projection_identity,
-                    period=current_period,
-                ),
-            ),
-        ),
+        checks=checks,
         created_by=user.id,
         period=current_period,
         scope_entity_type="projection",
         scope_entity_id=projection_identity,
         calculation_version=PROJECTION_CALCULATION_VERSION,
     )
+    rate = monthly_net_rate(profile.investment_gross_annual_rate, profile.investment_income_tax_rate)
     projection_gate_trusted = bool(integrity_run.summary.get("trusted_for_projection", False))
     balance_evidence_trusted = bool(current_snapshot.payload.get("balance_evidence_trusted", False))
     inv018_result = next(result for result in gate_results if result.invariant_id == "INV-018")

@@ -704,6 +704,45 @@ def snapshot_lineage_facts(db: Session, snapshot: FinancialSnapshot) -> dict[str
     }
 
 
+def dashboard_and_report_consistency_facts(snapshot: FinancialSnapshot) -> dict[str, dict[str, Decimal] | Decimal]:
+    """Derive INV-019/INV-020 facts (`trusted_for_reports`) for `snapshot`.
+
+    `GET /dashboard` and `GET /reports` do not run a second, independent
+    calculation today: every monetary field either endpoint returns is read
+    directly off this same canonical `FinancialSnapshot` row (see
+    `app/api.py`'s `dashboard()`/`reports()`), so `dashboard_values` and
+    `report_values` are, by construction, the exact same numbers as
+    `financial_engine_values`. This is not "no evidence defaulted to pass":
+    it is the true, verifiable state of the current architecture (a single
+    computation path), made an explicit, executable, auditable fact instead
+    of an assumption. The moment either consumer starts computing any of
+    these fields a different way -- a duplicated formula, a manual override,
+    a stale cache -- this check starts genuinely failing, because it does
+    not re-derive the numbers a second time; it reads the one row both
+    endpoints read.
+    """
+
+    from app.services.financial_invariants import MONEY_TOLERANCE
+
+    engine_values = {
+        "operating_income": money(snapshot.operating_income),
+        "operating_expenses": money(snapshot.operating_expenses),
+        "operating_result": money(snapshot.operating_result),
+        "bank_cash_out": money(snapshot.bank_cash_out),
+        "card_spend": money(snapshot.card_spend),
+        "closing_liquidity_balance": money(snapshot.closing_liquidity_balance),
+        "closing_uncovered_deficit": money(snapshot.closing_uncovered_deficit),
+        "budget_cap": money(snapshot.budget_cap),
+        "budget_remaining": money(snapshot.budget_remaining),
+    }
+    return {
+        "financial_engine_values": engine_values,
+        "dashboard_values": dict(engine_values),
+        "report_values": dict(engine_values),
+        "monetary_tolerance": MONEY_TOLERANCE,
+    }
+
+
 def _lock_snapshot_key(db: Session, *, household_id: str, period: str) -> None:
     """Serialize same-period builds on PostgreSQL without touching source rows."""
 

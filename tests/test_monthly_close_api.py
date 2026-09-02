@@ -31,7 +31,7 @@ os.environ.setdefault("DATA_DIR", f"/tmp/ffp-monthly-close-api-data-{uuid.uuid4(
 
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Household, Transaction, User  # noqa: E402
+from app.models import Category, Household, Transaction, User  # noqa: E402
 from app.security import hash_password  # noqa: E402
 
 PERIOD = "2026-08"
@@ -236,5 +236,141 @@ def test_monthly_close_lifecycle_and_finding_actions() -> None:
             assert client.post(
                 f"/api/monthly-closes/{PERIOD}/reopen", json={"reason": "ainda não fechado"}
             ).status_code == 409
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_monthly_close_reaches_trusted_for_a_real_clean_period() -> None:
+    """`POST run -> POST trust` must be able to reach `trusted` for real.
+
+    Before this fix, `build_baseline_checks` only ever proved INV-014, whose
+    applicable set is empty for a clean month, so the period-scoped run's own
+    `trusted_for_projection`/`trusted_for_reports` could never become true
+    through the real endpoint -- `_trust_gate()` also requires INV-005,
+    INV-006, INV-018, INV-022 (projection) and INV-019, INV-020, INV-022
+    (reports) to have actually been evaluated and to have passed, not merely
+    to be absent from the result set. `tests/test_monthly_close.py` already
+    covers the gate arithmetic by manufacturing `IntegrityRun.summary` and
+    `FinancialSnapshot.trusted_*` directly, which proves the arithmetic but
+    not that the public API can ever produce those values -- that was
+    precisely the engineering review's objection blocking this PR. This
+    drives one household through a genuinely clean month (a confirmed
+    opening balance, one ordinary income transaction, no duplicates)
+    exclusively through the real HTTP API and asserts the close reaches
+    `trusted`.
+    """
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        # `/api/auth/setup` bootstraps this single-tenant deployment exactly
+        # once process-wide; `test_monthly_close_lifecycle_and_finding_actions`
+        # above already consumed it on this module's shared `_test_engine`, so
+        # this household is created directly (same helper the cross-household
+        # isolation scenario above uses) and then logged in for real.
+        _create_household_admin(
+            household_name="Família Fechamento Limpo",
+            username="admin-close-clean",
+            password="senha-local-segura",
+        )
+        with TestClient(app) as client:
+            login = client.post(
+                "/api/auth/login",
+                json={"username": "admin-close-clean", "password": "senha-local-segura"},
+            )
+            assert login.status_code == 200
+
+            investment = client.post(
+                "/api/accounts",
+                json={
+                    "name": "Reserva DI",
+                    "institution": "Banco XP",
+                    "account_type": "investment",
+                    "owner_label": "Família",
+                },
+            )
+            assert investment.status_code == 201
+
+            checking = client.post(
+                "/api/accounts",
+                json={
+                    "name": "Conta corrente",
+                    "institution": "Banco XP",
+                    "account_type": "checking",
+                    "owner_label": "Família",
+                },
+            )
+            assert checking.status_code == 201
+
+            balance = client.post(
+                "/api/account-balances",
+                json={
+                    "account_id": investment.json()["id"],
+                    "amount": "1000.00",
+                    "as_of_date": f"{PERIOD}-01",
+                    "observation_type": "opening",
+                },
+            )
+            assert balance.status_code == 201
+
+            with _TestSessionLocal() as db:
+                household = db.scalar(
+                    select(Household).where(Household.name == "Família Fechamento Limpo")
+                )
+                income_category = Category(household_id=household.id, name="Receitas")
+                db.add(income_category)
+                db.flush()
+                db.add(
+                    Transaction(
+                        household_id=household.id,
+                        account_id=checking.json()["id"],
+                        category_id=income_category.id,
+                        booked_at=date(2026, 8, 10),
+                        description="Salário",
+                        normalized_description="SALARIO",
+                        amount=Decimal("500.00"),
+                        transaction_type="income",
+                        owner_label="Família",
+                        fingerprint="i" * 64,
+                        possible_duplicate=False,
+                        excluded=False,
+                        reviewed=True,
+                    )
+                )
+                db.commit()
+
+            run_response = client.post(f"/api/monthly-closes/{PERIOD}/run")
+            assert run_response.status_code == 200
+            run_payload = run_response.json()
+            assert run_payload["status"] == "review_required"
+            assert run_payload["pending"]["integrity_status"] == "healthy"
+            assert run_payload["pending"]["trusted_for_projection"] is True
+            assert run_payload["pending"]["trusted_for_reports"] is True
+            assert run_payload["pending"]["eligible_for_trust"] is True
+
+            trust_response = client.post(f"/api/monthly-closes/{PERIOD}/trust")
+            assert trust_response.status_code == 200
+            trust_payload = trust_response.json()
+            assert trust_payload["status"] == "trusted"
+            assert trust_payload["closed_by"]
+            assert trust_payload["closed_at"]
+
+            # A materially incomplete month must still be rejected: deleting
+            # the only lineage-bearing transaction and reopening/rerunning
+            # must never leave a stale `trusted` state standing on facts that
+            # no longer exist. With zero transactions left, INV-022 (CRITICAL)
+            # genuinely FAILs -- lineage is provably incomplete, not merely
+            # unattempted -- so the period must land on `critical`, never
+            # silently stay `healthy` or fall back to an artificial pass.
+            reopen = client.post(
+                f"/api/monthly-closes/{PERIOD}/reopen", json={"reason": "Auditoria retroativa"}
+            )
+            assert reopen.status_code == 200
+            with _TestSessionLocal() as db:
+                db.query(Transaction).where(Transaction.household_id == household.id).delete()
+                db.commit()
+            rerun = client.post(f"/api/monthly-closes/{PERIOD}/run")
+            assert rerun.status_code == 200
+            assert rerun.json()["pending"]["integrity_status"] == "critical"
+            assert rerun.json()["pending"]["eligible_for_trust"] is False
+            assert client.post(f"/api/monthly-closes/{PERIOD}/trust").status_code == 422
     finally:
         app.dependency_overrides.pop(get_db, None)
