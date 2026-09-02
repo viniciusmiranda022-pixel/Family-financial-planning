@@ -615,6 +615,95 @@ def build_snapshot(
     return snapshot
 
 
+def liquidity_transition_facts(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """Derive INV-005/INV-006 facts for an already-built snapshot.
+
+    `settle_liquidity` (the engine) zeroes the opening balance and pays down any
+    prior uncovered deficit before a positive result can rebuild liquidity, so a
+    period that carries debt cannot be replayed through the invariants' own
+    independent `calculate_liquidity_transition(opening, monthly_result)` -- that
+    function has no debt parameter at all.
+
+    A period that starts with `opening_uncovered_deficit > 0` always closes with
+    `opening_liquidity_balance == 0` (the engine forces it), and the two-step
+    "pay debt, then deposit the remainder" transition is algebraically identical
+    to a single step of `calculate_liquidity_transition(0, operating_result +
+    investment_yield - opening_uncovered_deficit)`: whatever is left over after
+    netting the period's result and yield against the carried debt is exactly
+    what either formula clamps at zero. Folding debt into the result this way
+    reproduces the engine's own closing/uncovered/liquidity_used figures only
+    when every max/min clamp in `settle_liquidity` was applied correctly, so a
+    regression in its debt-priority branch still surfaces as a mismatch here.
+    A period with no carried debt is unaffected: the fold is a no-op because
+    `opening_uncovered_deficit` is zero.
+    """
+
+    debt = money(snapshot.opening_uncovered_deficit)
+    opening = Decimal("0.00") if debt > 0 else money(snapshot.opening_liquidity_balance)
+    monthly_result = money(money(snapshot.operating_result) + money(snapshot.investment_yield) - debt)
+    return {
+        "opening_liquidity_balance": opening,
+        "monthly_operating_result": monthly_result,
+        "closing_liquidity_balance": money(snapshot.closing_liquidity_balance),
+        "uncovered_deficit": money(snapshot.closing_uncovered_deficit),
+        "liquidity_used": money(snapshot.liquidity_used),
+    }
+
+
+def snapshot_lineage_facts(db: Session, snapshot: FinancialSnapshot) -> dict[str, Any]:
+    """Derive INV-022 facts from the lineage rows persisted for `snapshot`.
+
+    Every row `build_snapshot` folded into the snapshot -- the opening evidence,
+    active obligations and every selected transaction -- was already persisted
+    to `financial_snapshot_lineage`, so this reads that trail back instead of
+    recomputing `_collect()`'s selection a second time.
+
+    `document_required` is left `False`: manual, non-imported transactions are
+    a supported source in this schema, so a period with no imported document at
+    all is not itself a lineage violation. Enforcing "every aggregate must cite
+    a document" is a separate, not-yet-normative decision left for a future
+    slice; see the PR's Technical Challenge / residual notes.
+    """
+
+    lineage_rows = tuple(
+        db.scalars(
+            select(FinancialSnapshotLineage).where(
+                FinancialSnapshotLineage.snapshot_id == snapshot.id
+            )
+        ).all()
+    )
+    source_ids = [f"{row.entity_type}:{row.entity_id}" for row in lineage_rows]
+    transaction_ids = sorted(
+        {row.entity_id for row in lineage_rows if row.entity_type == "transaction"}
+    )
+    document_ids = sorted({row.document_id for row in lineage_rows if row.document_id})
+    rule_ids = sorted({row.rule_id for row in lineage_rows if row.rule_id})
+    account_ids: set[str] = set()
+    category_ids: set[str] = set()
+    if transaction_ids:
+        for account_id, category_id in db.execute(
+            select(Transaction.account_id, Transaction.category_id).where(
+                Transaction.id.in_(transaction_ids)
+            )
+        ).all():
+            if account_id:
+                account_ids.add(account_id)
+            if category_id:
+                category_ids.add(category_id)
+    return {
+        "source_count": len(source_ids),
+        "source_ids": source_ids,
+        "transaction_ids": transaction_ids,
+        "document_ids": document_ids,
+        "document_required": False,
+        "rule_ids": rule_ids,
+        "account_ids": sorted(account_ids),
+        "category_ids": sorted(category_ids),
+        "calculation_version": snapshot.calculation_version,
+        "lineage_period": snapshot.period,
+    }
+
+
 def _lock_snapshot_key(db: Session, *, household_id: str, period: str) -> None:
     """Serialize same-period builds on PostgreSQL without touching source rows."""
 
