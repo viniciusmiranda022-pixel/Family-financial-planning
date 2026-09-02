@@ -159,9 +159,11 @@ def upsert_monthly_close_after_run(
     produced `integrity_run_id`/`snapshot_id`, captured under
     `lock_household_financial_revision` -- see
     `MonthlyFinancialClose.financial_revision`'s docstring and
-    `trust_monthly_close`'s use of it. Defaults to `None` (no comparison at
-    trust time) for callers that manufacture a close outside the real `run`
-    endpoint -- see the parameter's docstring on the model.
+    `trust_monthly_close`'s use of it. Defaults to `None` for callers that
+    manufacture a close outside the real `run` endpoint; since the Round 10
+    fix, `trust_monthly_close` treats a `None` revision as missing evidence
+    and fails closed on any subsequent `trust` attempt, requiring a real
+    `run` first -- it is no longer "no comparison at trust time".
     """
 
     close = get_monthly_close(db, household_id=household_id, period=period)
@@ -228,14 +230,36 @@ def trust_monthly_close(
     # itself locked and observed (see `MonthlyFinancialClose`'s docstring);
     # if the barrier's current value has moved since, the run's gates were
     # evaluated against data that is no longer current, and this trust
-    # attempt must be rejected -- exactly the case a
-    # `financial_revision is None` close (created before this column
-    # existed, or manufactured directly by a test) cannot be judged on, so
-    # it is skipped rather than unconditionally blocked. See the
-    # engineering review on PR 7, Round 8: "Persist the revision used by
-    # /run on the close/run and require it to equal the locked revision
-    # before trusting."
-    if close.financial_revision is not None and close.financial_revision != revision_at_lock:
+    # attempt must be rejected.
+    #
+    # `financial_revision is None` fails closed instead of being skipped
+    # (Round 10 fix): a close created before column `0008` existed (every
+    # pre-migration `review_required` row, left `NULL` by an additive,
+    # non-backfilling migration -- see `alembic/versions/0008_...`) or
+    # manufactured directly without going through the real `run` endpoint has
+    # no proof any revision barrier was ever observed for it. Treating that
+    # absence as "not applicable" would let such a close reach `trusted`
+    # without `trust_monthly_close` ever having compared anything -- exactly
+    # the fail-open gap the Round 10 engineering review found: "a
+    # pre-migration `review_required` close can be promoted after deployment
+    # without ever having a revision captured by `/run`. Unknown provenance
+    # must fail closed." A close already sitting at `trusted` is untouched by
+    # this (the guard at the top of this function raises before reaching
+    # here), so historical `trusted` rows created under the old, more
+    # permissive behavior are never retroactively invalidated -- only a *new*
+    # promotion from `review_required` is required to carry real revision
+    # evidence. See the engineering review on PR 7, Round 8 ("Persist the
+    # revision used by /run on the close/run and require it to equal the
+    # locked revision before trusting") and Round 10 ("a NULL revision should
+    # add a gate reason requiring a fresh /run, not mean 'not applicable'").
+    if close.financial_revision is None:
+        reasons.append(
+            "Fechamento não possui uma revisão financeira registrada por uma execução "
+            "(run) real -- provavelmente foi migrado antes desta verificação existir ou "
+            "criado fora do fluxo normal. Execute o fechamento novamente (run) para "
+            "registrar uma revisão auditável antes de confiar (trust)."
+        )
+    elif close.financial_revision != revision_at_lock:
         reasons.append(
             "Dados financeiros do household mudaram desde a última execução do "
             "fechamento (run); execute o fechamento novamente."

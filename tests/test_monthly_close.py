@@ -397,12 +397,19 @@ def test_trust_succeeds_when_healthy_and_snapshot_trusted() -> None:
         household, user = _household_and_user(db)
         run = _completed_period_run(db, household_id=household.id, summary=_healthy_summary())
         snapshot = _snapshot(db, household_id=household.id, trusted=True)
+        # A real `run` always captures `financial_revision` under the same
+        # barrier `trust_monthly_close` locks (see `run_monthly_close` in
+        # `app/api.py`) -- since the Round 10 fix, `trust_monthly_close`
+        # fails closed on a `None` revision, so the happy path must persist
+        # one here too, exactly as the real endpoint does.
+        run_financial_revision = lock_household_financial_revision(db, household_id=household.id)
         upsert_monthly_close_after_run(
             db,
             household_id=household.id,
             period=PERIOD,
             snapshot_id=snapshot.id,
             integrity_run_id=run.id,
+            financial_revision=run_financial_revision,
         )
 
         close = trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
@@ -414,6 +421,92 @@ def test_trust_succeeds_when_healthy_and_snapshot_trusted() -> None:
             trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
         with pytest.raises(MonthlyCloseStateError):
             assert_close_runnable(db, household_id=household.id, period=PERIOD)
+
+
+def test_trust_blocked_when_financial_revision_is_missing() -> None:
+    """PR 7, Round 10: a `NULL` `financial_revision` must fail closed, not be skipped.
+
+    Reproduces a pre-migration `review_required` close: `financial_revision`
+    is `NULL` because the close was upserted before column `0008` existed
+    (migration `0008` is additive and does not backfill), or because a
+    caller manufactured it outside the real `run` endpoint. Before the
+    Round 10 fix, `trust_monthly_close` skipped the revision comparison
+    entirely for a `None` value, so this close -- otherwise healthy, with a
+    genuinely current, trusted snapshot -- would have been promoted to
+    `trusted` without `trust_monthly_close` ever having proven no financial
+    source mutated since any `run`. See the engineering review on PR 7,
+    Round 10: "Unknown provenance must fail closed: a NULL revision should
+    add a gate reason requiring a fresh /run, not mean 'not applicable'."
+    """
+
+    with _engine_session() as db:
+        household, user = _household_and_user(db)
+        run = _completed_period_run(db, household_id=household.id, summary=_healthy_summary())
+        snapshot = _snapshot(db, household_id=household.id, trusted=True)
+        close = upsert_monthly_close_after_run(
+            db,
+            household_id=household.id,
+            period=PERIOD,
+            snapshot_id=snapshot.id,
+            integrity_run_id=run.id,
+            # No `financial_revision` -- simulates a pre-0008 row or a close
+            # manufactured outside the real `run` endpoint.
+        )
+        assert close.financial_revision is None
+
+        with pytest.raises(MonthlyCloseGateError) as excinfo:
+            trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
+        assert any("não possui uma revisão financeira" in reason for reason in excinfo.value.reasons)
+
+        # The blocked attempt must not have persisted anything -- the close
+        # is still exactly `review_required`, ready for a real `run`.
+        close_after = get_monthly_close(db, household_id=household.id, period=PERIOD)
+        assert close_after.status == "review_required"
+
+        # A real `run` capturing a revision clears the gate -- proving this
+        # is a real, actionable rejection, not a permanent dead end.
+        close_after.financial_revision = lock_household_financial_revision(
+            db, household_id=household.id
+        )
+        db.flush()
+        trusted = trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
+        assert trusted.status == "trusted"
+
+
+def test_historical_trusted_close_with_missing_revision_is_not_reevaluated() -> None:
+    """A `trusted` close persisted under the pre-Round-10 behavior (`NULL`
+    revision, promoted back when `None` was treated as "not applicable")
+    must stay historical -- the Round 10 fix must never retroactively
+    invalidate it. `trust_monthly_close` only evaluates `financial_revision`
+    while promoting a `review_required` close; an already-`trusted` row is
+    rejected by the state guard before that comparison is ever reached.
+    """
+
+    with _engine_session() as db:
+        household, user = _household_and_user(db)
+        run = _completed_period_run(db, household_id=household.id, summary=_healthy_summary())
+        snapshot = _snapshot(db, household_id=household.id, trusted=True)
+        close = upsert_monthly_close_after_run(
+            db,
+            household_id=household.id,
+            period=PERIOD,
+            snapshot_id=snapshot.id,
+            integrity_run_id=run.id,
+        )
+        assert close.financial_revision is None
+        # Simulates a close that reached `trusted` before the Round 10 fix
+        # existed (or a directly-seeded historical row).
+        close.status = "trusted"
+        close.closed_at = datetime.now(UTC)
+        close.closed_by = user.id
+        db.flush()
+
+        with pytest.raises(MonthlyCloseStateError):
+            trust_monthly_close(db, household_id=household.id, period=PERIOD, user_id=user.id)
+
+        untouched = get_monthly_close(db, household_id=household.id, period=PERIOD)
+        assert untouched.status == "trusted"
+        assert untouched.financial_revision is None
 
 
 def test_financial_revision_barrier_covers_integrity_and_projection_gate_models() -> None:
@@ -567,12 +660,17 @@ def test_reopen_requires_trusted_and_preserves_close_history() -> None:
         household, user = _household_and_user(db)
         run = _completed_period_run(db, household_id=household.id, summary=_healthy_summary())
         snapshot = _snapshot(db, household_id=household.id, trusted=True)
+        # See `test_trust_succeeds_when_healthy_and_snapshot_trusted`: a real
+        # `run` always captures `financial_revision`, and `trust_monthly_close`
+        # fails closed on `None` since the Round 10 fix.
+        run_financial_revision = lock_household_financial_revision(db, household_id=household.id)
         upsert_monthly_close_after_run(
             db,
             household_id=household.id,
             period=PERIOD,
             snapshot_id=snapshot.id,
             integrity_run_id=run.id,
+            financial_revision=run_financial_revision,
         )
         with pytest.raises(MonthlyCloseStateError):
             reopen_monthly_close(

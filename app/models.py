@@ -715,11 +715,20 @@ class MonthlyFinancialClose(Base, TimestampMixin):
     `healthy` status silently satisfied. See the engineering review on PR 7,
     Round 8: "Persist the revision used by /run on the close/run and
     require it to equal the locked revision before trusting."　Nullable:
-    a close created before this column existed (or one manufactured
-    directly by a test that bypasses the real `run` endpoint) has no
-    recorded value, and `trust_monthly_close` treats `None` as "not
-    applicable" rather than an unconditional block -- it does not weaken
-    any of the other deterministic gates, which still apply in full.
+    a close created before this column existed (every pre-migration
+    `review_required` row -- migration `0008` is additive and does not
+    backfill) or one manufactured directly by a test that bypasses the real
+    `run` endpoint has no recorded value. Since the Round 10 fix,
+    `trust_monthly_close` treats `None` as missing evidence and fails closed
+    -- any *new* promotion from `review_required` requires a real `run` to
+    capture a revision first; it is not treated as "not applicable". A close
+    already sitting at `trusted` (created under the earlier, more permissive
+    behavior) is never retroactively invalidated by this: `trust_monthly_close`
+    only ever evaluates this column while promoting a `review_required`
+    close, never against an already-`trusted` one. See the engineering
+    review on PR 7, Round 10: "Unknown provenance must fail closed... a NULL
+    revision should add a gate reason requiring a fresh /run, not mean 'not
+    applicable'."
     """
 
     __tablename__ = "monthly_financial_closes"
