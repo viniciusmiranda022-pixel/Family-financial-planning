@@ -74,37 +74,12 @@ function unknownEvidenceRefs(output, knownIds) {
 }
 
 /**
- * Complete numeric lexemes that appear anywhere in the sanitized input
- * package -- the only numbers the model is allowed to cite back.
- * This is a best-effort guard against the model inventing financial
- * figures inside free text, where no schema/enum can constrain content.
- * It cannot prove a cited number is used correctly, only that it was not
- * fabricated from nothing: it is a floor, not a substitute for the
- * deterministic engine.
+ * Numeric lexemes are forbidden in provider-authored prose. Exact presence
+ * in the input is insufficient proof that a model used a figure with the
+ * right meaning (an id/count/score can be repurposed as a currency claim).
+ * Deterministic figures remain available in the engine-owned response block;
+ * Codex observations refer to opaque evidence ids and stay qualitative.
  */
-function collectKnownNumberClaims(input) {
-  const known = new Set();
-  const addValue = (value) => {
-    if (typeof value === "number" && Number.isFinite(value)) known.add(String(value));
-  };
-  const addText = (value) => {
-    for (const claim of extractNumberClaims(value)) known.add(claim);
-  };
-
-  // Deliberately enumerate financial/count-bearing fields. Never scan the
-  // serialized package wholesale: trace/opaque/invariant ids and periods can
-  // contain digits but are not evidence for a financial numeric claim.
-  addValue(input?.integrity_snapshot?.score);
-  addValue(input?.integrity_snapshot?.open_findings);
-  for (const value of Object.values(input?.integrity_snapshot?.open_findings_by_severity || {})) {
-    addValue(value);
-  }
-  for (const finding of input?.findings || []) addText(finding?.message);
-  for (const item of input?.category_breakdown || []) addValue(item?.amount);
-  for (const value of Object.values(input?.financial_metrics || {})) addValue(value);
-  return known;
-}
-
 function extractNumberClaims(text) {
   // Match complete numeric lexemes, including short household amounts and
   // formatted decimals (99, 99.90, 1.234,56), while ignoring digits embedded
@@ -132,24 +107,22 @@ function deterministicAuditSummary(input) {
  * a single hallucinated figure in one observation does not make every
  * other observation untrustworthy.
  */
-function stripInventedNumberClaims(output, input) {
-  const knownDigits = collectKnownNumberClaims(input);
+function stripInventedNumberClaims(output) {
   let strippedCount = 0;
   const observations = (output.observations || []).filter((observation) => {
     const candidateNumbers = [
       ...extractNumberClaims(observation.message),
       ...extractNumberClaims(observation.recommendation),
     ];
-    const invented = candidateNumbers.some((digits) => !knownDigits.has(digits));
+    const invented = candidateNumbers.length > 0;
     if (invented) strippedCount += 1;
     return !invented;
   });
   return { output: { ...output, observations }, strippedCount };
 }
 
-function summaryHasInventedNumber(output, input) {
-  const knownDigits = collectKnownNumberClaims(input);
-  return extractNumberClaims(output.summary).some((digits) => !knownDigits.has(digits));
+function summaryHasInventedNumber(output) {
+  return extractNumberClaims(output.summary).length > 0;
 }
 
 // ---------------------------------------------------------------------
@@ -226,7 +199,7 @@ export function buildAuditPrompt(payload) {
     "Não use ferramentas, comandos, arquivos, rede ou pesquisa. Responda somente com o JSON solicitado,",
     "aderente ao schema de saída fornecido. Não inclua nenhum campo fora do schema.",
     "Cite apenas ids presentes no próprio pacote em evidence_ref; nunca invente um id.",
-    "Cite apenas números literalmente presentes no pacote; nunca invente ou estime um valor monetário.",
+    "Não cite números em texto livre; use evidence_ref para apontar aos fatos determinísticos do pacote.",
     "severity é somente 'info' ou 'review'; você nunca usa 'critical' ou 'block'.",
     "O summary deve citar literalmente o token de status recebido em integrity_snapshot.status e não pode",
     "afirmar aprovação, ausência de riscos ou confiabilidade quando esse status não for 'healthy'.",
@@ -340,7 +313,7 @@ export async function runAudit({ payload, provider, timeoutMs }) {
     };
   }
 
-  if (summaryHasInventedNumber(raw, payload)) {
+  if (summaryHasInventedNumber(raw)) {
     metrics.number_claims_stripped_total += 1;
     metrics.failure_total += 1;
     logAuditEvent("codex_audit.invented_summary_number", { duration_ms: durationMs });
@@ -354,7 +327,7 @@ export async function runAudit({ payload, provider, timeoutMs }) {
     };
   }
 
-  const { output: sanitizedOutput, strippedCount } = stripInventedNumberClaims(raw, payload);
+  const { output: sanitizedOutput, strippedCount } = stripInventedNumberClaims(raw);
   if (strippedCount > 0) {
     metrics.number_claims_stripped_total += strippedCount;
     logAuditEvent("codex_audit.number_claims_stripped", { count: strippedCount });

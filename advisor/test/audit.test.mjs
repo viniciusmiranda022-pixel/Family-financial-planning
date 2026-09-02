@@ -305,6 +305,31 @@ test("digits in identifiers never authorize a financial numeric claim", async ()
   assert.equal(result.observations.length, 0);
 });
 
+test("digits embedded in finding prose never authorize a financial claim", async () => {
+  const result = await runAudit({
+    payload: {
+      ...basePayload,
+      findings: [{ ...basePayload.findings[0], message: "Falha no registro ACCOUNT_777" }],
+    },
+    provider: fakeProvider("success", {
+      responseOverrides: {
+        summary: "Status attention: revisão consultiva.",
+        observations: [
+          {
+            category: "liquidity",
+            type: "hypothesis",
+            severity: "review",
+            message: "Saldo disponível de R$ 777.",
+          },
+        ],
+      },
+    }),
+    timeoutMs: 1000,
+  });
+  assert.equal(result.available, true);
+  assert.equal(result.observations.length, 0);
+});
+
 test("a request payload outside the allowlisted input schema is rejected before any provider call", async () => {
   let providerCalled = false;
   const result = await runAudit({
