@@ -127,6 +127,31 @@ def test_projection_gate_requires_complete_deterministic_coverage() -> None:
     assert assessment.trusted_for_projection is True
 
 
+def test_projection_gate_stays_false_when_a_required_invariant_is_never_evaluated() -> None:
+    """A required invariant that is never run must never be inferred as PASS.
+
+    PR 34 was blocked on merge because the forecast endpoint only ran INV-018
+    and inferred the rest of the projection gate from unrelated ad hoc facts.
+    Omitting INV-022 entirely here (not failing it -- never evaluating it at
+    all) must still leave the gate false, exactly like the missing-coverage
+    case already covered for a single check in
+    `test_non_pass_block_finding_blocks_the_affected_trust_gate`.
+    """
+
+    assessment = assess_integrity(
+        [
+            _result(
+                invariant_id,
+                InvariantStatus.PASS,
+                IntegritySeverity.BLOCK if invariant_id == "INV-018" else IntegritySeverity.CRITICAL,
+                scope=InvariantScope.PROJECTION,
+            )
+            for invariant_id in ("INV-005", "INV-006", "INV-018")
+        ]
+    )
+    assert assessment.trusted_for_projection is False
+
+
 def test_integrity_orchestrator_has_no_advisor_or_codex_dependency() -> None:
     source = Path("app/services/financial_integrity.py").read_text(encoding="utf-8").lower()
     assert "codex_client" not in source

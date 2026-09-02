@@ -97,7 +97,12 @@ from app.services.financial_integrity import (
     serialize_run,
 )
 from app.services.financial_invariants import InvariantContext, InvariantScope
-from app.services.financial_snapshots import build_snapshot, serialize_snapshot
+from app.services.financial_snapshots import (
+    build_snapshot,
+    liquidity_transition_facts,
+    serialize_snapshot,
+    snapshot_lineage_facts,
+)
 from app.services.importer import (
     PARSER_CONTRACT_VERSION,
     ParsedTransaction,
@@ -3100,8 +3105,20 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
     )
     rows = build_forecast(projection_input)
     validation = validate_projection(projection_input, rows)
-    projection_identity = f"projection:{user.household_id}:{month_key(current_start)}"
-    integrity_run, validation_results = execute_integrity_run(
+    current_period = month_key(current_start)
+    projection_identity = f"projection:{user.household_id}:{current_period}"
+    # The projection trust gate is not `balance_evidence_trusted and
+    # validation.valid`: that pair only proves acceptable opening evidence and
+    # engine/validator parity, never the projection gate's required invariant
+    # coverage (INV-005, INV-006, INV-018, INV-022 -- `_trust_gate` in
+    # financial_integrity.py). A snapshot can fail lineage or liquidity
+    # closure and still reproduce identical engine/validator numbers, so this
+    # run evaluates the full required set against the current snapshot itself
+    # and lets the canonical `_trust_gate` decide, instead of substituting a
+    # more permissive ad hoc gate.
+    liquidity_facts = liquidity_transition_facts(current_snapshot)
+    lineage_facts = snapshot_lineage_facts(db, current_snapshot)
+    integrity_run, gate_results = execute_integrity_run(
         db,
         household_id=user.household_id,
         scope=IntegrityRunScope.PROJECTION,
@@ -3118,16 +3135,49 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
                     scope=InvariantScope.PROJECTION,
                     entity_type="projection",
                     entity_id=projection_identity,
-                    period=month_key(current_start),
+                    period=current_period,
+                ),
+            ),
+            IntegrityCheck(
+                "INV-005",
+                InvariantContext(
+                    facts=liquidity_facts,
+                    scope=InvariantScope.PROJECTION,
+                    entity_type="projection",
+                    entity_id=projection_identity,
+                    period=current_period,
+                ),
+            ),
+            IntegrityCheck(
+                "INV-006",
+                InvariantContext(
+                    facts=liquidity_facts,
+                    scope=InvariantScope.PROJECTION,
+                    entity_type="projection",
+                    entity_id=projection_identity,
+                    period=current_period,
+                ),
+            ),
+            IntegrityCheck(
+                "INV-022",
+                InvariantContext(
+                    facts=lineage_facts,
+                    scope=InvariantScope.PROJECTION,
+                    entity_type="projection",
+                    entity_id=projection_identity,
+                    period=current_period,
                 ),
             ),
         ),
         created_by=user.id,
-        period=month_key(current_start),
+        period=current_period,
         scope_entity_type="projection",
         scope_entity_id=projection_identity,
         calculation_version=PROJECTION_CALCULATION_VERSION,
     )
+    projection_gate_trusted = bool(integrity_run.summary.get("trusted_for_projection", False))
+    balance_evidence_trusted = bool(current_snapshot.payload.get("balance_evidence_trusted", False))
+    inv018_result = next(result for result in gate_results if result.invariant_id == "INV-018")
     db.commit()
     serialized = [
         {key: decimal_value(value) if isinstance(value, Decimal) else value for key, value in row.items()}
@@ -3147,16 +3197,14 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
             "emergency_floor": decimal_value(profile.emergency_floor),
             "viable": min(delayed_balances) >= decimal_value(profile.emergency_floor),
             "trusted_for_projection": bool(
-                current_snapshot.payload.get("balance_evidence_trusted", False)
-                and validation.valid
+                balance_evidence_trusted and validation.valid and projection_gate_trusted
             ),
             "projection_formula_trusted": validation.valid,
+            "projection_invariant_gate_trusted": projection_gate_trusted,
             "source_snapshot_trusted_for_projection": current_snapshot.trusted_for_projection,
-            "source_balance_evidence_trusted": bool(
-                current_snapshot.payload.get("balance_evidence_trusted", False)
-            ),
+            "source_balance_evidence_trusted": balance_evidence_trusted,
             "source_snapshot_integrity_status": current_snapshot.integrity_status,
-            "integrity_status": validation_results[0].status.value,
+            "integrity_status": inv018_result.status.value,
             "integrity_run_id": integrity_run.id,
             "source_snapshot_id": current_snapshot.id,
             "source_snapshot_checksum": current_snapshot.checksum,
