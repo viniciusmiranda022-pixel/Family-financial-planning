@@ -51,77 +51,11 @@ class ForecastInput:
     installments: dict[str, Decimal]
     payroll_extras: dict[str, Decimal]
     commissions: tuple[ForecastCommission, ...]
-
-
-def _delayed_month(expected: date, delay_days: int) -> date:
-    month_shift = max(0, (delay_days + 29) // 30)
-    return add_months(date(expected.year, expected.month, 1), month_shift)
+    starting_uncovered_deficit: Decimal = Decimal("0")
+    safety_floor: Decimal = Decimal("0")
 
 
 def build_forecast(data: ForecastInput) -> list[dict[str, Decimal | str]]:
-    expected_commissions: dict[str, Decimal] = {}
-    delayed_commissions: dict[str, Decimal] = {}
-    for item in data.commissions:
-        expected_key = month_key(item.expected_date)
-        delayed_key = month_key(_delayed_month(item.expected_date, item.delay_days))
-        expected_commissions[expected_key] = (
-            expected_commissions.get(expected_key, Decimal("0")) + item.net_amount
-        )
-        delayed_commissions[delayed_key] = (
-            delayed_commissions.get(delayed_key, Decimal("0")) + item.net_amount
-        )
+    from app.services.projection_engine import build_projection
 
-    balances = {
-        "no_commission": money(data.starting_balance),
-        "delayed": money(data.starting_balance),
-        "expected": money(data.starting_balance),
-    }
-    rows: list[dict[str, Decimal | str]] = []
-    cursor = date(data.start_month.year, data.start_month.month, 1)
-    end = date(data.end_month.year, data.end_month.month, 1)
-    while cursor <= end:
-        key = month_key(cursor)
-        salary = money(data.monthly_salary)
-        extras = money(data.payroll_extras.get(key, Decimal("0")))
-        obligations = money(data.obligations.get(key, Decimal("0")))
-        installments = money(data.installments.get(key, Decimal("0")))
-        spend = money(data.monthly_cash_cap)
-        expected_commission = money(expected_commissions.get(key, Decimal("0")))
-        delayed_commission = money(delayed_commissions.get(key, Decimal("0")))
-        returns: dict[str, Decimal] = {}
-        for scenario, commission in (
-            ("no_commission", Decimal("0")),
-            ("delayed", delayed_commission),
-            ("expected", expected_commission),
-        ):
-            opening = balances[scenario]
-            investment_return = money(max(Decimal("0"), opening) * data.monthly_investment_rate)
-            balances[scenario] = money(
-                opening
-                + investment_return
-                + salary
-                + extras
-                + commission
-                - obligations
-                - installments
-                - spend
-            )
-            returns[scenario] = investment_return
-        rows.append(
-            {
-                "month": key,
-                "salary": salary,
-                "payroll_extras": extras,
-                "commission_expected": expected_commission,
-                "commission_delayed": delayed_commission,
-                "obligations": obligations,
-                "installments": installments,
-                "cash_cap": spend,
-                "investment_return_delayed": returns["delayed"],
-                "balance_no_commission": balances["no_commission"],
-                "balance_delayed": balances["delayed"],
-                "balance_expected": balances["expected"],
-            }
-        )
-        cursor = add_months(cursor, 1)
-    return rows
+    return build_projection(data)

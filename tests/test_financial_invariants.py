@@ -484,10 +484,8 @@ def test_aggregate_requires_complete_lineage() -> None:
     assert duplicated_source.status is InvariantStatus.FAIL
 
 
-def test_current_projection_negative_balance_is_characterized_as_inv_005_violation() -> None:
-    """Document the legacy behavior that PR 5 will replace with explicit uncovered deficit."""
-
-    legacy_row = build_forecast(
+def test_projection_exposes_deficit_instead_of_negative_balance() -> None:
+    row = build_forecast(
         ForecastInput(
             start_month=date(2026, 9, 1),
             end_month=date(2026, 9, 1),
@@ -501,18 +499,26 @@ def test_current_projection_negative_balance_is_characterized_as_inv_005_violati
             commissions=(),
         )
     )[0]
-    assert legacy_row["balance_no_commission"] == Decimal("-100.00")
+    assert row["balance_no_commission"] == Decimal("0.00")
+    assert row["uncovered_deficit_no_commission"] == Decimal("100.00")
 
     result = _evaluate(
         "INV-005",
         opening_liquidity_balance="100.00",
         monthly_operating_result="-200.00",
-        liquidity_used="0.00",
-        closing_liquidity_balance=legacy_row["balance_no_commission"],
-        uncovered_deficit="0.00",
+        liquidity_used=row["liquidity_used_no_commission"],
+        closing_liquidity_balance=row["balance_no_commission"],
+        uncovered_deficit=row["uncovered_deficit_no_commission"],
+    )
+    assert result.status is InvariantStatus.PASS
+
+
+def test_projection_validator_divergence_is_blocking() -> None:
+    result = _evaluate(
+        "INV-018",
+        financial_engine_values={"2026-09.balance_expected": Decimal("1.02")},
+        projection_validator_values={"2026-09.balance_expected": Decimal("1.00")},
+        monetary_tolerance=Decimal("0.01"),
     )
     assert result.status is InvariantStatus.FAIL
-    assert result.expected == {
-        "closing_liquidity_balance": Decimal("0.00"),
-        "uncovered_deficit": Decimal("100.00"),
-    }
+    assert result.severity.value == "block"
