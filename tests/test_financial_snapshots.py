@@ -599,14 +599,20 @@ def test_inv020_catches_a_reports_savings_rate_divergence(monkeypatch) -> None:
         )
 
 
-def test_reports_endpoint_uses_the_shared_savings_rate_function(monkeypatch) -> None:
-    """`GET /reports` itself must call `savings_rate_from_totals`, not an inline copy.
+def test_reports_endpoint_uses_the_shared_summary_publication_function(monkeypatch) -> None:
+    """`GET /reports` itself must spread `report_summary_monetary_publication`
+    verbatim into `summary`, not assign `summary["savings_rate"]` from a
+    private local.
 
-    Complements the two facts-level tests above (which exercise the
-    invariant in isolation) by proving the live endpoint's publication path
-    is genuinely wired to the shared function the engineering review asked
-    for: patch `savings_rate_from_totals` as imported into `app.api` and
-    show the real HTTP response changes.
+    PR 7, Round 6: `reports()` used to call `savings_rate_from_totals`
+    directly and assign `summary["savings_rate"]` from that local -- the
+    engineering review on PR 7, Round 6 found that assembly step invisible
+    to INV-020 no matter what `savings_rate_from_totals` returned (see
+    `report_summary_monetary_publication`'s docstring). Complements the two
+    facts-level tests above (which exercise the invariant in isolation) by
+    proving the live endpoint's `summary` is genuinely spread from that
+    shared function's return value: patch `report_summary_monetary_publication`
+    as imported into `app.api` and show the real HTTP response changes.
     """
 
     import app.api as api_module
@@ -625,19 +631,24 @@ def test_reports_endpoint_uses_the_shared_savings_rate_function(monkeypatch) -> 
         db.add(user)
         db.commit()
 
-        real_savings_rate = api_module.savings_rate_from_totals
+        real_summary_publication = api_module.report_summary_monetary_publication
+
+        def _corrupted_summary_publication(*, total_cash_in, total_cash_out):
+            values = dict(
+                real_summary_publication(total_cash_in=total_cash_in, total_cash_out=total_cash_out)
+            )
+            values["savings_rate"] = values["savings_rate"] + Decimal("7.00")
+            return values
+
         monkeypatch.setattr(
-            api_module,
-            "savings_rate_from_totals",
-            lambda total_cash_in, total_cash_out: real_savings_rate(total_cash_in, total_cash_out)
-            + Decimal("7.00"),
+            api_module, "report_summary_monetary_publication", _corrupted_summary_publication
         )
 
         result = reports(end_month="2026-09", months=1, user=user, db=db)
-        expected = real_savings_rate(
-            Decimal(str(result["summary"]["total_cash_in"])),
-            Decimal(str(result["summary"]["total_cash_out"])),
-        )
+        expected = real_summary_publication(
+            total_cash_in=Decimal(str(result["summary"]["total_cash_in"])),
+            total_cash_out=Decimal(str(result["summary"]["total_cash_out"])),
+        )["savings_rate"]
         assert Decimal(str(result["summary"]["savings_rate"])) == expected + Decimal("7.00")
 
 
@@ -968,6 +979,259 @@ def test_reports_summary_savings_rate_gap_is_caught_by_inv020_and_the_real_endpo
         result = _evaluate_report_check("INV-020", facts["report"])
         assert result.status is InvariantStatus.FAIL
         assert "savings_rate" in result.metadata["mismatches"]
+
+
+def test_dashboard_liquidity_flow_emergency_floor_food_benefits_gap_is_caught_by_inv019_and_the_real_endpoint(
+    monkeypatch,
+) -> None:
+    """PR 7, Round 6: `liquidity_flow`, `emergency_floor` and `food_benefits`
+    used to be built inline in `dashboard()`'s own `return {...}` --
+    `liquidity_flow` aliasing `cash_net` a second time, `emergency_floor`
+    straight off `profile`, `food_benefits` from a private
+    `food_allowance + meal_allowance_daily * workdays_month` local -- outside
+    `dashboard_monetary_publication` and therefore outside anything INV-019
+    observed. See the engineering review on PR 7, Round 6: "canonical
+    snapshot outputs ... such as liquidity_flow, emergency_floor and
+    food_benefits ... remain shaped separately".
+
+    Mutates `dashboard_monetary_publication` to add distinct offsets to all
+    three fields at once, strictly after the canonical monetary calculation
+    already ran, and proves both halves of the required convergence for
+    each: the real `/dashboard` response now publishes the wrong figures,
+    and INV-019 -- whose `financial_engine_values` for these three fields
+    are read straight off `snapshot`/`profile` and never call the mutated
+    function -- fails against that same real divergence, on all three
+    fields at once.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        household, profile, snapshot = _consistency_household(db)
+        user = User(
+            household_id=household.id,
+            name="Revisor",
+            username="revisor-liquidity-flow-floor-benefits",
+            password_hash="x",
+            is_admin=True,
+        )
+        db.add(user)
+        db.commit()
+
+        real_publication = financial_snapshots_module.dashboard_monetary_publication
+        baseline = real_publication(snapshot, profile=profile)
+        expected_liquidity_flow = baseline["liquidity_flow"]
+        expected_emergency_floor = baseline["emergency_floor"]
+        expected_food_benefits = baseline["food_benefits"]
+
+        def _corrupted_publication(snapshot_arg, *, profile):
+            values = dict(real_publication(snapshot_arg, profile=profile))
+            values["liquidity_flow"] = values["liquidity_flow"] + Decimal("0.03")
+            values["emergency_floor"] = values["emergency_floor"] + Decimal("11.00")
+            values["food_benefits"] = values["food_benefits"] + Decimal("5.00")
+            return values
+
+        monkeypatch.setattr(
+            financial_snapshots_module, "dashboard_monetary_publication", _corrupted_publication
+        )
+        import app.api as api_module
+
+        monkeypatch.setattr(api_module, "dashboard_monetary_publication", _corrupted_publication)
+
+        # (1) The real endpoint's actual published contract diverges on all
+        # three fields.
+        response = dashboard(month="2026-09", user=user, db=db)
+        assert Decimal(str(response["liquidity_flow"])) == expected_liquidity_flow + Decimal("0.03")
+        assert Decimal(str(response["emergency_floor"])) == expected_emergency_floor + Decimal("11.00")
+        assert Decimal(str(response["food_benefits"])) == expected_food_benefits + Decimal("5.00")
+
+        # (2) INV-019, evaluated against the same untouched snapshot, fails
+        # on all three fields.
+        facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        assert facts["dashboard"]["financial_engine_values"]["liquidity_flow"] == expected_liquidity_flow
+        assert (
+            facts["dashboard"]["financial_engine_values"]["emergency_floor"] == expected_emergency_floor
+        )
+        assert facts["dashboard"]["financial_engine_values"]["food_benefits"] == expected_food_benefits
+        result = _evaluate_report_check("INV-019", facts["dashboard"])
+        assert result.status is InvariantStatus.FAIL
+        assert result.metadata["mismatches"]["liquidity_flow"]["difference"] == Decimal("0.03")
+        assert result.metadata["mismatches"]["emergency_floor"]["difference"] == Decimal("11.00")
+        assert result.metadata["mismatches"]["food_benefits"]["difference"] == Decimal("5.00")
+
+
+def test_dashboard_category_spending_gap_is_caught_by_inv019_and_the_real_endpoint(monkeypatch) -> None:
+    """PR 7, Round 6: the monetary amounts nested in `category_spending` were
+    published verbatim from `snapshot.payload` but never observed by
+    INV-019 at all -- see the engineering review on PR 7, Round 6:
+    "category_spending contains monetary amounts nested and continues
+    coming direct from snapshot.payload".
+
+    `dashboard()` now sources its `category_spending` key from
+    `category_spending_rows(snapshot)`, the same function
+    `dashboard_and_report_consistency_facts()` flattens into
+    `dashboard_values`. Mutating that one function corrupts both the real
+    per-category amount `/dashboard` returns *and* the flattened fact
+    INV-019 reads, while the independent "expected" side
+    (`_dashboard_category_spending_engine_truth`, reading
+    `snapshot.payload["category_spending"]` directly) stays untouched.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        household, profile, snapshot = _consistency_household(db)
+        user = User(
+            household_id=household.id,
+            name="Revisor",
+            username="revisor-category-spending",
+            password_hash="x",
+            is_admin=True,
+        )
+        db.add(user)
+        db.commit()
+
+        real_rows = financial_snapshots_module.category_spending_rows
+        baseline_rows = real_rows(snapshot)
+        assert len(baseline_rows) == 1
+        category_key = str(baseline_rows[0]["category"])
+        expected_amount = Decimal(str(baseline_rows[0]["amount"]))
+
+        def _corrupted_rows(snapshot_arg):
+            rows = [dict(row) for row in real_rows(snapshot_arg)]
+            rows[0]["amount"] = float(Decimal(str(rows[0]["amount"])) + Decimal("25.00"))
+            return rows
+
+        monkeypatch.setattr(financial_snapshots_module, "category_spending_rows", _corrupted_rows)
+        import app.api as api_module
+
+        monkeypatch.setattr(api_module, "category_spending_rows", _corrupted_rows)
+
+        # (1) The real endpoint's actual published per-category amount diverges.
+        response = dashboard(month="2026-09", user=user, db=db)
+        assert Decimal(str(response["category_spending"][0]["amount"])) == expected_amount + Decimal(
+            "25.00"
+        )
+
+        # (2) INV-019, evaluated against the same untouched snapshot, fails on
+        # the corresponding flattened fact -- the independent engine-truth
+        # side never called the mutated function.
+        facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        fact_key = f"category_spending.{category_key}.amount"
+        assert facts["dashboard"]["financial_engine_values"][fact_key] == expected_amount
+        result = _evaluate_report_check("INV-019", facts["dashboard"])
+        assert result.status is InvariantStatus.FAIL
+        assert result.metadata["mismatches"][fact_key]["difference"] == Decimal("25.00")
+
+
+def test_dashboard_does_not_certify_future_commissions_gross_under_inv019(monkeypatch) -> None:
+    """PR 7, Round 6: `future_commissions_gross` is a live query against
+    `Commission` rows, not a Financial Engine/snapshot output -- it must stay
+    explicitly uncertified by INV-019 rather than silently omitted (see the
+    engineering review on PR 7, Round 6: "classify explicitly ... do not
+    present as certified by snapshot/INV-019").
+
+    Locks in that classification: the publication contract INV-019 observes
+    never gains this key, so a live-query value that legitimately changes
+    between two reads of the same snapshot (a commission gets cancelled a
+    moment later) can never make a monthly close's `trusted_for_reports`
+    gate flap.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household, profile, snapshot = _consistency_household(db)
+        del household
+
+        publication = financial_snapshots_module.dashboard_monetary_publication(snapshot, profile=profile)
+        assert "future_commissions_gross" not in publication
+
+        facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        assert "future_commissions_gross" not in facts["dashboard"]["dashboard_values"]
+        assert "future_commissions_gross" not in facts["dashboard"]["financial_engine_values"]
+
+
+def test_reports_summary_savings_rate_builder_gap_is_caught_by_inv020_and_the_real_endpoint(
+    monkeypatch,
+) -> None:
+    """PR 7, Round 6: even after `report_values["savings_rate"]` started
+    reading `report_month_monetary_publication`'s own `cash_in`/`cash_out`
+    (Round 5), `reports()` still assembled `summary["savings_rate"]` as its
+    own separate literal (`savings_rate_from_totals(...)` assigned inline),
+    so a regression confined to that one assignment -- not `cash_in`, not
+    the snapshot, not the canonical formula -- would still corrupt the real
+    response with nothing for INV-020 to observe. See the engineering
+    review on PR 7, Round 6: "the endpoint continues building savings_rate
+    = savings_rate_from_totals(...) and inserting summary['savings_rate']
+    separately ... It is necessary [to have] a builder of the summary's
+    monetary contract ... consumed verbatim by the endpoint ... the
+    regression must adulterate only the published field of the summary."
+
+    This mutates `report_summary_monetary_publication` -- the shared
+    builder both `reports()` and `dashboard_and_report_consistency_facts()`
+    now call -- to overwrite `savings_rate` after it is computed, touching
+    neither `cash_in`/`cash_out`, the snapshot, nor `savings_rate_from_totals`
+    itself, and proves both halves: the real `/reports` response (a
+    one-month window, the shape a monthly close checks) diverges, and
+    INV-020 fails on the same field against the untouched snapshot.
+    """
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        household, profile, snapshot = _consistency_household(db)
+        user = User(
+            household_id=household.id,
+            name="Revisor",
+            username="revisor-report-summary-builder",
+            password_hash="x",
+            is_admin=True,
+        )
+        db.add(user)
+        db.commit()
+
+        real_summary_publication = financial_snapshots_module.report_summary_monetary_publication
+
+        def _corrupted_summary_publication(*, total_cash_in, total_cash_out):
+            values = dict(
+                real_summary_publication(total_cash_in=total_cash_in, total_cash_out=total_cash_out)
+            )
+            values["savings_rate"] = values["savings_rate"] + Decimal("3.00")
+            return values
+
+        monkeypatch.setattr(
+            financial_snapshots_module, "report_summary_monetary_publication", _corrupted_summary_publication
+        )
+        import app.api as api_module
+
+        monkeypatch.setattr(
+            api_module, "report_summary_monetary_publication", _corrupted_summary_publication
+        )
+
+        real_report_publication = financial_snapshots_module.report_month_monetary_publication(snapshot)
+        expected_savings_rate = real_summary_publication(
+            total_cash_in=real_report_publication["cash_in"],
+            total_cash_out=real_report_publication["cash_out"],
+        )["savings_rate"]
+
+        # (1) The real endpoint's actual published summary diverges, with
+        # `cash_in`/`cash_out`/`total_cash_in`/`total_cash_out` untouched.
+        response = reports(end_month="2026-09", months=1, user=user, db=db)
+        assert Decimal(str(response["summary"]["total_cash_in"])) == real_report_publication["cash_in"]
+        assert Decimal(str(response["summary"]["total_cash_out"])) == real_report_publication["cash_out"]
+        assert Decimal(str(response["summary"]["savings_rate"])) == expected_savings_rate + Decimal(
+            "3.00"
+        )
+
+        # (2) INV-020, evaluated against the same untouched snapshot, fails
+        # on `savings_rate` -- the engine-truth side never called the
+        # mutated builder.
+        facts = dashboard_and_report_consistency_facts(snapshot, profile=profile)
+        assert facts["report"]["financial_engine_values"]["savings_rate"] == expected_savings_rate
+        result = _evaluate_report_check("INV-020", facts["report"])
+        assert result.status is InvariantStatus.FAIL
+        assert result.metadata["mismatches"]["savings_rate"]["difference"] == Decimal("3.00")
 
 
 def _evaluate_projection_gate_check(invariant_id: str, facts: dict[str, object]):

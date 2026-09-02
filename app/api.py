@@ -111,11 +111,12 @@ from app.services.financial_invariants import InvariantContext, InvariantScope
 from app.services.financial_snapshots import (
     account_cash_flow_rows,
     build_snapshot,
+    category_spending_rows,
     dashboard_and_report_consistency_facts,
     dashboard_monetary_publication,
     liquidity_transition_facts,
     report_month_monetary_publication,
-    savings_rate_from_totals,
+    report_summary_monetary_publication,
     serialize_snapshot,
     snapshot_lineage_facts,
 )
@@ -4121,6 +4122,20 @@ def dashboard(
             Transaction.booked_at < end,
         )
     )
+    # `future_commissions_gross` is a live query against `Commission` rows
+    # with `expected_date` in the current window and `status != "cancelled"`
+    # -- not a Financial Engine/snapshot output. It is deliberately excluded
+    # from `dashboard_monetary_publication`/INV-019: unlike a snapshot
+    # column, this figure can change between two reads of the *same*,
+    # already-generated snapshot (a commission gets cancelled or
+    # rescheduled a moment later), so folding it into the INV-019 gate would
+    # either falsely certify a value the snapshot never fixed, or make
+    # `trusted_for_reports` flap on data that isn't a financial fact
+    # `build_snapshot` recorded. See the engineering review on PR 7, Round 6:
+    # "classify explicitly ... do not present as certified by
+    # snapshot/INV-019; preserve the contract without inventing or freezing
+    # a financial fact." It stays a plain, uncertified live read; the
+    # response contract keeps the key unchanged.
     future_commission = db.scalar(
         select(func.coalesce(func.sum(Commission.gross_amount), 0)).where(
             Commission.household_id == user.household_id,
@@ -4128,7 +4143,6 @@ def dashboard(
             Commission.status != "cancelled",
         )
     )
-    benefit = profile.food_allowance + profile.meal_allowance_daily * profile.workdays_month
     obligation_alerts = [
         item for item in _obligation_rows(db, user.household_id) if item["days_until_due"] <= 30
     ][:5]
@@ -4140,13 +4154,13 @@ def dashboard(
     # on top) instead of re-deriving each key inline, so there is no
     # endpoint-only mapping step left for INV-019 to be blind to -- see the
     # engineering review on PR 7, Round 3. `liquidity_starting_balance`,
-    # `liquidity_available`, `liquidity_deposit` and `liquidity_withdrawal`
-    # (Round 5) used to be built here from `snapshot`/`snapshot_payload`
-    # directly, outside this dict -- now they come from `publication` too,
-    # so INV-019's `dashboard_and_report_consistency_facts` (which reads the
-    # exact same function) observes them as well.
+    # `liquidity_available`, `liquidity_deposit`, `liquidity_withdrawal`
+    # (Round 5), and `liquidity_flow`/`emergency_floor`/`food_benefits`
+    # (Round 6) used to be built here from `snapshot`/`snapshot_payload`/
+    # `profile` directly, outside this dict -- now they all come from
+    # `publication` too, so INV-019's `dashboard_and_report_consistency_facts`
+    # (which reads the exact same function) observes them as well.
     publication = dashboard_monetary_publication(snapshot, profile=profile)
-    cash_net = publication["cash_net"]
     return {
         "month": month_key(start),
         "snapshot_id": snapshot.id,
@@ -4154,15 +4168,25 @@ def dashboard(
         "integrity_status": snapshot.integrity_status,
         "trusted_for_reports": snapshot.trusted_for_reports,
         **{key: decimal_value(value) for key, value in publication.items()},
+        # `cash_flow_by_account`/`category_spending` are non-scalar (row
+        # lists), so they cannot join the flat `publication` dict above --
+        # `account_cash_flow_rows`/`category_spending_rows` are still the
+        # exact functions `dashboard_and_report_consistency_facts()`
+        # flattens into the INV-019 facts it observes (see their
+        # docstrings), so this endpoint calling them (not `snapshot.payload`
+        # inline) keeps the same verbatim-publication guarantee.
         "cash_flow_by_account": account_cash_flow_rows(snapshot),
         "liquidity_name": profile.investment_name,
-        "liquidity_flow": decimal_value(cash_net),
-        "liquidity_direction": ("deposit" if cash_net > 0 else "withdrawal" if cash_net < 0 else "balanced"),
-        "emergency_floor": decimal_value(profile.emergency_floor),
-        "food_benefits": decimal_value(benefit),
+        "liquidity_direction": (
+            "deposit"
+            if publication["liquidity_flow"] > 0
+            else "withdrawal"
+            if publication["liquidity_flow"] < 0
+            else "balanced"
+        ),
         "review_count": int(review_count or 0),
         "duplicates_ignored": snapshot_payload["duplicates_ignored"],
-        "category_spending": snapshot_payload["category_spending"],
+        "category_spending": category_spending_rows(snapshot),
         "future_commissions_gross": decimal_value(future_commission),
         "obligation_alerts": obligation_alerts,
     }
@@ -4302,11 +4326,18 @@ def reports(
     total_liquidity_used = money(
         sum((Decimal(item.liquidity_used) for item in report_snapshots), Decimal("0"))
     )
-    # `savings_rate_from_totals` is the same function INV-020 reads to verify
-    # a one-month window's `savings_rate` -- see its docstring and
-    # `dashboard_and_report_consistency_facts`. Previously computed inline
-    # here only, with zero invariant coverage.
-    savings_rate = savings_rate_from_totals(total_cash_in, total_cash_out)
+    # `report_summary_monetary_publication` is the exact function INV-020
+    # reads to verify a one-month window's `summary.savings_rate` -- see its
+    # docstring and `dashboard_and_report_consistency_facts`. `summary`
+    # below spreads its return value verbatim (Round 6) instead of assigning
+    # `"savings_rate": decimal_value(savings_rate)` as its own literal, so
+    # there is no endpoint-only assembly step left for INV-020 to be blind
+    # to -- see the engineering review on PR 7, Round 6: "the endpoint
+    # continues building savings_rate = savings_rate_from_totals(...) and
+    # inserting summary['savings_rate'] separately".
+    summary_publication = report_summary_monetary_publication(
+        total_cash_in=total_cash_in, total_cash_out=total_cash_out
+    )
     account_totals: dict[str, dict[str, object]] = {}
     for snapshot in report_snapshots:
         for account in snapshot.payload.get("cash_flow_by_account", []):
@@ -4386,7 +4417,7 @@ def reports(
                 if total_cash_out > total_cash_in
                 else "balanced"
             ),
-            "savings_rate": decimal_value(savings_rate),
+            **{key: decimal_value(value) for key, value in summary_publication.items()},
             "highest_month": highest_month["month"],
             "highest_spending": highest_month["spending"],
             "lowest_month": lowest_month["month"],
