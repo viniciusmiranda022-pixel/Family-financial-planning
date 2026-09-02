@@ -143,6 +143,28 @@
   de um `trust` concorrente já commitado sobrescreveria `trusted` de volta para `review_required` sem
   passar por `reopen` — sem motivo, sem `reopened_by` e sem trilha de auditoria da demoção.
 
+### Backfill (reprocessamento de dados existentes)
+
+- `app.cli.backfill` reprocessa famílias já cadastradas reutilizando os mesmos serviços
+  determinísticos do fluxo de importação/API; nunca reimplementa uma regra financeira própria.
+- Nunca escreve em `Transaction`, `Document`, `PayrollRecord`, `Commission` ou `Obligation`. As
+  únicas colunas de `Transaction` que pode alterar são as de classificação de duplicidade
+  (`canonical_status`, `possible_duplicate`, `excluded`, `duplicate_group_id`), e somente através da
+  mesma função que o fluxo ao vivo já usa para isso.
+- Documento sem reconciliação prévia recebe um registro `unknown` explícito, nunca um total
+  declarado/reconstruído fabricado -- a evidência de parsing original não é retida após a importação.
+- Saldo legado sem `AccountBalanceObservation` confiável permanece `unknown`/não confiado; o backfill
+  nunca infere uma data efetiva nem reconstrói saldo por suposição.
+- É idempotente e retomável por construção: cada passo é um no-op sobre dado inalterado ou fica
+  restrito às linhas que ainda precisam dele. Repetir a execução -- inclusive após falha parcial --
+  reproduz o mesmo estado final; apenas a trilha de auditoria (`IntegrityRun`, `BackfillRun`) cresce
+  a cada execução, por definição.
+- `--dry-run` executa o mesmo processamento e reverte a transação em vez de persistir, reportando o
+  que mudaria sem alterar dado algum; o manifesto `BackfillRun` da execução em dry-run é registrado à
+  parte, preservando a evidência de auditoria mesmo com o rollback.
+- Nunca resolve, reconhece ou corrige um `IntegrityFinding` automaticamente -- apenas a reavaliação
+  determinística de `execute_integrity_run` pode superar (`superseded`) um finding.
+
 ## Reconciliação, duplicidades e anomalias
 
 - Todo parser financeiro produz um `ParsedDocument` versionado. Um arquivo tabular sem nenhum
