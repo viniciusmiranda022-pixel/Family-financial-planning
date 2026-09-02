@@ -109,6 +109,7 @@ from app.services.financial_integrity import (
 )
 from app.services.financial_invariants import InvariantContext, InvariantScope
 from app.services.financial_snapshots import (
+    account_cash_flow_rows,
     build_snapshot,
     dashboard_and_report_consistency_facts,
     dashboard_monetary_publication,
@@ -4138,7 +4139,12 @@ def dashboard(
     # return value verbatim (only the uniform `decimal_value()` cast applied
     # on top) instead of re-deriving each key inline, so there is no
     # endpoint-only mapping step left for INV-019 to be blind to -- see the
-    # engineering review on PR 7, Round 3.
+    # engineering review on PR 7, Round 3. `liquidity_starting_balance`,
+    # `liquidity_available`, `liquidity_deposit` and `liquidity_withdrawal`
+    # (Round 5) used to be built here from `snapshot`/`snapshot_payload`
+    # directly, outside this dict -- now they come from `publication` too,
+    # so INV-019's `dashboard_and_report_consistency_facts` (which reads the
+    # exact same function) observes them as well.
     publication = dashboard_monetary_publication(snapshot, profile=profile)
     cash_net = publication["cash_net"]
     return {
@@ -4148,12 +4154,8 @@ def dashboard(
         "integrity_status": snapshot.integrity_status,
         "trusted_for_reports": snapshot.trusted_for_reports,
         **{key: decimal_value(value) for key, value in publication.items()},
-        "cash_flow_by_account": snapshot_payload["cash_flow_by_account"],
+        "cash_flow_by_account": account_cash_flow_rows(snapshot),
         "liquidity_name": profile.investment_name,
-        "liquidity_starting_balance": decimal_value(snapshot.opening_liquidity_balance),
-        "liquidity_available": decimal_value(snapshot.distance_to_floor),
-        "liquidity_deposit": decimal_value(snapshot_payload["liquidity_deposit"]),
-        "liquidity_withdrawal": decimal_value(snapshot.liquidity_used),
         "liquidity_flow": decimal_value(cash_net),
         "liquidity_direction": ("deposit" if cash_net > 0 else "withdrawal" if cash_net < 0 else "balanced"),
         "emergency_floor": decimal_value(profile.emergency_floor),

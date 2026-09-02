@@ -722,6 +722,14 @@ def _snapshot_monetary_fields(snapshot: FinancialSnapshot) -> dict[str, Decimal]
     is not itself "the formula", so `dashboard_monetary_dataset` and
     `report_month_monetary_dataset` sharing it is not duplicated financial
     logic, only a shared attribute selector.
+
+    `opening_liquidity_balance`, `distance_to_floor` and `liquidity_used`
+    were added post-review (PR 7, Round 5): `/dashboard` was publishing
+    `liquidity_starting_balance`/`liquidity_available`/`liquidity_withdrawal`
+    straight off these same three columns inline in `app/api.py`'s
+    `dashboard()`, outside any function INV-019 observed -- an endpoint-only
+    mapping bug on any of the three could corrupt the real response without
+    the invariant, blind to these columns, ever noticing.
     """
 
     return {
@@ -734,6 +742,9 @@ def _snapshot_monetary_fields(snapshot: FinancialSnapshot) -> dict[str, Decimal]
         "closing_uncovered_deficit": money(snapshot.closing_uncovered_deficit),
         "budget_cap": money(snapshot.budget_cap),
         "budget_remaining": money(snapshot.budget_remaining),
+        "opening_liquidity_balance": money(snapshot.opening_liquidity_balance),
+        "distance_to_floor": money(snapshot.distance_to_floor),
+        "liquidity_used": money(snapshot.liquidity_used),
     }
 
 
@@ -753,6 +764,83 @@ def _profile_monetary_fields(profile: FinancialProfile) -> dict[str, Decimal]:
     return {"investment_balance": money(profile.investment_balance)}
 
 
+def _snapshot_payload_monetary_fields(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """`liquidity_deposit` is a genuine Financial Engine output
+    (`FinancialEngineResult.liquidity_deposit`) that never got its own
+    `FinancialSnapshot` column -- `build_snapshot` only carries it inside
+    `payload` via `canonical_payload()`. It needs its own selector, separate
+    from `_snapshot_monetary_fields` (scoped to the model's numeric
+    columns), reading the exact same JSON attribute `/dashboard` already
+    reads verbatim off `snapshot.payload` -- see the engineering review on
+    PR 7, Round 5.
+    """
+
+    return {"liquidity_deposit": money(Decimal(str(snapshot.payload["liquidity_deposit"])))}
+
+
+_ACCOUNT_CASH_FLOW_METRICS = ("cash_in", "cash_out", "bank_cash_out", "card_spending", "refunds", "net")
+
+
+def account_cash_flow_rows(snapshot: FinancialSnapshot) -> list[dict[str, Any]]:
+    """The exact `cash_flow_by_account` rows `GET /dashboard` publishes for
+    `snapshot`. `_serialize_accounts` wrote this list once, inside
+    `build_snapshot`/`_collect()`, directly into `snapshot.payload`; `/dashboard`
+    now calls this function -- not `snapshot.payload` inline -- for its own
+    `cash_flow_by_account` key, the same way it consumes
+    `dashboard_monetary_publication` verbatim for its scalar fields (PR 7,
+    Round 5). `_dashboard_account_cash_flow_publication_facts` below calls
+    this same function to flatten the identical rows into the facts INV-019
+    observes, so a regression in what this function returns changes the
+    real HTTP response and the invariant fact together. The independent
+    "expected" side, `_dashboard_account_cash_flow_engine_truth`, reads
+    `snapshot.payload["cash_flow_by_account"]` directly instead of calling
+    this function, for the same reason `_dashboard_financial_engine_truth`
+    never calls `dashboard_monetary_publication`.
+    """
+
+    return list(snapshot.payload.get("cash_flow_by_account", []))
+
+
+def _dashboard_account_cash_flow_publication_facts(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """Flatten `account_cash_flow_rows` into `cash_flow_by_account.<account_id>.<metric>`
+    facts for `dashboard_values` -- the per-account monetary amounts
+    `/dashboard` publishes verbatim under `cash_flow_by_account`, previously
+    outside anything INV-019 observed (see the engineering review on PR 7,
+    Round 5).
+
+    Kept as its own hand-written loop, separate from
+    `_dashboard_account_cash_flow_engine_truth` below, for the same reason
+    `dashboard_monetary_publication` and `_dashboard_financial_engine_truth`
+    each hand-write their own alias mapping instead of sharing one function:
+    a bug introduced in *this* flattening specifically must not also appear
+    on the independent "expected" side.
+    """
+
+    fields: dict[str, Decimal] = {}
+    for row in account_cash_flow_rows(snapshot):
+        account_key = str(row.get("account_id") or "unidentified")
+        for metric in _ACCOUNT_CASH_FLOW_METRICS:
+            fields[f"cash_flow_by_account.{account_key}.{metric}"] = money(Decimal(str(row.get(metric, 0))))
+    return fields
+
+
+def _dashboard_account_cash_flow_engine_truth(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
+    """INV-019's independent "expected" side for `cash_flow_by_account`.
+
+    Reads `snapshot.payload["cash_flow_by_account"]` directly through its
+    own separately hand-written loop, instead of calling
+    `_dashboard_account_cash_flow_publication_facts` -- see that function's
+    docstring for why this is not shared code.
+    """
+
+    fields: dict[str, Decimal] = {}
+    for row in snapshot.payload.get("cash_flow_by_account", []):
+        account_key = str(row.get("account_id") or "unidentified")
+        for metric in _ACCOUNT_CASH_FLOW_METRICS:
+            fields[f"cash_flow_by_account.{account_key}.{metric}"] = money(Decimal(str(row.get(metric, 0))))
+    return fields
+
+
 def dashboard_monetary_dataset(
     snapshot: FinancialSnapshot, *, profile: FinancialProfile
 ) -> dict[str, Decimal]:
@@ -770,7 +858,11 @@ def dashboard_monetary_dataset(
     failing against the real gap.
     """
 
-    return {**_snapshot_monetary_fields(snapshot), **_profile_monetary_fields(profile)}
+    return {
+        **_snapshot_monetary_fields(snapshot),
+        **_profile_monetary_fields(profile),
+        **_snapshot_payload_monetary_fields(snapshot),
+    }
 
 
 def report_month_monetary_dataset(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
@@ -865,6 +957,10 @@ def dashboard_monetary_publication(
         "liquidity_balance": monetary["closing_liquidity_balance"],
         "liquidity_closing_balance": monetary["closing_liquidity_balance"],
         "liquidity_uncovered_deficit": monetary["closing_uncovered_deficit"],
+        "liquidity_starting_balance": monetary["opening_liquidity_balance"],
+        "liquidity_available": monetary["distance_to_floor"],
+        "liquidity_deposit": monetary["liquidity_deposit"],
+        "liquidity_withdrawal": monetary["liquidity_used"],
     }
 
 
@@ -885,6 +981,7 @@ def _dashboard_financial_engine_truth(
 
     engine = _snapshot_monetary_fields(snapshot)
     profile_fields = _profile_monetary_fields(profile)
+    payload_fields = _snapshot_payload_monetary_fields(snapshot)
     return {
         "spending": engine["operating_expenses"],
         "cash_in": engine["operating_income"],
@@ -898,6 +995,10 @@ def _dashboard_financial_engine_truth(
         "liquidity_balance": engine["closing_liquidity_balance"],
         "liquidity_closing_balance": engine["closing_liquidity_balance"],
         "liquidity_uncovered_deficit": engine["closing_uncovered_deficit"],
+        "liquidity_starting_balance": engine["opening_liquidity_balance"],
+        "liquidity_available": engine["distance_to_floor"],
+        "liquidity_deposit": payload_fields["liquidity_deposit"],
+        "liquidity_withdrawal": engine["liquidity_used"],
     }
 
 
@@ -960,30 +1061,56 @@ def dashboard_and_report_consistency_facts(
     the exact functions `app/api.py`'s `dashboard()`/`reports()` call to
     build the monetary keys of their own responses, verbatim, with no
     per-field logic of their own left in the endpoint (see those functions'
-    docstrings). `financial_engine_values` comes from
-    `_dashboard_financial_engine_truth`/`_report_financial_engine_truth`,
-    which read the snapshot/profile columns directly and never call the
-    publication functions, so a regression in either publication mapping is
-    real evidence of a genuine divergence, not an artifact of comparing a
+    docstrings), plus `cash_flow_by_account.<account_id>.<metric>` facts
+    flattened from the exact per-account rows `/dashboard` also publishes
+    verbatim (`_dashboard_account_cash_flow_publication_facts`).
+    `financial_engine_values` comes from
+    `_dashboard_financial_engine_truth`/`_report_financial_engine_truth`
+    (plus `_dashboard_account_cash_flow_engine_truth` for the per-account
+    facts), which read the snapshot/profile columns directly and never call
+    the publication functions, so a regression in either publication mapping
+    is real evidence of a genuine divergence, not an artifact of comparing a
     value to itself. See `tests/test_financial_snapshots.py` for regressions
     that mutate each publication function (post-calculation, publication-only
     mutations included) and prove both the live endpoint and the invariant
     diverge together.
+
+    `report_values["savings_rate"]` (PR 7, Round 5) is computed from
+    `report_month_monetary_publication(snapshot)`'s own `cash_in`/`cash_out`
+    -- the exact values `reports()`'s `serialized_months` rows publish and
+    sum into `summary.total_cash_in`/`total_cash_out` -- instead of from the
+    raw, pre-publication `engine_totals`. For the one-month window this
+    function checks (matching a monthly close's single closed period),
+    `total_cash_in`/`total_cash_out` reduce to exactly this month's published
+    `cash_in`/`cash_out` with no cross-month summation to offset them, so a
+    bug confined to `report_month_monetary_publication`'s mapping now
+    corrupts `report_values["savings_rate"]` too, exactly like it corrupts
+    `summary.savings_rate` in the real response -- see the engineering
+    review on PR 7, Round 5: "the serialized one-month summary, including
+    savings_rate, must come from the publication object INV-020 observes."
+    `financial_engine_values["savings_rate"]` stays independent
+    (`_savings_rate_engine_truth`, reading `snapshot` columns directly).
     """
 
     from app.services.financial_invariants import MONEY_TOLERANCE
 
-    engine_totals = _snapshot_monetary_fields(snapshot)
     engine_savings_rate = _savings_rate_engine_truth(
         Decimal(snapshot.operating_income), Decimal(snapshot.operating_expenses)
     )
+    report_publication = report_month_monetary_publication(snapshot)
     report_savings_rate = savings_rate_from_totals(
-        engine_totals["operating_income"], engine_totals["operating_expenses"]
+        report_publication["cash_in"], report_publication["cash_out"]
     )
     return {
         "dashboard": {
-            "financial_engine_values": _dashboard_financial_engine_truth(snapshot, profile=profile),
-            "dashboard_values": dashboard_monetary_publication(snapshot, profile=profile),
+            "financial_engine_values": {
+                **_dashboard_financial_engine_truth(snapshot, profile=profile),
+                **_dashboard_account_cash_flow_engine_truth(snapshot),
+            },
+            "dashboard_values": {
+                **dashboard_monetary_publication(snapshot, profile=profile),
+                **_dashboard_account_cash_flow_publication_facts(snapshot),
+            },
             "monetary_tolerance": MONEY_TOLERANCE,
         },
         "report": {
@@ -992,7 +1119,7 @@ def dashboard_and_report_consistency_facts(
                 "savings_rate": engine_savings_rate,
             },
             "report_values": {
-                **report_month_monetary_publication(snapshot),
+                **report_publication,
                 "savings_rate": report_savings_rate,
             },
             "monetary_tolerance": MONEY_TOLERANCE,
