@@ -464,47 +464,79 @@ def _parse_nubank_credit_card_pdf(text: str) -> list[ParsedTransaction]:
     return parsed
 
 
-_NUBANK_DAY_HEADER = re.compile(r"^(\d{2})\s+([A-ZÇ]{3})\s+(\d{4})\s*$", re.IGNORECASE)
-_NUBANK_DAY_AGGREGATE = re.compile(r"^TOTAL DE (ENTRADAS|SAIDAS)\b")
-_NUBANK_STATEMENT_TAIL = re.compile(r"(.*?)\s*([+-])\s*R\$\s*(-?[\d.]+,\d{2})\s*$")
+# Real extracted Nubank bank-statement text (confirmed against the actual
+# August 2026 statement behind this Work Order's baseline -- see PR #41
+# engineer review on `bcd003e`) does not look like a per-transaction
+# "description ... +R$ value" line. Instead:
+#
+#   14 AGO 2026 Total de entradas + 3.044,80
+#   Transferência recebida pelo Pix ...
+#   (description may continue for several lines)
+#   3.044,80
+#   Total de saídas - 3.044,80
+#   Transferência enviada pelo Pix ...
+#   3.044,80
+#
+# The day header and the *first* section aggregate for that day share one
+# line; a later section switch within the same day (entradas -> saídas or
+# the reverse) repeats only the bare "Total de ..." aggregate, not the date.
+# Each individual transaction is then a run of description lines terminated
+# by a bare amount line -- no "R$", no sign; direction comes only from which
+# aggregate section is currently open, never from the amount line or the
+# description text (Work Order requirement: do not infer sign from
+# description). The aggregate line itself is always discarded, never a
+# transaction, so per-day/period totals can never leak into the ledger.
+_NUBANK_DAY_SECTION_HEADER = re.compile(
+    r"^(\d{2})\s+([A-ZÇ]{3})\s+(\d{4})\s+TOTAL DE (ENTRADAS|SA[IÍ]DAS)\b", re.IGNORECASE
+)
+_NUBANK_SECTION_HEADER = re.compile(r"^TOTAL DE (ENTRADAS|SA[IÍ]DAS)\b", re.IGNORECASE)
+_NUBANK_BARE_AMOUNT = re.compile(r"^-?[\d.]+,\d{2}$")
 
 
 def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
     parsed: list[ParsedTransaction] = []
     current_day: date | None = None
+    current_sign: int | None = None
     pending_parts: list[str] = []
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
             continue
-        header = _NUBANK_DAY_HEADER.match(line)
-        if header:
-            day, month_abbr, year = header.groups()
+        day_section = _NUBANK_DAY_SECTION_HEADER.match(line)
+        if day_section:
+            day, month_abbr, year, direction = day_section.groups()
             month = MONTHS_PT_ABBR.get(month_abbr.upper())
             current_day = date(int(year), month, int(day)) if month else None
+            current_sign = 1 if direction.upper().startswith("ENTRADA") else -1
             pending_parts = []
             continue
         if current_day is None:
+            # Everything before the first per-day block -- the period-level
+            # "Saldo inicial"/"Rendimento líquido"/"Total de entradas/saídas
+            # (período)"/"Saldo final do período" summary -- is declared-field
+            # territory (`_statement_declared_fields`), never a transaction.
             continue
-        normalized = normalize_description(line)
-        if _NUBANK_DAY_AGGREGATE.match(normalized) or normalized.startswith("SALDO"):
-            # Per-day and period aggregate lines ("Total de entradas/saídas",
-            # "Saldo inicial/final") close in the same "R$ value" shape as a
-            # real transaction but must never become one.
+        section = _NUBANK_SECTION_HEADER.match(line)
+        if section:
+            current_sign = 1 if section.group(1).upper().startswith("ENTRADA") else -1
             pending_parts = []
             continue
-        pending_parts.append(line)
-        joined = " ".join(pending_parts)
-        money = _NUBANK_STATEMENT_TAIL.match(joined)
-        if not money:
+        normalized = normalize_description(line)
+        if normalized.startswith("SALDO") or normalized.startswith("RENDIMENTO"):
+            pending_parts = []
             continue
-        description, sign, raw_amount = money.groups()
-        description = description.strip()
-        if description and not _NON_TRANSACTION_TEXT.search(normalize_description(description)):
-            amount = parse_decimal(raw_amount)
-            amount = -abs(amount) if sign == "-" else abs(amount)
-            parsed.append(ParsedTransaction(current_day, description, amount, line_number))
+        if not _NUBANK_BARE_AMOUNT.match(line):
+            pending_parts.append(line)
+            continue
+        description = " ".join(pending_parts).strip()
         pending_parts = []
+        if not description or _NON_TRANSACTION_TEXT.search(normalize_description(description)):
+            continue
+        if current_sign is None:
+            continue
+        value = abs(parse_decimal(line))
+        amount = value if current_sign > 0 else -value
+        parsed.append(ParsedTransaction(current_day, description, amount, line_number))
     if not parsed:
         raise ValueError("Extrato Nubank sem lançamentos textuais reconhecíveis; encaminhado para revisão")
     return parsed

@@ -198,21 +198,33 @@ def test_nubank_credit_card_pdf_without_transactions_block_is_rejected() -> None
 
 
 def test_nubank_bank_statement_pdf_recognizes_multiline_entries_and_signs() -> None:
+    # Fixture shape corrected on PR #41 (engineer review, head `3e25bfb`) to
+    # match the real extracted layout: day header shares its line with the
+    # first section aggregate, a bare "Total de ..." line switches section
+    # within the same day, and each transaction is a multiline description
+    # terminated by a bare (no "R$", no sign) amount line.
     parsed = parse_document_contract("extrato.pdf", fx.nubank_bank_statement_pdf(), "bank_statement")
     assert parsed.parser_name == "nubank_bank_statement_pdf"
     by_desc = {t.description: t for t in parsed.transactions}
 
-    entrada = by_desc["Transferencia recebida Fulano de Tal"]
+    entrada = by_desc["Transferencia recebida pelo Pix Fulano de Tal"]
     assert entrada.amount == Decimal("300.00")
     assert entrada.booked_at == date(2026, 8, 14)
 
-    saida = by_desc["Compra no debito - Padaria"]
+    saida = by_desc["Compra no debito Padaria Modelo"]
     assert saida.amount == Decimal("-20.00")
     assert saida.booked_at == date(2026, 8, 14)
 
-    second_day = by_desc["Recebimento Pix Ciclano"]
-    assert second_day.amount == Decimal("50.00")
-    assert second_day.booked_at == date(2026, 8, 20)
+    second_day_entrada = by_desc["Recebimento Pix Ciclano"]
+    assert second_day_entrada.amount == Decimal("50.00")
+    assert second_day_entrada.booked_at == date(2026, 8, 20)
+
+    # Section switch (entradas -> saídas) within the same day, on a
+    # genuinely multiline description, must not leak the day's opening sign
+    # or the previous section's date into this record.
+    second_day_saida = by_desc["Transferencia enviada pelo Pix Beltrano de Souza"]
+    assert second_day_saida.amount == Decimal("-100.00")
+    assert second_day_saida.booked_at == date(2026, 8, 20)
 
     # Per-day/period aggregate lines are never transactions.
     assert not any("TOTAL DE" in normalize for normalize in (d.upper() for d in by_desc))

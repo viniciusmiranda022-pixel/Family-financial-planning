@@ -206,10 +206,19 @@ def nubank_credit_card_pdf_without_transactions_block() -> bytes:
 
 # ---------------------------------------------------------------------------
 # Nubank -- extrato de conta (bank statement). Layout per the Work Order's
-# "Nubank — extrato de conta PDF" section: a spelled-out period, a summary
-# block, then per-day blocks ("dd MMM yyyy" header followed by that day's
-# transactions and a "Total de entradas/saídas" subtotal that must not be
-# read as a transaction).
+# "Nubank — extrato de conta PDF" section, corrected on PR #41 (engineer
+# review, head `3e25bfb`) to match the *real* extracted shape rather than a
+# cleaner invented one: a spelled-out period, a summary block, then per-day
+# blocks where the day header shares its line with the first section
+# aggregate for that day ("dd MMM yyyy Total de entradas/saídas ± valor"),
+# a section can switch again within the same day via a bare "Total de
+# entradas/saídas ± valor" line (no date repeated), and each individual
+# transaction is a multiline description terminated by a bare amount line --
+# no "R$", no sign; direction comes only from which section is open. This
+# fixture models one day with only one direction each and a second day that
+# switches from entradas to saídas mid-day, plus a genuinely multiline
+# description, so both the section-switch and description-accumulation
+# state machines are exercised.
 # ---------------------------------------------------------------------------
 
 NUBANK_BANK_STATEMENT_LINES = (
@@ -220,17 +229,20 @@ NUBANK_BANK_STATEMENT_LINES = (
     "Total de entradas R$ 350,00",
     "Total de saidas R$ 120,00",
     "Saldo final do periodo R$ 1.230,00",
-    "14 AGO 2026",
-    "Transferencia recebida",
-    "Fulano de Tal +R$ 300,00",
-    "Compra no debito - Padaria -R$ 20,00",
-    "Total de entradas + R$ 300,00",
-    "Total de saidas - R$ 20,00",
-    "20 AGO 2026",
-    "Recebimento Pix Ciclano +R$ 50,00",
-    "Pagamento de boleto -R$ 100,00",
-    "Total de entradas + R$ 50,00",
-    "Total de saidas - R$ 100,00",
+    "14 AGO 2026 Total de entradas + 300,00",
+    "Transferencia recebida pelo Pix",
+    "Fulano de Tal",
+    "300,00",
+    "Total de saidas - 20,00",
+    "Compra no debito Padaria Modelo",
+    "20,00",
+    "20 AGO 2026 Total de entradas + 50,00",
+    "Recebimento Pix Ciclano",
+    "50,00",
+    "Total de saidas - 100,00",
+    "Transferencia enviada pelo Pix",
+    "Beltrano de Souza",
+    "100,00",
 )
 
 
