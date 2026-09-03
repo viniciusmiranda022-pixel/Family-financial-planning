@@ -367,6 +367,23 @@ def test_discover_transaction_duplicates_reopens_a_resolved_group_for_a_new_memb
         assert reopened_group.resolution is None
         assert reopened_group.signals["previous_resolution"] == "distinct"
         assert reopened_group.signals["reopened_reason"] == "new_matching_transaction"
+        # 2026-09-03 review round 3, P1: who resolved it and why are part of
+        # the human decision being reopened, not just the resolution type
+        # and timestamp -- both must survive the reopen.
+        assert reopened_group.signals["previous_resolved_by"] == admin.id
+        assert (
+            reopened_group.signals["previous_resolution_reason"]
+            == "Movimentos distintos confirmados"
+        )
+        assert reopened_group.signals["resolution_history"] == [
+            {
+                "resolution": "distinct",
+                "resolved_at": reopened_group.signals["previous_resolved_at"],
+                "resolved_by": admin.id,
+                "resolution_reason": "Movimentos distintos confirmados",
+                "reopened_reason": "new_matching_transaction",
+            }
+        ]
 
         # The new evidence is deterministically surfaced as derived
         # membership -- this is exactly what INV-014's open-group-member
@@ -392,3 +409,88 @@ def test_discover_transaction_duplicates_reopens_a_resolved_group_for_a_new_memb
         assert late_evidence.possible_duplicate is False
         assert late_evidence.excluded is False
         assert late_evidence.duplicate_group_id is None
+
+        # A second human resolves the reopened group -- a different admin,
+        # a different resolution, a different reason -- and a fourth,
+        # still-unexamined transaction later surfaces matching evidence.
+        # Both prior human decisions must remain auditable, not just the
+        # immediately preceding one.
+        second_admin = User(
+            household_id=household.id,
+            name="Segunda Administradora",
+            username="admin-reopen-2",
+            password_hash="hash",
+            is_admin=True,
+        )
+        capture_2 = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="capture-2.json",
+            document_type="capture",
+            sha256="5" * 64,
+            encrypted_path="k.enc",
+        )
+        db.add_all([second_admin, capture_2])
+        db.flush()
+
+        resolve_duplicate_group(
+            db,
+            group_id=reopened_group.id,
+            household_id=household.id,
+            resolution="duplicate",
+            user_id=second_admin.id,
+            reason="Confirmado como lançamento duplicado na revisão",
+            canonical_transaction_id=authoritative.id,
+        )
+        assert reopened_group.status == "resolved"
+        assert reopened_group.resolution == "duplicate"
+        first_resolved_at = reopened_group.signals["previous_resolved_at"]
+        second_resolved_at = reopened_group.resolved_at.isoformat()
+
+        even_later_evidence = _transaction(household.id, account.id, capture_2.id, 60)
+        db.add(even_later_evidence)
+        db.flush()
+
+        twice_reopened_group, second_assessment = discover_transaction_duplicates(
+            db, transaction=even_later_evidence, household_id=household.id
+        )
+
+        assert twice_reopened_group.id == group.id
+        assert second_assessment is not None
+        assert twice_reopened_group.status == "open"
+        assert twice_reopened_group.resolution is None
+        # The most recent decision is surfaced as `previous_*`...
+        assert twice_reopened_group.signals["previous_resolution"] == "duplicate"
+        assert twice_reopened_group.signals["previous_resolved_by"] == second_admin.id
+        assert (
+            twice_reopened_group.signals["previous_resolution_reason"]
+            == "Confirmado como lançamento duplicado na revisão"
+        )
+        assert twice_reopened_group.signals["previous_resolved_at"] == second_resolved_at
+        # ...but neither human decision is lost: both remain fully
+        # inspectable, oldest first, in the append-only history.
+        assert twice_reopened_group.signals["resolution_history"] == [
+            {
+                "resolution": "distinct",
+                "resolved_at": first_resolved_at,
+                "resolved_by": admin.id,
+                "resolution_reason": "Movimentos distintos confirmados",
+                "reopened_reason": "new_matching_transaction",
+            },
+            {
+                "resolution": "duplicate",
+                "resolved_at": second_resolved_at,
+                "resolved_by": second_admin.id,
+                "resolution_reason": "Confirmado como lançamento duplicado na revisão",
+                "reopened_reason": "new_matching_transaction",
+            },
+        ]
+
+        # Discovery mode still never mutates the source `Transaction` rows,
+        # even across repeated resolve/reopen cycles -- only the explicit
+        # human `resolve_duplicate_group` call above (not discovery) may
+        # touch `imported`/`authoritative`'s classification columns.
+        assert even_later_evidence.canonical_status == "unassigned"
+        assert even_later_evidence.possible_duplicate is False
+        assert even_later_evidence.excluded is False
+        assert even_later_evidence.duplicate_group_id is None

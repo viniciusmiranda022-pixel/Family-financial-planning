@@ -159,9 +159,17 @@ def discover_transaction_duplicates(
     para revisão sem apagar a resolução anterior, preservada nos sinais do
     grupo"), it reopens the group for review through the same
     reopen-on-new-matching-transaction lifecycle `register_transaction_duplicates`
-    uses, so the new evidence is not silently lost. Even then, discovery mode
-    never mutates the source `Transaction` rows -- only the derived
-    `DuplicateGroup`/`DuplicateGroupMember` evidence changes.
+    uses, so the new evidence is not silently lost. The full prior decision --
+    `resolution`, `resolved_at`, `resolved_by` and `resolution_reason`, not
+    just the resolution type and timestamp -- is preserved in `signals`
+    (`previous_resolution`/`previous_resolved_at`/`previous_resolved_by`/
+    `previous_resolution_reason`), and every past decision the group has ever
+    had is additionally kept, oldest first, in an append-only
+    `signals["resolution_history"]` list, so a group resolved and reopened
+    more than once never loses an earlier human decision to a later one.
+    Even then, discovery mode never mutates the source `Transaction` rows --
+    only the derived `DuplicateGroup`/`DuplicateGroupMember` evidence
+    changes.
     """
 
     return _match_and_persist_group(
@@ -300,13 +308,38 @@ def _match_and_persist_group(
             )
 
     if group.status == "resolved":
-        group.signals = {
-            **dict(group.signals or {}),
-            "previous_resolution": group.resolution,
-            "previous_resolved_at": (
+        # 2026-09-03 review round 3, P1: `resolved_by`/`resolution_reason`
+        # are as much a part of the human decision being reopened as
+        # `resolution`/`resolved_at` -- docs/FINANCIAL_RULES.md requires the
+        # *resolution* to be preserved, not just its type and timestamp.
+        # Losing who decided and why is a silent loss of audit trail.
+        # Because the same group can be resolved and reopened more than
+        # once, a flat `previous_*` set of keys would itself be silently
+        # overwritten by a second reopen. Every prior decision is instead
+        # appended to an append-only `resolution_history` list, so no human
+        # decision -- however many reopens later -- is ever dropped.
+        previous_decision = {
+            "resolution": group.resolution,
+            "resolved_at": (
                 group.resolved_at.isoformat() if group.resolved_at else None
             ),
+            "resolved_by": group.resolved_by,
+            "resolution_reason": group.resolution_reason,
             "reopened_reason": "new_matching_transaction",
+        }
+        existing_signals = dict(group.signals or {})
+        resolution_history = [
+            *list(existing_signals.get("resolution_history") or []),
+            previous_decision,
+        ]
+        group.signals = {
+            **existing_signals,
+            "previous_resolution": previous_decision["resolution"],
+            "previous_resolved_at": previous_decision["resolved_at"],
+            "previous_resolved_by": previous_decision["resolved_by"],
+            "previous_resolution_reason": previous_decision["resolution_reason"],
+            "reopened_reason": "new_matching_transaction",
+            "resolution_history": resolution_history,
         }
         group.status = "open"
         group.resolution = None
