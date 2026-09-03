@@ -67,10 +67,24 @@
   (`acknowledge`/`resolve`/`ignore`/`false-positive`, com motivo obrigatório e audit trail, sem alterar
   dados financeiros automaticamente), banner global persistente para BLOCK, reconciliação de
   documentos visível e Monthly Financial Close (`open`/`review_required`/`trusted`, com `run`/`trust`/
-  `reopen` como ações separadas e gates determinísticos) entregues como PR 7; pendente revisão do
-  engenheiro responsável antes do merge;
-- próximos incrementos: safety gates completos de CI (PostgreSQL/Alembic no pipeline, property tests
-  financeiros e backfill controlado) na PR 8.
+  `reopen` como ações separadas e gates determinísticos) entregues como PR 7;
+- PostgreSQL/Alembic real no CI (`alembic upgrade head` a partir de banco vazio e da baseline legada
+  `0002`, downgrade da revisão final), doze gates nomeados e obrigatórios (`lint`, `unit`,
+  `financial-invariants`, `property-tests`, `parser-reconciliation`, `projection-parity`,
+  `snapshot-channel-consistency`, `advisor-contract-security`, `frontend-syntax`, `docker-build`,
+  `alembic-migration`, `integration-postgres`), datasets fictícios de regressão reutilizáveis
+  (`tests/fixtures/synthetic_household.py`), property tests finais (arredondamento `ROUND_HALF_UP`,
+  liquidez zero, déficit maior que saldo, piso de segurança, comissão por recebível, competência,
+  idempotência), comando de backfill idempotente e retomável (`app.cli.backfill`, com `--dry-run`) que
+  reconcilia documentos legados como `unknown`, classifica duplicidades e reconstrói
+  snapshots/integrity runs sem nunca alterar `Transaction`/`Document`/`PayrollRecord`/`Commission`/
+  `Obligation`, e runbook de rollout/rollback (`docs/RUNBOOK_PR8_BACKFILL.md`) entregues como PR 8;
+  pendente revisão do engenheiro responsável antes do merge.
+
+PR 8 é o último incremento planejado em `docs/INTEGRITY_IMPLEMENTATION_PLAN.md` para o Financial
+Integrity Engine. Com PR 8 revisado e mesclado pelo engenheiro responsável, os incrementos PR 0 a
+PR 8 estarão todos entregues; até lá, PR 8 permanece aberto aguardando revisão -- nenhum PR desta
+série foi mesclado por conta própria.
 
 ## Fase 3 — Próximas evoluções
 

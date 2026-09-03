@@ -80,7 +80,10 @@ docker compose --profile container-advisor run --rm --no-deps advisor codex logo
 - classificações automáticas são sugestões;
 - nenhum item é gravado antes da confirmação do usuário;
 - uma recomendação do consultor depende da integridade dos lançamentos cadastrados;
-- o consultor não substitui aconselhamento profissional e não inicia operações financeiras.
+- o consultor não substitui aconselhamento profissional e não inicia operações financeiras;
+- o backfill (`app.cli.backfill`, PR 8) nunca chama o Codex/Advisor: reconciliação, classificação de
+  duplicidade, snapshots e integrity runs reprocessados continuam inteiramente determinísticos, sem
+  ampliar em nada a autoridade ou o acesso do Codex descritos acima.
 
 ## Referências oficiais
 

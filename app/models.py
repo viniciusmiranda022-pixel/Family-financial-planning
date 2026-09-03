@@ -821,6 +821,54 @@ class HouseholdFinancialRevision(Base):
     )
 
 
+class BackfillRun(Base):
+    """Auditable manifest row for one invocation of `app.cli.backfill`.
+
+    Deliberately its own table, not another `IntegrityRun` (`trigger="backfill"`
+    already exists on that model and is still used per-household/per-period by
+    `execute_integrity_run` during a backfill): a single `app.cli.backfill`
+    invocation can span every household and many periods, and PR 8's Work
+    Order requires recording "run, versões, duração, resultado e
+    rastreabilidade suficiente para auditoria" for the *backfill process
+    itself*, independent of however many `IntegrityRun`/`FinancialSnapshot`/
+    `DocumentReconciliation`/`DuplicateGroup` rows it touches underneath.
+
+    Not listed in `FINANCIAL_REVISION_MODELS` below: this row never feeds
+    `financial_snapshots._collect()` or a monthly-close trust gate the way an
+    `IntegrityRun`/`IntegrityFinding` row does -- it is a record *about* a
+    process, like `AuditEvent` (also absent from that list), not a financial
+    fact or gate input a snapshot recomputation could diverge from.
+
+    `dry_run=True` rows are written *after* the in-memory pass completes and
+    the session that ran it is rolled back (see `app/cli/backfill.py`): the
+    manifest of what a dry run *would* have done is itself audit-worthy
+    evidence, and is committed on its own, separate connection/transaction so
+    it survives the rollback of every other change the dry run touched.
+    """
+
+    __tablename__ = "backfill_runs"
+    __table_args__ = (Index("ix_backfill_runs_status", "status"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
+    household_scope: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    period_from: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    period_to: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    financial_rules_version: Mapped[str] = mapped_column(String(20))
+    calculation_version: Mapped[str] = mapped_column(String(40))
+    app_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    triggered_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 # Every model whose rows feed either (a) `app/services/financial_snapshots.py`'s
 # `_collect()` (what a period's `FinancialSnapshot` recomputes to) or (b) a
 # deterministic gate `trust_monthly_close` relies on without recomputing --

@@ -143,6 +143,32 @@
   de um `trust` concorrente já commitado sobrescreveria `trusted` de volta para `review_required` sem
   passar por `reopen` — sem motivo, sem `reopened_by` e sem trilha de auditoria da demoção.
 
+### Backfill (reprocessamento de dados existentes)
+
+- `app.cli.backfill` reprocessa famílias já cadastradas reutilizando os mesmos serviços
+  determinísticos do fluxo de importação/API; nunca reimplementa uma regra financeira própria.
+- Nunca escreve em `Transaction`, `Document`, `PayrollRecord`, `Commission` ou `Obligation` -- nem
+  mesmo nas colunas de classificação de duplicidade (`canonical_status`, `possible_duplicate`,
+  `excluded`, `duplicate_group_id`). Duplicidade legada é reportada como evidência derivada
+  (`DuplicateGroup`/`DuplicateGroupMember`, via `discover_transaction_duplicates`), imediatamente
+  visível em `GET /duplicate-groups`; aplicar essa classificação a uma transação já publicada
+  continua sendo uma decisão humana explícita (`resolve_duplicate_group`) ou um efeito de uma
+  transação genuinamente nova chegando pelo fluxo ao vivo (`register_transaction_duplicates`), nunca
+  um efeito colateral automático do reprocessamento histórico.
+- Documento sem reconciliação prévia recebe um registro `unknown` explícito, nunca um total
+  declarado/reconstruído fabricado -- a evidência de parsing original não é retida após a importação.
+- Saldo legado sem `AccountBalanceObservation` confiável permanece `unknown`/não confiado; o backfill
+  nunca infere uma data efetiva nem reconstrói saldo por suposição.
+- É idempotente e retomável por construção: cada passo é um no-op sobre dado inalterado ou fica
+  restrito às linhas que ainda precisam dele. Repetir a execução -- inclusive após falha parcial --
+  reproduz o mesmo estado final; apenas a trilha de auditoria (`IntegrityRun`, `BackfillRun`) cresce
+  a cada execução, por definição.
+- `--dry-run` executa o mesmo processamento e reverte a transação em vez de persistir, reportando o
+  que mudaria sem alterar dado algum; o manifesto `BackfillRun` da execução em dry-run é registrado à
+  parte, preservando a evidência de auditoria mesmo com o rollback.
+- Nunca resolve, reconhece ou corrige um `IntegrityFinding` automaticamente -- apenas a reavaliação
+  determinística de `execute_integrity_run` pode superar (`superseded`) um finding.
+
 ## Reconciliação, duplicidades e anomalias
 
 - Todo parser financeiro produz um `ParsedDocument` versionado. Um arquivo tabular sem nenhum

@@ -75,3 +75,25 @@ sandbox somente leitura. O serviço aceita a interface interna usada por `host.d
 mas toda análise ou classificação exige o segredo aleatório e a porta 8081 não é publicada pelo
 Tailscale Serve. Ele é iniciado por uma tarefa do próprio usuário. Credenciais do Codex ficam fora
 do repositório em `%LOCALAPPDATA%\FamilyFinancialPlanning\codex`.
+
+## CI (PR 8)
+
+- `.github/workflows/ci.yml` usa apenas credenciais fixas e claramente falsas, nunca reaproveitadas
+  em produção: `SECRET_KEY`/`FILE_ENCRYPTION_KEY` de teste (o mesmo padrão que `tests/test_api.py`
+  já usa para seu próprio processo) e um usuário/senha `family`/`family` para o serviço PostgreSQL
+  descartável dos jobs `alembic-migration`/`integration-postgres`, que existe só durante o job e é
+  destruído ao final.
+- Nenhum job de CI recebe documento, backup ou dado financeiro real; todo dado usado em teste é
+  fictício (`tests/fixtures/synthetic_household.py`).
+- O serviço `advisor` não participa de nenhum job de CI; `advisor-contract-security` valida apenas o
+  contrato/sanitização/allowlist com o fake provider já existente, sem rede real com nenhum sidecar.
+
+## Backfill (`app.cli.backfill`, PR 8)
+
+- É um comando de linha de comando executado por um operador com acesso direto ao banco/servidor,
+  nunca uma rota HTTP -- não amplia a superfície de rede da aplicação nem do `advisor`.
+- Não concede ao Codex/Advisor nenhuma autoridade adicional; o comando nunca chama o `advisor` e
+  opera inteiramente sobre o banco local, com os mesmos serviços determinísticos do fluxo normal.
+- `--dry-run` permite inspecionar o efeito antes de uma execução real sobre dados existentes; use-o
+  antes de rodar sobre uma base com dados financeiros reais. Ver
+  [docs/RUNBOOK_PR8_BACKFILL.md](RUNBOOK_PR8_BACKFILL.md) para o procedimento completo.

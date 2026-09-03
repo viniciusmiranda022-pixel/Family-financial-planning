@@ -79,6 +79,47 @@ Tailscale Serve é executado no Windows e publica a porta local em HTTPS somente
 
 Um contêiner isolado executa `pg_dump` diariamente. A retenção local padrão é de 30 dias. A cópia externa deve ser implementada na operação do servidor.
 
+### Integração contínua (PR 8)
+
+`.github/workflows/ci.yml` roda doze jobs nomeados e obrigatórios em paralelo a cada PR/push em
+`main`: `lint` (Ruff), `unit` (suíte completa sobre SQLite -- a rede de segurança que cobre qualquer
+dimensão sem gate dedicado), `financial-invariants`, `property-tests`, `parser-reconciliation`,
+`projection-parity`, `snapshot-channel-consistency`, `advisor-contract-security`, `frontend-syntax`,
+`docker-build` e, com um serviço `postgres:17-alpine` real (a mesma imagem de `compose.yaml`, não
+apenas SQLite): `alembic-migration` (upgrade de banco vazio até `head`, upgrade da baseline legada
+`0002` preservando linhas existentes, downgrade seguro da revisão final) e `integration-postgres`
+(idempotência e não mutação de fatos do `app.cli.backfill`, com o locking real do PostgreSQL que
+`SELECT ... FOR UPDATE` exige -- SQLite não tem lock de linha entre conexões; ver
+`app/services/financial_integrity.py` e `app/models.py::HouseholdFinancialRevision`). CI verde é
+necessário para revisão, nunca suficiente
+para merge -- ver `docs/INTEGRITY_IMPLEMENTATION_PLAN.md` seções 17-18.
+
+### Backfill (`app.cli.backfill`, PR 8)
+
+Reprocessa famílias já existentes contra o Financial Integrity Engine sem reimplementar nenhuma
+regra financeira própria: reutiliza `unknown_reconciliation`/`persist_reconciliation`,
+`discover_transaction_duplicates`, `build_snapshot` e `execute_integrity_run` -- serviços que
+compartilham a mesma regra determinística que o fluxo de importação já usa. Documentos sem
+reconciliação recebem um registro `unknown` explícito (nunca um total declarado/reconstruído
+fabricado); transações ainda não examinadas por nenhum passe de duplicidade têm evidência derivada
+(`DuplicateGroup`/`DuplicateGroupMember`) criada pela mesma regra determinística do fluxo ao vivo, mas
+sem aplicar a classificação à própria `Transaction` (ver abaixo); cada competência tem seus achados de
+integridade avaliados antes do snapshot correspondente ser construído (ordem necessária para
+convergência -- ver o docstring de `_backfill_snapshots_and_period_integrity`). Nunca escreve em
+`Transaction`, `Document`, `PayrollRecord`, `Commission` ou `Obligation` -- nem mesmo nas colunas de
+classificação de duplicidade (`canonical_status`/`possible_duplicate`/`excluded`/
+`duplicate_group_id`): aplicar essa classificação a uma transação já publicada continua sendo uma
+decisão humana (`resolve_duplicate_group`) ou efeito de uma transação genuinamente nova no fluxo ao
+vivo (`register_transaction_duplicates`), nunca um efeito colateral automático do backfill. Nunca
+fabrica uma `AccountBalanceObservation` ou data efetiva para um saldo legado -- o fallback já
+existente de `build_snapshot` mantém essa evidência `unknown`/não confiável. Idempotente e retomável
+por
+construção (cada passo é um no-op sobre dado inalterado ou fica restrito às linhas que ainda
+precisam dele), não por um checkpoint de retomada separado. `--dry-run` executa o mesmo caminho de
+código e reverte a transação em vez de persistir; o manifesto `BackfillRun` da execução em dry-run é
+gravado à parte, após o rollback, para preservar a evidência de auditoria mesmo assim. Ver
+`docs/RUNBOOK_PR8_BACKFILL.md`.
+
 ## Fluxo de importação
 
 ```text

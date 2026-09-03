@@ -105,7 +105,90 @@ def register_transaction_duplicates(
     transaction: Any,
     household_id: str,
 ) -> tuple[Any | None, DuplicateAssessment | None]:
-    """Find the strongest bounded candidate and persist both sides of the group."""
+    """Find the strongest bounded candidate, persist both sides of the
+    derived group, and apply the resulting classification to the matched
+    `Transaction` row(s) themselves.
+
+    This is the live import/API path: `transaction` is either a row that
+    just arrived through the pipeline or one a human is actively acting on,
+    so immediately writing `canonical_status`/`possible_duplicate`/
+    `excluded`/`duplicate_group_id` is the documented, intended effect, not
+    a silent correction of settled history. Historical reprocessing must
+    use `discover_transaction_duplicates` instead -- see its docstring.
+    """
+
+    return _match_and_persist_group(
+        db, transaction=transaction, household_id=household_id, apply_to_transactions=True
+    )
+
+
+def discover_transaction_duplicates(
+    db: Session,
+    *,
+    transaction: Any,
+    household_id: str,
+) -> tuple[Any | None, DuplicateAssessment | None]:
+    """Non-mutating duplicate discovery for historical reprocessing.
+
+    Runs the exact same candidate search and `assess_duplicate` scoring as
+    `register_transaction_duplicates` -- the deterministic rule is never
+    forked -- and persists the same *derived* evidence rows (`DuplicateGroup`,
+    `DuplicateGroupMember`), so a discovered pair is immediately visible
+    through `GET /duplicate-groups` like any other group.
+
+    Unlike `register_transaction_duplicates`, it never writes to
+    `transaction`'s own `canonical_status`, `possible_duplicate`, `excluded`
+    or `duplicate_group_id` -- nor to those same columns on any matched
+    transaction. Those columns are the system's applied classification of
+    *existing*, already-published financial history; changing them changes
+    which source is treated as canonical and whether a transaction is
+    counted. Only a genuinely new transaction arriving through the live
+    pipeline, or an explicit human decision
+    (`resolve_duplicate_group`), may change them -- never an automatic
+    historical backfill side effect (docs/INTEGRITY_IMPLEMENTATION_PLAN.md
+    §0.2: "O backfill planejado deverá produzir findings sobre a base real
+    sem corrigi-la silenciosamente").
+
+    A group a human has already resolved is left untouched only while every
+    transaction being examined is already a persisted member of it:
+    rediscovering an already-resolved pair during a passive backfill pass is
+    not new evidence and must not reopen that decision. A transaction that is
+    *not* yet a member of that resolved group -- a genuinely new, unexamined
+    row matching a pair a human already decided on -- is different: per
+    docs/FINANCIAL_RULES.md ("Uma nova ocorrência compatível reabre o grupo
+    para revisão sem apagar a resolução anterior, preservada nos sinais do
+    grupo"), it reopens the group for review through the same
+    reopen-on-new-matching-transaction lifecycle `register_transaction_duplicates`
+    uses, so the new evidence is not silently lost. The full prior decision --
+    `resolution`, `resolved_at`, `resolved_by` and `resolution_reason`, not
+    just the resolution type and timestamp -- is preserved in `signals`
+    (`previous_resolution`/`previous_resolved_at`/`previous_resolved_by`/
+    `previous_resolution_reason`), and every past decision the group has ever
+    had is additionally kept, oldest first, in an append-only
+    `signals["resolution_history"]` list, so a group resolved and reopened
+    more than once never loses an earlier human decision to a later one.
+    Even then, discovery mode never mutates the source `Transaction` rows --
+    only the derived `DuplicateGroup`/`DuplicateGroupMember` evidence
+    changes.
+    """
+
+    return _match_and_persist_group(
+        db, transaction=transaction, household_id=household_id, apply_to_transactions=False
+    )
+
+
+def _match_and_persist_group(
+    db: Session,
+    *,
+    transaction: Any,
+    household_id: str,
+    apply_to_transactions: bool,
+) -> tuple[Any | None, DuplicateAssessment | None]:
+    """Shared candidate search, scoring and derived-evidence persistence for
+    `register_transaction_duplicates` (`apply_to_transactions=True`) and
+    `discover_transaction_duplicates` (`apply_to_transactions=False`). See
+    those two docstrings for the behavioral contract each one promises.
+    """
 
     from app.models import Document, DuplicateGroup, DuplicateGroupMember, Transaction
 
@@ -131,7 +214,8 @@ def register_transaction_duplicates(
         reverse=True,
     )
     if not assessments or assessments[0][1].confidence < PROBABLE_THRESHOLD:
-        transaction.canonical_status = "unassigned"
+        if apply_to_transactions:
+            transaction.canonical_status = "unassigned"
         return None, assessments[0][1] if assessments else None
 
     existing, assessment = assessments[0]
@@ -173,6 +257,37 @@ def register_transaction_duplicates(
             db.add(group)
             db.flush()
 
+    if not apply_to_transactions and group.status == "resolved":
+        already_member = (
+            db.scalar(
+                select(DuplicateGroupMember.id).where(
+                    DuplicateGroupMember.group_id == group.id,
+                    DuplicateGroupMember.transaction_id == transaction.id,
+                )
+            )
+            is not None
+        )
+        if already_member:
+            # Rediscovering a pair a human already resolved is not new
+            # evidence: passive rediscovery of an *existing* member of a
+            # resolved group must not reopen that decision or touch the
+            # transactions it applies to.
+            return group, assessment
+        # `transaction` is not yet a persisted member of this resolved
+        # group -- i.e. a genuinely new (to this group), unexamined
+        # transaction matches a pair a human already decided on.
+        # docs/FINANCIAL_RULES.md, "Reconciliação, duplicidades e
+        # anomalias": "Uma nova ocorrência compatível reabre o grupo para
+        # revisão sem apagar a resolução anterior, preservada nos sinais do
+        # grupo." That rule is not conditioned on the occurrence arriving
+        # through the live pipeline vs. a backfill scan, so fall through
+        # into the same reopen-on-new-matching-transaction lifecycle the
+        # live path already uses below (`reopened_reason`, resolution
+        # preserved in `signals`). `apply_to_transactions` still gates
+        # every mutation of the source `Transaction` rows -- discovery mode
+        # only ever persists derived `DuplicateGroup`/`DuplicateGroupMember`
+        # evidence, never the transaction's own classification columns.
+
     # A candidate can point at any member of an existing group. Canonical
     # precedence must always compare the new row with the group's persisted
     # canonical row, never with whichever supporting member happened to win
@@ -193,13 +308,38 @@ def register_transaction_duplicates(
             )
 
     if group.status == "resolved":
-        group.signals = {
-            **dict(group.signals or {}),
-            "previous_resolution": group.resolution,
-            "previous_resolved_at": (
+        # 2026-09-03 review round 3, P1: `resolved_by`/`resolution_reason`
+        # are as much a part of the human decision being reopened as
+        # `resolution`/`resolved_at` -- docs/FINANCIAL_RULES.md requires the
+        # *resolution* to be preserved, not just its type and timestamp.
+        # Losing who decided and why is a silent loss of audit trail.
+        # Because the same group can be resolved and reopened more than
+        # once, a flat `previous_*` set of keys would itself be silently
+        # overwritten by a second reopen. Every prior decision is instead
+        # appended to an append-only `resolution_history` list, so no human
+        # decision -- however many reopens later -- is ever dropped.
+        previous_decision = {
+            "resolution": group.resolution,
+            "resolved_at": (
                 group.resolved_at.isoformat() if group.resolved_at else None
             ),
+            "resolved_by": group.resolved_by,
+            "resolution_reason": group.resolution_reason,
             "reopened_reason": "new_matching_transaction",
+        }
+        existing_signals = dict(group.signals or {})
+        resolution_history = [
+            *list(existing_signals.get("resolution_history") or []),
+            previous_decision,
+        ]
+        group.signals = {
+            **existing_signals,
+            "previous_resolution": previous_decision["resolution"],
+            "previous_resolved_at": previous_decision["resolved_at"],
+            "previous_resolved_by": previous_decision["resolved_by"],
+            "previous_resolution_reason": previous_decision["resolution_reason"],
+            "reopened_reason": "new_matching_transaction",
+            "resolution_history": resolution_history,
         }
         group.status = "open"
         group.resolution = None
@@ -228,11 +368,12 @@ def register_transaction_duplicates(
         ),
     )
     for member, role, priority, excluded_by_policy in member_policies:
-        member.duplicate_group_id = group.id
-        member.canonical_status = role if strong else "unassigned"
-        member.possible_duplicate = role != "canonical"
-        if excluded_by_policy:
-            member.excluded = True
+        if apply_to_transactions:
+            member.duplicate_group_id = group.id
+            member.canonical_status = role if strong else "unassigned"
+            member.possible_duplicate = role != "canonical"
+            if excluded_by_policy:
+                member.excluded = True
         stored_member = db.scalar(
             select(DuplicateGroupMember).where(
                 DuplicateGroupMember.group_id == group.id,

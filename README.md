@@ -252,6 +252,38 @@ pytest -q
 ruff check .
 ```
 
+`pytest -q` roda a suíte completa sobre SQLite. O CI (`.github/workflows/ci.yml`) exige, além
+disso, doze gates nomeados e obrigatórios -- lint, a suíte completa, invariantes financeiros,
+property tests, parser/reconciliação, paridade de projeção, consistência dashboard/relatórios,
+segurança do contrato do Advisor, sintaxe do frontend, build das imagens Docker e, com PostgreSQL
+real (não apenas SQLite), migração Alembic e idempotência do backfill. Para rodar os testes que
+exigem PostgreSQL localmente:
+
+```bash
+export POSTGRES_TEST_DATABASE_URL=postgresql+psycopg://family:family@localhost:5432/family_finance
+pytest -q tests/test_postgresql_integration.py
+```
+
+Sem essa variável definida, esses testes são pulados (skip), não falham.
+
+### Backfill (reprocessamento de dados existentes)
+
+`python -m app.cli.backfill` reconcilia documentos legados sem evidência retida como `unknown`,
+classifica duplicidades ainda não avaliadas e reconstrói snapshots/integrity runs para famílias já
+cadastradas, usando os mesmos serviços determinísticos do fluxo de importação -- nunca escreve em
+`Transaction`, `Document`, `PayrollRecord`, `Commission` ou `Obligation`. É idempotente e retomável:
+rodar de novo após uma falha parcial, ou repetir a execução, reproduz o mesmo estado final.
+
+```bash
+python -m app.cli.backfill --dry-run                 # relatório do que mudaria, nada é gravado
+python -m app.cli.backfill                            # todas as famílias
+python -m app.cli.backfill --household "Família X"    # uma família específica
+python -m app.cli.backfill --from 2026-01 --to 2026-06 # intervalo de competência explícito
+```
+
+Consulte [docs/RUNBOOK_PR8_BACKFILL.md](docs/RUNBOOK_PR8_BACKFILL.md) para pré-condições, plano de
+rollback e critérios de parada antes de rodar em uma base com dados reais.
+
 ## Limitações conscientes do MVP
 
 - OCR e transcrição podem errar; nenhum resultado é gravado sem prévia e confirmação.
@@ -269,3 +301,4 @@ ruff check .
 - [Acesso remoto com Tailscale](docs/TAILSCALE.md)
 - [Central inteligente e Codex](docs/INTELLIGENCE.md)
 - [Roteiro do produto](docs/ROADMAP.md)
+- [Runbook de backfill (rollout/rollback)](docs/RUNBOOK_PR8_BACKFILL.md)
