@@ -27,8 +27,27 @@ class Classification:
 # "Devolução") and `ENCARGO` (Mercado Pago's "Tarifas e encargos") are
 # additive synonyms: every description the previous, narrower patterns
 # already matched still matches.
+#
+# `PAGAMENTO EM \d{1,2} [A-Z]{3}` is the Nubank invoice's own literal wording
+# for the credit-card-bill payment line item (observed layout: "Pagamento em
+# 01 JUL", i.e. day + three-letter month abbreviation, matching the day/month
+# tokens `_NUBANK_CARD_START`/`MONTHS_PT_ABBR` already parse). Before this,
+# that description matched none of the payment alternatives, so `classify()`
+# fell through to plain positive `income` -- violating INV-002 (card-bill
+# payment must be reconciliation, zero operating effect) even though
+# `_transaction_components`' separate positive-credit fallback already
+# bucketed the same row into `payments_total` for reconciliation. Matching it
+# here, in the one shared pattern, is a positive identity check (the exact
+# Nubank phrasing plus a day-of-month and a real month abbreviation), not a
+# generic "any positive credit is a payment" heuristic -- it does not touch
+# that reconciliation fallback, which still only ever applies to credits no
+# named pattern recognizes.
 PAYMENT_PATTERN = re.compile(
-    r"PAGAMENTO.*FATURA|PAGAMENTO RECEBIDO|FATURA PAGA|PAG(?:AMENTO)? BOLETO.*(?:NU PAGAMENTOS|NUBANK)"
+    r"PAGAMENTO.*FATURA"
+    r"|PAGAMENTO RECEBIDO"
+    r"|FATURA PAGA"
+    r"|PAG(?:AMENTO)? BOLETO.*(?:NU PAGAMENTOS|NUBANK)"
+    r"|PAGAMENTO EM \d{1,2}\s+[A-Z]{3}\b"
 )
 REFUND_PATTERN = re.compile(r"ESTORNO|CREDITO.*COMPRA|CREDITO.*CARTAO|DEVOLU")
 FEE_PATTERN = re.compile(r"IOF|JUROS|TARIFA|ENCARGO")

@@ -188,6 +188,11 @@ def test_nubank_credit_card_pdf_recognizes_purchases_payment_and_refund() -> Non
     payment = by_desc["Pagamento em 01 JUL"]
     assert payment.amount == Decimal("200.00")
     assert payment.occurred_at == date(2026, 7, 1)
+    # INV-002: a card-bill payment must be reconciliation, not operating
+    # income, even though the parsed amount is a positive credit.
+    payment_classification = classify(payment.description, float(payment.amount))
+    assert payment_classification.transaction_type == "reconciliation"
+    assert payment_classification.excluded is True
 
 
 def test_nubank_credit_card_pdf_declared_fields_and_reconciliation() -> None:
@@ -399,3 +404,28 @@ def test_classifier_payment_pattern_recognizes_new_issuer_phrasing() -> None:
     assert classify("Devolucao", 20.0).transaction_type == "refund"
     assert classify("Estorno Compra", 20.0).transaction_type == "refund"  # unchanged existing case
     assert classify("Tarifas e encargos", -5.0).category == "Juros, IOF e tarifas"
+
+
+def test_classifier_recognizes_nubank_invoice_payment_phrasing() -> None:
+    # Regression for PR #41 engineer review (P0 on `ef1f5a2`): the parser
+    # already emitted "Pagamento em 01 JUL" as a positive credit and
+    # `_transaction_components` already bucketed it into `payments_total`
+    # for reconciliation via its generic unmatched-positive-credit fallback,
+    # but `classify()` -- the canonical path that decides the *published*
+    # transaction_type/excluded for the ledger, dashboard and reports --
+    # matched none of the payment alternatives and fell through to plain
+    # positive `income`. That silently violated INV-002 (a card-bill payment
+    # must have zero operating income/expense effect) even though the
+    # invoice still reconciled to R$ 0.01. `PAYMENT_PATTERN` now recognizes
+    # this exact Nubank phrasing (day + month abbreviation), so the shared
+    # policy classifies it correctly instead of only reconciling correctly.
+    result = classify("Pagamento em 01 JUL", 200.0)
+    assert result.transaction_type == "reconciliation"
+    assert result.excluded is True
+    # A merchant name that merely starts with "Pagamento" but carries no
+    # day + month-abbreviation identity marker must not be swept in by this
+    # addition -- e.g. no bare "Pagamento em" prefix, and no full month name
+    # (only the real Nubank three-letter abbreviation, "JUL"/"AGO"/etc., not
+    # "Setembro") is accepted as the marker.
+    assert classify("Pagamento Estabelecimento Um", 50.0).transaction_type != "reconciliation"
+    assert classify("Pagamento em 01 Setembro", 50.0).transaction_type != "reconciliation"
