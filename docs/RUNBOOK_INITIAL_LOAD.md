@@ -9,6 +9,7 @@ Use este procedimento somente para popular uma instalação que já possui a fam
 - Não commite manifesto real, extratos, faturas, holerites ou números de conta/cartão.
 - Execute `--dry-run` antes de `--apply`.
 - Conflito de conta, obrigação ou saldo bloqueia a carga. O CLI nunca sobrescreve esses fatos para "fazer passar".
+- Não copie os documentos originais em claro para `/data` do container. `/data` é persistente e é usado pelo armazenamento criptografado da aplicação. Para a carga, os originais devem existir apenas temporariamente em `/tmp/initial-load` e ser removidos ao final.
 
 ## 2. Manifesto
 
@@ -83,25 +84,34 @@ Crie `data/initial-load/manifest.json`:
 
 Caminhos relativos são resolvidos a partir da pasta onde está o manifesto.
 
-## 3. Prévia obrigatória
+## 3. Preparar os arquivos temporariamente no container
 
-No host:
+Com o serviço `app` em execução, no PowerShell do host:
 
 ```powershell
 cd C:\Users\ViniciusMiranda\Family-financial-planning
-docker compose exec app python -m app.cli.initial_load /data/initial-load/manifest.json --dry-run
+docker compose exec app sh -lc "rm -rf /tmp/initial-load && mkdir -p /tmp/initial-load"
+docker compose cp .\data\initial-load\. app:/tmp/initial-load/
 ```
 
-Se o diretório local `data/` não estiver montado dentro do container, copie temporariamente o diretório para o container ou execute o CLI no ambiente Python do projeto. Não altere o Compose somente para expor documentos reais sem necessidade.
+Essa cópia em `/tmp` é apenas staging. Quando o documento é efetivamente importado, o pipeline oficial grava sua própria cópia criptografada no armazenamento da aplicação.
+
+## 4. Prévia obrigatória
+
+```powershell
+docker compose exec app python -m app.cli.initial_load /tmp/initial-load/manifest.json --dry-run
+```
 
 O relatório mostra contas/obrigações/saldos que seriam criados, documentos já importados, quantidade de registros reconhecidos e status de reconciliação. `review_required` ou `ready_with_review` não é autorização para corrigir dados automaticamente; significa que o documento deverá ser revisado no sistema.
 
-## 4. Aplicação
+O `--dry-run` não persiste contas, perfil, obrigações ou saldos e não cria `Document`/`Transaction`; ele valida os arquivos e executa parser/reconciliação para produzir a prévia.
 
-Depois de revisar a prévia:
+## 5. Aplicação
+
+Somente depois de revisar a prévia:
 
 ```powershell
-docker compose exec app python -m app.cli.initial_load /data/initial-load/manifest.json --apply
+docker compose exec app python -m app.cli.initial_load /tmp/initial-load/manifest.json --apply
 ```
 
 A estrutura é aplicada de forma conservadora. Documentos são encaminhados ao mesmo pipeline de `/api/imports`, preservando:
@@ -115,9 +125,19 @@ A estrutura é aplicada de forma conservadora. Documentos são encaminhados ao m
 - `ReviewItem`;
 - trilha de auditoria.
 
-Reexecutar o mesmo manifesto não duplica contas, obrigações, observações de saldo idênticas ou documentos com o mesmo hash.
+A aplicação é retomável por idempotência. Cada documento é importado pelo pipeline normal, que possui sua própria transação/commit; se uma execução for interrompida, reexecute o mesmo manifesto. Contas, obrigações, observações de saldo idênticas e documentos com o mesmo SHA serão ignorados em vez de duplicados. Não trate uma execução interrompida como motivo para apagar ou reescrever fatos já importados.
 
-## 5. Depois da carga
+## 6. Remover o staging em claro
+
+Após o `--apply` — inclusive quando houver itens para revisão — remova a cópia temporária:
+
+```powershell
+docker compose exec app sh -lc "rm -rf /tmp/initial-load"
+```
+
+Os arquivos originais continuam na pasta local escolhida pelo operador. Dentro do armazenamento persistente do sistema permanece apenas a cópia gerenciada pelo `EncryptedDocumentStore`.
+
+## 7. Depois da carga
 
 1. Revise `ReviewItem` e grupos de duplicidade.
 2. Não marque findings como resolvidos sem corrigir/revisar o fato correspondente.
