@@ -24,7 +24,11 @@ every engine/session here is built locally against `POSTGRES_TEST_DATABASE_URL`.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
+from datetime import date
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 
@@ -34,18 +38,34 @@ os.environ.setdefault("SECRET_KEY", "postgres-integration-test-secret-not-used-i
 os.environ.setdefault("FILE_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 
 from alembic.config import Config  # noqa: E402
-from sqlalchemy import create_engine, inspect, select, text  # noqa: E402
+from sqlalchemy import create_engine, func, inspect, select, text  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from alembic import command  # noqa: E402
 from app.cli.backfill import process_household  # noqa: E402
+from app.cli.initial_load import (  # noqa: E402
+    AccountSeed,
+    BalanceSeed,
+    DocumentSeed,
+    InitialLoadManifest,
+    ObligationSeed,
+    _apply_balances,
+    _apply_documents,
+    _apply_obligations,
+    _lock_household_initial_load,
+)
 from app.config import get_settings  # noqa: E402
 from app.models import (  # noqa: E402
+    Account,
+    AccountBalanceObservation,
+    Document,
     DocumentReconciliation,
     DuplicateGroup,
     FinancialSnapshot,
     Household,
+    Obligation,
     Transaction,
+    User,
 )
 from tests.fixtures.fact_fingerprint import fact_fingerprint  # noqa: E402
 from tests.fixtures.synthetic_household import build_synthetic_household  # noqa: E402
@@ -245,3 +265,243 @@ def test_backfill_dry_run_leaves_postgresql_database_unchanged() -> None:
             is None
         )
     engine.dispose()
+
+
+def test_initial_load_documents_are_idempotent_and_resumable_on_real_postgresql(
+    tmp_path, monkeypatch
+) -> None:
+    """`tests/test_initial_load.py` proves the same properties against
+    SQLite for fast, hermetic unit coverage, but the initial-load Work
+    Order explicitly requires PostgreSQL compatibility for the real,
+    unmocked `import_document` pipeline the CLI delegates to (encryption,
+    hashing/idempotency, classification, duplicate grouping, persisted
+    reconciliation, audit trail). This proves both: a second application of
+    an already-imported document is a true no-op, and an interrupted run
+    (each document is its own commit unit) resumes by completing only the
+    remaining documents rather than duplicating what was already committed.
+    """
+    command.upgrade(_alembic_config(), "head")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    get_settings.cache_clear()
+    try:
+        engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+        with Session(engine) as db:
+            household = Household(name="Família PostgreSQL Initial Load")
+            db.add(household)
+            db.flush()
+            user = User(
+                household_id=household.id,
+                name="Admin PostgreSQL",
+                username=f"admin-pg-{household.id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            account = Account(
+                household_id=household.id,
+                name="Conta PostgreSQL",
+                institution="Banco Teste",
+                account_type="checking",
+                owner_label="Família",
+            )
+            db.add_all([user, account])
+            db.commit()
+
+            (tmp_path / "statement-1.csv").write_text(
+                "data,descricao,valor\n2026-09-01,Compra teste 1,-10.00\n", encoding="utf-8"
+            )
+            (tmp_path / "statement-2.csv").write_text(
+                "data,descricao,valor\n2026-09-02,Compra teste 2,-20.00\n", encoding="utf-8"
+            )
+            manifest_path = tmp_path / "manifest.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            full_manifest = InitialLoadManifest(
+                version=1,
+                load_id="postgres-resume-test",
+                accounts=[AccountSeed(key="bank", name="Conta PostgreSQL")],
+                documents=[
+                    DocumentSeed(
+                        path="statement-1.csv", document_type="bank_statement", account="bank"
+                    ),
+                    DocumentSeed(
+                        path="statement-2.csv", document_type="bank_statement", account="bank"
+                    ),
+                ],
+            )
+            partial_manifest = full_manifest.model_copy(deep=True)
+            partial_manifest.documents = partial_manifest.documents[:1]
+
+            # Simulate a process interrupted right after the first document
+            # committed.
+            asyncio.run(
+                _apply_documents(db, manifest_path, partial_manifest, {"bank": account}, user)
+            )
+            assert db.scalar(select(func.count(Document.id))) == 1
+
+            resumed_report = asyncio.run(
+                _apply_documents(db, manifest_path, full_manifest, {"bank": account}, user)
+            )
+            assert resumed_report[0]["status"] == "skipped_existing"
+            assert resumed_report[1]["status"] in {"imported", "imported_with_review"}
+            assert db.scalar(select(func.count(Document.id))) == 2
+            assert db.scalar(select(func.count(Transaction.id))) == 2
+
+            # Full idempotent rerun: nothing new is created for either
+            # document.
+            rerun_report = asyncio.run(
+                _apply_documents(db, manifest_path, full_manifest, {"bank": account}, user)
+            )
+            assert {item["status"] for item in rerun_report} == {"skipped_existing"}
+            assert db.scalar(select(func.count(Document.id))) == 2
+            assert db.scalar(select(func.count(Transaction.id))) == 2
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_initial_load_concurrent_apply_does_not_duplicate_obligation_or_balance() -> None:
+    """PR #40 review, P1: unlike `Account`/`FinancialProfile`/`Document`,
+    `Obligation` and `AccountBalanceObservation` carry no DB-level
+    `UniqueConstraint` (see `app/models.py`), so
+    `_apply_obligations`/`_apply_balances` are idempotent only through a
+    plain SELECT-then-INSERT in Python. Two overlapping invocations of this
+    CLI against the same household could each pass the SELECT before
+    either commits and each INSERT its own row, silently doubling an
+    obligation or a confirmed balance -- exactly the class of race
+    docs/INTEGRITY_IMPLEMENTATION_PLAN.md and protocol §20 warn against.
+
+    `_lock_household_initial_load` closes this with a transaction-scoped
+    `pg_advisory_xact_lock` (mirroring
+    `app/services/financial_snapshots.py::_lock_snapshot_key`). This proves
+    it holds under a real two-connection race against the engine
+    production uses, not merely by reading the code: a first transaction
+    takes the lock, resolves and inserts both facts, and deliberately holds
+    the transaction open (no commit yet) while a second, fully concurrent
+    transaction attempts the same seed; the second's lock acquisition must
+    block until the first commits, after which its own SELECT observes the
+    already-created rows and takes the idempotent skip path. Exactly one
+    obligation row and one balance observation survive -- never two, and
+    no `IntegrityError`.
+    """
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as setup_db:
+            household = Household(name="Família Concorrência Initial Load")
+            setup_db.add(household)
+            setup_db.flush()
+            user = User(
+                household_id=household.id,
+                name="Admin Concorrência",
+                username=f"admin-concur-{household.id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            account = Account(
+                household_id=household.id,
+                name="Reserva Concorrência",
+                institution="Corretora Teste",
+                account_type="investment",
+                owner_label="Família",
+            )
+            setup_db.add_all([user, account])
+            setup_db.commit()
+            household_id = household.id
+            account_id = account.id
+            user_id = user.id
+
+        manifest = InitialLoadManifest(
+            version=1,
+            load_id="postgres-concurrency-test",
+            accounts=[
+                AccountSeed(key="inv", name="Reserva Concorrência", account_type="investment")
+            ],
+            obligations=[
+                ObligationSeed(
+                    name="Financiamento concorrente",
+                    due_date=date(2026, 10, 10),
+                    amount=Decimal("1000.00"),
+                )
+            ],
+            balances=[
+                BalanceSeed(
+                    account="inv",
+                    amount=Decimal("5000.00"),
+                    as_of_date=date(2026, 9, 1),
+                    observation_type="point_in_time",
+                )
+            ],
+        )
+
+        second_lock_acquired = threading.Event()
+        second_done = threading.Event()
+        second_error: list[BaseException] = []
+
+        def _second_run() -> None:
+            try:
+                second_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(second_engine) as second_db:
+                    _lock_household_initial_load(second_db, household_id)
+                    # Only reachable once the first transaction below has
+                    # committed and released the advisory lock.
+                    second_lock_acquired.set()
+                    second_account = second_db.get(Account, account_id)
+                    _apply_obligations(
+                        second_db, household_id, manifest, apply=True, user_id=user_id
+                    )
+                    _apply_balances(
+                        second_db,
+                        household_id,
+                        manifest,
+                        {"inv": second_account},
+                        apply=True,
+                        user_id=user_id,
+                    )
+                    second_db.commit()
+                second_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001 - surfaced via assertion below
+                second_error.append(exc)
+            finally:
+                second_done.set()
+
+        with Session(engine) as first_db:
+            _lock_household_initial_load(first_db, household_id)
+            first_account = first_db.get(Account, account_id)
+            _apply_obligations(first_db, household_id, manifest, apply=True, user_id=user_id)
+            _apply_balances(
+                first_db, household_id, manifest, {"inv": first_account}, apply=True, user_id=user_id
+            )
+            # Deliberately do not commit yet: the second connection must
+            # block on `pg_advisory_xact_lock` for as long as this
+            # transaction (and the lock it holds) stays open.
+            worker = threading.Thread(target=_second_run, daemon=True)
+            worker.start()
+            still_blocked = not second_lock_acquired.wait(timeout=1.0)
+            assert still_blocked, (
+                "second connection acquired the advisory lock before the first "
+                "transaction committed -- the lock is not actually serializing"
+            )
+            first_db.commit()
+
+        assert second_done.wait(timeout=10.0), "second connection never finished"
+        if second_error:
+            raise second_error[0]
+
+        with Session(engine) as verify_db:
+            obligations = verify_db.scalars(
+                select(Obligation).where(Obligation.household_id == household_id)
+            ).all()
+            balances = verify_db.scalars(
+                select(AccountBalanceObservation).where(
+                    AccountBalanceObservation.household_id == household_id
+                )
+            ).all()
+            assert len(obligations) == 1
+            assert len(balances) == 1
+            assert obligations[0].amount == Decimal("1000.00")
+            assert balances[0].amount == Decimal("5000.00")
+            assert balances[0].source == "manual_confirmed"
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
