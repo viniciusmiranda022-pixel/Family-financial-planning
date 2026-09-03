@@ -215,21 +215,52 @@ def _pdf_text(payload: bytes) -> str:
     return raw.translate(_PDF_TEXT_TRANSLATION)
 
 
+# A brand token alone ("NUBANK", "MERCADO PAGO") is not safe issuer
+# evidence: it also occurs as a *counterparty* inside another bank's own
+# transaction text -- confirmed against the real Itaú statement behind this
+# Work Order's baseline, which contains lines like
+# "PAG BOLETO NU PAGAMENTOS SA -1.724,90" and "PIX QRS MERCADO PAG...".
+# Detection therefore requires the brand token *and* one of these
+# document-identity/layout markers -- section headers and date formats that
+# only the issuer's own masthead/summary prints, never a transaction
+# description naming that issuer as a counterparty on someone else's
+# statement.
+_NUBANK_STRUCTURE = re.compile(
+    r"RESUMO DA FATURA ATUAL"
+    r"|TRANSA[ÇC][ÕO]ES DE"
+    r"|FATURA\s+\d{2}\s+[A-ZÇ]{3}\s+\d{4}"
+    r"|SALDO FINAL DO PER[IÍ]ODO"
+    r"|\d{1,2}\s+DE\s+[A-ZÇ]+\s+DE\s+\d{4}\s+A\s+\d{1,2}\s+DE\s+[A-ZÇ]+\s+DE\s+\d{4}",
+    re.IGNORECASE,
+)
+_MERCADO_PAGO_STRUCTURE = re.compile(
+    r"DETALHES DE CONSUMO"
+    r"|MOVIMENTA[ÇC][ÕO]ES NA FATURA"
+    r"|PER[IÍ]ODO\s*:?\s*DE\s+\d{2}-\d{2}-\d{4}\s+(?:AL|AT[EÉ])\s+\d{2}-\d{2}-\d{4}",
+    re.IGNORECASE,
+)
+
+
 def _detect_pdf_issuer(text: str) -> str:
     """Identify which institution's textual layout produced this PDF.
 
     Detection is content-based only, per the Work Order's requirement: it
-    looks for the issuer's own masthead/brand name inside the *extracted*
-    text, never the uploaded filename and never personal data -- an
-    institution name is not PII. Anything that does not match a known
-    issuer signature falls back to the existing Itaú-shaped parser, so
-    every PDF this project already parses keeps working exactly as before.
+    looks for the issuer's own document-identity markers inside the
+    *extracted* text, never the uploaded filename and never personal data --
+    an institution name is not PII. A brand mention by itself is not enough
+    (see `_NUBANK_STRUCTURE`/`_MERCADO_PAGO_STRUCTURE` above); it must
+    co-occur with a layout marker that issuer's own document prints, never
+    a counterparty. Anything that does not match a known issuer signature
+    falls back to the existing Itaú-shaped parser, so every PDF this
+    project already parses keeps working exactly as before.
     """
 
     normalized = normalize_description(text)
-    if "NUBANK" in normalized or "NU PAGAMENTOS" in normalized:
+    if ("NUBANK" in normalized or "NU PAGAMENTOS" in normalized) and _NUBANK_STRUCTURE.search(text):
         return "nubank"
-    if "MERCADO PAGO" in normalized or "MERCADOPAGO" in normalized:
+    if (
+        "MERCADO PAGO" in normalized or "MERCADOPAGO" in normalized
+    ) and _MERCADO_PAGO_STRUCTURE.search(text):
         return "mercado_pago"
     return "itau"
 

@@ -126,6 +126,26 @@ def itau_bank_statement_pdf() -> bytes:
     return render_single_column_pdf(ITAU_BANK_STATEMENT_LINES)
 
 
+# Adversarial regression: real Itaú statement text (see PR #41 engineer
+# review) legitimately names other institutions as *counterparties* --
+# "PAG BOLETO NU PAGAMENTOS SA" (paying a Nubank-issued boleto) and
+# "PIX QRS MERCADO PAG..." (a Pix to/from a Mercado Pago-linked account) --
+# without the document being a Nubank or Mercado Pago PDF. `_detect_pdf_issuer`
+# must resolve this as Itaú (brand token alone is not enough; it also needs
+# one of that issuer's own document-identity/layout markers, absent here).
+ITAU_BANK_STATEMENT_WITH_CROSS_BRAND_COUNTERPARTIES_LINES = (
+    "SALDO ANTERIOR 1000,00",
+    "05/08/2026 PAG BOLETO NU PAGAMENTOS SA -1.724,90",
+    "06/08/2026 PIX QRS MERCADO PAG SILVA -50,00",
+    "07/08/2026 Deposito Salario 3000,00",
+    "SALDO FINAL EM 07/08/2026 2225,10",
+)
+
+
+def itau_bank_statement_pdf_with_cross_brand_counterparties() -> bytes:
+    return render_single_column_pdf(ITAU_BANK_STATEMENT_WITH_CROSS_BRAND_COUNTERPARTIES_LINES)
+
+
 # ---------------------------------------------------------------------------
 # Nubank -- fatura (credit card). Layout per the Work Order's "Nubank —
 # fatura PDF" section: header with "FATURA dd MMM yyyy", a
@@ -306,3 +326,38 @@ MERCADO_PAGO_BANK_STATEMENT_ZERO_MOVEMENT_LINES = (
 
 def mercado_pago_bank_statement_pdf_zero_movement() -> bytes:
     return render_single_column_pdf(MERCADO_PAGO_BANK_STATEMENT_ZERO_MOVEMENT_LINES)
+
+
+# ---------------------------------------------------------------------------
+# Reciprocal ambiguity: a genuine document from one issuer naming *another*
+# issuer as a counterparty must still resolve to its own, real identity --
+# document-identity/layout markers decide, never a brand mention alone.
+# ---------------------------------------------------------------------------
+
+MERCADO_PAGO_BANK_STATEMENT_MENTIONING_NUBANK_LINES = (
+    "Mercado Pago",
+    "EXTRATO DE CONTA",
+    "Periodo: De 01-02-2026 al 28-02-2026",
+    "Saldo inicial R$ 1.000,00",
+    "Saldo final R$ 950,00",
+    "Data Descricao ID da operacao Valor Saldo",
+    "05-02-2026 Pagamento fatura Nubank 111111 R$ -50,00 R$ 950,00",
+)
+
+
+def mercado_pago_bank_statement_pdf_mentioning_nubank() -> bytes:
+    return render_single_column_pdf(MERCADO_PAGO_BANK_STATEMENT_MENTIONING_NUBANK_LINES)
+
+
+NUBANK_CREDIT_CARD_MENTIONING_MERCADO_PAGO_LINES = (
+    "Nubank",
+    "FATURA 03 AGO 2026 EMISSAO E ENVIO 25 JUL 2026",
+    "RESUMO DA FATURA ATUAL",
+    "Total a pagar R$ 80,00",
+    "TRANSACOES DE 26 JUN A 25 JUL",
+    "24 JUN Pagamento Mercado Pago Loja R$ 80,00",
+)
+
+
+def nubank_credit_card_pdf_mentioning_mercado_pago() -> bytes:
+    return render_single_column_pdf(NUBANK_CREDIT_CARD_MENTIONING_MERCADO_PAGO_LINES)

@@ -80,6 +80,59 @@ def test_itau_bank_statement_pdf_unchanged_by_new_dispatch() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-brand counterparty regression (PR #41 engineer review, confirmed):
+# `_detect_pdf_issuer` scanning the whole document for a bare brand token
+# misrouted a real Itaú statement to the Nubank parser, because the real
+# statement behind this Work Order's baseline names Nubank/Mercado Pago as
+# *counterparties* ("PAG BOLETO NU PAGAMENTOS SA", "PIX QRS MERCADO PAG...").
+# Detection must require a document-identity/layout marker, not just the
+# brand token, before selecting a non-Itaú parser.
+# ---------------------------------------------------------------------------
+
+
+def test_itau_bank_statement_with_cross_brand_counterparties_stays_itau() -> None:
+    payload = fx.itau_bank_statement_pdf_with_cross_brand_counterparties()
+    assert _detect_pdf_issuer(_pdf_text(payload)) == "itau"
+
+    parsed = parse_document_contract("extrato.pdf", payload, "bank_statement")
+    assert parsed.parser_name == "bank_statement_pdf"
+    descriptions = [t.description for t in parsed.transactions]
+    assert descriptions == [
+        "PAG BOLETO NU PAGAMENTOS SA",
+        "PIX QRS MERCADO PAG SILVA",
+        "Deposito Salario",
+    ]
+
+    result = reconcile_parsed_document(parsed)
+    assert result.status == "reconciled"
+    assert result.difference == Decimal("0.00")
+
+
+def test_mercado_pago_statement_mentioning_nubank_counterparty_stays_mercado_pago() -> None:
+    payload = fx.mercado_pago_bank_statement_pdf_mentioning_nubank()
+    assert _detect_pdf_issuer(_pdf_text(payload)) == "mercado_pago"
+
+    parsed = parse_document_contract("extrato.pdf", payload, "bank_statement")
+    assert parsed.parser_name == "mercado_pago_bank_statement_pdf"
+    by_desc = {t.description: t for t in parsed.transactions}
+    assert by_desc["Pagamento fatura Nubank"].amount == Decimal("-50.00")
+
+    result = reconcile_parsed_document(parsed)
+    assert result.status == "reconciled"
+    assert result.difference == Decimal("0.00")
+
+
+def test_nubank_fatura_mentioning_mercado_pago_counterparty_stays_nubank() -> None:
+    payload = fx.nubank_credit_card_pdf_mentioning_mercado_pago()
+    assert _detect_pdf_issuer(_pdf_text(payload)) == "nubank"
+
+    parsed = parse_document_contract("fatura.pdf", payload, "credit_card")
+    assert parsed.parser_name == "nubank_credit_card_pdf"
+    by_desc = {t.description: t for t in parsed.transactions}
+    assert by_desc["Pagamento Mercado Pago Loja"].amount == Decimal("-80.00")
+
+
+# ---------------------------------------------------------------------------
 # Nubank -- fatura (credit card)
 # ---------------------------------------------------------------------------
 
