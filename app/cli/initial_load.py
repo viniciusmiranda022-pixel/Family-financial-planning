@@ -1,9 +1,9 @@
-"""Safe, local-only bootstrap for a clean household database.
+"""Safe local bootstrap for a clean household database.
 
-The manifest contains operator-confirmed facts and file paths. Real manifests live
-under ``data/`` (gitignored). Financial documents are always applied through the
-same ``/api/imports`` implementation used by the UI so parsing, reconciliation,
-duplicate discovery, classification, encryption and audit do not drift.
+Real manifests and documents stay outside Git. Financial documents are applied
+through the exact `/api/imports` implementation used by the UI so parsing,
+classification, duplicate discovery, reconciliation, encryption and audit do
+not acquire a second source of truth.
 """
 
 from __future__ import annotations
@@ -34,11 +34,7 @@ from app.models import (
     Obligation,
     User,
 )
-from app.services.importer import (
-    file_sha256,
-    parse_document_contract,
-    parse_payroll_document,
-)
+from app.services.importer import file_sha256, parse_document_contract, parse_payroll_document
 from app.services.plan_workbook import select_household
 from app.services.reconciliation import reconcile_parsed_document
 
@@ -92,7 +88,7 @@ class DocumentSeed(StrictModel):
     account: str | None = Field(default=None, max_length=80)
 
     @model_validator(mode="after")
-    def validate_account_reference(self) -> "DocumentSeed":
+    def validate_account_reference(self) -> DocumentSeed:
         if self.document_type != "payroll" and not self.account:
             raise ValueError("Extratos e faturas exigem a chave da conta")
         if self.document_type == "payroll" and self.account:
@@ -110,7 +106,7 @@ class InitialLoadManifest(StrictModel):
     documents: list[DocumentSeed] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_references(self) -> "InitialLoadManifest":
+    def validate_references(self) -> InitialLoadManifest:
         keys = [item.key for item in self.accounts]
         if len(keys) != len(set(keys)):
             raise ValueError("Chaves de conta duplicadas no manifesto")
@@ -141,14 +137,12 @@ PROFILE_FIELDS = (
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Carrega estrutura e documentos históricos locais sem duplicar fatos financeiros."
-        )
+        description="Carrega estrutura e documentos históricos locais sem duplicar fatos financeiros."
     )
-    parser.add_argument("manifest", type=Path, help="Manifesto JSON local (recomendado: data/)")
+    parser.add_argument("manifest", type=Path, help="Manifesto JSON local")
     parser.add_argument("--household", help="Nome exato da família quando houver mais de uma")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--dry-run", action="store_true", help="Valida e mostra a prévia sem gravar")
+    mode.add_argument("--dry-run", action="store_true", help="Valida e mostra prévia sem gravar")
     mode.add_argument("--apply", action="store_true", help="Aplica a carga confirmada")
     return parser.parse_args()
 
@@ -250,8 +244,7 @@ def _resolve_accounts(
         if existing:
             if _account_state(existing) != _account_state(seed):
                 raise ValueError(
-                    f"Conflito na conta '{seed.name}': o manifesto não pode sobrescrever "
-                    "metadados existentes silenciosamente"
+                    f"Conflito na conta '{seed.name}': metadados existentes não serão sobrescritos"
                 )
             resolved[seed.key] = existing
             stats["skipped"] += 1
@@ -316,7 +309,7 @@ def _apply_profile(
             db.flush()
     changes = _profile_changes(profile, manifest.profile)
     if not apply:
-        return {"created": created, "changes": {key: str(value) for key, value in changes.items()}}
+        return {"created": created, "changes": {k: str(v) for k, v in changes.items()}}
     if not changes and not created:
         return {"created": False, "changes": {}}
     before = {key: str(getattr(profile, key)) for key in changes}
@@ -366,8 +359,7 @@ def _apply_obligations(
             actual = {key: getattr(existing, key) for key in expected}
             if actual != expected:
                 raise ValueError(
-                    f"Conflito na obrigação '{seed.name}' em {seed.due_date}: "
-                    "a carga não altera compromisso existente silenciosamente"
+                    f"Conflito na obrigação '{seed.name}' em {seed.due_date}: não será alterada"
                 )
             stats["skipped"] += 1
             continue
@@ -434,8 +426,8 @@ def _apply_balances(
         if existing:
             if Decimal(existing.amount) != seed.amount:
                 raise ValueError(
-                    f"Conflito de saldo para '{account.name}' em {seed.as_of_date}: "
-                    "use o fluxo explícito de correção/supersessão de saldo"
+                    f"Conflito de saldo para '{account.name}' em {seed.as_of_date}; "
+                    "use o fluxo explícito de supersessão"
                 )
             stats["skipped"] += 1
             continue
@@ -486,7 +478,7 @@ def _preview_documents(
         path = _document_path(manifest_path, seed)
         payload = path.read_bytes()
         digest = file_sha256(payload)
-        already_imported = db.scalar(
+        existing = db.scalar(
             select(Document.id).where(
                 Document.household_id == household_id,
                 Document.sha256 == digest,
@@ -495,10 +487,10 @@ def _preview_documents(
         item: dict[str, object] = {
             "file": path.name,
             "document_type": seed.document_type,
-            "status": "skipped_existing" if already_imported else "ready",
+            "status": "skipped_existing" if existing else "ready",
             "records": 0,
         }
-        if already_imported:
+        if existing:
             report.append(item)
             continue
         try:
@@ -552,6 +544,7 @@ async def _apply_documents(
             )
         except HTTPException as exc:
             if exc.status_code == 409 and exc.detail == "Este arquivo já foi importado":
+                db.rollback()
                 report.append(
                     {
                         "file": path.name,
@@ -560,7 +553,6 @@ async def _apply_documents(
                         "records": 0,
                     }
                 )
-                db.rollback()
                 continue
             raise
         finally:
@@ -578,6 +570,7 @@ def _summary(
     balances: dict[str, int],
     documents: list[dict[str, object]],
 ) -> dict[str, object]:
+    review_statuses = {"review_required", "ready_with_review", "imported_with_review"}
     return {
         "mode": mode,
         "load_id": manifest.load_id,
@@ -588,10 +581,7 @@ def _summary(
         "documents": documents,
         "document_counts": {
             "total": len(documents),
-            "review_required": sum(
-                item.get("status") in {"review_required", "ready_with_review", "imported_with_review"}
-                for item in documents
-            ),
+            "review_required": sum(item.get("status") in review_statuses for item in documents),
             "skipped_existing": sum(item.get("status") == "skipped_existing" for item in documents),
         },
     }
@@ -604,47 +594,31 @@ def main() -> int:
         with SessionLocal() as db:
             household = select_household(db, args.household)
             user = _admin_user(db, household.id)
-            resolved_accounts, account_stats = _resolve_accounts(
-                db,
-                household.id,
-                manifest,
-                apply=args.apply,
-                user_id=user.id,
+            accounts, account_stats = _resolve_accounts(
+                db, household.id, manifest, apply=args.apply, user_id=user.id
             )
             profile_stats = _apply_profile(
-                db,
-                household.id,
-                manifest,
-                apply=args.apply,
-                user_id=user.id,
+                db, household.id, manifest, apply=args.apply, user_id=user.id
             )
             obligation_stats = _apply_obligations(
-                db,
-                household.id,
-                manifest,
-                apply=args.apply,
-                user_id=user.id,
+                db, household.id, manifest, apply=args.apply, user_id=user.id
             )
             balance_stats = _apply_balances(
                 db,
                 household.id,
                 manifest,
-                resolved_accounts,
+                accounts,
                 apply=args.apply,
                 user_id=user.id,
             )
-
             if args.apply:
                 db.commit()
-                documents = asyncio.run(
-                    _apply_documents(db, args.manifest, manifest, resolved_accounts, user)
-                )
+                documents = asyncio.run(_apply_documents(db, args.manifest, manifest, accounts, user))
                 mode = "apply"
             else:
                 documents = _preview_documents(db, household.id, args.manifest, manifest)
                 db.rollback()
                 mode = "dry-run"
-
             print(
                 json.dumps(
                     _summary(
