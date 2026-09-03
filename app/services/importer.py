@@ -249,24 +249,18 @@ _MERCADO_PAGO_STRUCTURE = re.compile(
 # transaction-row shape generic enough that an unrelated document could
 # produce it by accident.
 #
-# Evidence caveat: unlike Nubank/MP, this Work Order's "Evidência de layout
-# observada" section documents no real Itaú masthead text -- Itaú was
-# already passing before this Work Order and was never diagnosed against a
-# real document here. Real financial PDFs are gitignored and out of scope to
-# add, so the markers below are not lifted from a transcribed real document;
-# they are the balance/emission vocabulary this module already relies on to
-# extract Itaú's own opening/closing balance and reference date
-# (`_statement_declared_fields`'s "SALDO ANTERIOR"/"SALDO DO DIA"/"SALDO
-# FINAL", `_reference_date`'s "EMISSÃO:") and that the Work Order's own
-# Nubank/Mercado Pago evidence shows those issuers phrase differently
-# ("Saldo inicial"/"Saldo final do período" for Nubank, "Saldo inicial"/
-# "Saldo final" for Mercado Pago -- never "SALDO ANTERIOR", "SALDO DO DIA" or
-# a standalone "EMISSAO:" label; Mercado Pago's invoice header is
-# "Vencimento:", not "Emissão:"). This turns an already-load-bearing
-# precondition into an explicit identity check instead of inventing a new
-# one, but it has not been verified against the real production PDFs the
-# way Nubank/MP were -- flagged for the engineer to confirm or correct
-# against the actual masthead text if it differs from this inference.
+# PR #41 engineer review (head `e42a470`), second round: the first
+# correction above (`_ITAU_STRUCTURE` alone) is still not an identity
+# signature -- "SALDO ANTERIOR"/"SALDO DO DIA"/"SALDO FINAL EM"/"EMISSAO:"
+# are generic Portuguese banking/document labels that an unrelated
+# institution's statement could print too, so a third-party PDF containing
+# only that vocabulary was still silently routed to Itaú. The engineer
+# separately confirmed against the real supported Itaú statement (kept out
+# of Git) that it also carries explicit Itaú brand identity ("Itaú"/
+# "itau.com.br") alongside this balance vocabulary. Detection now requires
+# both, exactly the same "brand token + own layout marker" combination
+# already used for Nubank/Mercado Pago above -- a bare "SALDO DO DIA" is
+# structure, not identity, and must not be enough by itself.
 _ITAU_STRUCTURE = re.compile(
     r"SALDO\s+ANTERIOR|SALDO\s+DO\s+DIA|SALDO\s+FINAL\s+EM|EMISS[ÃA]O\s*:",
     re.IGNORECASE,
@@ -282,9 +276,10 @@ def _detect_pdf_issuer(text: str) -> str:
     an institution name is not PII. A brand mention by itself is not enough
     (see `_NUBANK_STRUCTURE`/`_MERCADO_PAGO_STRUCTURE` above); it must
     co-occur with a layout marker that issuer's own document prints, never
-    a counterparty. Itaú is likewise positively identified via its own
-    balance/emission vocabulary (`_ITAU_STRUCTURE`), not treated as the
-    unconditional fallback. Anything matching none of the three known
+    a counterparty. Itaú requires the identical combination -- its own brand
+    token ("Itaú") *and* its balance/emission vocabulary (`_ITAU_STRUCTURE`)
+    -- rather than being treated as the unconditional fallback or accepted on
+    generic vocabulary alone. Anything matching none of the three known
     signatures is `"unknown"`: the caller must reject it for review rather
     than guess, so an unsupported or ambiguous PDF can never be silently
     ingested as if it were a supported issuer.
@@ -297,7 +292,7 @@ def _detect_pdf_issuer(text: str) -> str:
         "MERCADO PAGO" in normalized or "MERCADOPAGO" in normalized
     ) and _MERCADO_PAGO_STRUCTURE.search(text):
         return "mercado_pago"
-    if _ITAU_STRUCTURE.search(text):
+    if "ITAU" in normalized and _ITAU_STRUCTURE.search(text):
         return "itau"
     return "unknown"
 

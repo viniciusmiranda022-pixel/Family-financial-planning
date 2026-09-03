@@ -92,6 +92,7 @@ def render_two_column_pdf(left_lines: Sequence[str], right_lines: Sequence[str])
 # ---------------------------------------------------------------------------
 
 ITAU_CREDIT_CARD_LEFT = (
+    "Itau Unibanco S.A.",
     "EMISSAO: 10/08/2026",
     "SALDO ANTERIOR R$ 500,00",
     "TOTAL A PAGAR R$ 400,00",
@@ -113,6 +114,7 @@ def itau_credit_card_pdf() -> bytes:
 
 
 ITAU_BANK_STATEMENT_LINES = (
+    "Itau Unibanco S.A. - www.itau.com.br",
     "SALDO ANTERIOR 1000,00",
     "05/08/2026 Deposito Salario 3000,00",
     "06/08/2026 Pagamento Boleto -200,00",
@@ -134,6 +136,7 @@ def itau_bank_statement_pdf() -> bytes:
 # must resolve this as Itaú (brand token alone is not enough; it also needs
 # one of that issuer's own document-identity/layout markers, absent here).
 ITAU_BANK_STATEMENT_WITH_CROSS_BRAND_COUNTERPARTIES_LINES = (
+    "Itau Unibanco S.A. - www.itau.com.br",
     "SALDO ANTERIOR 1000,00",
     "05/08/2026 PAG BOLETO NU PAGAMENTOS SA -1.724,90",
     "06/08/2026 PIX QRS MERCADO PAG SILVA -50,00",
@@ -397,6 +400,27 @@ UNSUPPORTED_BANK_STATEMENT_LINES = (
 
 def unsupported_issuer_bank_statement_pdf() -> bytes:
     return render_single_column_pdf(UNSUPPORTED_BANK_STATEMENT_LINES)
+
+
+# PR #41 engineer review (head `e42a470`), second round: requiring
+# `_ITAU_STRUCTURE` alone let an unrelated institution's statement be
+# accepted as Itaú just because it happened to print the same generic
+# Portuguese balance/emission vocabulary ("SALDO ANTERIOR"/"SALDO DO DIA").
+# This fixture reproduces exactly that: an Itaú-shaped transaction row *and*
+# that vocabulary, but no Itaú brand identity anywhere -- `_detect_pdf_issuer`
+# must still resolve `"unknown"` rather than silently misattributing an
+# unsupported document to a supported issuer.
+UNSUPPORTED_BANK_STATEMENT_WITH_ITAU_STRUCTURE_VOCABULARY_LINES = (
+    "Banco Delta",
+    "Extrato mensal",
+    "SALDO ANTERIOR 1000,00",
+    "05/08/2026 Compra Loja Delta -120,00",
+    "06/08/2026 SALDO DO DIA 06/08/2026 880,00",
+)
+
+
+def unsupported_issuer_bank_statement_pdf_with_itau_structure_vocabulary() -> bytes:
+    return render_single_column_pdf(UNSUPPORTED_BANK_STATEMENT_WITH_ITAU_STRUCTURE_VOCABULARY_LINES)
 
 
 UNSUPPORTED_CREDIT_CARD_LINES = (

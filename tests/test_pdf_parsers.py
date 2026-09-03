@@ -158,6 +158,20 @@ def test_unsupported_issuer_credit_card_is_not_guessed_as_itau() -> None:
         parse_document_contract("fatura.pdf", payload, "credit_card")
 
 
+def test_unsupported_issuer_with_itau_vocabulary_but_no_itau_identity_is_unknown() -> None:
+    # PR #41 engineer review (head `e42a470`), second round: `_ITAU_STRUCTURE`
+    # ("SALDO ANTERIOR"/"SALDO DO DIA"/"SALDO FINAL EM"/"EMISSAO:") is generic
+    # Portuguese banking vocabulary, not Itaú identity -- an unrelated
+    # institution's statement that happens to print the same labels, and an
+    # Itaú-shaped transaction row, must still be rejected as unknown rather
+    # than silently accepted as Itaú.
+    payload = fx.unsupported_issuer_bank_statement_pdf_with_itau_structure_vocabulary()
+    assert _detect_pdf_issuer(_pdf_text(payload)) == "unknown"
+
+    with pytest.raises(ValueError, match="não identificado"):
+        parse_document_contract("extrato.pdf", payload, "bank_statement")
+
+
 # ---------------------------------------------------------------------------
 # Nubank -- fatura (credit card)
 # ---------------------------------------------------------------------------
