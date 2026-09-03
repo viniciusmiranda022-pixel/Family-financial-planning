@@ -21,9 +21,11 @@ from app.cli.initial_load import (  # noqa: E402
     _apply_documents,
     _apply_obligations,
     _apply_profile,
+    _document_path,
     _lock_household_initial_load,
     _preview_documents,
     _resolve_accounts,
+    _sanitize_validation_error,
     _summary,
     load_manifest,
 )
@@ -317,7 +319,7 @@ def test_conflicts_block_instead_of_overwriting() -> None:
 
         conflicting_account = manifest.model_copy(deep=True)
         conflicting_account.accounts[0].institution = "Outro Banco"
-        with pytest.raises(ValueError, match="Conflito na conta"):
+        with pytest.raises(ValueError, match="Conflito na conta") as account_exc:
             _resolve_accounts(
                 db,
                 household.id,
@@ -325,11 +327,15 @@ def test_conflicts_block_instead_of_overwriting() -> None:
                 apply=True,
                 user_id=user.id,
             )
+        # stdout privacy contract: identify by the manifest `key` (a
+        # restricted slug), never the free-text account `name`.
+        assert manifest.accounts[0].key in str(account_exc.value)
+        assert manifest.accounts[0].name not in str(account_exc.value)
         db.rollback()
 
         conflicting_obligation = manifest.model_copy(deep=True)
         conflicting_obligation.obligations[0].amount = Decimal("1600.00")
-        with pytest.raises(ValueError, match="Conflito na obrigação"):
+        with pytest.raises(ValueError, match="Conflito na obrigação") as obligation_exc:
             _apply_obligations(
                 db,
                 household.id,
@@ -337,11 +343,12 @@ def test_conflicts_block_instead_of_overwriting() -> None:
                 apply=True,
                 user_id=user.id,
             )
+        assert manifest.obligations[0].name not in str(obligation_exc.value)
         db.rollback()
 
         conflicting_balance = manifest.model_copy(deep=True)
         conflicting_balance.balances[0].amount = Decimal("999.00")
-        with pytest.raises(ValueError, match="Conflito de saldo"):
+        with pytest.raises(ValueError, match="Conflito de saldo") as balance_exc:
             _apply_balances(
                 db,
                 household.id,
@@ -350,6 +357,8 @@ def test_conflicts_block_instead_of_overwriting() -> None:
                 apply=True,
                 user_id=user.id,
             )
+        assert manifest.balances[0].account in str(balance_exc.value)
+        assert manifest.accounts[0].name not in str(balance_exc.value)
 
 
 def test_apply_documents_delegates_to_official_import_pipeline(tmp_path, monkeypatch) -> None:
@@ -632,3 +641,105 @@ def test_apply_documents_resumes_only_remaining_after_partial_run(tmp_path, monk
             assert db.scalar(select(func.count(Document.id))) == 2
     finally:
         get_settings.cache_clear()
+
+
+def test_manifest_validation_error_never_leaks_input_value(tmp_path) -> None:
+    """Work Order `docs/WORK_ORDER_INITIAL_LOAD_BOOTSTRAP.md` ("Segurança e
+    privacidade") covers the manifest-rejection path too: Pydantic's default
+    `str(ValidationError)` appends `input_value=...`, so an invalid salary in
+    the manifest would otherwise reappear verbatim on stdout via `main()`'s
+    `except (ValueError, HTTPException)` handler. `load_manifest` must report
+    which field failed without echoing the value itself."""
+    sentinel = "-918273.45"
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "load_id": "privacy-validation-error",
+                "accounts": [],
+                "profile": {"monthly_salary_net": sentinel},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        load_manifest(path)
+
+    message = str(exc_info.value)
+    assert sentinel not in message
+    assert "monthly_salary_net" in message
+
+
+def test_sanitize_validation_error_strips_input_value_by_construction() -> None:
+    """Unit-level companion to the test above: proves the helper itself
+    drops Pydantic's `input_value=...`/`input_type=...` suffix for a
+    directly constructed `ValidationError`, independent of `load_manifest`'s
+    plumbing."""
+    from pydantic import ValidationError
+
+    sentinel = Decimal("-42.42")
+    try:
+        ProfileSeed(monthly_salary_net=sentinel)
+    except ValidationError as exc:
+        message = _sanitize_validation_error(exc)
+    else:
+        pytest.fail("expected ProfileSeed to reject a negative salary")
+
+    assert str(sentinel) not in message
+    assert "input_value" not in message
+    assert "monthly_salary_net" in message
+
+
+def test_document_not_found_error_reports_file_name_only(tmp_path) -> None:
+    """The Work Order's stdout contract allows file names, not local
+    directory structure -- a resolved absolute path can embed the
+    operator's home directory or a real household/document folder name
+    chosen outside Git."""
+    nested = tmp_path / "real-household-name" / "extrato.csv"
+    manifest_path = tmp_path / "manifest.json"
+    seed = DocumentSeed(path=str(nested), document_type="bank_statement", account="bank")
+
+    with pytest.raises(ValueError) as exc_info:
+        _document_path(manifest_path, seed)
+
+    message = str(exc_info.value)
+    assert "extrato.csv" in message
+    assert "real-household-name" not in message
+    assert str(nested.parent) not in message
+
+
+def test_preview_parse_failure_never_leaks_document_fragment(tmp_path) -> None:
+    """`_preview_documents` must not forward `str(exc)` from the parser:
+    `parse_decimal`/`parse_date`/the payroll month lookup all build their
+    message from the document's own content (see
+    `app/services/importer.py`), so doing so would put a fragment of a real
+    financial document on stdout in exactly the path meant to report
+    `status`/`records`, violating the same stdout contract as the profile
+    values fix."""
+    with Session(_engine()) as db:
+        household, _user = _seed_household(db)
+
+        sentinel = "SENTINEL-99.99.99"
+        (tmp_path / "statement.csv").write_text(
+            f"data,descricao,valor\n2026-09-01,Compra teste,{sentinel}\n", encoding="utf-8"
+        )
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        manifest = InitialLoadManifest(
+            version=1,
+            load_id="preview-parse-failure",
+            accounts=[AccountSeed(key="bank", name="Conta Teste")],
+            documents=[
+                DocumentSeed(path="statement.csv", document_type="bank_statement", account="bank")
+            ],
+        )
+
+        report = _preview_documents(db, household.id, manifest_path, manifest)
+
+        assert len(report) == 1
+        assert report[0]["status"] == "review_required"
+        assert report[0]["message"] == "parse_failed"
+        report_json = json.dumps(report, ensure_ascii=False, default=str)
+        assert sentinel not in report_json

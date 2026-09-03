@@ -153,6 +153,29 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _sanitize_validation_error(exc: ValidationError) -> str:
+    """Render a manifest `ValidationError` without echoing the offending value.
+
+    Pydantic's default `str(ValidationError)` appends `input_value=...` to
+    every error line -- for `ProfileSeed`/`BalanceSeed`/`ObligationSeed`
+    fields that is the literal salary, cap, balance or amount the operator
+    typed into the manifest. Printing that on the exact path meant to signal
+    "this value is invalid" would violate the Work Order's stdout contract
+    (`docs/WORK_ORDER_INITIAL_LOAD_BOOTSTRAP.md`, "Segurança e privacidade":
+    only file names, status and counts). `errors(include_input=False, ...)`
+    keeps `loc` (which field) and `msg` (why) -- both of which are either
+    Pydantic's own generic constraint text or this module's own
+    hand-written validator messages (`InitialLoadManifest.validate_references`
+    etc.), none of which interpolate raw manifest values, only manifest-local
+    account keys the operator chose as safe-to-print identifiers.
+    """
+    details = []
+    for error in exc.errors(include_url=False, include_context=False, include_input=False):
+        field = ".".join(str(part) for part in error["loc"])
+        details.append(f"{field}: {error['msg']}" if field else error["msg"])
+    return "Manifesto inválido — " + "; ".join(details)
+
+
 def load_manifest(path: Path) -> InitialLoadManifest:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -163,7 +186,7 @@ def load_manifest(path: Path) -> InitialLoadManifest:
     try:
         return InitialLoadManifest.model_validate(raw)
     except ValidationError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ValueError(_sanitize_validation_error(exc)) from exc
 
 
 def _document_path(manifest_path: Path, item: DocumentSeed) -> Path:
@@ -172,7 +195,11 @@ def _document_path(manifest_path: Path, item: DocumentSeed) -> Path:
         candidate = manifest_path.parent / candidate
     candidate = candidate.resolve()
     if not candidate.is_file():
-        raise ValueError(f"Documento não encontrado: {candidate}")
+        # File name only, never the resolved absolute path: the Work Order's
+        # stdout contract permits "nomes de arquivo", not local directory
+        # structure (which can embed the operator's home directory or a
+        # real household/document taxonomy chosen outside Git).
+        raise ValueError(f"Documento não encontrado: {candidate.name}")
     return candidate
 
 
@@ -290,8 +317,13 @@ def _resolve_accounts(
         )
         if existing:
             if _account_state(existing) != _account_state(seed):
+                # Identify the conflicting entry by its manifest `key`
+                # (operator-chosen slug, restricted to `[a-zA-Z0-9._-]`), not
+                # by the free-text `name` -- the latter can carry a real
+                # institution/owner label the stdout privacy contract does
+                # not allow past "file names, status and counts".
                 raise ValueError(
-                    f"Conflito na conta '{seed.name}': metadados existentes não serão sobrescritos"
+                    f"Conflito na conta '{seed.key}': metadados existentes não serão sobrescritos"
                 )
             resolved[seed.key] = existing
             stats["skipped"] += 1
@@ -401,7 +433,7 @@ def _apply_obligations(
     user_id: str,
 ) -> dict[str, int]:
     stats = {"created": 0, "skipped": 0}
-    for seed in manifest.obligations:
+    for index, seed in enumerate(manifest.obligations):
         existing = db.scalar(
             select(Obligation).where(
                 Obligation.household_id == household_id,
@@ -419,8 +451,13 @@ def _apply_obligations(
         if existing:
             actual = {key: getattr(existing, key) for key in expected}
             if actual != expected:
+                # Positional reference into `manifest.obligations`, not the
+                # free-text `name` -- unlike accounts, obligations have no
+                # manifest-local slug the operator marked safe to print, and
+                # `name` (e.g. "Consignado ..." or a real payee) is exactly
+                # the kind of label the stdout privacy contract excludes.
                 raise ValueError(
-                    f"Conflito na obrigação '{seed.name}' em {seed.due_date}: não será alterada"
+                    f"Conflito na obrigação #{index} em {seed.due_date}: não será alterada"
                 )
             stats["skipped"] += 1
             continue
@@ -497,8 +534,14 @@ def _apply_balances(
                 and Decimal(existing.amount) == seed.amount
             )
             if not is_equivalent_seed:
+                # `seed.account` (manifest key) instead of `account.name`:
+                # the account's free-text name/institution label is not
+                # covered by the stdout privacy contract's "file names,
+                # status and counts" allowance. `source`/`confidence` are
+                # this system's own provenance classification, not financial
+                # content, so they stay to make the conflict actionable.
                 raise ValueError(
-                    f"Conflito de saldo para '{account.name}' em {seed.as_of_date}: já existe "
+                    f"Conflito de saldo para '{seed.account}' em {seed.as_of_date}: já existe "
                     f"observação ativa (source={existing.source}, confidence={existing.confidence}) "
                     "que não corresponde à confirmação manual exigida pela carga inicial; "
                     "use o fluxo explícito de supersessão"
@@ -593,9 +636,18 @@ def _preview_documents(
                 "Duplicidade e classificação só são avaliadas durante --apply, "
                 "pelo pipeline oficial de importação."
             )
-        except ValueError as exc:
+        except ValueError:
+            # A stable, non-sensitive code -- never `str(exc)`. Parser
+            # exceptions build their message from the document itself (e.g.
+            # `parse_decimal`: "Valor monetário inválido: {value}",
+            # `parse_date`: "Data inválida: {value}", payroll month lookup:
+            # "Mês não reconhecido no holerite: {month_name}"), so echoing
+            # them here would put a document fragment on stdout in exactly
+            # the preview path the Work Order restricts to file names,
+            # status and counts. The operator has the real file locally to
+            # investigate further; this only needs to say parsing failed.
             item["status"] = "review_required"
-            item["message"] = str(exc)
+            item["message"] = "parse_failed"
         report.append(item)
     return report
 
