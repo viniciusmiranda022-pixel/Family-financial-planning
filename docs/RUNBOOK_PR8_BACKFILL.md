@@ -70,10 +70,13 @@ execução em dry-run (gravado à parte, para preservar a evidência de que o
 dry-run aconteceu e o que ele reportou).
 
 Revise a saída: quantos documentos ficariam `unknown`, quantas transações
-seriam reclassificadas, quantos findings abertos restariam por família.
-Divergência inesperada (por exemplo, um número de duplicidades muito maior
-do que o esperado) é motivo para investigar antes de rodar de verdade, não
-para prosseguir.
+seriam examinadas para duplicidade (evidência derivada em
+`duplicate_groups`/`duplicate_group_members` -- o backfill nunca aplica essa
+classificação à própria `Transaction`, ver `docs/FINANCIAL_RULES.md` seção
+"Backfill"), quantos findings abertos restariam por família. Divergência
+inesperada (por exemplo, um número de duplicidades muito maior do que o
+esperado) é motivo para investigar antes de rodar de verdade, não para
+prosseguir.
 
 ### 3.2 Execução real
 
@@ -112,11 +115,14 @@ seguidas e comparando o estado resultante.
 
 ### 3.4 Concorrência
 
-`register_transaction_duplicates`, `execute_integrity_run`/`_persist_finding`
-e `build_snapshot` já usam `SELECT ... FOR UPDATE`/savepoints para tolerar
-duas execuções concorrentes sobre a mesma família (ver os docstrings dessas
-funções em `app/services/`). O backfill não introduz um novo mecanismo de
-concorrência -- herda as mesmas garantias que o fluxo de importação/API já
+`discover_transaction_duplicates`/`register_transaction_duplicates`,
+`execute_integrity_run`/`_persist_finding` e `build_snapshot` já toleram
+duas execuções concorrentes sobre a mesma família -- por idempotência
+determinística (`group_key` único por `household_id`, checksum de
+snapshot) e, onde a linha já existe, `SELECT ... FOR UPDATE`/savepoints
+(ver os docstrings dessas funções em `app/services/`). O backfill não
+introduz um novo mecanismo de concorrência -- herda as mesmas garantias
+que o fluxo de importação/API já
 usa em produção.
 
 ## 4. Observabilidade

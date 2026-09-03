@@ -98,15 +98,22 @@ para merge -- ver `docs/INTEGRITY_IMPLEMENTATION_PLAN.md` seções 17-18.
 
 Reprocessa famílias já existentes contra o Financial Integrity Engine sem reimplementar nenhuma
 regra financeira própria: reutiliza `unknown_reconciliation`/`persist_reconciliation`,
-`register_transaction_duplicates`, `build_snapshot` e `execute_integrity_run` -- os mesmos serviços
-que o fluxo de importação já usa. Documentos sem reconciliação recebem um registro `unknown`
-explícito (nunca um total declarado/reconstruído fabricado); transações sem grupo de duplicidade são
-classificadas pela mesma regra determinística do fluxo ao vivo; cada competência tem seus achados de
+`discover_transaction_duplicates`, `build_snapshot` e `execute_integrity_run` -- serviços que
+compartilham a mesma regra determinística que o fluxo de importação já usa. Documentos sem
+reconciliação recebem um registro `unknown` explícito (nunca um total declarado/reconstruído
+fabricado); transações ainda não examinadas por nenhum passe de duplicidade têm evidência derivada
+(`DuplicateGroup`/`DuplicateGroupMember`) criada pela mesma regra determinística do fluxo ao vivo, mas
+sem aplicar a classificação à própria `Transaction` (ver abaixo); cada competência tem seus achados de
 integridade avaliados antes do snapshot correspondente ser construído (ordem necessária para
 convergência -- ver o docstring de `_backfill_snapshots_and_period_integrity`). Nunca escreve em
-`Transaction`, `Document`, `PayrollRecord`, `Commission` ou `Obligation`; nunca fabrica uma
-`AccountBalanceObservation` ou data efetiva para um saldo legado -- o fallback já existente de
-`build_snapshot` mantém essa evidência `unknown`/não confiável. Idempotente e retomável por
+`Transaction`, `Document`, `PayrollRecord`, `Commission` ou `Obligation` -- nem mesmo nas colunas de
+classificação de duplicidade (`canonical_status`/`possible_duplicate`/`excluded`/
+`duplicate_group_id`): aplicar essa classificação a uma transação já publicada continua sendo uma
+decisão humana (`resolve_duplicate_group`) ou efeito de uma transação genuinamente nova no fluxo ao
+vivo (`register_transaction_duplicates`), nunca um efeito colateral automático do backfill. Nunca
+fabrica uma `AccountBalanceObservation` ou data efetiva para um saldo legado -- o fallback já
+existente de `build_snapshot` mantém essa evidência `unknown`/não confiável. Idempotente e retomável
+por
 construção (cada passo é um no-op sobre dado inalterado ou fica restrito às linhas que ainda
 precisam dele), não por um checkpoint de retomada separado. `--dry-run` executa o mesmo caminho de
 código e reverte a transação em vez de persistir; o manifesto `BackfillRun` da execução em dry-run é

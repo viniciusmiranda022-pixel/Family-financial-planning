@@ -147,10 +147,14 @@
 
 - `app.cli.backfill` reprocessa famílias já cadastradas reutilizando os mesmos serviços
   determinísticos do fluxo de importação/API; nunca reimplementa uma regra financeira própria.
-- Nunca escreve em `Transaction`, `Document`, `PayrollRecord`, `Commission` ou `Obligation`. As
-  únicas colunas de `Transaction` que pode alterar são as de classificação de duplicidade
-  (`canonical_status`, `possible_duplicate`, `excluded`, `duplicate_group_id`), e somente através da
-  mesma função que o fluxo ao vivo já usa para isso.
+- Nunca escreve em `Transaction`, `Document`, `PayrollRecord`, `Commission` ou `Obligation` -- nem
+  mesmo nas colunas de classificação de duplicidade (`canonical_status`, `possible_duplicate`,
+  `excluded`, `duplicate_group_id`). Duplicidade legada é reportada como evidência derivada
+  (`DuplicateGroup`/`DuplicateGroupMember`, via `discover_transaction_duplicates`), imediatamente
+  visível em `GET /duplicate-groups`; aplicar essa classificação a uma transação já publicada
+  continua sendo uma decisão humana explícita (`resolve_duplicate_group`) ou um efeito de uma
+  transação genuinamente nova chegando pelo fluxo ao vivo (`register_transaction_duplicates`), nunca
+  um efeito colateral automático do reprocessamento histórico.
 - Documento sem reconciliação prévia recebe um registro `unknown` explícito, nunca um total
   declarado/reconstruído fabricado -- a evidência de parsing original não é retida após a importação.
 - Saldo legado sem `AccountBalanceObservation` confiável permanece `unknown`/não confiado; o backfill
