@@ -710,6 +710,23 @@ def test_document_not_found_error_reports_file_name_only(tmp_path) -> None:
     assert str(nested.parent) not in message
 
 
+def test_manifest_not_found_error_reports_file_name_only(tmp_path) -> None:
+    """Same stdout contract as `_document_path`: a missing manifest path is
+    exactly what the operator passed on the command line, which can be
+    absolute and embed the operator's home directory or a real
+    household/document folder name chosen outside Git. `load_manifest` must
+    report only the manifest's file name, never the full path."""
+    missing = tmp_path / "real-household-name" / "manifest.json"
+
+    with pytest.raises(ValueError) as exc_info:
+        load_manifest(missing)
+
+    message = str(exc_info.value)
+    assert "manifest.json" in message
+    assert "real-household-name" not in message
+    assert str(missing.parent) not in message
+
+
 def test_preview_parse_failure_never_leaks_document_fragment(tmp_path) -> None:
     """`_preview_documents` must not forward `str(exc)` from the parser:
     `parse_decimal`/`parse_date`/the payroll month lookup all build their

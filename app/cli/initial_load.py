@@ -180,7 +180,12 @@ def load_manifest(path: Path) -> InitialLoadManifest:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise ValueError(f"Manifesto não encontrado: {path}") from exc
+        # File name only, never the path the operator passed on the command
+        # line: the same stdout contract that made `_document_path` report
+        # `candidate.name` instead of the resolved path applies here -- a
+        # missing manifest can otherwise echo the operator's home directory
+        # or a real household folder name chosen outside Git.
+        raise ValueError(f"Manifesto não encontrado: {path.name}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"Manifesto JSON inválido: {exc}") from exc
     try:
