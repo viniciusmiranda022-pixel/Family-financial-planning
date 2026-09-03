@@ -266,6 +266,21 @@ _ITAU_STRUCTURE = re.compile(
     re.IGNORECASE,
 )
 
+# PR #41 engineer review (head `82db527`), third round: a bare "ITAU" token
+# anywhere in the normalized text is still not identity -- it is satisfied
+# by an ordinary counterparty/transaction description naming Itaú on
+# someone else's statement (e.g. "PIX TRANSF ITAU ..."), the exact
+# cross-institution collision class already fixed above for Nubank/Mercado
+# Pago. The engineer confirmed the real supported Itaú statement carries
+# issuer-owned identity text ("itau.com.br") that an ordinary transaction
+# description cannot produce; the existing synthetic fixtures already model
+# this with "Itau Unibanco S.A." / "www.itau.com.br" masthead lines. Both
+# patterns are matched against the *normalized* text, where
+# `normalize_description` has already turned "itau.com.br" into
+# "ITAU COM BR" (dots become spaces) -- so this is checked here rather than
+# with `_ITAU_STRUCTURE` above, which matches the raw, un-normalized text.
+_ITAU_IDENTITY = re.compile(r"ITAU\s+UNIBANCO|ITAU\s+COM\s+BR")
+
 
 def _detect_pdf_issuer(text: str) -> str:
     """Identify which institution's textual layout produced this PDF.
@@ -276,13 +291,15 @@ def _detect_pdf_issuer(text: str) -> str:
     an institution name is not PII. A brand mention by itself is not enough
     (see `_NUBANK_STRUCTURE`/`_MERCADO_PAGO_STRUCTURE` above); it must
     co-occur with a layout marker that issuer's own document prints, never
-    a counterparty. Itaú requires the identical combination -- its own brand
-    token ("Itaú") *and* its balance/emission vocabulary (`_ITAU_STRUCTURE`)
-    -- rather than being treated as the unconditional fallback or accepted on
-    generic vocabulary alone. Anything matching none of the three known
-    signatures is `"unknown"`: the caller must reject it for review rather
-    than guess, so an unsupported or ambiguous PDF can never be silently
-    ingested as if it were a supported issuer.
+    a counterparty. Itaú requires the identical combination -- its own
+    owned identity marker (`_ITAU_IDENTITY`: "Itaú Unibanco" or
+    "itau.com.br", never a bare "Itaú" token that an ordinary transaction
+    description could also contain) *and* its balance/emission vocabulary
+    (`_ITAU_STRUCTURE`) -- rather than being treated as the unconditional
+    fallback or accepted on generic vocabulary alone. Anything matching none
+    of the three known signatures is `"unknown"`: the caller must reject it
+    for review rather than guess, so an unsupported or ambiguous PDF can
+    never be silently ingested as if it were a supported issuer.
     """
 
     normalized = normalize_description(text)
@@ -292,7 +309,7 @@ def _detect_pdf_issuer(text: str) -> str:
         "MERCADO PAGO" in normalized or "MERCADOPAGO" in normalized
     ) and _MERCADO_PAGO_STRUCTURE.search(text):
         return "mercado_pago"
-    if "ITAU" in normalized and _ITAU_STRUCTURE.search(text):
+    if _ITAU_IDENTITY.search(normalized) and _ITAU_STRUCTURE.search(text):
         return "itau"
     return "unknown"
 

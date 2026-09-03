@@ -172,6 +172,23 @@ def test_unsupported_issuer_with_itau_vocabulary_but_no_itau_identity_is_unknown
         parse_document_contract("extrato.pdf", payload, "bank_statement")
 
 
+def test_unsupported_issuer_with_itau_counterparty_and_structure_is_unknown() -> None:
+    # PR #41 engineer review (head `82db527`), third round: a bare "ITAU"
+    # token anywhere in the document is still not identity -- it is
+    # satisfied by an ordinary counterparty/transaction description naming
+    # Itaú on someone else's statement (e.g. "PIX TRANSF ITAU ..."), the
+    # same collision class already fixed above for Nubank/Mercado Pago.
+    # An unrelated bank's statement carrying both its own generic balance
+    # vocabulary and an Itaú counterparty reference -- but no Itaú-owned
+    # identity ("Itaú Unibanco"/"itau.com.br") -- must still be rejected as
+    # unknown, never silently attributed to Itaú.
+    payload = fx.unsupported_issuer_bank_statement_pdf_with_itau_structure_and_counterparty()
+    assert _detect_pdf_issuer(_pdf_text(payload)) == "unknown"
+
+    with pytest.raises(ValueError, match="não identificado"):
+        parse_document_contract("extrato.pdf", payload, "bank_statement")
+
+
 # ---------------------------------------------------------------------------
 # Nubank -- fatura (credit card)
 # ---------------------------------------------------------------------------

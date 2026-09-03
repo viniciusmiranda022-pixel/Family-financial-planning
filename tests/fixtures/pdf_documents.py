@@ -423,6 +423,30 @@ def unsupported_issuer_bank_statement_pdf_with_itau_structure_vocabulary() -> by
     return render_single_column_pdf(UNSUPPORTED_BANK_STATEMENT_WITH_ITAU_STRUCTURE_VOCABULARY_LINES)
 
 
+# PR #41 engineer review (head `82db527`), third round: a bare "ITAU" brand
+# token anywhere in the document -- even paired with `_ITAU_STRUCTURE` -- is
+# still not identity. "Itaú" is a common Pix/TED/boleto counterparty name,
+# so an unrelated institution's statement can legitimately mention it in a
+# transaction description while also happening to print the same generic
+# balance vocabulary. This fixture reproduces exactly that collision: an
+# unsupported bank's own structure vocabulary *and* an "ITAU" counterparty
+# reference, but no Itaú-owned identity ("Itaú Unibanco"/"itau.com.br")
+# anywhere. `_detect_pdf_issuer` must still resolve `"unknown"`.
+UNSUPPORTED_BANK_STATEMENT_WITH_ITAU_STRUCTURE_AND_COUNTERPARTY_LINES = (
+    "Banco Delta",
+    "Extrato mensal",
+    "SALDO ANTERIOR 1000,00",
+    "05/08/2026 PIX TRANSF ITAU SILVA -200,00",
+    "06/08/2026 SALDO DO DIA 06/08/2026 800,00",
+)
+
+
+def unsupported_issuer_bank_statement_pdf_with_itau_structure_and_counterparty() -> bytes:
+    return render_single_column_pdf(
+        UNSUPPORTED_BANK_STATEMENT_WITH_ITAU_STRUCTURE_AND_COUNTERPARTY_LINES
+    )
+
+
 UNSUPPORTED_CREDIT_CARD_LINES = (
     "Banco Delta",
     "Fatura mensal",
