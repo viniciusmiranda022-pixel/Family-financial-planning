@@ -44,8 +44,7 @@ Crie `data/initial-load/manifest.json`:
     }
   ],
   "profile": {
-    "investment_name": "Reserva DI",
-    "investment_balance": "10000.00"
+    "investment_name": "Reserva DI"
   },
   "balances": [
     {
@@ -84,6 +83,12 @@ Crie `data/initial-load/manifest.json`:
 
 Caminhos relativos são resolvidos a partir da pasta onde está o manifesto.
 
+O manifesto não aceita `profile.investment_balance`. Esse campo é o contador
+mutável e não reconciliado descrito em `docs/INTEGRITY_IMPLEMENTATION_PLAN.md`
+(seção 1); a carga inicial só registra saldo de investimento através de
+`balances[]`, que gera uma `AccountBalanceObservation(source=manual_confirmed)`
+auditável, para não criar duas fontes divergentes para o mesmo saldo.
+
 ## 3. Preparar os arquivos temporariamente no container
 
 Com o serviço `app` em execução, no PowerShell do host:
@@ -102,7 +107,7 @@ Essa cópia em `/tmp` é apenas staging. Quando o documento é efetivamente impo
 docker compose exec app python -m app.cli.initial_load /tmp/initial-load/manifest.json --dry-run
 ```
 
-O relatório mostra contas/obrigações/saldos que seriam criados, documentos já importados, quantidade de registros reconhecidos e status de reconciliação. `review_required` ou `ready_with_review` não é autorização para corrigir dados automaticamente; significa que o documento deverá ser revisado no sistema.
+O relatório mostra contas/obrigações/saldos que seriam criados, documentos já importados, quantidade de registros reconhecidos e status de reconciliação. `review_required` é um fato determinístico (o parser rejeitou o arquivo). `pending_full_validation` significa apenas que o arquivo foi parseado e reconciliado com sucesso na prévia — a prévia **não** executa classificação nem detecção de duplicidade (isso só acontece no `--apply`, via pipeline oficial), então um documento `pending_full_validation` ainda pode virar `imported_with_review` na aplicação real. Nenhum dos dois status autoriza corrigir dados automaticamente.
 
 O `--dry-run` não persiste contas, perfil, obrigações ou saldos e não cria `Document`/`Transaction`; ele valida os arquivos e executa parser/reconciliação para produzir a prévia.
 

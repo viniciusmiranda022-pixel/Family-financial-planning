@@ -59,8 +59,15 @@ class ProfileSeed(StrictModel):
     food_allowance: Decimal | None = Field(default=None, ge=0)
     meal_allowance_daily: Decimal | None = Field(default=None, ge=0)
     workdays_month: int | None = Field(default=None, ge=0, le=31)
+    # `investment_balance` is intentionally NOT a field here. It is the
+    # mutable, non-reconciled counter `docs/INTEGRITY_IMPLEMENTATION_PLAN.md`
+    # (section 1, row "Saldo do Privilège") identifies as the project's
+    # single riskiest source of financial drift, slated for deprecation in
+    # favor of `AccountBalanceObservation`. Accepting it here alongside
+    # `balances[]` would let the initial load create two independent,
+    # divergence-prone sources for the same account balance. Balance seeding
+    # must go exclusively through `BalanceSeed` / `AccountBalanceObservation`.
     investment_name: str | None = Field(default=None, min_length=2, max_length=120)
-    investment_balance: Decimal | None = Field(default=None, ge=0)
     investment_gross_annual_rate: Decimal | None = Field(default=None, ge=0, le=1)
     investment_income_tax_rate: Decimal | None = Field(default=None, ge=0, le=1)
     projection_end: date | None = None
@@ -128,7 +135,6 @@ PROFILE_FIELDS = (
     "meal_allowance_daily",
     "workdays_month",
     "investment_name",
-    "investment_balance",
     "investment_gross_annual_rate",
     "investment_income_tax_rate",
     "projection_end",
@@ -424,9 +430,22 @@ def _apply_balances(
             )
         )
         if existing:
-            if Decimal(existing.amount) != seed.amount:
+            # Idempotency must match the seed's own provenance contract, not
+            # merely the amount: a lower-confidence/different-source fact
+            # (e.g. `source="statement"` from reconciliation, see
+            # app/services/reconciliation.py) that happens to share the same
+            # amount/date/type is not evidence of a prior `manual_confirmed`
+            # confirmation and must never be silently accepted as one.
+            is_equivalent_seed = (
+                existing.source == "manual_confirmed"
+                and existing.confidence == Decimal("1.0000")
+                and Decimal(existing.amount) == seed.amount
+            )
+            if not is_equivalent_seed:
                 raise ValueError(
-                    f"Conflito de saldo para '{account.name}' em {seed.as_of_date}; "
+                    f"Conflito de saldo para '{account.name}' em {seed.as_of_date}: já existe "
+                    f"observação ativa (source={existing.source}, confidence={existing.confidence}) "
+                    "que não corresponde à confirmação manual exigida pela carga inicial; "
                     "use o fluxo explícito de supersessão"
                 )
             stats["skipped"] += 1
@@ -502,8 +521,23 @@ def _preview_documents(
             reconciliation = reconcile_parsed_document(parsed)
             item["records"] = 1 if parsed.payroll is not None else len(parsed.transactions)
             item["reconciliation"] = reconciliation.status
-            if reconciliation.status in {"unknown", "not_reconciled"}:
-                item["status"] = "ready_with_review"
+            # `--dry-run` only exercises parsing + reconciliation, which are
+            # pure/deterministic. It deliberately never calls the official
+            # `import_document` pipeline here (unlike `--apply`, see
+            # `_apply_documents`) because that pipeline writes the encrypted
+            # payload to disk via `EncryptedDocumentStore.save()` as an
+            # unconditional side effect *before* any DB commit — a side
+            # effect a later `db.rollback()` cannot undo. So classification
+            # and duplicate detection (`classify_with_local_rules`,
+            # `register_transaction_duplicates` in app/api.py) are only ever
+            # evaluated during `--apply`. A document that parses and
+            # reconciles cleanly here can still be routed to `ReviewItem`
+            # during `--apply`; never report it as unconditionally "ready".
+            item["status"] = "pending_full_validation"
+            item["note"] = (
+                "Duplicidade e classificação só são avaliadas durante --apply, "
+                "pelo pipeline oficial de importação."
+            )
         except ValueError as exc:
             item["status"] = "review_required"
             item["message"] = str(exc)
@@ -570,7 +604,12 @@ def _summary(
     balances: dict[str, int],
     documents: list[dict[str, object]],
 ) -> dict[str, object]:
-    review_statuses = {"review_required", "ready_with_review", "imported_with_review"}
+    # "review_required" is a deterministic fact (parse failed / real pipeline
+    # already routed it to review). "pending_full_validation" is dry-run's
+    # honest "unknown yet" state — it must never be folded into
+    # review_required, since that would overclaim in the opposite direction.
+    review_statuses = {"review_required", "imported_with_review"}
+    pending_statuses = {"pending_full_validation"}
     return {
         "mode": mode,
         "load_id": manifest.load_id,
@@ -582,6 +621,7 @@ def _summary(
         "document_counts": {
             "total": len(documents),
             "review_required": sum(item.get("status") in review_statuses for item in documents),
+            "pending_full_validation": sum(item.get("status") in pending_statuses for item in documents),
             "skipped_existing": sum(item.get("status") == "skipped_existing" for item in documents),
         },
     }
