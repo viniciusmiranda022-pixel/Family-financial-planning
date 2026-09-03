@@ -52,6 +52,10 @@ Este incremento deve obedecer, nesta ordem, a:
 - saldo confirmado cria `AccountBalanceObservation` com `source=manual_confirmed` e não é sobrescrito por reexecução;
 - documentos passam pelo pipeline oficial de importação, não por implementação paralela de regra financeira.
 
+## Concorrência
+
+O CLI é uma ferramenta de bootstrap de operador único (execução manual, sequencial, documentada no runbook). `Account`, `FinancialProfile` e `Document` têm `UniqueConstraint` no banco e por isso uma corrida entre execuções sempre falha alto (erro visível) em vez de duplicar. `Obligation` e `AccountBalanceObservation` não têm essa constraint; adicioná-la mudaria o comportamento aceito da API web hoje (`POST /obligations` permite duas obrigações com mesmo nome/vencimento) só para fechar uma corrida local a esta CLI, o que é risco de compatibilidade fora do escopo desta fatia. Em vez disso, o CLI toma um `pg_advisory_xact_lock` por família (mesmo padrão de `app/services/financial_snapshots.py::_lock_snapshot_key`) durante a janela de SELECT-then-INSERT dessas duas entidades: uma segunda invocação concorrente bloqueia em vez de arriscar duplicar. É um no-op em SQLite (dev local); execução concorrente continua fora de contrato nesse ambiente e documentada como tal no runbook.
+
 ## Executor/revisão
 
 Claude pode implementar e deve contestar este Work Order quando houver evidência concreta de que ele contradiz os documentos normativos ou cria risco técnico. Claude não pode fazer merge, alterar regra financeira não documentada, corrigir automaticamente dados financeiros reais nem incluir PII no repositório. Divergência não resolvida bloqueia merge.

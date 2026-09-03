@@ -20,7 +20,7 @@ from typing import Literal
 
 from fastapi import HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api import import_document
@@ -189,6 +189,47 @@ def _admin_user(db: Session, household_id: str) -> User:
     if user is None:
         raise ValueError("A família precisa ter um administrador ativo antes da carga inicial")
     return user
+
+
+def _lock_household_initial_load(db: Session, household_id: str) -> None:
+    """Serialize concurrent initial-load runs for the same household.
+
+    `Account`, `FinancialProfile` and `Document` each have a DB-level
+    `UniqueConstraint` (see `app/models.py`), so a concurrent race on those
+    tables surfaces as a loud `IntegrityError`, never a silent duplicate.
+    `Obligation` and `AccountBalanceObservation` have no such constraint --
+    `_apply_obligations`/`_apply_balances` below only SELECT before
+    deciding to create, so two overlapping invocations of this CLI against
+    the same household could both pass the SELECT and each INSERT its own
+    row, silently doubling an obligation or a confirmed balance.
+
+    A schema-level `UniqueConstraint` was considered and rejected here: the
+    web API's `POST /obligations` (`app/api.py`) already allows a household
+    to legitimately hold two obligations with the same name and due date
+    (no such uniqueness rule exists in `docs/FINANCIAL_RULES.md` or
+    `docs/FINANCIAL_INVARIANTS.md`), so adding one at the schema level would
+    change accepted behavior for the whole application to fix a race that
+    is local to this one-operator bootstrap CLI -- out of scope for this
+    slice and a real backward-compatibility risk (docs/WORK_ORDER
+    §"Invariantes/proibições", protocol §15/§38).
+
+    Instead this mirrors the already-established pattern in
+    `app/services/financial_snapshots.py::_lock_snapshot_key`: a
+    transaction-scoped PostgreSQL advisory lock keyed by household, held
+    for the lifetime of the DB transaction that performs the unprotected
+    SELECT-then-INSERT (see call site in `main()`) and released
+    automatically on commit or rollback. A second concurrent run blocks on
+    this call until the first finishes, then observes the already-created
+    rows and takes the idempotent skip path -- no duplicate is ever
+    created. No-op on SQLite (dev/tests only; production is always
+    PostgreSQL per docs/ARCHITECTURE.md), where this CLI's documented
+    contract remains single-operator, non-concurrent use
+    (docs/RUNBOOK_INITIAL_LOAD.md).
+    """
+
+    bind = db.get_bind()
+    if bind.dialect.name == "postgresql":
+        db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"initial-load:{household_id}"))))
 
 
 def _audit(
@@ -634,6 +675,7 @@ def main() -> int:
         with SessionLocal() as db:
             household = select_household(db, args.household)
             user = _admin_user(db, household.id)
+            _lock_household_initial_load(db, household.id)
             accounts, account_stats = _resolve_accounts(
                 db, household.id, manifest, apply=args.apply, user_id=user.id
             )

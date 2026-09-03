@@ -21,6 +21,7 @@ from app.cli.initial_load import (  # noqa: E402
     _apply_documents,
     _apply_obligations,
     _apply_profile,
+    _lock_household_initial_load,
     _preview_documents,
     _resolve_accounts,
     load_manifest,
@@ -96,6 +97,22 @@ def _manifest() -> InitialLoadManifest:
             )
         ],
     )
+
+
+def test_lock_household_initial_load_is_a_no_op_on_sqlite() -> None:
+    """`_lock_household_initial_load` only takes a real
+    `pg_advisory_xact_lock` on PostgreSQL (see its docstring and
+    `tests/test_postgresql_integration.py::
+    test_initial_load_concurrent_apply_does_not_duplicate_obligation_or_balance`
+    for the real-lock proof). This is the fast SQLite-side guarantee that
+    `main()` calling it unconditionally never breaks dev/test runs, which
+    always use SQLite (see `app/db.py`)."""
+    engine = _engine()
+    with Session(engine) as db:
+        household, _ = _seed_household(db)
+        db.commit()
+        _lock_household_initial_load(db, household.id)
+        _lock_household_initial_load(db, household.id)
 
 
 def test_manifest_rejects_unknown_account_reference(tmp_path) -> None:

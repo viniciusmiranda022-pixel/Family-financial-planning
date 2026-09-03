@@ -10,6 +10,7 @@ Use este procedimento somente para popular uma instalação que já possui a fam
 - Execute `--dry-run` antes de `--apply`.
 - Conflito de conta, obrigação ou saldo bloqueia a carga. O CLI nunca sobrescreve esses fatos para "fazer passar".
 - Não copie os documentos originais em claro para `/data` do container. `/data` é persistente e é usado pelo armazenamento criptografado da aplicação. Para a carga, os originais devem existir apenas temporariamente em `/tmp/initial-load` e ser removidos ao final.
+- Esta é uma ferramenta de bootstrap de operador único: não execute duas invocações do CLI simultaneamente para a mesma família. Em PostgreSQL (produção/CI), o CLI toma um `pg_advisory_xact_lock` por família durante a resolução de contas/obrigações/saldos, então uma segunda invocação concorrente bloqueia até a primeira terminar em vez de arriscar duplicar `Obligation`/`AccountBalanceObservation` (essas duas entidades não têm `UniqueConstraint` no banco — ver `app/cli/initial_load.py::_lock_household_initial_load`). Em SQLite (dev local) esse lock é um no-op; não rode o CLI concorrentemente fora de produção.
 
 ## 2. Manifesto
 
