@@ -133,6 +133,32 @@ def test_nubank_fatura_mentioning_mercado_pago_counterparty_stays_nubank() -> No
 
 
 # ---------------------------------------------------------------------------
+# Unsupported issuer (PR #41 engineer review on `c260aed`): falling back to
+# Itaú unconditionally whenever Nubank/MP do not match let any textual PDF
+# with an Itaú-shaped transaction row be silently accepted as Itaú, even
+# with no Itaú document-identity marker at all. Detection must be positive
+# for Itaú too, and an unknown/ambiguous PDF must be rejected for review,
+# never guessed.
+# ---------------------------------------------------------------------------
+
+
+def test_unsupported_issuer_bank_statement_is_not_guessed_as_itau() -> None:
+    payload = fx.unsupported_issuer_bank_statement_pdf()
+    assert _detect_pdf_issuer(_pdf_text(payload)) == "unknown"
+
+    with pytest.raises(ValueError, match="não identificado"):
+        parse_document_contract("extrato.pdf", payload, "bank_statement")
+
+
+def test_unsupported_issuer_credit_card_is_not_guessed_as_itau() -> None:
+    payload = fx.unsupported_issuer_credit_card_pdf()
+    assert _detect_pdf_issuer(_pdf_text(payload)) == "unknown"
+
+    with pytest.raises(ValueError, match="não identificado"):
+        parse_document_contract("fatura.pdf", payload, "credit_card")
+
+
+# ---------------------------------------------------------------------------
 # Nubank -- fatura (credit card)
 # ---------------------------------------------------------------------------
 

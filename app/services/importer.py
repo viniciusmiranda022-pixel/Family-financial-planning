@@ -240,6 +240,38 @@ _MERCADO_PAGO_STRUCTURE = re.compile(
     re.IGNORECASE,
 )
 
+# PR #41 engineer review (head `c260aed`): falling back to Itaú unconditionally
+# whenever Nubank/MP do not match is not positive identification -- any
+# unsupported textual PDF that happens to contain a `dd/mm(/yyyy)
+# description amount` row would be silently accepted as Itaú instead of
+# being rejected for review. Itaú needs the same treatment already applied
+# to Nubank/MP above: a document-identity/layout marker, not just a
+# transaction-row shape generic enough that an unrelated document could
+# produce it by accident.
+#
+# Evidence caveat: unlike Nubank/MP, this Work Order's "Evidência de layout
+# observada" section documents no real Itaú masthead text -- Itaú was
+# already passing before this Work Order and was never diagnosed against a
+# real document here. Real financial PDFs are gitignored and out of scope to
+# add, so the markers below are not lifted from a transcribed real document;
+# they are the balance/emission vocabulary this module already relies on to
+# extract Itaú's own opening/closing balance and reference date
+# (`_statement_declared_fields`'s "SALDO ANTERIOR"/"SALDO DO DIA"/"SALDO
+# FINAL", `_reference_date`'s "EMISSÃO:") and that the Work Order's own
+# Nubank/Mercado Pago evidence shows those issuers phrase differently
+# ("Saldo inicial"/"Saldo final do período" for Nubank, "Saldo inicial"/
+# "Saldo final" for Mercado Pago -- never "SALDO ANTERIOR", "SALDO DO DIA" or
+# a standalone "EMISSAO:" label; Mercado Pago's invoice header is
+# "Vencimento:", not "Emissão:"). This turns an already-load-bearing
+# precondition into an explicit identity check instead of inventing a new
+# one, but it has not been verified against the real production PDFs the
+# way Nubank/MP were -- flagged for the engineer to confirm or correct
+# against the actual masthead text if it differs from this inference.
+_ITAU_STRUCTURE = re.compile(
+    r"SALDO\s+ANTERIOR|SALDO\s+DO\s+DIA|SALDO\s+FINAL\s+EM|EMISS[ÃA]O\s*:",
+    re.IGNORECASE,
+)
+
 
 def _detect_pdf_issuer(text: str) -> str:
     """Identify which institution's textual layout produced this PDF.
@@ -250,9 +282,12 @@ def _detect_pdf_issuer(text: str) -> str:
     an institution name is not PII. A brand mention by itself is not enough
     (see `_NUBANK_STRUCTURE`/`_MERCADO_PAGO_STRUCTURE` above); it must
     co-occur with a layout marker that issuer's own document prints, never
-    a counterparty. Anything that does not match a known issuer signature
-    falls back to the existing Itaú-shaped parser, so every PDF this
-    project already parses keeps working exactly as before.
+    a counterparty. Itaú is likewise positively identified via its own
+    balance/emission vocabulary (`_ITAU_STRUCTURE`), not treated as the
+    unconditional fallback. Anything matching none of the three known
+    signatures is `"unknown"`: the caller must reject it for review rather
+    than guess, so an unsupported or ambiguous PDF can never be silently
+    ingested as if it were a supported issuer.
     """
 
     normalized = normalize_description(text)
@@ -262,7 +297,14 @@ def _detect_pdf_issuer(text: str) -> str:
         "MERCADO PAGO" in normalized or "MERCADOPAGO" in normalized
     ) and _MERCADO_PAGO_STRUCTURE.search(text):
         return "mercado_pago"
-    return "itau"
+    if _ITAU_STRUCTURE.search(text):
+        return "itau"
+    return "unknown"
+
+
+_UNSUPPORTED_PDF_ISSUER_ERROR = (
+    "PDF não identificado como Itaú, Nubank ou Mercado Pago; encaminhado para revisão"
+)
 
 
 # Vocabulary observed on Itaú/Nubank/Mercado Pago invoices that shares the
@@ -650,6 +692,8 @@ def parse_credit_card_pdf(payload: bytes) -> list[ParsedTransaction]:
         return _parse_nubank_credit_card_pdf(text)
     if issuer == "mercado_pago":
         return _parse_mercado_pago_credit_card_pdf(text)
+    if issuer == "unknown":
+        raise ValueError(_UNSUPPORTED_PDF_ISSUER_ERROR)
     # Itaú keeps its own `pdfplumber` pass: its two-column crop needs page
     # geometry, not just plain text.
     return _parse_itau_credit_card_pdf(payload)
@@ -662,6 +706,8 @@ def parse_bank_statement_pdf(payload: bytes) -> list[ParsedTransaction]:
         return _parse_nubank_bank_statement_pdf(text)
     if issuer == "mercado_pago":
         return _parse_mercado_pago_bank_statement_pdf(text)
+    if issuer == "unknown":
+        raise ValueError(_UNSUPPORTED_PDF_ISSUER_ERROR)
     return _parse_itau_bank_statement_pdf(text)
 
 
@@ -738,6 +784,8 @@ def _pdf_declared_fields(payload: bytes, document_type: str) -> tuple[str, dict[
 
     text = _pdf_text(payload)
     issuer = _detect_pdf_issuer(text)
+    if issuer == "unknown":
+        raise ValueError(_UNSUPPORTED_PDF_ISSUER_ERROR)
     if document_type == "credit_card":
         if issuer == "nubank":
             return "nubank_credit_card_pdf", _nubank_credit_card_declared_fields(text)

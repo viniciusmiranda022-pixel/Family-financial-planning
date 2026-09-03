@@ -373,3 +373,39 @@ NUBANK_CREDIT_CARD_MENTIONING_MERCADO_PAGO_LINES = (
 
 def nubank_credit_card_pdf_mentioning_mercado_pago() -> bytes:
     return render_single_column_pdf(NUBANK_CREDIT_CARD_MENTIONING_MERCADO_PAGO_LINES)
+
+
+# ---------------------------------------------------------------------------
+# Unsupported issuer (PR #41 engineer review on `c260aed`): a textual PDF
+# that is transaction-row-shaped like Itaú's own layout
+# (`dd/mm(/yyyy) description amount`) but carries none of the three known
+# issuers' document-identity markers -- no Nubank/Mercado Pago brand+layout
+# combination, and none of Itaú's own balance/emission vocabulary ("SALDO
+# ANTERIOR", "SALDO DO DIA", "SALDO FINAL EM", "EMISSAO:"). `_detect_pdf_issuer`
+# must resolve this as `"unknown"`, and `parse_credit_card_pdf`/
+# `parse_bank_statement_pdf` must reject it for review instead of guessing
+# Itaú from the row shape alone.
+# ---------------------------------------------------------------------------
+
+UNSUPPORTED_BANK_STATEMENT_LINES = (
+    "Banco Delta",
+    "Extrato mensal",
+    "05/08/2026 Compra Loja Delta -120,00",
+    "06/08/2026 Deposito Recebido 300,00",
+)
+
+
+def unsupported_issuer_bank_statement_pdf() -> bytes:
+    return render_single_column_pdf(UNSUPPORTED_BANK_STATEMENT_LINES)
+
+
+UNSUPPORTED_CREDIT_CARD_LINES = (
+    "Banco Delta",
+    "Fatura mensal",
+    "05/08 Compra Loja Delta 120,00",
+    "06/08 Assinatura Servico X 40,00",
+)
+
+
+def unsupported_issuer_credit_card_pdf() -> bytes:
+    return render_single_column_pdf(UNSUPPORTED_CREDIT_CARD_LINES)
