@@ -149,9 +149,19 @@ def discover_transaction_duplicates(
     §0.2: "O backfill planejado deverá produzir findings sobre a base real
     sem corrigi-la silenciosamente").
 
-    A group a human has already resolved is left untouched: rediscovering an
-    already-resolved pair during a passive backfill pass is not new evidence
-    and must not reopen that decision.
+    A group a human has already resolved is left untouched only while every
+    transaction being examined is already a persisted member of it:
+    rediscovering an already-resolved pair during a passive backfill pass is
+    not new evidence and must not reopen that decision. A transaction that is
+    *not* yet a member of that resolved group -- a genuinely new, unexamined
+    row matching a pair a human already decided on -- is different: per
+    docs/FINANCIAL_RULES.md ("Uma nova ocorrência compatível reabre o grupo
+    para revisão sem apagar a resolução anterior, preservada nos sinais do
+    grupo"), it reopens the group for review through the same
+    reopen-on-new-matching-transaction lifecycle `register_transaction_duplicates`
+    uses, so the new evidence is not silently lost. Even then, discovery mode
+    never mutates the source `Transaction` rows -- only the derived
+    `DuplicateGroup`/`DuplicateGroupMember` evidence changes.
     """
 
     return _match_and_persist_group(
@@ -240,10 +250,35 @@ def _match_and_persist_group(
             db.flush()
 
     if not apply_to_transactions and group.status == "resolved":
-        # A human already resolved this pair; passive rediscovery
-        # (backfill) is not new evidence and must not reopen that decision
-        # or touch the transactions it applies to.
-        return group, assessment
+        already_member = (
+            db.scalar(
+                select(DuplicateGroupMember.id).where(
+                    DuplicateGroupMember.group_id == group.id,
+                    DuplicateGroupMember.transaction_id == transaction.id,
+                )
+            )
+            is not None
+        )
+        if already_member:
+            # Rediscovering a pair a human already resolved is not new
+            # evidence: passive rediscovery of an *existing* member of a
+            # resolved group must not reopen that decision or touch the
+            # transactions it applies to.
+            return group, assessment
+        # `transaction` is not yet a persisted member of this resolved
+        # group -- i.e. a genuinely new (to this group), unexamined
+        # transaction matches a pair a human already decided on.
+        # docs/FINANCIAL_RULES.md, "Reconciliação, duplicidades e
+        # anomalias": "Uma nova ocorrência compatível reabre o grupo para
+        # revisão sem apagar a resolução anterior, preservada nos sinais do
+        # grupo." That rule is not conditioned on the occurrence arriving
+        # through the live pipeline vs. a backfill scan, so fall through
+        # into the same reopen-on-new-matching-transaction lifecycle the
+        # live path already uses below (`reopened_reason`, resolution
+        # preserved in `signals`). `apply_to_transactions` still gates
+        # every mutation of the source `Transaction` rows -- discovery mode
+        # only ever persists derived `DuplicateGroup`/`DuplicateGroupMember`
+        # evidence, never the transaction's own classification columns.
 
     # A candidate can point at any member of an existing group. Canonical
     # precedence must always compare the new row with the group's persisted

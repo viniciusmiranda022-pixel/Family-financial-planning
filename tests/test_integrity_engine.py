@@ -16,7 +16,20 @@ os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 import app.services.financial_integrity as financial_integrity_module  # noqa: E402
 from app.db import Base  # noqa: E402
-from app.models import Account, Household, IntegrityFinding, IntegrityRun, Transaction  # noqa: E402
+from app.models import (  # noqa: E402
+    Account,
+    Document,
+    Household,
+    IntegrityFinding,
+    IntegrityRun,
+    Transaction,
+    User,
+)
+from app.services.duplicates import (  # noqa: E402
+    discover_transaction_duplicates,
+    register_transaction_duplicates,
+    resolve_duplicate_group,
+)
 from app.services.financial_integrity import (  # noqa: E402
     ACTIVE_FINDING_STATUSES,
     IntegrityRunScope,
@@ -328,6 +341,111 @@ def test_duplicate_confidence_is_unknown_without_real_pair() -> None:
         assert checks[0].context.facts["duplicate_confidence"] is None
         result = evaluate_invariant(checks[0].invariant_id, checks[0].context)
         assert result.status is InvariantStatus.UNKNOWN
+
+
+def test_reopened_group_from_new_discovered_member_is_seen_by_inv014() -> None:
+    """2026-09-03 review round 2, P1: a resolved `DuplicateGroup` matched by
+    a genuinely new, not-yet-examined transaction must reopen -- otherwise
+    `build_baseline_checks`'s open-`DuplicateGroup`-membership branch (see
+    its docstring: exactly the mechanism a `discover_transaction_duplicates`
+    find relies on, since discovery mode never sets
+    `Transaction.possible_duplicate`) never includes that transaction and
+    INV-014 silently never evaluates it. This reproduces the review's
+    required proof end-to-end: resolve a group, discover a new member
+    against it, and assert INV-014 actually sees that member."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família Teste")
+        db.add(household)
+        db.flush()
+        account = Account(household_id=household.id, name="Conta", owner_label="Família")
+        admin = User(
+            household_id=household.id,
+            name="Admin",
+            username="admin-inv014-reopen",
+            password_hash="hash",
+            is_admin=True,
+        )
+        statement = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="statement.csv",
+            document_type="bank_statement",
+            sha256="5" * 64,
+            encrypted_path="k.enc",
+        )
+        workbook = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="plan.xlsx",
+            document_type="financial_plan_workbook",
+            sha256="6" * 64,
+            encrypted_path="l.enc",
+        )
+        capture = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="capture.json",
+            document_type="capture",
+            sha256="7" * 64,
+            encrypted_path="m.enc",
+        )
+        db.add_all([account, admin, statement, workbook, capture])
+        db.flush()
+
+        def _txn(document: Document, priority: int, fingerprint_seed: str) -> Transaction:
+            return Transaction(
+                household_id=household.id,
+                account_id=account.id,
+                document_id=document.id,
+                booked_at=date(2026, 8, 10),
+                description="Mercado Central",
+                normalized_description="MERCADO CENTRAL",
+                amount=Decimal("-100.00"),
+                transaction_type="expense",
+                owner_label="Família",
+                fingerprint=fingerprint_seed.rjust(64, "0"),
+                source_priority=priority,
+                confidence=Decimal("1"),
+            )
+
+        imported = _txn(statement, 70, "a")
+        authoritative = _txn(workbook, 100, "b")
+        db.add_all([imported, authoritative])
+        db.flush()
+
+        group, _ = register_transaction_duplicates(
+            db, transaction=authoritative, household_id=household.id
+        )
+        resolve_duplicate_group(
+            db,
+            group_id=group.id,
+            household_id=household.id,
+            resolution="distinct",
+            user_id=admin.id,
+            reason="Movimentos distintos confirmados",
+        )
+        assert group.status == "resolved"
+
+        # A legacy row a backfill pass is scanning for the first time.
+        late_evidence = _txn(capture, 60, "c")
+        db.add(late_evidence)
+        db.flush()
+
+        discover_transaction_duplicates(db, transaction=late_evidence, household_id=household.id)
+        assert group.status == "open"
+        db.commit()
+
+        checks = build_baseline_checks(db, household_id=household.id, scope=IntegrityRunScope.GLOBAL)
+        inv014_entity_ids = {
+            check.context.entity_id for check in checks if check.invariant_id == "INV-014"
+        }
+        assert late_evidence.id in inv014_entity_ids
+        # Discovery mode never touches the source `Transaction` rows.
+        assert late_evidence.possible_duplicate is False
+        assert late_evidence.canonical_status == "unassigned"
 
 
 def test_duplicate_confidence_follows_live_fields_not_stale_stored_fingerprint() -> None:

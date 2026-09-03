@@ -272,3 +272,123 @@ def test_discover_transaction_duplicates_does_not_reopen_a_resolved_group() -> N
         assert rediscovered_group.resolution == "distinct"
         assert (imported.canonical_status, imported.excluded) == imported_state
         assert (authoritative.canonical_status, authoritative.excluded) == authoritative_state
+
+
+def test_discover_transaction_duplicates_reopens_a_resolved_group_for_a_new_member() -> None:
+    """2026-09-03 review round 2, P1: a resolved group must stay untouched
+    only when the transaction being examined is *already* one of its
+    persisted members (covered above). A different, not-yet-examined
+    transaction that matches the same resolved pair is genuinely new
+    evidence -- docs/FINANCIAL_RULES.md requires it to reopen the group for
+    review, preserving the prior resolution in `signals`, exactly like the
+    live path's reopen-on-new-matching-transaction lifecycle. The passive
+    early return must not silently drop that membership, or INV-014 would
+    never see it."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família")
+        db.add(household)
+        db.flush()
+        account = Account(household_id=household.id, name="Conta", owner_label="Família")
+        admin = User(
+            household_id=household.id,
+            name="Admin",
+            username="admin-reopen",
+            password_hash="hash",
+            is_admin=True,
+        )
+        statement = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="statement.csv",
+            document_type="bank_statement",
+            sha256="2" * 64,
+            encrypted_path="h.enc",
+        )
+        workbook = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="plan.xlsx",
+            document_type="financial_plan_workbook",
+            sha256="3" * 64,
+            encrypted_path="i.enc",
+        )
+        capture = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="capture.json",
+            document_type="capture",
+            sha256="4" * 64,
+            encrypted_path="j.enc",
+        )
+        db.add_all([account, admin, statement, workbook, capture])
+        db.flush()
+        imported = _transaction(household.id, account.id, statement.id, 70)
+        authoritative = _transaction(household.id, account.id, workbook.id, 100)
+        db.add_all([imported, authoritative])
+        db.flush()
+
+        group, _ = register_transaction_duplicates(
+            db, transaction=authoritative, household_id=household.id
+        )
+        resolve_duplicate_group(
+            db,
+            group_id=group.id,
+            household_id=household.id,
+            resolution="distinct",
+            user_id=admin.id,
+            reason="Movimentos distintos confirmados",
+        )
+        assert group.status == "resolved"
+        imported_state = (imported.canonical_status, imported.possible_duplicate, imported.excluded)
+        authoritative_state = (
+            authoritative.canonical_status,
+            authoritative.possible_duplicate,
+            authoritative.excluded,
+        )
+
+        # A third, unexamined transaction -- e.g. a legacy row a backfill
+        # pass is scanning for the first time -- matches the same pair.
+        late_evidence = _transaction(household.id, account.id, capture.id, 60)
+        db.add(late_evidence)
+        db.flush()
+
+        reopened_group, assessment = discover_transaction_duplicates(
+            db, transaction=late_evidence, household_id=household.id
+        )
+
+        assert reopened_group.id == group.id
+        assert assessment is not None
+        # The group is reopened for review; the prior human resolution is
+        # preserved as audit history, never erased.
+        assert reopened_group.status == "open"
+        assert reopened_group.resolution is None
+        assert reopened_group.signals["previous_resolution"] == "distinct"
+        assert reopened_group.signals["reopened_reason"] == "new_matching_transaction"
+
+        # The new evidence is deterministically surfaced as derived
+        # membership -- this is exactly what INV-014's open-group-member
+        # check relies on to flag it.
+        members = db.scalars(
+            select(DuplicateGroupMember).where(DuplicateGroupMember.group_id == group.id)
+        ).all()
+        assert late_evidence.id in {member.transaction_id for member in members}
+
+        # No source `Transaction` row -- old members or the new one -- is
+        # ever mutated by discovery mode.
+        assert (
+            imported.canonical_status,
+            imported.possible_duplicate,
+            imported.excluded,
+        ) == imported_state
+        assert (
+            authoritative.canonical_status,
+            authoritative.possible_duplicate,
+            authoritative.excluded,
+        ) == authoritative_state
+        assert late_evidence.canonical_status == "unassigned"
+        assert late_evidence.possible_duplicate is False
+        assert late_evidence.excluded is False
+        assert late_evidence.duplicate_group_id is None
