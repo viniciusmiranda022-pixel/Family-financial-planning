@@ -8,8 +8,12 @@ financial rule of its own. Concretely, for every targeted household it:
    has none yet (`app.services.reconciliation.unknown_reconciliation` +
    `persist_reconciliation`) -- it never invents declared/reconstructed
    totals for a document whose original parsed evidence is gone;
-2. runs `app.services.duplicates.register_transaction_duplicates` for every
-   `Transaction` not yet assigned to a duplicate group;
+2. runs `app.services.duplicates.discover_transaction_duplicates` for every
+   `Transaction` not yet examined by any duplicate pass -- it only ever
+   creates/updates the derived `DuplicateGroup`/`DuplicateGroupMember`
+   evidence rows, immediately visible through `GET /duplicate-groups` for
+   human review; it never writes to the `Transaction` rows themselves (see
+   below);
 3. rebuilds the canonical `FinancialSnapshot` for every period in range
    (`app.services.financial_snapshots.build_snapshot`, already idempotent by
    checksum) and, per period, evaluates the INV-014 baseline checks through
@@ -20,10 +24,15 @@ financial rule of its own. Concretely, for every targeted household it:
 What it never does, by construction (see docs/WORK_ORDER_PR8_...):
 
 - it never writes to `Transaction`, `Document`, `PayrollRecord`,
-  `Commission` or `Obligation` -- the only columns it can change on
-  `Transaction` are the classification columns
-  (`canonical_status`/`possible_duplicate`/`excluded`/`duplicate_group_id`)
-  `register_transaction_duplicates` already owns for the live pipeline;
+  `Commission` or `Obligation` at all -- including the duplicate
+  classification columns (`canonical_status`/`possible_duplicate`/
+  `excluded`/`duplicate_group_id`): those are the system's *applied*
+  classification of already-published financial history, and changing them
+  changes which source is counted as canonical, so only a genuinely new
+  transaction arriving through the live pipeline
+  (`app.services.duplicates.register_transaction_duplicates`) or an
+  explicit human decision (`resolve_duplicate_group`) may change them --
+  never an automatic historical reprocessing side effect;
 - it never fabricates an `AccountBalanceObservation` or an "as of" date for
   a legacy investment balance -- `build_snapshot`'s own `_opening_balance`
   fallback already leaves that evidence untrusted (`balance_evidence_trusted:
@@ -74,12 +83,13 @@ from app.models import (
     Document,
     DocumentReconciliation,
     DuplicateGroup,
+    DuplicateGroupMember,
     FinancialSnapshot,
     Household,
     IntegrityFinding,
     Transaction,
 )
-from app.services.duplicates import register_transaction_duplicates
+from app.services.duplicates import discover_transaction_duplicates
 from app.services.finance import add_months, month_key
 from app.services.financial_integrity import (
     ACTIVE_FINDING_STATUSES,
@@ -105,7 +115,7 @@ class HouseholdBackfillReport:
     household_name: str
     periods: list[str] = field(default_factory=list)
     documents_reconciled_unknown: int = 0
-    duplicate_candidates_processed: int = 0
+    duplicate_candidates_examined: int = 0
     snapshots_touched: int = 0
     period_integrity_runs: int = 0
     global_integrity_run_id: str | None = None
@@ -117,7 +127,7 @@ class HouseholdBackfillReport:
             "household_name": self.household_name,
             "periods": self.periods,
             "documents_reconciled_unknown": self.documents_reconciled_unknown,
-            "duplicate_candidates_processed": self.duplicate_candidates_processed,
+            "duplicate_candidates_examined": self.duplicate_candidates_examined,
             "snapshots_touched": self.snapshots_touched,
             "period_integrity_runs": self.period_integrity_runs,
             "global_integrity_run_id": self.global_integrity_run_id,
@@ -235,24 +245,41 @@ def _backfill_unreconciled_documents(db: Session, household: Household) -> int:
 
 
 def _backfill_duplicate_classification(db: Session, household: Household) -> int:
-    """Classify every transaction not yet assigned to a duplicate group.
+    """Discover duplicate evidence for every transaction not yet examined by
+    any duplicate pass, without mutating the transactions themselves.
 
-    Reuses `register_transaction_duplicates` verbatim -- the exact function
-    the live import pipeline calls -- so a legacy transaction is classified
-    by the identical deterministic rule a newly imported one would be,
-    never a parallel/duplicated implementation.
+    Reuses `app.services.duplicates.discover_transaction_duplicates` --
+    built on the exact same deterministic `assess_duplicate` rule the live
+    import pipeline uses -- so a legacy transaction is scored by the
+    identical rule a newly imported one would be, never a parallel/
+    duplicated implementation. Unlike the live pipeline's
+    `register_transaction_duplicates`, this only creates/updates the
+    derived `DuplicateGroup`/`DuplicateGroupMember` evidence: it never
+    writes `canonical_status`/`possible_duplicate`/`excluded`/
+    `duplicate_group_id` on an existing `Transaction` (see the module
+    docstring and docs/WORK_ORDER_PR8_...).
+
+    Because this command never sets `Transaction.duplicate_group_id`,
+    "not yet examined" is tracked by the absence of a `DuplicateGroupMember`
+    row for the transaction instead. A transaction already classified by the
+    live pipeline is also already a group member, so it is correctly
+    skipped here too -- idempotency does not depend on ever mutating the
+    transaction.
     """
 
+    already_examined = select(DuplicateGroupMember.transaction_id).where(
+        DuplicateGroupMember.transaction_id == Transaction.id
+    )
     pending = db.scalars(
         select(Transaction)
         .where(
             Transaction.household_id == household.id,
-            Transaction.duplicate_group_id.is_(None),
+            ~already_examined.exists(),
         )
         .order_by(Transaction.booked_at, Transaction.id)
     ).all()
     for transaction in pending:
-        register_transaction_duplicates(db, transaction=transaction, household_id=household.id)
+        discover_transaction_duplicates(db, transaction=transaction, household_id=household.id)
     return len(pending)
 
 
@@ -330,7 +357,7 @@ def process_household(
 ) -> HouseholdBackfillReport:
     report = HouseholdBackfillReport(household_id=household.id, household_name=household.name)
     report.documents_reconciled_unknown = _backfill_unreconciled_documents(db, household)
-    report.duplicate_candidates_processed = _backfill_duplicate_classification(db, household)
+    report.duplicate_candidates_examined = _backfill_duplicate_classification(db, household)
     periods = _period_range(db, household.id, period_from=period_from, period_to=period_to)
     report.periods = periods
     report.snapshots_touched, report.period_integrity_runs = _backfill_snapshots_and_period_integrity(
@@ -511,7 +538,7 @@ def _print_summary(summary: dict[str, Any], *, dry_run: bool) -> None:
             f"- {household['household_name']}: "
             f"{len(household['periods'])} período(s), "
             f"{household['documents_reconciled_unknown']} documento(s) marcado(s) unknown, "
-            f"{household['duplicate_candidates_processed']} transação(ões) reclassificada(s), "
+            f"{household['duplicate_candidates_examined']} transação(ões) examinada(s) para duplicidade, "
             f"{household['open_findings_after']} finding(s) aberto(s)"
         )
     print(f"Antes:  {summary['state_before']}")

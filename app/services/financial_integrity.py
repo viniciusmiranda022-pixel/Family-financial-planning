@@ -428,15 +428,33 @@ def build_baseline_checks(
     as canonical reconciliations and snapshots arrive in PRs 3-5.
     """
 
-    from app.models import IntegrityFinding, Transaction
+    from app.models import DuplicateGroup, DuplicateGroupMember, IntegrityFinding, Transaction
 
     run_scope = IntegrityRunScope(str(scope))
     if run_scope is IntegrityRunScope.ENTITY and (entity_type != "transaction" or not entity_id):
         raise ValueError("entity scope requires a transaction entity_id")
 
+    # `Transaction.possible_duplicate` is set immediately for a genuinely new
+    # transaction (live import/API) or an explicit human resolution -- see
+    # `app.services.duplicates.register_transaction_duplicates`. Historical
+    # reprocessing (`app.cli.backfill`) deliberately never sets it (PR 8:
+    # applying a classification to already-published financial history is
+    # not something an automatic backfill pass may do), so a duplicate pair
+    # `app.cli.backfill` discovers is also included here through its open
+    # `DuplicateGroup` membership -- otherwise it would create derived
+    # evidence nobody ever sees as an open finding.
+    open_group_member_statement = select(DuplicateGroupMember.transaction_id).join(
+        DuplicateGroup, DuplicateGroupMember.group_id == DuplicateGroup.id
+    ).where(
+        DuplicateGroup.household_id == household_id,
+        DuplicateGroup.status == "open",
+    )
     flagged_statement = select(Transaction).where(
         Transaction.household_id == household_id,
-        Transaction.possible_duplicate.is_(True),
+        or_(
+            Transaction.possible_duplicate.is_(True),
+            Transaction.id.in_(open_group_member_statement),
+        ),
     )
     # A finding only stays superseded (or reopens) while its check keeps being
     # evaluated. The supported UI resolution flow -- "considerar lançamento

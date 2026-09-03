@@ -105,7 +105,72 @@ def register_transaction_duplicates(
     transaction: Any,
     household_id: str,
 ) -> tuple[Any | None, DuplicateAssessment | None]:
-    """Find the strongest bounded candidate and persist both sides of the group."""
+    """Find the strongest bounded candidate, persist both sides of the
+    derived group, and apply the resulting classification to the matched
+    `Transaction` row(s) themselves.
+
+    This is the live import/API path: `transaction` is either a row that
+    just arrived through the pipeline or one a human is actively acting on,
+    so immediately writing `canonical_status`/`possible_duplicate`/
+    `excluded`/`duplicate_group_id` is the documented, intended effect, not
+    a silent correction of settled history. Historical reprocessing must
+    use `discover_transaction_duplicates` instead -- see its docstring.
+    """
+
+    return _match_and_persist_group(
+        db, transaction=transaction, household_id=household_id, apply_to_transactions=True
+    )
+
+
+def discover_transaction_duplicates(
+    db: Session,
+    *,
+    transaction: Any,
+    household_id: str,
+) -> tuple[Any | None, DuplicateAssessment | None]:
+    """Non-mutating duplicate discovery for historical reprocessing.
+
+    Runs the exact same candidate search and `assess_duplicate` scoring as
+    `register_transaction_duplicates` -- the deterministic rule is never
+    forked -- and persists the same *derived* evidence rows (`DuplicateGroup`,
+    `DuplicateGroupMember`), so a discovered pair is immediately visible
+    through `GET /duplicate-groups` like any other group.
+
+    Unlike `register_transaction_duplicates`, it never writes to
+    `transaction`'s own `canonical_status`, `possible_duplicate`, `excluded`
+    or `duplicate_group_id` -- nor to those same columns on any matched
+    transaction. Those columns are the system's applied classification of
+    *existing*, already-published financial history; changing them changes
+    which source is treated as canonical and whether a transaction is
+    counted. Only a genuinely new transaction arriving through the live
+    pipeline, or an explicit human decision
+    (`resolve_duplicate_group`), may change them -- never an automatic
+    historical backfill side effect (docs/INTEGRITY_IMPLEMENTATION_PLAN.md
+    §0.2: "O backfill planejado deverá produzir findings sobre a base real
+    sem corrigi-la silenciosamente").
+
+    A group a human has already resolved is left untouched: rediscovering an
+    already-resolved pair during a passive backfill pass is not new evidence
+    and must not reopen that decision.
+    """
+
+    return _match_and_persist_group(
+        db, transaction=transaction, household_id=household_id, apply_to_transactions=False
+    )
+
+
+def _match_and_persist_group(
+    db: Session,
+    *,
+    transaction: Any,
+    household_id: str,
+    apply_to_transactions: bool,
+) -> tuple[Any | None, DuplicateAssessment | None]:
+    """Shared candidate search, scoring and derived-evidence persistence for
+    `register_transaction_duplicates` (`apply_to_transactions=True`) and
+    `discover_transaction_duplicates` (`apply_to_transactions=False`). See
+    those two docstrings for the behavioral contract each one promises.
+    """
 
     from app.models import Document, DuplicateGroup, DuplicateGroupMember, Transaction
 
@@ -131,7 +196,8 @@ def register_transaction_duplicates(
         reverse=True,
     )
     if not assessments or assessments[0][1].confidence < PROBABLE_THRESHOLD:
-        transaction.canonical_status = "unassigned"
+        if apply_to_transactions:
+            transaction.canonical_status = "unassigned"
         return None, assessments[0][1] if assessments else None
 
     existing, assessment = assessments[0]
@@ -172,6 +238,12 @@ def register_transaction_duplicates(
             )
             db.add(group)
             db.flush()
+
+    if not apply_to_transactions and group.status == "resolved":
+        # A human already resolved this pair; passive rediscovery
+        # (backfill) is not new evidence and must not reopen that decision
+        # or touch the transactions it applies to.
+        return group, assessment
 
     # A candidate can point at any member of an existing group. Canonical
     # precedence must always compare the new row with the group's persisted
@@ -228,11 +300,12 @@ def register_transaction_duplicates(
         ),
     )
     for member, role, priority, excluded_by_policy in member_policies:
-        member.duplicate_group_id = group.id
-        member.canonical_status = role if strong else "unassigned"
-        member.possible_duplicate = role != "canonical"
-        if excluded_by_policy:
-            member.excluded = True
+        if apply_to_transactions:
+            member.duplicate_group_id = group.id
+            member.canonical_status = role if strong else "unassigned"
+            member.possible_duplicate = role != "canonical"
+            if excluded_by_policy:
+                member.excluded = True
         stored_member = db.scalar(
             select(DuplicateGroupMember).where(
                 DuplicateGroupMember.group_id == group.id,
