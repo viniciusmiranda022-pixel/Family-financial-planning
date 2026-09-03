@@ -17,21 +17,30 @@ class Classification:
     review_reason: str | None = None
 
 
+# Shared with `app/services/importer.py`, which uses these same patterns to
+# decide the *sign* of a credit-card amount (`_normalize_credit_card_amount`)
+# and to bucket it for reconciliation (`_transaction_components`). Defining
+# them once here and importing them there keeps "what counts as a card
+# payment/refund/fee" a single financial policy instead of two regexes that
+# could silently drift apart (see docs/WORK_ORDER_PDF_PARSERS_NUBANK_MERCADO_PAGO.md,
+# "não criar segunda política de classificação"). `DEVOLU` (Mercado Pago's
+# "Devolução") and `ENCARGO` (Mercado Pago's "Tarifas e encargos") are
+# additive synonyms: every description the previous, narrower patterns
+# already matched still matches.
+PAYMENT_PATTERN = re.compile(
+    r"PAGAMENTO.*FATURA|PAGAMENTO RECEBIDO|FATURA PAGA|PAG(?:AMENTO)? BOLETO.*(?:NU PAGAMENTOS|NUBANK)"
+)
+REFUND_PATTERN = re.compile(r"ESTORNO|CREDITO.*COMPRA|CREDITO.*CARTAO|DEVOLU")
+FEE_PATTERN = re.compile(r"IOF|JUROS|TARIFA|ENCARGO")
+
+
 RULES: tuple[tuple[re.Pattern[str], Classification], ...] = (
-    (
-        re.compile(
-            r"PAGAMENTO.*FATURA|PAGAMENTO RECEBIDO|FATURA PAGA|PAG(?:AMENTO)? BOLETO.*(?:NU PAGAMENTOS|NUBANK)"
-        ),
-        Classification("Conciliação", "reconciliation", True, 0.99),
-    ),
+    (PAYMENT_PATTERN, Classification("Conciliação", "reconciliation", True, 0.99)),
     (
         re.compile(r"PRIVILEGE|PRIVILEGE DI|APLICACAO|RESGATE"),
         Classification("Transferência patrimonial", "transfer", True, 0.97),
     ),
-    (
-        re.compile(r"ESTORNO|CREDITO.*COMPRA|CREDITO.*CARTAO"),
-        Classification("Reembolsos e estornos", "refund", False, 0.98),
-    ),
+    (REFUND_PATTERN, Classification("Reembolsos e estornos", "refund", False, 0.98)),
     (
         re.compile(r"IFOOD|RESTAURANTE|LANCHONETE|PIZZARIA|PADARIA|PANIF"),
         Classification("Restaurantes e delivery", "expense", False, 0.92),
@@ -70,7 +79,7 @@ RULES: tuple[tuple[re.Pattern[str], Classification], ...] = (
         Classification("Compras, casa e vestuário", "expense", False, 0.86),
     ),
     (re.compile(r"SEGURO|PORTO SEGURO|AZUL SEGUROS"), Classification("Seguros", "expense", False, 0.9)),
-    (re.compile(r"IOF|JUROS|TARIFA"), Classification("Juros, IOF e tarifas", "expense", False, 0.95)),
+    (FEE_PATTERN, Classification("Juros, IOF e tarifas", "expense", False, 0.95)),
 )
 
 
