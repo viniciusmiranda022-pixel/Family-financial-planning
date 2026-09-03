@@ -13,7 +13,11 @@ os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.db import Base
 from app.models import Account, Document, DuplicateGroupMember, Household, Transaction, User
-from app.services.duplicates import register_transaction_duplicates, resolve_duplicate_group
+from app.services.duplicates import (
+    discover_transaction_duplicates,
+    register_transaction_duplicates,
+    resolve_duplicate_group,
+)
 
 
 def _transaction(household_id: str, account_id: str, document_id: str, priority: int) -> Transaction:
@@ -142,3 +146,129 @@ def test_probable_same_document_match_does_not_auto_exclude() -> None:
         assert second.excluded is False
         assert first.canonical_status == "unassigned"
         assert second.canonical_status == "unassigned"
+
+
+def test_discover_transaction_duplicates_persists_evidence_without_mutating_transactions() -> None:
+    """`app.cli.backfill`'s non-mutating path: historical reprocessing must
+    surface the same derived evidence `register_transaction_duplicates`
+    would, without ever writing to either transaction's own classification
+    columns (2026-09-03 engineering review of PR 8)."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família")
+        db.add(household)
+        db.flush()
+        account = Account(household_id=household.id, name="Conta", owner_label="Família")
+        statement = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="statement.csv",
+            document_type="bank_statement",
+            sha256="d" * 64,
+            encrypted_path="d.enc",
+        )
+        workbook = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="plan.xlsx",
+            document_type="financial_plan_workbook",
+            sha256="e" * 64,
+            encrypted_path="e.enc",
+        )
+        db.add_all([account, statement, workbook])
+        db.flush()
+        imported = _transaction(household.id, account.id, statement.id, 70)
+        authoritative = _transaction(household.id, account.id, workbook.id, 100)
+        db.add_all([imported, authoritative])
+        db.flush()
+
+        group, assessment = discover_transaction_duplicates(
+            db, transaction=authoritative, household_id=household.id
+        )
+
+        assert group is not None
+        assert assessment.band == "strong"
+        assert group.status == "open"
+        assert group.canonical_transaction_id == authoritative.id
+
+        # Derived evidence is persisted and immediately visible for review...
+        members = db.scalars(select(DuplicateGroupMember)).all()
+        assert len(members) == 2
+        assert {member.transaction_id for member in members} == {imported.id, authoritative.id}
+
+        # ...but neither transaction's own columns were touched.
+        for row in (imported, authoritative):
+            assert row.canonical_status == "unassigned"
+            assert row.possible_duplicate is False
+            assert row.excluded is False
+            assert row.duplicate_group_id is None
+
+
+def test_discover_transaction_duplicates_does_not_reopen_a_resolved_group() -> None:
+    """A human's `resolve_duplicate_group` decision is authoritative: a
+    passive rediscovery pass (backfill) rescanning the same pair later must
+    not reopen it or touch the transactions it applies to."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família")
+        db.add(household)
+        db.flush()
+        account = Account(household_id=household.id, name="Conta", owner_label="Família")
+        admin = User(
+            household_id=household.id,
+            name="Admin",
+            username="admin-discover",
+            password_hash="hash",
+            is_admin=True,
+        )
+        statement = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="statement.csv",
+            document_type="bank_statement",
+            sha256="f" * 64,
+            encrypted_path="f.enc",
+        )
+        workbook = Document(
+            household_id=household.id,
+            account_id=account.id,
+            original_name="plan.xlsx",
+            document_type="financial_plan_workbook",
+            sha256="1" * 64,
+            encrypted_path="g.enc",
+        )
+        db.add_all([account, admin, statement, workbook])
+        db.flush()
+        imported = _transaction(household.id, account.id, statement.id, 70)
+        authoritative = _transaction(household.id, account.id, workbook.id, 100)
+        db.add_all([imported, authoritative])
+        db.flush()
+
+        group, _ = register_transaction_duplicates(
+            db, transaction=authoritative, household_id=household.id
+        )
+        resolve_duplicate_group(
+            db,
+            group_id=group.id,
+            household_id=household.id,
+            resolution="distinct",
+            user_id=admin.id,
+            reason="Movimentos distintos confirmados",
+        )
+        assert group.status == "resolved"
+        imported_state = (imported.canonical_status, imported.excluded)
+        authoritative_state = (authoritative.canonical_status, authoritative.excluded)
+
+        rediscovered_group, _ = discover_transaction_duplicates(
+            db, transaction=authoritative, household_id=household.id
+        )
+
+        assert rediscovered_group.id == group.id
+        assert rediscovered_group.status == "resolved"
+        assert rediscovered_group.resolution == "distinct"
+        assert (imported.canonical_status, imported.excluded) == imported_state
+        assert (authoritative.canonical_status, authoritative.excluded) == authoritative_state

@@ -23,6 +23,7 @@ from app.models import (  # noqa: E402
     Document,
     DocumentReconciliation,
     DuplicateGroup,
+    DuplicateGroupMember,
     FinancialSnapshot,
     Household,
     IntegrityFinding,
@@ -41,7 +42,16 @@ def _engine():
 
 
 def _source_fact_fingerprint(db: Session, household_id: str) -> dict[str, object]:
-    """A snapshot of every column `app.cli.backfill` must never change."""
+    """A snapshot of every column `app.cli.backfill` must never change.
+
+    Includes the duplicate-classification columns (`canonical_status`,
+    `possible_duplicate`, `excluded`, `duplicate_group_id`): a 2026-09-03
+    engineering review found that the backfill *did* mutate them through
+    `register_transaction_duplicates` while this fingerprint omitted them,
+    so the byte-for-byte assertions below did not actually detect the
+    mutation. See docs/WORK_ORDER_PR8_...: the backfill "não pode modificar
+    silenciosamente Transaction... ou fatos financeiros de origem".
+    """
 
     transactions = {
         row.id: (
@@ -51,6 +61,10 @@ def _source_fact_fingerprint(db: Session, household_id: str) -> dict[str, object
             row.transaction_type,
             row.account_id,
             row.category_id,
+            row.canonical_status,
+            row.possible_duplicate,
+            row.excluded,
+            row.duplicate_group_id,
         )
         for row in db.scalars(select(Transaction).where(Transaction.household_id == household_id)).all()
     }
@@ -92,22 +106,71 @@ def test_backfill_never_mutates_source_financial_facts() -> None:
         assert before == after
 
 
-def test_backfill_classifies_the_duplicate_pair_and_reconciles_documents_as_unknown() -> None:
+def test_backfill_reports_the_duplicate_pair_as_derived_evidence_without_mutating_it() -> None:
+    """The backfill must surface the legacy duplicate pair as review-ready
+    evidence (`DuplicateGroup`/`DuplicateGroupMember`, discoverable through
+    `GET /duplicate-groups`) while leaving the `Transaction` rows themselves
+    exactly as they were -- see the 2026-09-03 review of this exact
+    behavior in the PR history and docs/FINANCIAL_RULES.md's "Backfill"
+    section.
+    """
+
     with Session(_engine()) as db:
         synthetic = build_synthetic_household(db)
         db.commit()
+
+        first, second = synthetic.duplicate_pair
+        first_before = (
+            first.canonical_status,
+            first.possible_duplicate,
+            first.excluded,
+            first.duplicate_group_id,
+        )
+        second_before = (
+            second.canonical_status,
+            second.possible_duplicate,
+            second.excluded,
+            second.duplicate_group_id,
+        )
+        assert first_before == ("unassigned", False, False, None)
+        assert second_before == ("unassigned", False, False, None)
 
         report = process_household(db, synthetic.household, period_from=None, period_to=None)
         db.commit()
 
         assert report.documents_reconciled_unknown == 3
-        assert report.duplicate_candidates_processed == len(synthetic.transactions)
+        assert report.duplicate_candidates_examined == len(synthetic.transactions)
 
-        first, second = synthetic.duplicate_pair
         db.refresh(first)
         db.refresh(second)
-        assert first.duplicate_group_id is not None
-        assert first.duplicate_group_id == second.duplicate_group_id
+        # The source `Transaction` rows are byte-for-byte unchanged: the
+        # backfill must never apply a duplicate classification automatically.
+        assert (
+            first.canonical_status,
+            first.possible_duplicate,
+            first.excluded,
+            first.duplicate_group_id,
+        ) == first_before
+        assert (
+            second.canonical_status,
+            second.possible_duplicate,
+            second.excluded,
+            second.duplicate_group_id,
+        ) == second_before
+
+        # The pair is nonetheless surfaced as derived evidence, in the same
+        # group, ready for human review via `POST /duplicate-groups/{id}/resolve`.
+        members = db.scalars(
+            select(DuplicateGroupMember).where(
+                DuplicateGroupMember.transaction_id.in_((first.id, second.id))
+            )
+        ).all()
+        assert len(members) == 2
+        group_ids = {member.group_id for member in members}
+        assert len(group_ids) == 1
+        group = db.get(DuplicateGroup, group_ids.pop())
+        assert group is not None
+        assert group.status == "open"
 
         reconciliations = db.scalars(
             select(DocumentReconciliation).where(
@@ -364,7 +427,7 @@ def test_household_with_no_transactions_is_a_safe_no_op() -> None:
         assert report.periods == []
         assert report.snapshots_touched == 0
         assert report.documents_reconciled_unknown == 0
-        assert report.duplicate_candidates_processed == 0
+        assert report.duplicate_candidates_examined == 0
 
 
 def test_legacy_investment_balance_without_observation_stays_unknown_after_backfill() -> None:
