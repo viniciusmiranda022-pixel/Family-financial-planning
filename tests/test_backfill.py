@@ -32,6 +32,7 @@ from app.models import (  # noqa: E402
     PayrollRecord,
     Transaction,
 )
+from tests.fixtures.fact_fingerprint import fact_fingerprint  # noqa: E402
 from tests.fixtures.synthetic_household import build_synthetic_household  # noqa: E402
 
 
@@ -42,54 +43,37 @@ def _engine():
 
 
 def _source_fact_fingerprint(db: Session, household_id: str) -> dict[str, object]:
-    """A snapshot of every column `app.cli.backfill` must never change.
+    """A snapshot of every mapped column of every source-fact model
+    `app.cli.backfill` must never change, derived structurally from each
+    model's SQLAlchemy mapping (`tests/fixtures/fact_fingerprint.py`) rather
+    than a hand-curated subset of columns.
 
-    Includes the duplicate-classification columns (`canonical_status`,
-    `possible_duplicate`, `excluded`, `duplicate_group_id`): a 2026-09-03
-    engineering review found that the backfill *did* mutate them through
-    `register_transaction_duplicates` while this fingerprint omitted them,
-    so the byte-for-byte assertions below did not actually detect the
-    mutation. See docs/WORK_ORDER_PR8_...: the backfill "não pode modificar
-    silenciosamente Transaction... ou fatos financeiros de origem".
+    A 2026-09-03 engineering review found the backfill *did* mutate the
+    duplicate-classification columns (`canonical_status`,
+    `possible_duplicate`, `excluded`, `duplicate_group_id`) through
+    `register_transaction_duplicates` while a prior, hand-curated version of
+    this fingerprint omitted them, so the byte-for-byte assertions below did
+    not actually detect the mutation; a follow-up round of that same review
+    found the corrected fingerprint was still only a partial subset of
+    `Transaction`'s source/lineage columns (missing, among others,
+    `document_id`, `normalized_description`, `fingerprint`, `source_line`,
+    `occurred_at`, `competence`, `classification_source`,
+    `classification_version`, `linked_transaction_id`, `transfer_group_id`,
+    `trace_id`, `source_priority`, `confidence`, `reviewed`) and that the
+    other source-fact models were undersampled the same way. Deriving the
+    column list from each model's own mapping instead of a hand-written
+    tuple makes this fingerprint complete by construction and keeps it that
+    way as columns are added. See docs/WORK_ORDER_PR8_...: the backfill
+    "não pode modificar silenciosamente Transaction... ou fatos financeiros
+    de origem".
     """
 
-    transactions = {
-        row.id: (
-            row.booked_at,
-            row.description,
-            str(row.amount),
-            row.transaction_type,
-            row.account_id,
-            row.category_id,
-            row.canonical_status,
-            row.possible_duplicate,
-            row.excluded,
-            row.duplicate_group_id,
-        )
-        for row in db.scalars(select(Transaction).where(Transaction.household_id == household_id)).all()
-    }
-    documents = {
-        row.id: (row.original_name, row.document_type, row.sha256, row.encrypted_path)
-        for row in db.scalars(select(Document).where(Document.household_id == household_id)).all()
-    }
-    payroll = {
-        row.id: (row.person_name, str(row.net_amount), row.competence)
-        for row in db.scalars(select(PayrollRecord).where(PayrollRecord.household_id == household_id)).all()
-    }
-    commissions = {
-        row.id: (str(row.gross_amount), row.status, row.expected_date)
-        for row in db.scalars(select(Commission).where(Commission.household_id == household_id)).all()
-    }
-    obligations = {
-        row.id: (row.name, str(row.amount), row.due_date)
-        for row in db.scalars(select(Obligation).where(Obligation.household_id == household_id)).all()
-    }
     return {
-        "transactions": transactions,
-        "documents": documents,
-        "payroll": payroll,
-        "commissions": commissions,
-        "obligations": obligations,
+        "transactions": fact_fingerprint(db, Transaction, household_id=household_id),
+        "documents": fact_fingerprint(db, Document, household_id=household_id),
+        "payroll": fact_fingerprint(db, PayrollRecord, household_id=household_id),
+        "commissions": fact_fingerprint(db, Commission, household_id=household_id),
+        "obligations": fact_fingerprint(db, Obligation, household_id=household_id),
     }
 
 

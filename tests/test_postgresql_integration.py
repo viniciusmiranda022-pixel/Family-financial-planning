@@ -47,6 +47,7 @@ from app.models import (  # noqa: E402
     Household,
     Transaction,
 )
+from tests.fixtures.fact_fingerprint import fact_fingerprint  # noqa: E402
 from tests.fixtures.synthetic_household import build_synthetic_household  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -168,12 +169,11 @@ def test_backfill_is_idempotent_against_real_postgresql_locking_semantics() -> N
         db.commit()
         household_id = synthetic.household.id
 
-        before_facts = {
-            row.id: (row.booked_at, row.description, str(row.amount), row.account_id)
-            for row in db.scalars(
-                select(Transaction).where(Transaction.household_id == household_id)
-            ).all()
-        }
+        # Same structurally-complete, mapping-derived fingerprint
+        # `tests/test_backfill.py` uses -- see
+        # `tests/fixtures/fact_fingerprint.py` for why a hand-curated subset
+        # of columns is not trusted here either.
+        before_facts = fact_fingerprint(db, Transaction, household_id=household_id)
 
         household = db.get(Household, household_id)
         process_household(db, household, period_from=None, period_to=None)
@@ -214,12 +214,7 @@ def test_backfill_is_idempotent_against_real_postgresql_locking_semantics() -> N
         assert after_first[1] == 3
         assert after_first[2] == 1
 
-        after_facts = {
-            row.id: (row.booked_at, row.description, str(row.amount), row.account_id)
-            for row in db.scalars(
-                select(Transaction).where(Transaction.household_id == household_id)
-            ).all()
-        }
+        after_facts = fact_fingerprint(db, Transaction, household_id=household_id)
         assert before_facts == after_facts
     engine.dispose()
 
