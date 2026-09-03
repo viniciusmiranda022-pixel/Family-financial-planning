@@ -24,6 +24,7 @@ from app.cli.initial_load import (  # noqa: E402
     _lock_household_initial_load,
     _preview_documents,
     _resolve_accounts,
+    _summary,
     load_manifest,
 )
 from app.config import get_settings  # noqa: E402
@@ -31,6 +32,7 @@ from app.db import Base  # noqa: E402
 from app.models import (  # noqa: E402
     Account,
     AccountBalanceObservation,
+    AuditEvent,
     Document,
     FinancialProfile,
     Household,
@@ -206,7 +208,11 @@ def test_apply_is_idempotent_for_structure_and_confirmed_balance() -> None:
         assert first_obligations == {"created": 1, "skipped": 0}
         assert first_balances == {"created": 1, "skipped": 0}
         assert second_accounts == {"created": 0, "skipped": 1}
-        assert second_profile == {"created": False, "changes": {}}
+        assert second_profile == {
+            "created": False,
+            "changed_count": 0,
+            "changed_fields": [],
+        }
         assert second_obligations == {"created": 0, "skipped": 1}
         assert second_balances == {"created": 0, "skipped": 1}
         assert db.scalar(select(func.count(Account.id))) == 1
@@ -219,6 +225,81 @@ def test_apply_is_idempotent_for_structure_and_confirmed_balance() -> None:
         assert observation.amount == Decimal("1000.00")
         assert observation.source == "manual_confirmed"
         assert observation.confirmed_by == user.id
+
+
+def test_profile_report_and_summary_never_leak_financial_values() -> None:
+    """Work Order `docs/WORK_ORDER_INITIAL_LOAD_BOOTSTRAP.md` ("Segurança e
+    privacidade"): the CLI must never print sensitive data, only file names,
+    status and counts. `_apply_profile`'s report (which flows straight into
+    `_summary()` and then `main()`'s stdout `json.dumps`) must therefore
+    carry field names/counts only — never the literal salary/cap/rate
+    values — in both dry-run and apply mode. The real values must still
+    reach the DB (profile row + audit trail), since only stdout/log
+    exposure is prohibited, not persistence or auditability."""
+    salary = Decimal("12345.67")
+    cap = Decimal("999.99")
+    with Session(_engine()) as db:
+        household, user = _seed_household(db)
+        manifest = InitialLoadManifest(
+            version=1,
+            load_id="privacy-check",
+            accounts=[],
+            profile=ProfileSeed(monthly_salary_net=salary, monthly_cash_cap=cap),
+        )
+
+        dry_run_report = _apply_profile(
+            db, household.id, manifest, apply=False, user_id=user.id
+        )
+        db.rollback()
+        assert dry_run_report == {
+            "created": True,
+            "changed_count": 2,
+            "changed_fields": ["monthly_cash_cap", "monthly_salary_net"],
+        }
+        dry_run_json = json.dumps(dry_run_report)
+        assert str(salary) not in dry_run_json
+        assert str(cap) not in dry_run_json
+
+        apply_report = _apply_profile(
+            db, household.id, manifest, apply=True, user_id=user.id
+        )
+        db.commit()
+        assert apply_report == {
+            "created": True,
+            "changed_count": 2,
+            "changed_fields": ["monthly_cash_cap", "monthly_salary_net"],
+        }
+
+        summary = _summary(
+            mode="apply",
+            manifest=manifest,
+            accounts={"created": 0, "skipped": 0},
+            profile=apply_report,
+            obligations={"created": 0, "skipped": 0},
+            balances={"created": 0, "skipped": 0},
+            documents=[],
+        )
+        # This is exactly the payload `main()` prints to stdout via
+        # `json.dumps(_summary(...))`.
+        stdout_json = json.dumps(summary, ensure_ascii=False, default=str)
+        assert str(salary) not in stdout_json
+        assert str(cap) not in stdout_json
+
+        # The values must still be persisted: privacy applies to stdout, not
+        # to the DB record or its audit trail.
+        profile = db.scalar(
+            select(FinancialProfile).where(FinancialProfile.household_id == household.id)
+        )
+        assert profile is not None
+        assert profile.monthly_salary_net == salary
+        assert profile.monthly_cash_cap == cap
+
+        audit = db.scalar(
+            select(AuditEvent).where(AuditEvent.event_type == "initial_load.profile.apply")
+        )
+        assert audit is not None
+        assert audit.after_state["monthly_salary_net"] == str(salary)
+        assert audit.after_state["monthly_cash_cap"] == str(cap)
 
 
 def test_conflicts_block_instead_of_overwriting() -> None:

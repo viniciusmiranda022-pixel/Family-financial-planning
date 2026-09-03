@@ -335,6 +335,20 @@ def _profile_changes(profile: FinancialProfile, seed: ProfileSeed | None) -> dic
     }
 
 
+def _profile_report(*, created: bool, changed_fields: list[str]) -> dict[str, object]:
+    # Deliberately field names + counts only, never values: the Work Order's
+    # privacy contract ("O CLI não imprime conteúdo de documentos nem dados
+    # sensíveis; imprime somente nomes de arquivo, status e contagens.")
+    # covers FinancialProfile amounts (salary, caps, floors, rates) the same
+    # way it covers document content. Real values stay in memory/DB only —
+    # the audit trail below is where the reconstructable before/after lives.
+    return {
+        "created": created,
+        "changed_count": len(changed_fields),
+        "changed_fields": sorted(changed_fields),
+    }
+
+
 def _apply_profile(
     db: Session,
     household_id: str,
@@ -344,7 +358,7 @@ def _apply_profile(
     user_id: str,
 ) -> dict[str, object]:
     if manifest.profile is None:
-        return {"created": False, "changes": {}}
+        return _profile_report(created=False, changed_fields=[])
     profile = db.scalar(
         select(FinancialProfile).where(FinancialProfile.household_id == household_id)
     )
@@ -356,9 +370,9 @@ def _apply_profile(
             db.flush()
     changes = _profile_changes(profile, manifest.profile)
     if not apply:
-        return {"created": created, "changes": {k: str(v) for k, v in changes.items()}}
+        return _profile_report(created=created, changed_fields=list(changes))
     if not changes and not created:
-        return {"created": False, "changes": {}}
+        return _profile_report(created=False, changed_fields=[])
     before = {key: str(getattr(profile, key)) for key in changes}
     for key, value in changes.items():
         setattr(profile, key, value)
@@ -375,7 +389,7 @@ def _apply_profile(
         before=before or None,
         after=after or {"created": True},
     )
-    return {"created": created, "changes": after}
+    return _profile_report(created=created, changed_fields=list(changes))
 
 
 def _apply_obligations(
