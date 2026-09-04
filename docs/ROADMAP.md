@@ -32,7 +32,20 @@
   de auditoria); pendente revisão do engenheiro responsável antes do merge;
 - importação em lote;
 - exportação Excel/PDF;
-- testes com cópias anonimizadas dos documentos reais.
+- testes com cópias anonimizadas dos documentos reais;
+- **go-live de uso manual / fluxos financeiros do dia a dia**: consolidar uma experiência manual
+  explícita e simples para `despesa`, `receita`, `transfer`, `investment`, `redemption`, `refund` e
+  `reconciliation`, sem exigir que o usuário conheça os tipos internos. O fluxo deve incluir, no
+  mínimo, pagamento manual de fatura (cartão + valor + conta pagadora), transferência entre contas,
+  aplicação e resgate de investimento, compra parcelada com projeção das parcelas futuras e o caso
+  combinado de resgate do Privilège DI seguido de pagamento de fatura. Pagamento de fatura nunca é
+  nova despesa (INV-002); aplicação, resgate e transferência nunca viram receita/despesa; fatos já
+  observados não podem ser duplicados por projeções. O formulário manual atual em "Lançamentos" só
+  expõe despesa, receita, aplicação, resgate e estorno, enquanto a Central Inteligente já representa
+  `transfer` e `reconciliation`; este gap deve ser fechado antes do go-live. Exigir testes de fluxo
+  completo pela API/UI, preservação de household isolation, auditoria, compatibilidade com dados
+  existentes e paridade com o classificador/motor financeiro canônico. Não criar segundo motor de
+  cálculo nem inferir automaticamente origem de recursos sem confirmação humana.
 
 ## Entregue em 25/08/2026 — captura e acesso remoto
 
