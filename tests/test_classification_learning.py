@@ -1,6 +1,9 @@
 import os
 import uuid
+from datetime import date
+from decimal import Decimal
 
+import pytest
 from cryptography.fernet import Fernet
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -10,12 +13,31 @@ os.environ.setdefault("SECRET_KEY", "classification-learning-test-secret")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.db import Base
-from app.models import Category, Household, User
+from app.models import Category, ClassificationRule, Household, Transaction, User
 from app.services.classification_learning import (
     accept_classification_rule,
     classify_with_local_rules,
+    deactivate_classification_rule,
+    edit_classification_rule,
     record_confirmed_correction,
 )
+from app.services.classifier import normalize_description
+
+
+def _household_with_admin(db: Session, *, household_name: str = "Família") -> tuple[Household, User]:
+    household = Household(name=household_name)
+    db.add(household)
+    db.flush()
+    admin = User(
+        household_id=household.id,
+        name="Admin",
+        username=f"admin-{uuid.uuid4().hex[:8]}",
+        password_hash="hash",
+        is_admin=True,
+    )
+    db.add(admin)
+    db.flush()
+    return household, admin
 
 
 def test_rule_requires_three_distinct_confirmations_and_explicit_acceptance() -> None:
@@ -83,3 +105,313 @@ def test_rule_requires_three_distinct_confirmations_and_explicit_acceptance() ->
             movement_type="expense",
         )
         assert repeated.confirmation_count == 3
+
+
+def test_local_rule_never_overrides_structural_invariant_classification() -> None:
+    """A household rule may only ever refine the *category* of an ordinary
+    income/expense classification. It must never recategorize a transfer
+    (INV-001), a card-payment reconciliation (INV-002), a patrimonial
+    application/redemption movement (INV-003/INV-004) or a refund
+    (INV-016) -- even when a rule happens to exist for the exact normalized
+    description of a structurally-protected transaction. See
+    docs/WORK_ORDER_EDITABLE_MERCHANT_RULES.md, acceptance criterion 6."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household, _admin = _household_with_admin(db)
+        category = Category(household_id=household.id, name="Categoria manipulada")
+        db.add(category)
+        db.flush()
+
+        # Fabricated directly (not through `record_confirmed_correction`,
+        # which never itself captures a protected movement_type -- see its
+        # docstring) to prove the *apply-time* guard holds even against
+        # data that should never occur through the normal lifecycle.
+        protected_rule = ClassificationRule(
+            household_id=household.id,
+            normalized_merchant=normalize_description("PAGAMENTO FATURA NUBANK"),
+            category_id=category.id,
+            movement_type="expense",
+            confirmation_count=3,
+            status="active",
+            active=True,
+        )
+        db.add(protected_rule)
+        db.flush()
+
+        result = classify_with_local_rules(
+            db, household_id=household.id, description="PAGAMENTO FATURA NUBANK", amount=500.0
+        )
+        assert result.source == "builtin_rule"
+        assert result.transaction_type == "reconciliation"
+        assert result.category == "Conciliação"
+        assert result.excluded is True
+
+
+def test_local_rule_with_stale_protected_movement_type_is_ignored() -> None:
+    """Defense in depth: even if a rule's *own* `movement_type` were ever
+    protected (stale data, a future bug), applying it is refused and the
+    deterministic classifier decides instead."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household, _admin = _household_with_admin(db)
+        category = Category(household_id=household.id, name="Categoria manipulada")
+        db.add(category)
+        db.flush()
+
+        stale_rule = ClassificationRule(
+            household_id=household.id,
+            normalized_merchant=normalize_description("Loja Genérica"),
+            category_id=category.id,
+            movement_type="transfer",
+            confirmation_count=3,
+            status="active",
+            active=True,
+        )
+        db.add(stale_rule)
+        db.flush()
+
+        result = classify_with_local_rules(
+            db, household_id=household.id, description="Loja Genérica", amount=-50.0
+        )
+        assert result.source == "builtin_rule"
+        assert result.transaction_type == "expense"
+
+
+def test_classification_rule_lifecycle_deactivate_and_edit() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household, admin = _household_with_admin(db)
+        original_category = Category(household_id=household.id, name="Transporte")
+        corrected_category = Category(household_id=household.id, name="Trabalho")
+        db.add_all([original_category, corrected_category])
+        db.flush()
+
+        rule = None
+        for index in (1, 2, 3):
+            rule = record_confirmed_correction(
+                db,
+                household_id=household.id,
+                transaction_id=f"tx-{index}",
+                description="Posto Avenida",
+                category_id=original_category.id,
+                movement_type="expense",
+            )
+        assert rule.status == "pending_acceptance"
+
+        # Deactivating before acceptance is rejected: only an active rule
+        # can be turned off.
+        with pytest.raises(ValueError):
+            deactivate_classification_rule(db, household_id=household.id, rule_id=rule.id)
+
+        edited = edit_classification_rule(
+            db, household_id=household.id, rule_id=rule.id, category_id=corrected_category.id
+        )
+        assert edited.category_id == corrected_category.id
+        # movement_type is untouched by edit; only the category changes.
+        assert edited.movement_type == "expense"
+
+        accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
+        applied = classify_with_local_rules(
+            db, household_id=household.id, description="Posto Avenida", amount=-80.0
+        )
+        assert applied.category == "Trabalho"
+        assert applied.rule_id == rule.id
+
+        deactivated = deactivate_classification_rule(db, household_id=household.id, rule_id=rule.id)
+        assert deactivated.status == "inactive"
+        assert deactivated.active is False
+        # Evidence is preserved, not deleted, by deactivation.
+        assert deactivated.confirmation_count == 3
+
+        after_deactivation = classify_with_local_rules(
+            db, household_id=household.id, description="Posto Avenida", amount=-80.0
+        )
+        assert after_deactivation.source == "builtin_rule"
+
+        # An admin cannot simply flip a deactivated rule back on without
+        # new evidence: it is not eligible for activation while `inactive`.
+        with pytest.raises(ValueError):
+            accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
+
+        # A genuinely new confirmed correction re-promotes it to
+        # `pending_acceptance`, from which it can be activated again.
+        reconfirmed = record_confirmed_correction(
+            db,
+            household_id=household.id,
+            transaction_id="tx-4",
+            description="Posto Avenida",
+            category_id=corrected_category.id,
+            movement_type="expense",
+        )
+        assert reconfirmed.status == "pending_acceptance"
+        accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
+        assert rule.status == "active"
+
+
+def test_classification_rule_edit_rejects_unknown_category() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household, _admin = _household_with_admin(db)
+        category = Category(household_id=household.id, name="Transporte")
+        db.add(category)
+        db.flush()
+        rule = None
+        for index in (1, 2, 3):
+            rule = record_confirmed_correction(
+                db,
+                household_id=household.id,
+                transaction_id=f"tx-{index}",
+                description="Posto Avenida",
+                category_id=category.id,
+                movement_type="expense",
+            )
+        with pytest.raises(LookupError):
+            edit_classification_rule(
+                db, household_id=household.id, rule_id=rule.id, category_id="does-not-exist"
+            )
+
+
+def test_classification_rule_actions_are_household_isolated() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household_a, _admin_a = _household_with_admin(db, household_name="Família A")
+        household_b, admin_b = _household_with_admin(db, household_name="Família B")
+        category_a = Category(household_id=household_a.id, name="Categoria A")
+        db.add(category_a)
+        db.flush()
+
+        rule = None
+        for index in (1, 2, 3):
+            rule = record_confirmed_correction(
+                db,
+                household_id=household_a.id,
+                transaction_id=f"tx-{index}",
+                description="Loja X",
+                category_id=category_a.id,
+                movement_type="expense",
+            )
+        assert rule.status == "pending_acceptance"
+
+        with pytest.raises(LookupError):
+            accept_classification_rule(
+                db, household_id=household_b.id, rule_id=rule.id, user_id=admin_b.id
+            )
+        with pytest.raises(LookupError):
+            deactivate_classification_rule(db, household_id=household_b.id, rule_id=rule.id)
+        with pytest.raises(LookupError):
+            edit_classification_rule(
+                db, household_id=household_b.id, rule_id=rule.id, category_id=category_a.id
+            )
+
+        accept_classification_rule(db, household_id=household_a.id, rule_id=rule.id, user_id=admin_b.id)
+
+        # A different household's active rule must never classify a
+        # transaction for this household, even with an identical merchant
+        # description.
+        result = classify_with_local_rules(
+            db, household_id=household_b.id, description="Loja X", amount=-40.0
+        )
+        assert result.source == "builtin_rule"
+
+
+def test_rule_activation_and_edit_never_mutate_existing_transactions() -> None:
+    """Activating, editing or deactivating a rule must never touch
+    `Transaction` rows -- classification only changes for future events
+    (acceptance criterion 3)."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household, admin = _household_with_admin(db)
+        original_category = Category(household_id=household.id, name="Transporte")
+        corrected_category = Category(household_id=household.id, name="Trabalho")
+        db.add_all([original_category, corrected_category])
+        db.flush()
+
+        historical = Transaction(
+            household_id=household.id,
+            account_id=None,
+            category_id=original_category.id,
+            booked_at=date(2026, 8, 1),
+            description="Posto Avenida",
+            normalized_description=normalize_description("Posto Avenida"),
+            amount=-80,
+            transaction_type="expense",
+            owner_label="Família",
+            fingerprint="a" * 64,
+        )
+        db.add(historical)
+        db.flush()
+        before = {
+            "category_id": historical.category_id,
+            "transaction_type": historical.transaction_type,
+            "amount": str(historical.amount),
+            "description": historical.description,
+        }
+
+        rule = None
+        for index in (1, 2, 3):
+            rule = record_confirmed_correction(
+                db,
+                household_id=household.id,
+                transaction_id=f"tx-{index}",
+                description="Posto Avenida",
+                category_id=original_category.id,
+                movement_type="expense",
+            )
+        accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
+        edit_classification_rule(
+            db, household_id=household.id, rule_id=rule.id, category_id=corrected_category.id
+        )
+        deactivate_classification_rule(db, household_id=household.id, rule_id=rule.id)
+
+        after = {
+            "category_id": historical.category_id,
+            "transaction_type": historical.transaction_type,
+            "amount": str(historical.amount),
+            "description": historical.description,
+        }
+        assert after == before
+
+
+def test_smart_capture_document_row_routes_through_active_household_rule() -> None:
+    """Smart capture's structured-document row classifier must resolve to
+    the same active household rule the importer uses when given the same
+    database session and household -- one canonical classification path,
+    not a second policy (acceptance criterion 4). HTTP-level proof through
+    the real `/api/captures/preview` endpoint lives in
+    `tests/test_classification_rules_api.py`; this is the fast, direct
+    unit of that same wiring."""
+    from app.services.importer import ParsedTransaction
+    from app.services.smart_capture import _parsed_transaction_item
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household, admin = _household_with_admin(db)
+        category = Category(household_id=household.id, name="Papelaria")
+        db.add(category)
+        db.flush()
+
+        rule = None
+        for index in (1, 2, 3):
+            rule = record_confirmed_correction(
+                db,
+                household_id=household.id,
+                transaction_id=f"tx-{index}",
+                description="Papelaria Central",
+                category_id=category.id,
+                movement_type="expense",
+            )
+        accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
+
+        item = ParsedTransaction(date(2026, 8, 1), "Papelaria Central", Decimal("-45"), 1)
+        with_rule = _parsed_transaction_item(item, db=db, household_id=household.id)
+        assert with_rule["category_name"] == "Papelaria"
+
+        without_context = _parsed_transaction_item(item)
+        assert without_context["category_name"] != "Papelaria"
