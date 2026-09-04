@@ -318,6 +318,40 @@ def test_report_export_excluded_transaction_never_inflates_exported_totals() -> 
         app.dependency_overrides.pop(get_db, None)
 
 
+def test_report_export_pdf_paginates_large_sections_without_dropping_rows() -> None:
+    """Unit-level regression on `build_report_pdf` directly: a section with
+    more rows than fit on one page (`_MAX_ROWS_PER_PDF_PAGE` is 28) must
+    still have every single row appear somewhere in the rendered PDF text --
+    never silently clipped onto a page that overflowed. 40 synthetic
+    categories forces at least two PDF pages for that section alone.
+    """
+
+    from datetime import UTC, datetime
+
+    from app.services.report_export import build_report_pdf
+
+    report = {
+        "start_month": "2026-08",
+        "end_month": "2026-08",
+        "months": 1,
+        "covered_months": 1,
+        "duplicates_ignored": 0,
+        "summary": {"liquidity_name": "Privilege DI", "total_spending": 1000.0},
+        "monthly": [],
+        "categories": [
+            {"category": f"Categoria Sintética {i:02d}", "amount": float(i + 1), "average": float(i + 1), "share": 1.0}
+            for i in range(40)
+        ],
+        "accounts": [],
+    }
+    pdf_bytes = build_report_pdf(report, generated_at=datetime.now(UTC))
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    full_text = "".join(page.get_text() for page in doc)
+    assert doc.page_count >= 3  # cover + at least 2 category pages (28 + 12)
+    for i in range(40):
+        assert f"Categoria Sintética {i:02d}" in full_text
+
+
 def test_report_export_rejects_invalid_format() -> None:
     app.dependency_overrides[get_db] = _override_get_db
     try:
