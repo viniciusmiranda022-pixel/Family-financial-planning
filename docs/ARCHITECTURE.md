@@ -160,6 +160,14 @@ envio individual), mais `MAX_BATCH_FILES` arquivos e `MAX_BATCH_TOTAL_MB` combin
 interface (`app/templates/index.html`, `app/static/app.js`) só exibe os campos que o backend já
 calculou por arquivo; nunca soma, parseia, classifica ou reconcilia no navegador.
 
+O lote inteiro é correlacionado por um `batch_id` (UUID) gravado no evento de auditoria agregado
+`document.import_batch` (`AuditEvent.details`, JSON já existente, nenhuma coluna nova). Cada entrada de
+`outcomes[]` nesse evento carrega `index`, `status`, `document_id` (o `Document.id` real quando o
+arquivo foi processado; `null` quando o arquivo foi rejeitado antes de qualquer `Document` existir --
+limite de tamanho, duplicidade de arquivo, falha inesperada) e `error_category`. Isso torna a
+trilha de auditoria persistida, por si só, a lineage determinística entre um lote e os `Document`s que
+ele produziu -- sem depender de reconstruir por proximidade de horário.
+
 ## Modelo de deduplicação
 
 Existem dois níveis:

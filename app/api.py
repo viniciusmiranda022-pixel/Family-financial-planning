@@ -2569,7 +2569,21 @@ async def import_documents_batch(
         {
             "batch_id": batch_id,
             "file_count": len(files),
-            "outcomes": [{"index": item["index"], "status": item["status"]} for item in results],
+            # `document_id`/`error_category` make the persisted audit trail
+            # itself the deterministic batch -> Document lineage: a rejected
+            # or precondition-failed file never created a Document, so it is
+            # truthfully `document_id: None` here (matching the response's
+            # own contract), never fabricated or reconstructed later from
+            # timestamps.
+            "outcomes": [
+                {
+                    "index": item["index"],
+                    "status": item["status"],
+                    "document_id": item["document_id"],
+                    "error_category": item["error_category"],
+                }
+                for item in results
+            ],
         },
     )
     db.commit()

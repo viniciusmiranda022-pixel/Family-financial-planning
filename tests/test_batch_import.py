@@ -21,6 +21,7 @@ singleton, which whichever test module imports first would otherwise claim
 for every other module in the same test run.
 """
 
+import json
 import logging
 import os
 import uuid
@@ -39,7 +40,7 @@ os.environ.setdefault("DATA_DIR", f"/tmp/ffp-batch-import-data-{uuid.uuid4().hex
 import app.api as api_module  # noqa: E402
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Document, Household, ReviewItem, Transaction, User  # noqa: E402
+from app.models import AuditEvent, Document, Household, ReviewItem, Transaction, User  # noqa: E402
 from app.security import hash_password  # noqa: E402
 
 _test_engine = create_engine(
@@ -612,6 +613,151 @@ def test_batch_import_unexpected_failure_after_encrypted_save_leaves_no_orphaned
                 rendered = record.getMessage()
                 assert "GATILHO" not in rendered
                 assert "orfao.csv" not in rendered
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_batch_import_audit_event_maps_batch_to_document_lineage(monkeypatch) -> None:
+    """Regression for the blocking audit-lineage finding: the persisted
+    `document.import_batch` `AuditEvent.details.outcomes[]` must carry
+    `document_id`/`error_category` per file, so the audit trail itself --
+    not timestamp proximity -- is the deterministic mapping from a batch to
+    the `Document` rows it produced (`null` for a file that never got one:
+    an exact-hash duplicate rejection and an unexpected failure, alongside a
+    real success in the same batch), and this lineage never crosses
+    households.
+    """
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as client:
+            household = _setup_household(
+                client,
+                household_name="Família Lineage",
+                username="admin-lote-lineage",
+                password="senha-lote-segura-lineage",
+            )
+            account = _create_account(client)
+
+            original_classify = api_module.classify_with_local_rules
+
+            def _boom(db, *, household_id, description, amount, internal_aliases):
+                if "GATILHO LINEAGE" in description.upper():
+                    raise RuntimeError("falha simulada para teste de lineage")
+                return original_classify(
+                    db,
+                    household_id=household_id,
+                    description=description,
+                    amount=amount,
+                    internal_aliases=internal_aliases,
+                )
+
+            monkeypatch.setattr(api_module, "classify_with_local_rules", _boom)
+
+            already_imported_csv = _csv("2026-08-01,Mercado,120.50\n")
+            crash_csv = _csv("2026-08-02,GATILHO LINEAGE,10.00\n")
+            other_good_csv = _csv("2026-08-03,Farmacia,45.30\n")
+
+            # Import this exact payload for real first, so the batch below can
+            # exercise a genuine exact-hash duplicate rejection against
+            # already-committed data (not just within-batch).
+            seed_response = client.post(
+                "/api/imports/batch",
+                data={"account_id": account["id"], "document_type": "bank_statement"},
+                files=[("files", ("original.csv", already_imported_csv, "text/csv"))],
+            )
+            assert seed_response.status_code == 201
+            seed_document_id = seed_response.json()["results"][0]["document_id"]
+
+            response = client.post(
+                "/api/imports/batch",
+                data={"account_id": account["id"], "document_type": "bank_statement"},
+                files=[
+                    ("files", ("segundo.csv", other_good_csv, "text/csv")),
+                    ("files", ("duplicado.csv", already_imported_csv, "text/csv")),
+                    ("files", ("crash.csv", crash_csv, "text/csv")),
+                ],
+            )
+            assert response.status_code == 201
+            body = response.json()
+            batch_id = body["batch_id"]
+            good_result, duplicate_result, crash_result = body["results"]
+            assert good_result["status"] in {"imported", "imported_with_review"}
+            assert good_result["document_id"]
+            assert duplicate_result["error_category"] == "duplicate_file"
+            assert duplicate_result["document_id"] is None
+            assert crash_result["error_category"] == "unexpected_error"
+            assert crash_result["document_id"] is None
+
+            with _TestSessionLocal() as db:
+                # Match by the batch's own `batch_id` inside `details`, not by
+                # `created_at` ordering: two batch requests in the same test
+                # can land in the same timestamp resolution, making ordering
+                # by time alone unreliable to pick the right event.
+                candidate_events = db.scalars(
+                    select(AuditEvent).where(
+                        AuditEvent.household_id == household["household_id"],
+                        AuditEvent.event_type == "document.import_batch",
+                    )
+                ).all()
+                event = next(
+                    (e for e in candidate_events if json.loads(e.details)["batch_id"] == batch_id),
+                    None,
+                )
+                assert event is not None
+                details = json.loads(event.details)
+                outcomes = {item["index"]: item for item in details["outcomes"]}
+
+                # index 0: the real success -- audit lineage points at the
+                # actual committed Document, not a placeholder.
+                assert outcomes[0]["document_id"] == good_result["document_id"]
+                assert outcomes[0]["error_category"] is None
+                # index 1: exact-hash duplicate -- no Document was ever
+                # created for it, so the audit trail truthfully says so.
+                assert outcomes[1]["document_id"] is None
+                assert outcomes[1]["error_category"] == "duplicate_file"
+                # index 2: unexpected failure -- same truthful absence.
+                assert outcomes[2]["document_id"] is None
+                assert outcomes[2]["error_category"] == "unexpected_error"
+
+                household_document_ids = set(
+                    db.scalars(
+                        select(Document.id).where(Document.household_id == household["household_id"])
+                    ).all()
+                )
+                assert outcomes[0]["document_id"] in household_document_ids
+                assert seed_document_id in household_document_ids
+
+            # Household isolation: an entirely separate household importing in
+            # the same test run must never appear in -- or be derivable from
+            # -- this household's persisted audit lineage.
+            other_household = _setup_household(
+                client,
+                household_name="Família Lineage Outra",
+                username="admin-lote-lineage-2",
+                password="senha-lote-segura-lineage-2",
+            )
+            other_account = _create_account(client)
+            other_response = client.post(
+                "/api/imports/batch",
+                data={"account_id": other_account["id"], "document_type": "bank_statement"},
+                files=[("files", ("outra-familia.csv", _csv("2026-08-04,Outra Familia,15.00\n"), "text/csv"))],
+            )
+            assert other_response.status_code == 201
+            other_document_id = other_response.json()["results"][0]["document_id"]
+
+            with _TestSessionLocal() as db:
+                other_event = db.scalars(
+                    select(AuditEvent).where(
+                        AuditEvent.household_id == other_household["household_id"],
+                        AuditEvent.event_type == "document.import_batch",
+                    )
+                ).first()
+                assert other_event is not None
+                assert other_event.household_id != household["household_id"]
+                other_details = json.loads(other_event.details)
+                assert other_details["batch_id"] != batch_id
+                assert other_document_id not in household_document_ids
     finally:
         app.dependency_overrides.pop(get_db, None)
 
