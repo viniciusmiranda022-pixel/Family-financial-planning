@@ -222,13 +222,26 @@ def _category_for_text(
     db: "Session | None" = None,
     household_id: str | None = None,
 ) -> tuple[str, float, list[str]]:
+    # `investment`/`redemption`/`refund` are structural outcomes the
+    # deterministic classifier itself protects (INV-003/INV-004/INV-016) --
+    # they are not "ordinary income/expense" in the sense
+    # docs/FINANCIAL_RULES.md uses, so a household merchant rule must never
+    # be consulted for them; the fixed category is correct here.
     if movement_type in {"investment", "redemption"}:
         return "Transferência patrimonial", 0.99, []
-    if movement_type == "income":
-        return "Receitas", 0.94, []
     if movement_type == "refund":
         return "Reembolsos e estornos", 0.94, []
-    classification = _classify(text, float(-abs(amount)), db=db, household_id=household_id)
+    # Ordinary income and ordinary expense are both "common income/expense
+    # classification" per docs/FINANCIAL_RULES.md and must both go through
+    # the one canonical, household-aware path (`_classify`, which defers to
+    # `classify_with_local_rules` whenever a db/household are available) --
+    # never a hardcoded category. This mirrors exactly what the structured
+    # document-import path (`_parsed_transaction_item`) already does for
+    # every movement type, including income. The signed amount passed to
+    # the deterministic fallback carries the movement's direction: positive
+    # for income, negative for expense.
+    signed_amount = abs(amount) if movement_type == "income" else -abs(amount)
+    classification = _classify(text, float(signed_amount), db=db, household_id=household_id)
     warnings = [classification.review_reason] if classification.review_reason else []
     return classification.category, classification.confidence, warnings
 

@@ -300,6 +300,93 @@ def test_smart_capture_preview_rule_does_not_cross_movement_type() -> None:
         app.dependency_overrides.pop(get_db, None)
 
 
+def test_smart_capture_preview_text_path_uses_active_income_household_rule() -> None:
+    """Engineer review on `85ca6f1` (P0): `_category_for_text()` short-circuited
+    to a hardcoded `"Receitas"` category whenever the free-text natural-language
+    capture path (`POST /api/captures/preview` with `text=`, not a CSV/document
+    upload) detected an income phrase, so it never consulted
+    `classify_with_local_rules` at all -- a second classification policy inside
+    smart capture, contradicting the normative sentence this PR added to
+    `docs/FINANCIAL_RULES.md` ("Todo caminho que classifica automaticamente uma
+    descrição ... passa pela mesma função"). `test_smart_capture_preview_*`
+    above only exercise the structured bank-statement/CSV path
+    (`_parsed_transaction_item`), which already called the canonical function
+    for every movement type.
+
+    This proves, through the real natural-language text path specifically:
+    1. an active household rule recorded for `movement_type="income"` applies
+       to a matching free-text income capture;
+    2. an active rule recorded for a *different* movement type that happens to
+       share the identical normalized description never cross-applies (the
+       movement-type compatibility guard also holds on this path, not only on
+       the structured-document path already covered above);
+    3. a merchant with no matching active rule for the event's movement type
+       still falls back to the deterministic canonical classifier -- not the
+       removed hardcoded shortcut.
+    """
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        household_id = _create_household_admin(
+            household_name="Família Captura Texto",
+            username="admin-capture-text",
+            password="senha-local-segura",
+        )
+        income_category_id = _create_category(household_id, "Consultoria recorrente")
+        expense_category_id = _create_category(household_id, "Serviços diversos")
+        capture_text = "Recebi 500 de Consultoria Alfa"
+
+        # Seeded with the identical normalized description as the text that
+        # will actually be captured below, but for a different movement type
+        # -- proves the movement-type guard, not merely string matching.
+        expense_rule_id = _seed_pending_rule(
+            household_id,
+            description=capture_text,
+            category_id=expense_category_id,
+            movement_type="expense",
+        )
+        income_rule_id = _seed_pending_rule(
+            household_id,
+            description=capture_text,
+            category_id=income_category_id,
+            movement_type="income",
+        )
+
+        with TestClient(app) as client:
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin-capture-text", "password": "senha-local-segura"},
+            )
+            assert client.post(f"/api/classification-rules/{expense_rule_id}/activate").status_code == 200
+            assert client.post(f"/api/classification-rules/{income_rule_id}/activate").status_code == 200
+
+            preview = client.post(
+                "/api/captures/preview",
+                data={"text": capture_text, "document_type": "auto"},
+            )
+            assert preview.status_code == 201
+            item = preview.json()["items"][0]
+            assert item["movement_type"] == "income"
+            # Must take the income-typed rule's category -- never the
+            # expense-typed rule's, even though both were recorded against
+            # the identical normalized description.
+            assert item["category_name"] == "Consultoria recorrente"
+
+            # A merchant with no active rule for this movement type still
+            # falls back to the deterministic canonical classifier (the
+            # shared "Revisar"/low-confidence path ordinary unmatched
+            # expense text already goes through), not a hardcoded category.
+            unmatched_preview = client.post(
+                "/api/captures/preview",
+                data={"text": "Recebi 300 de Cliente Desconhecido", "document_type": "auto"},
+            )
+            assert unmatched_preview.status_code == 201
+            unmatched_item = unmatched_preview.json()["items"][0]
+            assert unmatched_item["movement_type"] == "income"
+            assert unmatched_item["category_name"] != "Consultoria recorrente"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
 def test_classification_rule_endpoints_are_household_isolated() -> None:
     app.dependency_overrides[get_db] = _override_get_db
     try:
