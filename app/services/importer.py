@@ -8,7 +8,13 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from app.services.classifier import normalize_description
+from app.services.classifier import (
+    FEE_PATTERN,
+    MONTHS_PT_ABBR,
+    PAYMENT_PATTERN,
+    REFUND_PATTERN,
+    normalize_description,
+)
 
 PARSER_CONTRACT_VERSION = "2026.09.1"
 
@@ -85,16 +91,24 @@ def parse_date(value: str) -> date:
     raise ValueError(f"Data inválida: {value}")
 
 
+# `PARCELA 12/12` (Itaú/Nubank) and `Parcela 4 de 18` (Mercado Pago) are the
+# only two installment phrasings observed across issuers; both require the
+# literal "PARCELA" word when the separator is the word "DE" instead of "/"
+# so a coincidental "<number> de <number>" in an unrelated description can't
+# be misread as an installment.
+_INSTALLMENT_SLASH = re.compile(r"(?:PARCELA\s*)?(\d{1,2})\s*/\s*(\d{1,2})")
+_INSTALLMENT_DE = re.compile(r"PARCELA\s*(\d{1,2})\s*DE\s*(\d{1,2})")
+
+
 def _installment(description: str) -> tuple[int | None, int | None]:
-    match = re.search(r"(?:PARCELA\s*)?(\d{1,2})\s*/\s*(\d{1,2})", description.upper())
+    upper = description.upper()
+    match = _INSTALLMENT_SLASH.search(upper) or _INSTALLMENT_DE.search(upper)
     return (int(match.group(1)), int(match.group(2))) if match else (None, None)
 
 
 def _normalize_credit_card_amount(description: str, amount: Decimal) -> Decimal:
     normalized = normalize_description(description)
-    if "PAGAMENTO RECEBIDO" in normalized or "PAGAMENTO FATURA" in normalized:
-        return abs(amount)
-    if "ESTORNO" in normalized or "CREDITO" in normalized:
+    if PAYMENT_PATTERN.search(normalized) or REFUND_PATTERN.search(normalized):
         return abs(amount)
     # Itaú invoices and the Nubank export use positive values for purchases and
     # negative values for credits, even though both appear in the same column.
@@ -175,6 +189,25 @@ def parse_ofx(payload: bytes) -> list[ParsedTransaction]:
     return parsed
 
 
+# Some issuers' textual PDFs (observed in Nubank exports) encode a negative
+# amount with a Unicode minus sign or dash variant instead of ASCII "-", and
+# a non-breaking space between the sign and "R$". `parse_decimal` (and every
+# regex below) only recognizes ASCII "-"; translating these once, right at
+# extraction, keeps that single behavior correct for every format instead of
+# teaching each format-specific parser its own copy of this normalization.
+# Plain ASCII "-" is untouched, so Itaú's existing output is unaffected.
+_PDF_TEXT_TRANSLATION = str.maketrans(
+    {
+        "\u2212": "-",  # minus sign
+        "\u2012": "-",  # figure dash
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2015": "-",  # horizontal bar
+        "\u00a0": " ",  # non-breaking space
+    }
+)
+
+
 def _pdf_text(payload: bytes) -> str:
     try:
         import pdfplumber
@@ -182,9 +215,124 @@ def _pdf_text(payload: bytes) -> str:
         raise ValueError("Leitor de PDF indisponível") from exc
     try:
         with pdfplumber.open(io.BytesIO(payload)) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+            raw = "\n".join(page.extract_text() or "" for page in pdf.pages)
     except Exception as exc:
         raise ValueError("PDF inválido, protegido ou incompleto; encaminhado para revisão") from exc
+    return raw.translate(_PDF_TEXT_TRANSLATION)
+
+
+# A brand token alone ("NUBANK", "MERCADO PAGO") is not safe issuer
+# evidence: it also occurs as a *counterparty* inside another bank's own
+# transaction text -- confirmed against the real Itaú statement behind this
+# Work Order's baseline, which contains lines like
+# "PAG BOLETO NU PAGAMENTOS SA -1.724,90" and "PIX QRS MERCADO PAG...".
+# Detection therefore requires the brand token *and* one of these
+# document-identity/layout markers -- section headers and date formats that
+# only the issuer's own masthead/summary prints, never a transaction
+# description naming that issuer as a counterparty on someone else's
+# statement.
+_NUBANK_STRUCTURE = re.compile(
+    r"RESUMO DA FATURA ATUAL"
+    r"|TRANSA[ÇC][ÕO]ES DE"
+    r"|FATURA\s+\d{2}\s+[A-ZÇ]{3}\s+\d{4}"
+    r"|SALDO FINAL DO PER[IÍ]ODO"
+    r"|\d{1,2}\s+DE\s+[A-ZÇ]+\s+DE\s+\d{4}\s+A\s+\d{1,2}\s+DE\s+[A-ZÇ]+\s+DE\s+\d{4}",
+    re.IGNORECASE,
+)
+_MERCADO_PAGO_STRUCTURE = re.compile(
+    r"DETALHES DE CONSUMO"
+    r"|MOVIMENTA[ÇC][ÕO]ES NA FATURA"
+    r"|PER[IÍ]ODO\s*:?\s*DE\s+\d{2}-\d{2}-\d{4}\s+(?:AL|AT[EÉ])\s+\d{2}-\d{2}-\d{4}",
+    re.IGNORECASE,
+)
+
+# PR #41 engineer review (head `c260aed`): falling back to Itaú unconditionally
+# whenever Nubank/MP do not match is not positive identification -- any
+# unsupported textual PDF that happens to contain a `dd/mm(/yyyy)
+# description amount` row would be silently accepted as Itaú instead of
+# being rejected for review. Itaú needs the same treatment already applied
+# to Nubank/MP above: a document-identity/layout marker, not just a
+# transaction-row shape generic enough that an unrelated document could
+# produce it by accident.
+#
+# PR #41 engineer review (head `e42a470`), second round: the first
+# correction above (`_ITAU_STRUCTURE` alone) is still not an identity
+# signature -- "SALDO ANTERIOR"/"SALDO DO DIA"/"SALDO FINAL EM"/"EMISSAO:"
+# are generic Portuguese banking/document labels that an unrelated
+# institution's statement could print too, so a third-party PDF containing
+# only that vocabulary was still silently routed to Itaú. The engineer
+# separately confirmed against the real supported Itaú statement (kept out
+# of Git) that it also carries explicit Itaú brand identity ("Itaú"/
+# "itau.com.br") alongside this balance vocabulary. Detection now requires
+# both, exactly the same "brand token + own layout marker" combination
+# already used for Nubank/Mercado Pago above -- a bare "SALDO DO DIA" is
+# structure, not identity, and must not be enough by itself.
+_ITAU_STRUCTURE = re.compile(
+    r"SALDO\s+ANTERIOR|SALDO\s+DO\s+DIA|SALDO\s+FINAL\s+EM|EMISS[ÃA]O\s*:",
+    re.IGNORECASE,
+)
+
+# PR #41 engineer review (head `82db527`), third round: a bare "ITAU" token
+# anywhere in the normalized text is still not identity -- it is satisfied
+# by an ordinary counterparty/transaction description naming Itaú on
+# someone else's statement (e.g. "PIX TRANSF ITAU ..."), the exact
+# cross-institution collision class already fixed above for Nubank/Mercado
+# Pago. The engineer confirmed the real supported Itaú statement carries
+# issuer-owned identity text ("itau.com.br") that an ordinary transaction
+# description cannot produce; the existing synthetic fixtures already model
+# this with "Itau Unibanco S.A." / "www.itau.com.br" masthead lines. Both
+# patterns are matched against the *normalized* text, where
+# `normalize_description` has already turned "itau.com.br" into
+# "ITAU COM BR" (dots become spaces) -- so this is checked here rather than
+# with `_ITAU_STRUCTURE` above, which matches the raw, un-normalized text.
+_ITAU_IDENTITY = re.compile(r"ITAU\s+UNIBANCO|ITAU\s+COM\s+BR")
+
+
+def _detect_pdf_issuer(text: str) -> str:
+    """Identify which institution's textual layout produced this PDF.
+
+    Detection is content-based only, per the Work Order's requirement: it
+    looks for the issuer's own document-identity markers inside the
+    *extracted* text, never the uploaded filename and never personal data --
+    an institution name is not PII. A brand mention by itself is not enough
+    (see `_NUBANK_STRUCTURE`/`_MERCADO_PAGO_STRUCTURE` above); it must
+    co-occur with a layout marker that issuer's own document prints, never
+    a counterparty. Itaú requires the identical combination -- its own
+    owned identity marker (`_ITAU_IDENTITY`: "Itaú Unibanco" or
+    "itau.com.br", never a bare "Itaú" token that an ordinary transaction
+    description could also contain) *and* its balance/emission vocabulary
+    (`_ITAU_STRUCTURE`) -- rather than being treated as the unconditional
+    fallback or accepted on generic vocabulary alone. Anything matching none
+    of the three known signatures is `"unknown"`: the caller must reject it
+    for review rather than guess, so an unsupported or ambiguous PDF can
+    never be silently ingested as if it were a supported issuer.
+    """
+
+    normalized = normalize_description(text)
+    if ("NUBANK" in normalized or "NU PAGAMENTOS" in normalized) and _NUBANK_STRUCTURE.search(text):
+        return "nubank"
+    if (
+        "MERCADO PAGO" in normalized or "MERCADOPAGO" in normalized
+    ) and _MERCADO_PAGO_STRUCTURE.search(text):
+        return "mercado_pago"
+    if _ITAU_IDENTITY.search(normalized) and _ITAU_STRUCTURE.search(text):
+        return "itau"
+    return "unknown"
+
+
+_UNSUPPORTED_PDF_ISSUER_ERROR = (
+    "PDF não identificado como Itaú, Nubank ou Mercado Pago; encaminhado para revisão"
+)
+
+
+# Vocabulary observed on Itaú/Nubank/Mercado Pago invoices that shares the
+# shape of a transaction line (a trailing "R$ value") but is a limit,
+# simulated-interest or minimum-payment disclosure, never a real
+# transaction. Work Order requirement: these must never become a
+# transaction just because they end in a money value.
+_NON_TRANSACTION_TEXT = re.compile(
+    r"LIMITE|SIMULA|M[ÍI]NIMO|EFETIV|ROTATIVO|\bCET\b|IOF SOBRE|ENCARGOS DE ATRASO"
+)
 
 
 def _reference_date(text: str) -> date:
@@ -205,7 +353,7 @@ def _card_date(raw_date: str, reference: date) -> date:
     return date(year, month, day)
 
 
-def parse_credit_card_pdf(payload: bytes) -> list[ParsedTransaction]:
+def _parse_itau_credit_card_pdf(payload: bytes) -> list[ParsedTransaction]:
     try:
         import pdfplumber
     except ImportError as exc:
@@ -254,8 +402,7 @@ def parse_credit_card_pdf(payload: bytes) -> list[ParsedTransaction]:
     return parsed
 
 
-def parse_bank_statement_pdf(payload: bytes) -> list[ParsedTransaction]:
-    text = _pdf_text(payload)
+def _parse_itau_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
     line_pattern = re.compile(r"^\s*(\d{2}/\d{2}/\d{4})\s+(.+?)\s+(-?\s*[\d.]+,\d{2})\s*$")
     parsed: list[ParsedTransaction] = []
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
@@ -274,6 +421,296 @@ def parse_bank_statement_pdf(payload: bytes) -> list[ParsedTransaction]:
     if not parsed:
         raise ValueError("Extrato sem lançamentos textuais reconhecíveis; encaminhado para revisão")
     return parsed
+
+
+def _nubank_reference_date(text: str) -> date:
+    match = re.search(r"FATURA\s+(\d{2})\s+([A-ZÇ]{3})\s+(\d{4})", text, re.IGNORECASE)
+    if match:
+        day, month_abbr, year = match.groups()
+        month = MONTHS_PT_ABBR.get(month_abbr.upper())
+        if month:
+            return date(int(year), month, int(day))
+    return _reference_date(text)
+
+
+def _nubank_card_date(day: int, month: int, reference: date) -> date:
+    year = reference.year - 1 if month > reference.month + 1 else reference.year
+    return date(year, month, day)
+
+
+def _combine_money_sign(sign_before_currency: str, raw_amount: str) -> str:
+    """Normalize a "-" that may sit right before "R$" instead of right
+    before the digits (Nubank prints negative amounts as "-R$ 200,00", with
+    no space to separate the sign from the currency symbol) into a single
+    leading "-" `parse_decimal` understands. Either position, or neither,
+    means the same thing.
+    """
+
+    if sign_before_currency == "-" or raw_amount.startswith("-"):
+        return f"-{raw_amount.lstrip('-')}"
+    return raw_amount
+
+
+_NUBANK_CARD_START = re.compile(r"^(\d{2})\s+([A-ZÇ]{3})\s+(.*)$", re.IGNORECASE)
+_NUBANK_CARD_TAIL = re.compile(r"(.*?)\s*(-?)\s*R\$\s*(-?[\d.]+,\d{2})\s*$")
+
+
+def _parse_nubank_credit_card_pdf(text: str) -> list[ParsedTransaction]:
+    reference = _nubank_reference_date(text)
+    marker = re.search(r"TRANSA[ÇC][ÕO]ES DE", text, re.IGNORECASE)
+    if not marker:
+        raise ValueError("Fatura Nubank sem bloco de transações reconhecível; encaminhada para revisão")
+    parsed: list[ParsedTransaction] = []
+    pending_date: date | None = None
+    pending_parts: list[str] = []
+    for line_number, raw_line in enumerate(text[marker.end() :].splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        start = _NUBANK_CARD_START.match(line)
+        if start:
+            day, month_abbr, rest = start.groups()
+            month = MONTHS_PT_ABBR.get(month_abbr.upper())
+            if not month:
+                pending_date = None
+                continue
+            pending_date = _nubank_card_date(int(day), month, reference)
+            pending_parts = [rest.strip()]
+        elif pending_date is not None:
+            pending_parts.append(line)
+        else:
+            continue
+        joined = " ".join(part for part in pending_parts if part)
+        money = _NUBANK_CARD_TAIL.match(joined)
+        if not money:
+            continue
+        description = money.group(1).strip()
+        if description and not _NON_TRANSACTION_TEXT.search(normalize_description(description)):
+            raw_amount = _combine_money_sign(money.group(2), money.group(3))
+            amount = _normalize_credit_card_amount(description, parse_decimal(raw_amount))
+            current, total = _installment(description)
+            parsed.append(
+                ParsedTransaction(
+                    reference.replace(day=1),
+                    description,
+                    amount,
+                    line_number,
+                    None,
+                    current,
+                    total,
+                    pending_date,
+                )
+            )
+        pending_date = None
+        pending_parts = []
+    if not parsed:
+        raise ValueError("Fatura Nubank sem compras textuais reconhecíveis; encaminhada para revisão")
+    return parsed
+
+
+# Real extracted Nubank bank-statement text (confirmed against the actual
+# August 2026 statement behind this Work Order's baseline -- see PR #41
+# engineer review on `bcd003e`) does not look like a per-transaction
+# "description ... +R$ value" line. Instead:
+#
+#   14 AGO 2026 Total de entradas + 3.044,80
+#   Transferência recebida pelo Pix ...
+#   (description may continue for several lines)
+#   3.044,80
+#   Total de saídas - 3.044,80
+#   Transferência enviada pelo Pix ...
+#   3.044,80
+#
+# The day header and the *first* section aggregate for that day share one
+# line; a later section switch within the same day (entradas -> saídas or
+# the reverse) repeats only the bare "Total de ..." aggregate, not the date.
+# Each individual transaction is then a run of description lines terminated
+# by a bare amount line -- no "R$", no sign; direction comes only from which
+# aggregate section is currently open, never from the amount line or the
+# description text (Work Order requirement: do not infer sign from
+# description). The aggregate line itself is always discarded, never a
+# transaction, so per-day/period totals can never leak into the ledger.
+_NUBANK_DAY_SECTION_HEADER = re.compile(
+    r"^(\d{2})\s+([A-ZÇ]{3})\s+(\d{4})\s+TOTAL DE (ENTRADAS|SA[IÍ]DAS)\b", re.IGNORECASE
+)
+_NUBANK_SECTION_HEADER = re.compile(r"^TOTAL DE (ENTRADAS|SA[IÍ]DAS)\b", re.IGNORECASE)
+_NUBANK_BARE_AMOUNT = re.compile(r"^-?[\d.]+,\d{2}$")
+
+
+def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
+    parsed: list[ParsedTransaction] = []
+    current_day: date | None = None
+    current_sign: int | None = None
+    pending_parts: list[str] = []
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        day_section = _NUBANK_DAY_SECTION_HEADER.match(line)
+        if day_section:
+            day, month_abbr, year, direction = day_section.groups()
+            month = MONTHS_PT_ABBR.get(month_abbr.upper())
+            current_day = date(int(year), month, int(day)) if month else None
+            current_sign = 1 if direction.upper().startswith("ENTRADA") else -1
+            pending_parts = []
+            continue
+        if current_day is None:
+            # Everything before the first per-day block -- the period-level
+            # "Saldo inicial"/"Rendimento líquido"/"Total de entradas/saídas
+            # (período)"/"Saldo final do período" summary -- is declared-field
+            # territory (`_statement_declared_fields`), never a transaction.
+            continue
+        section = _NUBANK_SECTION_HEADER.match(line)
+        if section:
+            current_sign = 1 if section.group(1).upper().startswith("ENTRADA") else -1
+            pending_parts = []
+            continue
+        normalized = normalize_description(line)
+        if normalized.startswith("SALDO") or normalized.startswith("RENDIMENTO"):
+            pending_parts = []
+            continue
+        if not _NUBANK_BARE_AMOUNT.match(line):
+            pending_parts.append(line)
+            continue
+        description = " ".join(pending_parts).strip()
+        pending_parts = []
+        if not description or _NON_TRANSACTION_TEXT.search(normalize_description(description)):
+            continue
+        if current_sign is None:
+            continue
+        value = abs(parse_decimal(line))
+        amount = value if current_sign > 0 else -value
+        parsed.append(ParsedTransaction(current_day, description, amount, line_number))
+    if not parsed:
+        raise ValueError("Extrato Nubank sem lançamentos textuais reconhecíveis; encaminhado para revisão")
+    return parsed
+
+
+_MERCADO_PAGO_CARD_START = re.compile(r"^(\d{2}/\d{2})\s+(.*)$")
+_MERCADO_PAGO_CARD_TAIL = re.compile(r"(.*?)\s*(-?)\s*R\$\s*(-?[\d.]+,\d{2})\s*$")
+_MERCADO_PAGO_CARD_MARKER = re.compile(r"CART[ÃA]O\s+\S+\s*\[?\**(\d{4})\]?", re.IGNORECASE)
+
+
+def _parse_mercado_pago_credit_card_pdf(text: str) -> list[ParsedTransaction]:
+    reference = _reference_date(text)
+    parsed: list[ParsedTransaction] = []
+    pending_date: date | None = None
+    pending_parts: list[str] = []
+    card_last_four: str | None = None
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        card_match = _MERCADO_PAGO_CARD_MARKER.search(line)
+        if card_match:
+            card_last_four = card_match.group(1)
+        start = _MERCADO_PAGO_CARD_START.match(line)
+        if start:
+            pending_date = _card_date(start.group(1), reference)
+            pending_parts = [start.group(2).strip()]
+        elif pending_date is not None:
+            pending_parts.append(line)
+        else:
+            continue
+        joined = " ".join(part for part in pending_parts if part)
+        money = _MERCADO_PAGO_CARD_TAIL.match(joined)
+        if not money:
+            continue
+        description = money.group(1).strip()
+        if description and not _NON_TRANSACTION_TEXT.search(normalize_description(description)):
+            raw_amount = _combine_money_sign(money.group(2), money.group(3))
+            amount = _normalize_credit_card_amount(description, parse_decimal(raw_amount))
+            current, total = _installment(description)
+            parsed.append(
+                ParsedTransaction(
+                    reference.replace(day=1),
+                    description,
+                    amount,
+                    line_number,
+                    card_last_four,
+                    current,
+                    total,
+                    pending_date,
+                )
+            )
+        pending_date = None
+        pending_parts = []
+    if not parsed:
+        raise ValueError("Fatura Mercado Pago sem compras textuais reconhecíveis; encaminhada para revisão")
+    return parsed
+
+
+_MERCADO_PAGO_STATEMENT_START = re.compile(r"^(\d{2}-\d{2}-\d{4})\s+(.*)$")
+_MERCADO_PAGO_STATEMENT_TAIL = re.compile(
+    r"(.*?)\s+\d+\s+(-?)\s*R\$\s*(-?[\d.]+,\d{2})\s+R\$\s*-?[\d.]+,\d{2}\s*$"
+)
+
+
+def _parse_mercado_pago_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
+    parsed: list[ParsedTransaction] = []
+    pending_date: date | None = None
+    pending_parts: list[str] = []
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        start = _MERCADO_PAGO_STATEMENT_START.match(line)
+        if start:
+            pending_date = parse_date(start.group(1))
+            pending_parts = [start.group(2).strip()]
+        elif pending_date is not None:
+            pending_parts.append(line)
+        else:
+            continue
+        joined = " ".join(part for part in pending_parts if part)
+        # "Data Descrição ID da operação Valor Saldo": the running balance
+        # (last "R$ value") is captured by the pattern to delimit the line
+        # correctly but intentionally discarded -- `declared_fields` already
+        # carries the document's own opening/closing balance, and inventing
+        # a second, per-row balance source here would be exactly the kind of
+        # parallel financial fact the Work Order prohibits.
+        money = _MERCADO_PAGO_STATEMENT_TAIL.match(joined)
+        if not money:
+            continue
+        description = money.group(1).strip()
+        if description:
+            raw_amount = _combine_money_sign(money.group(2), money.group(3))
+            parsed.append(
+                ParsedTransaction(pending_date, description, parse_decimal(raw_amount), line_number)
+            )
+        pending_date = None
+        pending_parts = []
+    if not parsed:
+        raise ValueError(
+            "Extrato Mercado Pago sem lançamentos textuais reconhecíveis; encaminhado para revisão"
+        )
+    return parsed
+
+
+def parse_credit_card_pdf(payload: bytes) -> list[ParsedTransaction]:
+    text = _pdf_text(payload)
+    issuer = _detect_pdf_issuer(text)
+    if issuer == "nubank":
+        return _parse_nubank_credit_card_pdf(text)
+    if issuer == "mercado_pago":
+        return _parse_mercado_pago_credit_card_pdf(text)
+    if issuer == "unknown":
+        raise ValueError(_UNSUPPORTED_PDF_ISSUER_ERROR)
+    # Itaú keeps its own `pdfplumber` pass: its two-column crop needs page
+    # geometry, not just plain text.
+    return _parse_itau_credit_card_pdf(payload)
+
+
+def parse_bank_statement_pdf(payload: bytes) -> list[ParsedTransaction]:
+    text = _pdf_text(payload)
+    issuer = _detect_pdf_issuer(text)
+    if issuer == "nubank":
+        return _parse_nubank_bank_statement_pdf(text)
+    if issuer == "mercado_pago":
+        return _parse_mercado_pago_bank_statement_pdf(text)
+    if issuer == "unknown":
+        raise ValueError(_UNSUPPORTED_PDF_ISSUER_ERROR)
+    return _parse_itau_bank_statement_pdf(text)
 
 
 MONTHS_PT = {
@@ -337,6 +774,33 @@ def parse_pdf(payload: bytes, document_type: str) -> list[ParsedTransaction]:
     raise ValueError("Tipo de PDF não suportado para lançamentos")
 
 
+def _pdf_declared_fields(payload: bytes, document_type: str) -> tuple[str, dict[str, Decimal | str | None]]:
+    """Resolve `(parser_name, declared_fields)` for a PDF from the same
+    content-based issuer detection `parse_credit_card_pdf`/
+    `parse_bank_statement_pdf` use, so a document's provenance label and its
+    reconciliation inputs always describe the same parser. Itaú's own
+    `parser_name` values ("itau_credit_card_pdf", "bank_statement_pdf") are
+    unchanged from before this Work Order to keep every already-passing
+    Itaú result identical.
+    """
+
+    text = _pdf_text(payload)
+    issuer = _detect_pdf_issuer(text)
+    if issuer == "unknown":
+        raise ValueError(_UNSUPPORTED_PDF_ISSUER_ERROR)
+    if document_type == "credit_card":
+        if issuer == "nubank":
+            return "nubank_credit_card_pdf", _nubank_credit_card_declared_fields(text)
+        if issuer == "mercado_pago":
+            return "mercado_pago_credit_card_pdf", _mercado_pago_credit_card_declared_fields(text)
+        return "itau_credit_card_pdf", _credit_card_declared_fields(text)
+    if issuer == "nubank":
+        return "nubank_bank_statement_pdf", _nubank_statement_declared_fields(text)
+    if issuer == "mercado_pago":
+        return "mercado_pago_bank_statement_pdf", _mercado_pago_statement_declared_fields(text)
+    return "bank_statement_pdf", _statement_declared_fields(text)
+
+
 def parse_document_contract(filename: str, payload: bytes, document_type: str) -> ParsedDocument:
     suffix = Path(filename).suffix.lower()
     if suffix in {".csv", ".txt"}:
@@ -348,16 +812,10 @@ def parse_document_contract(filename: str, payload: bytes, document_type: str) -
         parser_name = "ofx_statement"
         declared_fields = _ofx_declared_fields(payload)
     elif suffix == ".pdf":
+        if document_type not in {"credit_card", "bank_statement"}:
+            raise ValueError("Tipo de PDF não suportado para lançamentos")
         rows = tuple(parse_pdf(payload, document_type))
-        parser_name = (
-            "itau_credit_card_pdf" if document_type == "credit_card" else "bank_statement_pdf"
-        )
-        text = _pdf_text(payload)
-        declared_fields = (
-            _credit_card_declared_fields(text)
-            if document_type == "credit_card"
-            else _statement_declared_fields(text)
-        )
+        parser_name, declared_fields = _pdf_declared_fields(payload, document_type)
     else:
         raise ValueError("Formato não suportado. Use PDF textual, CSV ou OFX")
 
@@ -450,12 +908,22 @@ def _transaction_components(
             debits += abs(amount)
         if document_type != "credit_card":
             continue
-        if re.search(r"PAGAMENTO.*FATURA|PAGAMENTO RECEBIDO|FATURA PAGA", normalized):
+        if PAYMENT_PATTERN.search(normalized):
             payments += abs(amount)
-        elif re.search(r"ESTORNO|CREDITO.*COMPRA|CREDITO.*CARTAO", normalized):
+        elif REFUND_PATTERN.search(normalized):
             refunds += abs(amount)
-        elif re.search(r"IOF|JUROS|TARIFA|ENCARGO", normalized):
+        elif FEE_PATTERN.search(normalized):
             fees += abs(amount)
+        elif amount > 0:
+            # A credit whose description matches none of the patterns above
+            # still reduces what is owed exactly like a named payment does in
+            # `card_previous_plus_purchases_fees_minus_credits_payments`
+            # (`purchases + fees - refunds - payments`, both subtracted).
+            # Bucketing it here keeps `_reconcile_card` truthful about every
+            # credit on the statement -- the previous behavior silently
+            # dropped it from every total, which could make a correctly
+            # reconciled invoice look `not_reconciled` for no real reason.
+            payments += amount
         elif amount < 0:
             purchases += abs(amount)
     return {
@@ -516,6 +984,81 @@ def _credit_card_declared_fields(text: str) -> dict[str, Decimal | str | None]:
         "declared_total": parse_decimal(totals[-1]) if totals else None,
         "opening_balance": parse_decimal(previous[-1]) if previous else None,
     }
+
+
+# Nubank/Mercado Pago declared-field extraction lives in its own function per
+# format instead of widening `_credit_card_declared_fields`/
+# `_statement_declared_fields` above with more alternatives: those two
+# functions are Itaú's contract today, and "Total" alone (Mercado Pago) is
+# ambiguous against Itaú's own "Total de encargos"/"Total de compras"
+# subtotals -- broadening the shared regex risked quietly changing which
+# money value Itaú's *existing*, already-shipped invoices resolve to. This
+# still reuses everything downstream unchanged (the same `ParsedDocument`
+# shape, the same `reconcile_parsed_document`): only the label text each
+# issuer prints differs.
+def _nubank_credit_card_declared_fields(text: str) -> dict[str, Decimal | str | None]:
+    totals = re.findall(r"TOTAL\s+A\s+PAGAR.*?R?\$?\s*([\d.]+,\d{2})", text, re.IGNORECASE)
+    previous = re.findall(r"FATURA\s+ANTERIOR.*?R?\$?\s*([\d.]+,\d{2})", text, re.IGNORECASE)
+    return {
+        "declared_total": parse_decimal(totals[-1]) if totals else None,
+        "opening_balance": parse_decimal(previous[-1]) if previous else None,
+    }
+
+
+def _mercado_pago_credit_card_declared_fields(text: str) -> dict[str, Decimal | str | None]:
+    # Anchored to a line that is *only* "Total[:] R$ value" (optionally with
+    # a colon) so it cannot match "Consumos de ... R$ ...", "Tarifas e
+    # encargos ... R$ ..." or any other subtotal that also starts with the
+    # word "Total". The Work Order's observed Mercado Pago layout does not
+    # include a previous-balance/carry-over line (unlike Itaú/Nubank), so
+    # `opening_balance` is honestly left `None` here -- `_reconcile_card`
+    # then reports `unknown`, never a fabricated balance.
+    totals = re.findall(r"^[ \t]*TOTAL\s*:?\s*R?\$?\s*([\d.]+,\d{2})[ \t]*$", text, re.IGNORECASE | re.MULTILINE)
+    return {
+        "declared_total": parse_decimal(totals[-1]) if totals else None,
+        "opening_balance": None,
+    }
+
+
+_NUBANK_PERIOD_EXTENSO = re.compile(
+    r"\d{1,2}\s+DE\s+[A-ZÇ]+\s+DE\s+\d{4}\s+A\s+(\d{1,2})\s+DE\s+([A-ZÇ]+)\s+DE\s+(\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _nubank_statement_declared_fields(text: str) -> dict[str, Decimal | str | None]:
+    # "Saldo inicial"/"Saldo final do período" already match the generic
+    # Itaú-shaped patterns in `_statement_declared_fields` verbatim, so that
+    # function is reused unchanged for both. Only the period, spelled out in
+    # Portuguese ("01 DE AGOSTO DE 2026 a 31 DE AGOSTO DE 2026") instead of
+    # Itaú's `dd/mm/yyyy`, needs issuer-specific extraction for `as_of_date`.
+    fields = dict(_statement_declared_fields(text))
+    if fields.get("as_of_date") is None:
+        match = _NUBANK_PERIOD_EXTENSO.search(text)
+        if match:
+            day, month_name, year = match.groups()
+            month = MONTHS_PT.get(normalize_description(month_name))
+            if month:
+                fields["as_of_date"] = date(int(year), month, int(day)).isoformat()
+    return fields
+
+
+_MERCADO_PAGO_PERIOD = re.compile(
+    r"PER[IÍ]ODO\s*:?\s*DE\s+(\d{2}-\d{2}-\d{4})\s+(?:AL|AT[EÉ])\s+(\d{2}-\d{2}-\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _mercado_pago_statement_declared_fields(text: str) -> dict[str, Decimal | str | None]:
+    # Same reasoning as the Nubank statement above: "Saldo inicial"/"Saldo
+    # final" already match `_statement_declared_fields` unchanged; only the
+    # period ("Periodo: De dd-mm-yyyy al dd-mm-yyyy") needs its own pattern.
+    fields = dict(_statement_declared_fields(text))
+    if fields.get("as_of_date") is None:
+        match = _MERCADO_PAGO_PERIOD.search(text)
+        if match:
+            fields["as_of_date"] = parse_date(match.group(2)).isoformat()
+    return fields
 
 
 def transaction_fingerprint(

@@ -17,21 +17,74 @@ class Classification:
     review_reason: str | None = None
 
 
+# Canonical Portuguese month abbreviations, shared with
+# `app/services/importer.py` (which imports this dict rather than defining
+# its own) so the set of "real" three-letter months used to *parse* Nubank
+# dates and the set used to *classify* the Nubank invoice-payment line below
+# cannot drift apart into two different policies.
+MONTHS_PT_ABBR = {
+    "JAN": 1,
+    "FEV": 2,
+    "MAR": 3,
+    "ABR": 4,
+    "MAI": 5,
+    "JUN": 6,
+    "JUL": 7,
+    "AGO": 8,
+    "SET": 9,
+    "OUT": 10,
+    "NOV": 11,
+    "DEZ": 12,
+}
+_MONTH_PT_ABBR_ALTERNATION = "|".join(MONTHS_PT_ABBR)
+
+
+# Shared with `app/services/importer.py`, which uses these same patterns to
+# decide the *sign* of a credit-card amount (`_normalize_credit_card_amount`)
+# and to bucket it for reconciliation (`_transaction_components`). Defining
+# them once here and importing them there keeps "what counts as a card
+# payment/refund/fee" a single financial policy instead of two regexes that
+# could silently drift apart (see docs/WORK_ORDER_PDF_PARSERS_NUBANK_MERCADO_PAGO.md,
+# "não criar segunda política de classificação"). `DEVOLU` (Mercado Pago's
+# "Devolução") and `ENCARGO` (Mercado Pago's "Tarifas e encargos") are
+# additive synonyms: every description the previous, narrower patterns
+# already matched still matches.
+#
+# `PAGAMENTO EM \d{1,2} (JAN|FEV|...)` is the Nubank invoice's own literal
+# wording for the credit-card-bill payment line item (observed layout:
+# "Pagamento em 01 JUL", i.e. day + three-letter month abbreviation, matching
+# the day/month tokens `_NUBANK_CARD_START` and `MONTHS_PT_ABBR` above already
+# parse). Before this, that description matched none of the payment
+# alternatives, so `classify()` fell through to plain positive `income` --
+# violating INV-002 (card-bill payment must be reconciliation, zero operating
+# effect) even though `_transaction_components`' separate positive-credit
+# fallback already bucketed the same row into `payments_total` for
+# reconciliation. Matching it here, in the one shared pattern, is a positive
+# identity check -- the exact Nubank phrasing plus a day-of-month and one of
+# the twelve real `MONTHS_PT_ABBR` tokens, spelled out from that same dict so
+# it cannot drift out of sync with the parser's own month vocabulary -- not a
+# generic "any positive credit is a payment" heuristic, and not a bare
+# `[A-Z]{3}` wildcard that would also match a non-month token such as "XYZ".
+# It does not touch the reconciliation fallback above, which still only ever
+# applies to credits no named pattern recognizes.
+PAYMENT_PATTERN = re.compile(
+    r"PAGAMENTO.*FATURA"
+    r"|PAGAMENTO RECEBIDO"
+    r"|FATURA PAGA"
+    r"|PAG(?:AMENTO)? BOLETO.*(?:NU PAGAMENTOS|NUBANK)"
+    rf"|PAGAMENTO EM \d{{1,2}}\s+(?:{_MONTH_PT_ABBR_ALTERNATION})\b"
+)
+REFUND_PATTERN = re.compile(r"ESTORNO|CREDITO.*COMPRA|CREDITO.*CARTAO|DEVOLU")
+FEE_PATTERN = re.compile(r"IOF|JUROS|TARIFA|ENCARGO")
+
+
 RULES: tuple[tuple[re.Pattern[str], Classification], ...] = (
-    (
-        re.compile(
-            r"PAGAMENTO.*FATURA|PAGAMENTO RECEBIDO|FATURA PAGA|PAG(?:AMENTO)? BOLETO.*(?:NU PAGAMENTOS|NUBANK)"
-        ),
-        Classification("Conciliação", "reconciliation", True, 0.99),
-    ),
+    (PAYMENT_PATTERN, Classification("Conciliação", "reconciliation", True, 0.99)),
     (
         re.compile(r"PRIVILEGE|PRIVILEGE DI|APLICACAO|RESGATE"),
         Classification("Transferência patrimonial", "transfer", True, 0.97),
     ),
-    (
-        re.compile(r"ESTORNO|CREDITO.*COMPRA|CREDITO.*CARTAO"),
-        Classification("Reembolsos e estornos", "refund", False, 0.98),
-    ),
+    (REFUND_PATTERN, Classification("Reembolsos e estornos", "refund", False, 0.98)),
     (
         re.compile(r"IFOOD|RESTAURANTE|LANCHONETE|PIZZARIA|PADARIA|PANIF"),
         Classification("Restaurantes e delivery", "expense", False, 0.92),
@@ -70,7 +123,7 @@ RULES: tuple[tuple[re.Pattern[str], Classification], ...] = (
         Classification("Compras, casa e vestuário", "expense", False, 0.86),
     ),
     (re.compile(r"SEGURO|PORTO SEGURO|AZUL SEGUROS"), Classification("Seguros", "expense", False, 0.9)),
-    (re.compile(r"IOF|JUROS|TARIFA"), Classification("Juros, IOF e tarifas", "expense", False, 0.95)),
+    (FEE_PATTERN, Classification("Juros, IOF e tarifas", "expense", False, 0.95)),
 )
 
 
