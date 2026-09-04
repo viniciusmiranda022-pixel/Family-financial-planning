@@ -141,6 +141,25 @@ Upload
 
 Um documento inválido ou incompatível não interrompe o sistema: o original permanece criptografado e uma pendência é criada para revisão.
 
+## Importação em lote (Fase 2)
+
+`POST /api/imports/batch` (`app/api.py`) não é um segundo fluxo de importação: é orquestração sobre o
+mesmo fluxo acima, executado uma vez por arquivo através de `_import_one_document`, a função
+compartilhada com `POST /api/imports`. Cada arquivo do lote é persistido e comitado de forma
+independente -- o mesmo `db.commit()` por documento que o envio individual já fazia -- então a falha de
+um arquivo (parser não reconhecido, exceção inesperada, limite de tamanho excedido) nunca desfaz nem
+reescreve o resultado já persistido de um arquivo anterior do mesmo lote; uma exceção fora do já tratado
+`ValueError` de parsing aciona `db.rollback()` apenas do trabalho não comitado desse arquivo antes de
+seguir para o próximo. A resposta é sempre a lista real de resultados por arquivo (`imported`/
+`imported_with_review`/`review_required`/`rejected`), nunca um "sucesso" agregado quando algum arquivo
+falhou. `account_id`/`document_type` são únicos para todo o lote, espelhando o mesmo contrato do envio
+individual (inclusive a dispensa de conta para holerite). Limites: `MAX_UPLOAD_MB` por arquivo (igual ao
+envio individual), mais `MAX_BATCH_FILES` arquivos e `MAX_BATCH_TOTAL_MB` combinados por envio
+(`app/config.py`). Nenhuma migração foi necessária -- `Document`, `Transaction` e
+`DocumentReconciliation` já carregam, por linha, tudo que um resultado por arquivo precisa expor. A
+interface (`app/templates/index.html`, `app/static/app.js`) só exibe os campos que o backend já
+calculou por arquivo; nunca soma, parseia, classifica ou reconcilia no navegador.
+
 ## Modelo de deduplicação
 
 Existem dois níveis:
