@@ -42,6 +42,8 @@ from app.schemas import (
     AccountRequest,
     AdvisorRequest,
     CaptureConfirmRequest,
+    CardPaymentLinkRequest,
+    CardPaymentUnlinkRequest,
     ClassificationRuleDeactivateRequest,
     ClassificationRuleEditRequest,
     CommissionRequest,
@@ -65,6 +67,13 @@ from app.security import (
     hash_password,
     set_session_cookie,
     verify_password,
+)
+from app.services.card_payment_reconciliation import (
+    CardPaymentLinkError,
+    link_card_payment,
+    list_card_payment_reconciliations,
+    serialize_card_payment_match,
+    unlink_card_payment,
 )
 from app.services.classification_learning import (
     accept_classification_rule,
@@ -3307,6 +3316,97 @@ def resolve_persisted_duplicate_group(
     )
     db.commit()
     return duplicate_group_detail(group.id, user, db)
+
+
+@router.get("/card-payment-reconciliations")
+def card_payment_reconciliations(
+    period: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    matches = list_card_payment_reconciliations(db, household_id=user.household_id, period=period)
+    return [serialize_card_payment_match(db, match) for match in matches]
+
+
+@router.post("/card-payment-reconciliations/link", status_code=status.HTTP_201_CREATED)
+def link_card_payment_reconciliation(
+    payload: CardPaymentLinkRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        checking, card = link_card_payment(
+            db,
+            household_id=user.household_id,
+            checking_transaction_id=payload.checking_transaction_id,
+            card_transaction_id=payload.card_transaction_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Lançamento não encontrado") from exc
+    except CardPaymentLinkError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "card_payment_reconciliation.link",
+        "transaction",
+        checking.id,
+        {"card_transaction_id": card.id},
+        before_state={"linked_transaction_id": None},
+        after_state={
+            "checking_transaction_id": checking.id,
+            "card_transaction_id": card.id,
+            "checking_amount": str(checking.amount),
+            "card_amount": str(card.amount),
+        },
+        reason=payload.reason,
+        source="card_payment_reconciliation",
+    )
+    db.commit()
+    match = next(
+        match
+        for match in list_card_payment_reconciliations(db, household_id=user.household_id)
+        if match.checking_transaction_id == checking.id
+    )
+    return serialize_card_payment_match(db, match)
+
+
+@router.post("/card-payment-reconciliations/unlink")
+def unlink_card_payment_reconciliation(
+    payload: CardPaymentUnlinkRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        transaction, counterpart = unlink_card_payment(
+            db, household_id=user.household_id, transaction_id=payload.transaction_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Lançamento não encontrado") from exc
+    except CardPaymentLinkError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    is_checking = transaction.account and transaction.account.account_type == "checking"
+    checking = transaction if is_checking else counterpart
+    card = counterpart if is_checking else transaction
+    audit(
+        db,
+        user,
+        "card_payment_reconciliation.unlink",
+        "transaction",
+        checking.id,
+        {"card_transaction_id": card.id},
+        before_state={"checking_transaction_id": checking.id, "card_transaction_id": card.id},
+        after_state={"linked_transaction_id": None},
+        reason=payload.reason,
+        source="card_payment_reconciliation",
+    )
+    db.commit()
+    match = next(
+        match
+        for match in list_card_payment_reconciliations(db, household_id=user.household_id)
+        if match.checking_transaction_id == checking.id
+    )
+    return serialize_card_payment_match(db, match)
 
 
 @router.get("/classification-rules")
