@@ -34,7 +34,16 @@ Matching policy (single, shared with the API/UI -- no second policy):
    prohibits).
 2. A candidate pair must have `abs(card.amount) == abs(bank.amount)` within
    the project's standard monetary tolerance (`RECONCILIATION_TOLERANCE`,
-   R$ 0.01, `app/services/reconciliation.py`).
+   R$ 0.01, `app/services/reconciliation.py`) *and* the documented financial
+   direction: the checking-side row must be a negative bank debit and the
+   card-side row must be a positive payment-received line (see
+   `_normalize_credit_card_amount` in `app/services/importer.py`, which
+   always normalizes a `PAYMENT_PATTERN` row on the card side to a positive
+   amount, and `docs/ARCHITECTURE.md`'s "Conciliação visual de pagamento de
+   fatura" section). Matching on absolute value alone would also treat two
+   same-magnitude rows on the *wrong* sides -- e.g. a positive checking
+   credit and a positive card row, or two negative rows -- as a valid card
+   payment, which is not the relationship this feature exists to evidence.
 3. An *automatically suggested* candidate must additionally fall inside
    `CARD_PAYMENT_MATCH_WINDOW_DAYS` of the invoice's `booked_at` (see the
    module-level constant for why the window is symmetric and how wide it
@@ -53,10 +62,14 @@ Matching policy (single, shared with the API/UI -- no second policy):
    that candidate also serves another checking row" case above -- is
    `ambiguous`, surfaced with every candidate, never auto-resolved.
 5. A human can still confirm a link outside the date window (a legitimately
-   late payment): `link_card_payment` only enforces the amount tolerance,
-   never the date window, because the operator -- not a heuristic -- is
-   providing the evidence at that point. The window only gates what the
-   system offers unprompted.
+   late payment): `link_card_payment` only enforces the amount tolerance and
+   the same direction contract as the candidate policy above, never the date
+   window, because the operator -- not a heuristic -- is providing the date
+   evidence at that point. A human confirmation can override *when* the
+   debit happened, but it cannot turn a non-debit/non-payment pair (wrong
+   sign on either side) into a card-payment reconciliation -- that would
+   silently misrepresent the lineage this feature is supposed to make
+   auditable, not merely bypass a convenience heuristic.
 """
 
 from __future__ import annotations
@@ -126,11 +139,24 @@ def _money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def _is_card_payment_direction(*, checking_amount: Decimal, card_amount: Decimal) -> bool:
+    """The only financial direction this feature evidences: a negative bank
+    debit paired with a positive card "payment received" line (see the
+    module docstring, point 2, and `_normalize_credit_card_amount` in
+    `app/services/importer.py`). Anything else -- a positive checking
+    credit, a negative card-side row -- is not a card-invoice payment no
+    matter how well the absolute values line up.
+    """
+
+    return checking_amount < 0 and card_amount > 0
+
+
 def _candidates_for_checking(checking: Any, card_rows: list[Any], window: timedelta) -> list[Any]:
     candidates = [
         card
         for card in card_rows
         if card.linked_transaction_id is None
+        and _is_card_payment_direction(checking_amount=checking.amount, card_amount=card.amount)
         and abs(abs(card.amount) - abs(checking.amount)) <= RECONCILIATION_TOLERANCE
         and abs(card.booked_at - checking.booked_at) <= window
     ]
@@ -420,6 +446,15 @@ def link_card_payment(
     if abs(abs(checking.amount) - abs(card.amount)) > RECONCILIATION_TOLERANCE:
         raise CardPaymentLinkError(
             "Os valores dos dois lançamentos não coincidem dentro da tolerância de R$ 0,01"
+        )
+    if not _is_card_payment_direction(checking_amount=checking.amount, card_amount=card.amount):
+        # A human can override the date window (see the module docstring,
+        # point 5) but not the documented sign relationship: this pair is
+        # not a bank debit paired with a card payment-received line no
+        # matter who confirms it.
+        raise CardPaymentLinkError(
+            "O lançamento da conta corrente precisa ser um débito (valor negativo) e o do "
+            "cartão precisa ser um pagamento recebido (valor positivo)"
         )
     checking.linked_transaction_id = card.id
     card.linked_transaction_id = checking.id

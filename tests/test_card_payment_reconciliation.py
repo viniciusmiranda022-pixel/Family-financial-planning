@@ -346,6 +346,95 @@ def test_link_is_symmetric_non_destructive_and_preserves_inv002() -> None:
     assert match_after_unlink.status == "matched"
 
 
+def test_positive_checking_reconciliation_never_matches_positive_card_payment() -> None:
+    """P0 regression: matching on absolute value alone would let a positive
+    checking-side reconciliation row (not a bank debit) pair with a positive
+    card-side payment row. The documented relationship (`docs/ARCHITECTURE.md`,
+    "Conciliação visual de pagamento de fatura") requires a negative bank
+    debit on the checking side; a positive checking row must never surface
+    as a candidate, and a human confirm attempt must be rejected too."""
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    positive_checking = _checking_side_debit(household, day=16, amount="220.00", suffix="pos")
+    card_line = _card_side_payment_line(household)  # +220.00
+    db.add_all([positive_checking, card_line])
+    db.flush()
+
+    matches = list_card_payment_reconciliations(db, household_id=household.household.id)
+    match = next(m for m in matches if m.checking_transaction_id == positive_checking.id)
+    assert match.status == "unmatched"
+    assert match.candidates == ()
+
+    try:
+        link_card_payment(
+            db,
+            household_id=household.household.id,
+            checking_transaction_id=positive_checking.id,
+            card_transaction_id=card_line.id,
+        )
+        raise AssertionError("expected CardPaymentLinkError")
+    except CardPaymentLinkError:
+        pass
+    assert positive_checking.linked_transaction_id is None
+    assert card_line.linked_transaction_id is None
+
+
+def test_negative_card_reconciliation_never_matches_negative_checking_debit() -> None:
+    """Symmetric P0 case: a negative card-side reconciliation row (not a
+    payment-received line) must never pair with a negative checking debit
+    even though the absolute values and account types line up."""
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    checking = household.transactions["card_payment"]  # -220.00
+    negative_card_line = _card_side_payment_line(household, amount="-220.00")
+    db.add(negative_card_line)
+    db.flush()
+
+    match = _checking_match(db, household)
+    assert match.status == "unmatched"
+    assert match.candidates == ()
+
+    try:
+        link_card_payment(
+            db,
+            household_id=household.household.id,
+            checking_transaction_id=checking.id,
+            card_transaction_id=negative_card_line.id,
+        )
+        raise AssertionError("expected CardPaymentLinkError")
+    except CardPaymentLinkError:
+        pass
+    assert checking.linked_transaction_id is None
+    assert negative_card_line.linked_transaction_id is None
+
+
+def test_valid_negative_checking_positive_card_direction_still_accepted() -> None:
+    """Control case: the documented valid direction (negative checking debit,
+    positive card payment) must remain unaffected by the direction check."""
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    checking = household.transactions["card_payment"]  # -220.00
+    card_line = _card_side_payment_line(household)  # +220.00
+    db.add(card_line)
+    db.flush()
+
+    match = _checking_match(db, household)
+    assert match.status == "matched"
+    assert match.candidates[0].transaction_id == card_line.id
+
+    linked_checking, linked_card = link_card_payment(
+        db,
+        household_id=household.household.id,
+        checking_transaction_id=checking.id,
+        card_transaction_id=card_line.id,
+    )
+    assert linked_checking.linked_transaction_id == card_line.id
+    assert linked_card.linked_transaction_id == checking.id
+
+
 def test_link_rejects_amount_mismatch() -> None:
     db = _memory_session()
     household = build_synthetic_household(db)
