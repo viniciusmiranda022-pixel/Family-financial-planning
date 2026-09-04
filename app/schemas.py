@@ -235,3 +235,19 @@ class FindingLifecycleRequest(BaseModel):
 
 class MonthlyCloseReopenRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
+
+
+class ClassificationRuleEditRequest(BaseModel):
+    """Admin-only edit of an eligible local merchant rule's category.
+
+    `movement_type` is deliberately not a field here: it is deterministic
+    evidence inherited from the confirming transaction, never a free choice
+    (see `app/services/classification_learning.py::edit_classification_rule`).
+    """
+
+    category_id: str = Field(min_length=1, max_length=36)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class ClassificationRuleDeactivateRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)

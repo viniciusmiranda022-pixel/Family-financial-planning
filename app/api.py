@@ -42,6 +42,8 @@ from app.schemas import (
     AccountRequest,
     AdvisorRequest,
     CaptureConfirmRequest,
+    ClassificationRuleDeactivateRequest,
+    ClassificationRuleEditRequest,
     CommissionRequest,
     DuplicateResolutionRequest,
     FindingLifecycleRequest,
@@ -67,6 +69,8 @@ from app.security import (
 from app.services.classification_learning import (
     accept_classification_rule,
     classify_with_local_rules,
+    deactivate_classification_rule,
+    edit_classification_rule,
     record_confirmed_correction,
     serialize_classification_rule,
 )
@@ -2417,6 +2421,8 @@ async def create_capture_preview(
             payload=payload,
             requested_type=document_type,
             account_type=account.account_type if account else None,
+            db=db,
+            household_id=user.household_id,
         )
     except CaptureParseError as exc:
         source_type = "text"
@@ -3330,6 +3336,97 @@ def activate_classification_rule(
         {"confirmation_count": rule.confirmation_count},
         after_state={"status": rule.status, "active": rule.active},
         reason="Aceite explícito de regra após três correções consistentes",
+        source="classification_learning",
+    )
+    db.commit()
+    return serialize_classification_rule(rule, category_name or "")
+
+
+@router.patch("/classification-rules/{rule_id}")
+def edit_classification_rule_endpoint(
+    rule_id: str,
+    payload: ClassificationRuleEditRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    before = db.execute(
+        select(ClassificationRule.category_id, Category.name)
+        .join(Category, Category.id == ClassificationRule.category_id)
+        .where(
+            ClassificationRule.id == rule_id,
+            ClassificationRule.household_id == user.household_id,
+        )
+    ).first()
+    if before is None:
+        raise HTTPException(status_code=404, detail="Regra local não encontrada")
+    before_category_id, before_category_name = before
+    try:
+        rule = edit_classification_rule(
+            db,
+            household_id=user.household_id,
+            rule_id=rule_id,
+            category_id=payload.category_id,
+        )
+        db.flush()
+    except LookupError as exc:
+        # The rule itself was already confirmed to exist above (`before`);
+        # a `LookupError` at this point can only be the requested category.
+        raise HTTPException(status_code=404, detail="Categoria não encontrada") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Já existe uma regra para este estabelecimento com esta categoria e tipo de movimento",
+        ) from exc
+    category_name = db.scalar(select(Category.name).where(Category.id == rule.category_id))
+    audit(
+        db,
+        user,
+        "classification_rule.edit",
+        "classification_rule",
+        rule.id,
+        {},
+        before_state={"category_id": before_category_id, "category": before_category_name},
+        after_state={"category_id": rule.category_id, "category": category_name},
+        reason=payload.reason,
+        source="classification_learning",
+    )
+    db.commit()
+    return serialize_classification_rule(rule, category_name or "")
+
+
+@router.post("/classification-rules/{rule_id}/deactivate")
+def deactivate_classification_rule_endpoint(
+    rule_id: str,
+    payload: ClassificationRuleDeactivateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        rule = deactivate_classification_rule(
+            db,
+            household_id=user.household_id,
+            rule_id=rule_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Regra local não encontrada") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    category_name = db.scalar(select(Category.name).where(Category.id == rule.category_id))
+    audit(
+        db,
+        user,
+        "classification_rule.deactivate",
+        "classification_rule",
+        rule.id,
+        {},
+        before_state={"status": "active", "active": True},
+        after_state={"status": rule.status, "active": rule.active},
+        reason=payload.reason,
         source="classification_learning",
     )
     db.commit()

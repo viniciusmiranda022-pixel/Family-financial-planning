@@ -5,10 +5,14 @@ from datetime import date, timedelta
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from app.config import get_settings
-from app.services.classifier import classify, normalize_description
+from app.services.classifier import Classification, classify, normalize_description
 from app.services.importer import ParsedTransaction, parse_date, parse_decimal, parse_document
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 SUPPORTED_DOCUMENT_TYPES = {
     "auto",
@@ -164,6 +168,39 @@ def _date_near_label(text: str, label: str, reference: date) -> date:
     return _date_from_text(text, reference)
 
 
+def _classify(
+    description: str,
+    amount: float,
+    *,
+    db: "Session | None" = None,
+    household_id: str | None = None,
+) -> Classification:
+    """Route classification through the one canonical, household-aware path.
+
+    Smart capture must never run a second classification policy alongside
+    the importer's (docs/WORK_ORDER_EDITABLE_MERCHANT_RULES.md: "no second
+    classification policy in importer, API, UI or Advisor"). When a database
+    session and household are available -- the live API path, via
+    `preview_capture` -- this defers to `classify_with_local_rules`, so an
+    active household merchant rule applies here exactly as it does on
+    import. Without them (pure-function unit tests, or any caller with no
+    household context yet) it falls back to the plain deterministic
+    classifier, which is exactly what `classify_with_local_rules` itself
+    falls back to when no rule matches -- so this is a degenerate case of
+    the same policy, never a separate one.
+    """
+    if db is not None and household_id is not None:
+        from app.services.classification_learning import classify_with_local_rules
+
+        applied = classify_with_local_rules(
+            db, household_id=household_id, description=description, amount=amount
+        )
+        return Classification(
+            applied.category, applied.transaction_type, applied.excluded, applied.confidence, applied.review_reason
+        )
+    return classify(description, amount)
+
+
 def _movement_type(text: str) -> str:
     normalized = normalize_description(text)
     if re.search(r"\b(INVESTI|INVESTIMENTO|APLIQUEI|APLICACAO|APLICAR)\b", normalized):
@@ -177,19 +214,32 @@ def _movement_type(text: str) -> str:
     return "expense"
 
 
-def _category_for_text(text: str, amount: Decimal, movement_type: str) -> tuple[str, float, list[str]]:
+def _category_for_text(
+    text: str,
+    amount: Decimal,
+    movement_type: str,
+    *,
+    db: "Session | None" = None,
+    household_id: str | None = None,
+) -> tuple[str, float, list[str]]:
     if movement_type in {"investment", "redemption"}:
         return "Transferência patrimonial", 0.99, []
     if movement_type == "income":
         return "Receitas", 0.94, []
     if movement_type == "refund":
         return "Reembolsos e estornos", 0.94, []
-    classification = classify(text, float(-abs(amount)))
+    classification = _classify(text, float(-abs(amount)), db=db, household_id=household_id)
     warnings = [classification.review_reason] if classification.review_reason else []
     return classification.category, classification.confidence, warnings
 
 
-def parse_text_capture(text: str, reference: date | None = None) -> dict:
+def parse_text_capture(
+    text: str,
+    reference: date | None = None,
+    *,
+    db: "Session | None" = None,
+    household_id: str | None = None,
+) -> dict:
     reference = reference or date.today()
     cleaned = " ".join(text.split())
     candidates = _money_candidates(cleaned, allow_shorthand=True)
@@ -197,7 +247,9 @@ def parse_text_capture(text: str, reference: date | None = None) -> dict:
         raise CaptureParseError("Não encontrei um valor. Exemplo: ‘Gastei R$ 150 com combustível’. ")
     movement_type = _movement_type(cleaned)
     amount = candidates[0][0]
-    category, confidence, warnings = _category_for_text(cleaned, amount, movement_type)
+    category, confidence, warnings = _category_for_text(
+        cleaned, amount, movement_type, db=db, household_id=household_id
+    )
     if len(candidates) > 1:
         confidence = min(confidence, 0.62)
         warnings.append("Encontrei mais de um valor; confirme o valor correto antes de gravar")
@@ -227,7 +279,13 @@ def _first_meaningful_line(text: str) -> str:
     return "Documento capturado"
 
 
-def parse_receipt_text(text: str, reference: date | None = None) -> dict:
+def parse_receipt_text(
+    text: str,
+    reference: date | None = None,
+    *,
+    db: "Session | None" = None,
+    household_id: str | None = None,
+) -> dict:
     reference = reference or date.today()
     amount = _amount_near_labels(
         text,
@@ -237,7 +295,9 @@ def parse_receipt_text(text: str, reference: date | None = None) -> dict:
         raise CaptureParseError("Não encontrei o valor total no comprovante. Digite o valor na prévia.")
     description = _first_meaningful_line(text)
     classification_text = f"{description} {text[:2000]}"
-    category, confidence, warnings = _category_for_text(classification_text, amount, "expense")
+    category, confidence, warnings = _category_for_text(
+        classification_text, amount, "expense", db=db, household_id=household_id
+    )
     return {
         "kind": "transaction",
         "booked_at": _date_from_text(text, reference).isoformat(),
@@ -311,9 +371,14 @@ def parse_payroll_text(text: str, reference: date | None = None) -> dict:
     }
 
 
-def _parsed_transaction_item(item: ParsedTransaction) -> dict:
+def _parsed_transaction_item(
+    item: ParsedTransaction,
+    *,
+    db: "Session | None" = None,
+    household_id: str | None = None,
+) -> dict:
     movement = "income" if item.amount > 0 else "expense"
-    classification = classify(item.description, float(item.amount))
+    classification = _classify(item.description, float(item.amount), db=db, household_id=household_id)
     if classification.transaction_type == "refund":
         movement = "refund"
     elif classification.transaction_type == "reconciliation":
@@ -389,6 +454,9 @@ def parse_financial_document(
     document_type: str,
     extracted_text: str,
     reference: date | None = None,
+    *,
+    db: "Session | None" = None,
+    household_id: str | None = None,
 ) -> list[dict]:
     reference = reference or date.today()
     try:
@@ -401,7 +469,7 @@ def parse_financial_document(
         )
     if not rows:
         raise CaptureParseError("Não encontrei lançamentos estruturados no documento.")
-    return [_parsed_transaction_item(item) for item in rows[:1000]]
+    return [_parsed_transaction_item(item, db=db, household_id=household_id) for item in rows[:1000]]
 
 
 def detect_document_type(
@@ -556,6 +624,8 @@ def preview_capture(
     requested_type: str,
     account_type: str | None,
     reference: date | None = None,
+    db: "Session | None" = None,
+    household_id: str | None = None,
 ) -> dict:
     reference = reference or date.today()
     filename = filename or ""
@@ -583,16 +653,17 @@ def preview_capture(
     )
     if payload and detected_type in {"bank_statement", "credit_card"}:
         items = parse_financial_document(
-            filename, payload, detected_type, combined, reference=reference
+            filename, payload, detected_type, combined, reference=reference,
+            db=db, household_id=household_id,
         )
     elif detected_type == "boleto":
         items = [parse_boleto_text(combined, reference)]
     elif detected_type == "payroll":
         items = [parse_payroll_text(combined, reference)]
     elif detected_type == "receipt":
-        items = [parse_receipt_text(combined, reference)]
+        items = [parse_receipt_text(combined, reference, db=db, household_id=household_id)]
     else:
-        items = [parse_text_capture(combined, reference)]
+        items = [parse_text_capture(combined, reference, db=db, household_id=household_id)]
 
     confidence = min(float(item.get("confidence", 0)) for item in items) if items else 0
     warnings = [warning for item in items for warning in item.get("warnings", []) if warning]
