@@ -62,7 +62,25 @@
   quantidade/tamanho do lote, falha inesperada em um arquivo sem afetar os demais nem deixar artefato
   criptografado órfão, mensagens de erro sem conteúdo bruto, lineage de auditoria batch → `document_id`
   por item, regressão do envio individual); pendente revisão do engenheiro responsável antes do merge;
-- exportação Excel/PDF;
+- exportação Excel/PDF: `GET /api/reports/export?format=xlsx|pdf` reutiliza `app.api._build_report_payload`
+  -- a mesma função que `GET /api/reports` já usava, extraída sem mudança de comportamento -- então ambos
+  os formatos representam exatamente os mesmos totais, categorias, períodos e exclusões do relatório
+  canônico; nenhum recálculo, reclassificação, deduplicação ou reconciliação paralela. Excel
+  (`app/services/report_export.py`, `openpyxl`, já dependência do projeto) grava células de dado puro com
+  formatação apenas de apresentação, nunca fórmula de planilha. PDF (mesmo módulo, `pymupdf.insert_htmlbox`,
+  já dependência do projeto) é gerado inteiramente no backend a partir do mesmo dict, sem navegador e sem
+  dependência nova -- mecanismo diferente do botão "Imprimir / PDF" existente, que continua funcionando
+  sem alteração. Tabelas paginadas em blocos de até 28 linhas mais auto-redução de escala evitam corte
+  silencioso de dados; uma seção que ainda assim não coubesse falha com exceção em vez de devolver um
+  arquivo incompleto. Sem migração -- nenhum modelo novo, só leitura do dict que `/reports` já monta. Nome
+  de arquivo carrega apenas o período (`relatorio_<início>_a_<fim>.<formato>`), nunca família/usuário/conta;
+  `Content-Disposition: attachment` força download. Autenticação e isolamento por família idênticos a
+  `GET /reports` (mesma função, mesmo `household_id`). Interface em "Relatórios" só solicita o formato e
+  baixa o arquivo (`downloadReportExport` em `app/static/app.js`), sem somar/parsear nada no navegador.
+  Testes em `tests/test_report_export.py` (paridade Excel/PDF com o JSON canônico, período sem
+  movimentação com resultado honesto e não fabricado, isolamento por família, content-type/
+  content-disposition seguros, formato inválido rejeitado, autenticação obrigatória); pendente revisão do
+  engenheiro responsável antes do merge;
 - testes com cópias anonimizadas dos documentos reais;
 - **go-live de uso manual / fluxos financeiros do dia a dia**: consolidar uma experiência manual
   explícita e simples para `despesa`, `receita`, `transfer`, `investment`, `redemption`, `refund` e
