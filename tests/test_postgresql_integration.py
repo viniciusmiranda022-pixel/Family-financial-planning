@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import uuid
 from datetime import date
 from decimal import Decimal
 from io import StringIO
@@ -502,6 +503,148 @@ def test_initial_load_concurrent_apply_does_not_duplicate_obligation_or_balance(
             assert obligations[0].amount == Decimal("1000.00")
             assert balances[0].amount == Decimal("5000.00")
             assert balances[0].source == "manual_confirmed"
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_card_payment_link_concurrent_confirmations_do_not_leave_asymmetric_pair() -> None:
+    """PR #43 engineer review, secondary concurrency hardening: two
+    concurrent human confirmations that both try to link the very same bank
+    debit (`checking`) to two *different* card-side candidates must not
+    both succeed. Before the `SELECT ... FOR UPDATE` fix,
+    `link_card_payment` only checked `linked_transaction_id is None` in
+    Python after a plain, non-locking read -- two overlapping calls could
+    both pass that check before either wrote, and both commit, leaving
+    `checking` pointing at whichever card row committed last while the
+    *other* card row's `linked_transaction_id` still (wrongly) points back
+    at `checking`: a non-symmetric pair, exactly what
+    `test_link_is_symmetric_non_destructive_and_preserves_inv002` proves a
+    *single* link never produces.
+
+    This proves it under a real two-connection PostgreSQL race, not merely
+    by reading the code: the first connection locks and links `checking` to
+    `card_a` but deliberately holds the transaction open before commit; a
+    second, fully concurrent connection attempts to link the same
+    `checking` to a different `card_b` and must block on the row lock until
+    the first commits, then observe the now-linked state and cleanly raise
+    `CardPaymentLinkError` instead of overwriting it.
+    """
+
+    from app.services.card_payment_reconciliation import CardPaymentLinkError, link_card_payment
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as setup_db:
+            synthetic = build_synthetic_household(setup_db)
+            checking = synthetic.transactions["card_payment"]
+            card_a = Transaction(
+                household_id=synthetic.household.id,
+                account_id=synthetic.credit_card.id,
+                category_id=synthetic.categories["Conciliação"].id,
+                booked_at=date(2026, 6, 1),
+                occurred_at=date(2026, 6, 1),
+                competence="2026-06",
+                description="Pagamento em 15 JUN (A)",
+                normalized_description="PAGAMENTO EM 15 JUN A",
+                amount=Decimal("220.00"),
+                transaction_type="reconciliation",
+                fingerprint=f"pgconcura{uuid.uuid4().hex}".ljust(64, "0")[:64],
+                source_priority=70,
+                confidence=Decimal("1"),
+                excluded=True,
+            )
+            card_b = Transaction(
+                household_id=synthetic.household.id,
+                account_id=synthetic.credit_card.id,
+                category_id=synthetic.categories["Conciliação"].id,
+                booked_at=date(2026, 6, 2),
+                occurred_at=date(2026, 6, 2),
+                competence="2026-06",
+                description="Pagamento em 15 JUN (B)",
+                normalized_description="PAGAMENTO EM 15 JUN B",
+                amount=Decimal("220.00"),
+                transaction_type="reconciliation",
+                fingerprint=f"pgconcurb{uuid.uuid4().hex}".ljust(64, "0")[:64],
+                source_priority=70,
+                confidence=Decimal("1"),
+                excluded=True,
+            )
+            setup_db.add_all([card_a, card_b])
+            setup_db.commit()
+            household_id = synthetic.household.id
+            checking_id = checking.id
+            card_a_id = card_a.id
+            card_b_id = card_b.id
+
+        second_blocked_confirmed = threading.Event()
+        second_done = threading.Event()
+        second_error: list[BaseException] = []
+        second_result: list[str] = []
+
+        def _second_attempt() -> None:
+            try:
+                second_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(second_engine) as second_db:
+                    try:
+                        link_card_payment(
+                            second_db,
+                            household_id=household_id,
+                            checking_transaction_id=checking_id,
+                            card_transaction_id=card_b_id,
+                        )
+                        second_db.commit()
+                        second_result.append("linked")
+                    except CardPaymentLinkError:
+                        second_db.rollback()
+                        second_result.append("rejected")
+                second_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001 - surfaced via assertion below
+                second_error.append(exc)
+            finally:
+                second_done.set()
+
+        with Session(engine) as first_db:
+            link_card_payment(
+                first_db,
+                household_id=household_id,
+                checking_transaction_id=checking_id,
+                card_transaction_id=card_a_id,
+            )
+            # Deliberately do not commit yet: the second connection's
+            # `SELECT ... FOR UPDATE` on the same `checking` row must block
+            # on PostgreSQL's row-level write lock for as long as this
+            # transaction stays open.
+            worker = threading.Thread(target=_second_attempt, daemon=True)
+            worker.start()
+            still_blocked = not second_done.wait(timeout=1.0)
+            assert still_blocked, (
+                "second connection completed before the first transaction "
+                "committed -- the row lock is not actually serializing"
+            )
+            second_blocked_confirmed.set()
+            first_db.commit()
+
+        assert second_done.wait(timeout=10.0), "second connection never finished"
+        if second_error:
+            raise second_error[0]
+        assert second_result == ["rejected"], (
+            "second concurrent link must be rejected once it observes the "
+            "first connection's committed link, never silently overwrite it"
+        )
+
+        with Session(engine) as verify_db:
+            checking_row = verify_db.get(Transaction, checking_id)
+            card_a_row = verify_db.get(Transaction, card_a_id)
+            card_b_row = verify_db.get(Transaction, card_b_id)
+            assert checking_row.linked_transaction_id == card_a_id
+            assert card_a_row.linked_transaction_id == checking_id
+            # The rejected candidate must remain completely untouched --
+            # this is exactly the non-symmetric corruption the lock
+            # prevents: `card_b` pointing at `checking` while `checking`
+            # points at `card_a` instead.
+            assert card_b_row.linked_transaction_id is None
         engine.dispose()
     finally:
         get_settings.cache_clear()
