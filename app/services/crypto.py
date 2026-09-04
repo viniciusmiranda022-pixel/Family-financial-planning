@@ -23,3 +23,17 @@ class EncryptedDocumentStore:
             return self.cipher.decrypt(Path(encrypted_path).read_bytes())
         except InvalidToken as exc:
             raise ValueError("Não foi possível descriptografar o documento") from exc
+
+    def delete(self, encrypted_path: str) -> None:
+        """Remove one encrypted artifact, idempotently.
+
+        Used only to undo this store's own `save()` when the `Document` row
+        that was meant to own the artifact fails to commit (see
+        `app.api._import_one_document`) -- never as a general-purpose or
+        bulk delete, and never for an artifact whose owning row already
+        committed. A missing file (already removed, or `save()` never
+        reached) is not an error: the caller's intent ("this path must not
+        exist") is already satisfied.
+        """
+
+        Path(encrypted_path).unlink(missing_ok=True)

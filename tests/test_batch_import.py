@@ -21,8 +21,10 @@ singleton, which whichever test module imports first would otherwise claim
 for every other module in the same test run.
 """
 
+import logging
 import os
 import uuid
+from pathlib import Path
 
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
@@ -510,6 +512,106 @@ def test_batch_import_unexpected_failure_on_one_file_does_not_affect_others(monk
                 assert statuses.get("boa-1.csv") in {"imported", "imported_with_review"}
                 assert statuses.get("boa-2.csv") in {"imported", "imported_with_review"}
                 assert "crash.csv" not in statuses
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_batch_import_unexpected_failure_after_encrypted_save_leaves_no_orphaned_artifact(
+    monkeypatch, caplog
+) -> None:
+    """Regression for the blocking P0/P1 review finding: `_import_one_document`
+    calls `EncryptedDocumentStore().save(...)` for a file's `Document` row
+    *before* parsing/classification/reconciliation run. If something
+    unexpected then fails before that `Document` commits, the encrypted
+    artifact already written must not be left orphaned on disk with no
+    owning DB row/provenance, must not touch any sibling file's own
+    already-committed artifact, and the failure must actually reach the
+    server-side logs (not be silently swallowed by `except Exception`).
+    """
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as client:
+            household = _setup_household(
+                client,
+                household_name="Família Falha Pós-Criptografia",
+                username="admin-lote-orfao",
+                password="senha-lote-segura-orfao",
+            )
+            account = _create_account(client)
+
+            original_classify = api_module.classify_with_local_rules
+
+            def _boom_after_encrypted_save(db, *, household_id, description, amount, internal_aliases):
+                # Classification runs only after `_import_one_document` has
+                # already called `EncryptedDocumentStore().save(...)` for
+                # this file's `Document` -- this is exactly the "encrypted
+                # artifact written, Document not yet committed" window the
+                # review flagged.
+                if "GATILHO ORFAO" in description.upper():
+                    raise RuntimeError("falha simulada apos gravacao criptografada")
+                return original_classify(
+                    db,
+                    household_id=household_id,
+                    description=description,
+                    amount=amount,
+                    internal_aliases=internal_aliases,
+                )
+
+            monkeypatch.setattr(api_module, "classify_with_local_rules", _boom_after_encrypted_save)
+
+            good_csv = _csv("2026-08-01,Mercado,120.50\n")
+            crashing_csv = _csv("2026-08-02,GATILHO ORFAO,10.00\n")
+
+            documents_dir = api_module.settings.documents_dir
+            artifacts_before = {p.name for p in documents_dir.iterdir()} if documents_dir.exists() else set()
+
+            with caplog.at_level(logging.ERROR, logger="app.api"):
+                response = client.post(
+                    "/api/imports/batch",
+                    data={"account_id": account["id"], "document_type": "bank_statement"},
+                    files=[
+                        ("files", ("boa.csv", good_csv, "text/csv")),
+                        ("files", ("orfao.csv", crashing_csv, "text/csv")),
+                    ],
+                )
+            assert response.status_code == 201
+            good_result, crash_result = response.json()["results"]
+            assert good_result["status"] in {"imported", "imported_with_review"}
+            assert crash_result["status"] == "rejected"
+            assert crash_result["error_category"] == "unexpected_error"
+            assert crash_result["document_id"] is None
+            # Same no-leak guarantee as the existing crash test, on the new trigger phrase.
+            assert "GATILHO" not in crash_result["message"]
+            assert "RuntimeError" not in crash_result["message"]
+            assert "falha simulada" not in crash_result["message"]
+
+            with _TestSessionLocal() as db:
+                documents = db.scalars(
+                    select(Document).where(Document.household_id == household["household_id"])
+                ).all()
+                # Exactly the good file's Document committed; the crashing
+                # file left no Document row at all (full rollback of it).
+                assert [doc.original_name for doc in documents] == ["boa.csv"]
+                surviving_encrypted_path = documents[0].encrypted_path
+
+            # No orphaned encrypted artifact: the only new file on disk from
+            # this request is the surviving Document's own, and it is
+            # actually readable (never partially written/corrupted).
+            artifacts_after = {p.name for p in documents_dir.iterdir()}
+            new_artifacts = artifacts_after - artifacts_before
+            assert new_artifacts == {Path(surviving_encrypted_path).name}
+            assert Path(surviving_encrypted_path).is_file()
+
+            # The unexpected failure actually reached the server-side logs
+            # (previously swallowed silently by `except Exception`), without
+            # leaking file content/description into the log message itself.
+            failure_logs = [r for r in caplog.records if "import.unexpected_failure" in r.getMessage()]
+            assert failure_logs, "expected the unexpected failure to be logged server-side"
+            for record in failure_logs:
+                rendered = record.getMessage()
+                assert "GATILHO" not in rendered
+                assert "orfao.csv" not in rendered
     finally:
         app.dependency_overrides.pop(get_db, None)
 

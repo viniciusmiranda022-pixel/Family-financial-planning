@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import uuid
 from calendar import monthrange
@@ -165,6 +166,7 @@ from app.services.smart_capture import CaptureParseError, preview_capture
 
 router = APIRouter(prefix="/api")
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 DEFAULT_CATEGORIES = (
     ("Conciliação", "#64748B", None, False),
@@ -2063,6 +2065,20 @@ def _import_one_document(
     transaction that could affect the next file processed on the same
     `Session` (relevant for the batch route only; the single-file route's
     `Session` is discarded after the request either way).
+
+    The encrypted artifact saved below is only truly owned by this
+    `Document` once that row commits. If `_persist_parsed_document` raises
+    anything unexpected (not one of its own `ValueError` parse-failure
+    paths, which already commit a truthful `review_required` `Document`),
+    the never-committed artifact this call just wrote would otherwise be
+    left on disk/object storage with no owning DB row -- an orphaned
+    encrypted financial document with no provenance and no supported
+    lifecycle. That is caught and cleaned up here, narrowly scoped to the
+    exact `document.encrypted_path` this call just produced (a fresh,
+    per-attempt path keyed by a freshly generated `document.id`), so this
+    can never remove a pre-existing or already-committed sibling document's
+    artifact. The caller's own `db.rollback()` still applies to the `Document`
+    row itself; this only keeps the filesystem consistent with it.
     """
 
     document = Document(
@@ -2076,6 +2092,40 @@ def _import_one_document(
     db.add(document)
     db.flush()
     document.encrypted_path = EncryptedDocumentStore().save(document.id, payload)
+    try:
+        return _persist_parsed_document(
+            db, user, document=document, account=account, document_type=document_type, payload=payload, digest=digest
+        )
+    except Exception:
+        EncryptedDocumentStore().delete(document.encrypted_path)
+        logger.exception(
+            "import.unexpected_failure document_id=%s document_type=%s -- encrypted artifact removed, "
+            "no Document row committed for it",
+            document.id,
+            document_type,
+        )
+        raise
+
+
+def _persist_parsed_document(
+    db: Session,
+    user: User,
+    *,
+    document: Document,
+    account: Account | None,
+    document_type: str,
+    payload: bytes,
+    digest: str,
+) -> dict:
+    """Parse, classify, persist and reconcile an already-created `Document`.
+
+    Extracted verbatim from `_import_one_document` so the caller above can
+    wrap it in a single `try/except` that cleans up the encrypted artifact
+    on any unexpected failure (see that function's docstring). No parsing,
+    classification, reconciliation or duplicate behavior changed by this
+    split.
+    """
+
     if document_type == "payroll":
         try:
             parsed_document = parse_payroll_document(payload)
