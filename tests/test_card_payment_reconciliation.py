@@ -136,6 +136,162 @@ def test_candidate_outside_match_window_is_not_offered() -> None:
     assert match.candidates == ()
 
 
+def _checking_side_debit(household, *, day: int, amount: str = "-220.00", suffix: str = "") -> Transaction:
+    """A second checking-side reconciliation row (bank debit), independent
+    of the fixture's own `card_payment` row, for the multi-checking-row
+    graph-cardinality tests below."""
+
+    return Transaction(
+        household_id=household.household.id,
+        account_id=household.checking.id,
+        booked_at=date(2026, 6, day),
+        occurred_at=date(2026, 6, day),
+        competence="2026-06",
+        description=f"Débito fatura{suffix}",
+        normalized_description=f"DEBITO FATURA{suffix}",
+        amount=Decimal(amount),
+        transaction_type="reconciliation",
+        fingerprint=f"chkdebit{suffix}{uuid.uuid4().hex}".ljust(64, "0")[:64],
+        source_priority=70,
+        confidence=Decimal("1"),
+        excluded=True,
+    )
+
+
+def test_orphaned_link_reference_falls_back_without_crashing() -> None:
+    """Defensive corner case introduced by the bipartite-degree rewrite:
+    `edges` deliberately has no entry for an already-linked checking row
+    (see `_candidate_edges`), so a row whose `linked_transaction_id` fails
+    to resolve to a same-household counterpart -- unreachable through this
+    module's own link/unlink API, which always keeps both sides symmetric,
+    but a real defensive branch nonetheless -- must fall back to a
+    stand-alone candidate lookup instead of a `KeyError`.
+
+    That stand-alone lookup has no way to know whether some *other*
+    checking row also wants the same card candidate (it is deliberately
+    excluded from the shared `card_degrees` count), so it reports the
+    conservative `ambiguous` rather than guessing `matched` -- consistent
+    with the project's "insufficient/uncertain evidence stays explicit
+    review, never fabricated certainty" rule, which applies doubly to a row
+    whose own link reference is already inconsistent.
+    """
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    checking = household.transactions["card_payment"]
+    checking.linked_transaction_id = "does-not-exist"
+    card_line = _card_side_payment_line(household)
+    db.add(card_line)
+    db.flush()
+
+    match = _checking_match(db, household)
+    assert match.status == "ambiguous"
+    assert match.candidates[0].transaction_id == card_line.id
+
+
+def test_two_checking_debits_one_card_candidate_never_both_matched() -> None:
+    """P0 regression: a single card-side payment cannot be the deterministic
+    `matched` suggestion for two different bank debits at once. Each
+    checking row sees exactly one candidate in isolation, but that candidate
+    (the card row) is claimed by both -- globally ambiguous evidence, so
+    neither may be presented as a one-click `matched` pair."""
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    # `card_payment` (the fixture's own checking row) is -220.00 on 2026-06-15.
+    other_debit = _checking_side_debit(household, day=16)
+    card_line = _card_side_payment_line(household)  # +220.00 on 2026-06-01
+    db.add_all([other_debit, card_line])
+    db.flush()
+
+    matches = list_card_payment_reconciliations(db, household_id=household.household.id)
+    checking_ids = {household.transactions["card_payment"].id, other_debit.id}
+    seen = {m.checking_transaction_id: m for m in matches if m.checking_transaction_id in checking_ids}
+    assert len(seen) == 2
+    for match in seen.values():
+        assert match.status == "ambiguous", (
+            f"checking row {match.checking_transaction_id} was presented as "
+            f"'{match.status}' even though its only candidate is shared with "
+            "another checking row"
+        )
+        assert match.candidates[0].transaction_id == card_line.id
+    # No auto-resolution: neither row was linked by merely listing evidence.
+    assert household.transactions["card_payment"].linked_transaction_id is None
+    assert other_debit.linked_transaction_id is None
+
+
+def test_one_checking_multiple_card_candidates_stays_ambiguous() -> None:
+    """Symmetric case (already covered by
+    `test_ambiguous_multiple_candidates_never_auto_resolve`, preserved here
+    under the new bipartite-degree implementation): one checking row, two
+    eligible card candidates, never auto-resolved."""
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    card_line_a = _card_side_payment_line(household, day=1)
+    card_line_b = _card_side_payment_line(household, day=3)
+    db.add_all([card_line_a, card_line_b])
+    db.flush()
+
+    match = _checking_match(db, household)
+    assert match.status == "ambiguous"
+    assert {c.transaction_id for c in match.candidates} == {card_line_a.id, card_line_b.id}
+
+
+def test_multiple_independent_pairs_each_remain_matched() -> None:
+    """Two checking rows and two card rows, each pair unambiguous (distinct
+    amounts so the graph has no cross-edges): both pairs must still surface
+    as deterministic `matched`, proving the one-to-one fix does not
+    over-flag unrelated pairs as ambiguous."""
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    other_debit = _checking_side_debit(household, day=20, amount="-75.50", suffix="b")
+    card_for_fixture = _card_side_payment_line(household, day=1, amount="220.00")
+    card_for_other = _card_side_payment_line(household, day=5, amount="75.50")
+    db.add_all([other_debit, card_for_fixture, card_for_other])
+    db.flush()
+
+    matches = {
+        m.checking_transaction_id: m
+        for m in list_card_payment_reconciliations(db, household_id=household.household.id)
+    }
+    fixture_match = matches[household.transactions["card_payment"].id]
+    other_match = matches[other_debit.id]
+    assert fixture_match.status == "matched"
+    assert fixture_match.candidates[0].transaction_id == card_for_fixture.id
+    assert other_match.status == "matched"
+    assert other_match.candidates[0].transaction_id == card_for_other.id
+
+
+def test_period_filter_does_not_hide_cross_period_ambiguity() -> None:
+    """The candidate graph must be built household-wide, not scoped to the
+    queried `period` -- otherwise a conflicting checking row that happens to
+    fall in a different competence than the one being displayed would be
+    invisible to the cardinality check, and the displayed row would be
+    mislabeled `matched`."""
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    # Fixture's own row is competence 2026-06. Put the conflicting debit in
+    # July, within the match window but a different competence/period.
+    other_debit = _checking_side_debit(household, day=1)
+    other_debit.competence = "2026-07"
+    card_line = _card_side_payment_line(household)
+    db.add_all([other_debit, card_line])
+    db.flush()
+
+    # Query scoped to the fixture row's own period only.
+    matches = list_card_payment_reconciliations(db, household_id=household.household.id, period="2026-06")
+    assert len(matches) == 1
+    match = matches[0]
+    assert match.checking_transaction_id == household.transactions["card_payment"].id
+    assert match.status == "ambiguous", (
+        "period filter hid the July checking row that also claims this same "
+        "card candidate, so the June row was wrongly reported as matched"
+    )
+
+
 def test_link_is_symmetric_non_destructive_and_preserves_inv002() -> None:
     db = _memory_session()
     household = build_synthetic_household(db)
