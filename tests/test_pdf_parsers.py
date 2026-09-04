@@ -460,3 +460,29 @@ def test_classifier_recognizes_nubank_invoice_payment_phrasing() -> None:
     # "Setembro") is accepted as the marker.
     assert classify("Pagamento Estabelecimento Um", 50.0).transaction_type != "reconciliation"
     assert classify("Pagamento em 01 Setembro", 50.0).transaction_type != "reconciliation"
+
+
+def test_classifier_nubank_payment_pattern_rejects_non_month_three_letter_token() -> None:
+    # Regression for PR #41 engineer review (P0 on `b71e91a`): the previous
+    # `PAGAMENTO EM \d{1,2}\s+[A-Z]{3}\b` alternative validated *shape*
+    # (day + any three ASCII letters), not *identity* (day + one of the
+    # twelve real Portuguese month abbreviations `classifier.MONTHS_PT_ABBR`
+    # already defines for Nubank date parsing). A syntactically-three-letter
+    # non-month token -- e.g. "XYZ"/"ABC" -- satisfied `[A-Z]{3}` and was
+    # therefore misclassified as a card-bill payment (reconciliation,
+    # excluded from operating totals) even though it names no real month and
+    # is not the observed Nubank invoice phrasing. The pattern now spells out
+    # the alternation from `MONTHS_PT_ABBR`'s own keys, so only a real month
+    # abbreviation completes the identity check.
+    assert classify("Pagamento em 01 XYZ", 200.0).transaction_type != "reconciliation"
+    assert classify("Pagamento em 01 XYZ", 200.0).excluded is False
+    assert classify("Pagamento em 12 ABC", 75.0).transaction_type != "reconciliation"
+    # The real Nubank phrasing for every supported month abbreviation must
+    # still match -- this addition narrows the pattern, it must not narrow
+    # out any of the twelve real tokens it is meant to accept.
+    from app.services.classifier import MONTHS_PT_ABBR
+
+    for month_abbr in MONTHS_PT_ABBR:
+        result = classify(f"Pagamento em 05 {month_abbr}", 10.0)
+        assert result.transaction_type == "reconciliation", month_abbr
+        assert result.excluded is True, month_abbr

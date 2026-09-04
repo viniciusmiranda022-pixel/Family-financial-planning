@@ -8,7 +8,13 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from app.services.classifier import FEE_PATTERN, PAYMENT_PATTERN, REFUND_PATTERN, normalize_description
+from app.services.classifier import (
+    FEE_PATTERN,
+    MONTHS_PT_ABBR,
+    PAYMENT_PATTERN,
+    REFUND_PATTERN,
+    normalize_description,
+)
 
 PARSER_CONTRACT_VERSION = "2026.09.1"
 
@@ -415,22 +421,6 @@ def _parse_itau_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
     if not parsed:
         raise ValueError("Extrato sem lançamentos textuais reconhecíveis; encaminhado para revisão")
     return parsed
-
-
-MONTHS_PT_ABBR = {
-    "JAN": 1,
-    "FEV": 2,
-    "MAR": 3,
-    "ABR": 4,
-    "MAI": 5,
-    "JUN": 6,
-    "JUL": 7,
-    "AGO": 8,
-    "SET": 9,
-    "OUT": 10,
-    "NOV": 11,
-    "DEZ": 12,
-}
 
 
 def _nubank_reference_date(text: str) -> date:
