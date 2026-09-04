@@ -325,11 +325,17 @@ def test_batch_import_probable_duplicate_stays_preserved_and_flagged() -> None:
                 # Both purchases are preserved -- neither merged nor deleted.
                 assert len(transactions) == 2
                 by_document = {t.document_id: t for t in transactions}
+                first_transaction = by_document[first_result["document_id"]]
                 second_transaction = by_document[second_result["document_id"]]
+                assert first_transaction.possible_duplicate is True
                 assert second_transaction.possible_duplicate is True
                 # INV-014: a probable/strong duplicate is excluded from totals
                 # until a human resolves it, but the row itself is untouched.
-                assert second_transaction.excluded is False
+                # Equal source priority (both `bank_statement`) elects the
+                # first-imported row canonical (stays counted); the second,
+                # supporting side is the one excluded pending resolution.
+                assert first_transaction.excluded is False
+                assert second_transaction.excluded is True
                 assert second_transaction.duplicate_group_id is not None
                 review_items = db.scalars(
                     select(ReviewItem).where(ReviewItem.transaction_id == second_transaction.id)
