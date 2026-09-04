@@ -30,7 +30,38 @@
   `tests/test_card_payment_reconciliation.py` (determinístico único, ambíguo, sem candidato, fora da
   janela, vínculo/desvínculo simétrico e não destrutivo, isolamento por família, autorização, trilha
   de auditoria); pendente revisão do engenheiro responsável antes do merge;
-- importação em lote;
+- importação em lote: `POST /api/imports/batch` recebe vários arquivos em um único envio (mesma
+  conta/cartão e tipo de documento, mesma faixa de aceitação de `POST /api/imports`) e chama, uma vez
+  por arquivo, o mesmo pipeline canônico já usado pelo envio individual (`app.api._import_one_document`
+  -- parser, classificação, fingerprint, duplicidade, reconciliação e auditoria de
+  `app/services/importer.py`/`app/services/reconciliation.py`/`app/services/duplicates.py`); não existe
+  uma segunda política de importação. Cada arquivo é persistido e comitado de forma independente (o
+  mesmo `db.commit()` por documento que o envio individual já fazia), então um arquivo com falha nunca
+  desfaz ou reescreve o resultado já persistido de outro arquivo do mesmo lote -- a resposta é sempre
+  a lista real de resultados por arquivo (`imported`/`imported_with_review`/`review_required`/
+  `rejected`, com `document_id`, `records`, `reconciliation` quando aplicável), nunca um "sucesso"
+  agregado quando algum arquivo falhou. Duplicidade exata por hash, duplicidade provável não destrutiva
+  (INV-014), precedência de fonte canônica e reconciliação `unknown` quando falta evidência seguem
+  inalteradas por arquivo. Limite de `MAX_BATCH_FILES` arquivos e `MAX_BATCH_TOTAL_MB` combinados por
+  envio, além do limite por arquivo já existente (`MAX_UPLOAD_MB`); autenticação e isolamento por
+  família idênticos ao envio individual; nenhuma mensagem de erro devolve conteúdo bruto do arquivo.
+  Sem migração de banco -- nenhum modelo novo foi necessário, cada `Document`/`Transaction` já carrega
+  tudo que o resultado por arquivo precisa. Se um arquivo falha de forma inesperada depois do artefato
+  criptografado já ter sido salvo mas antes do `Document` comitar, o artefato órfão (sem linha dona) é
+  removido nesse mesmo momento e a falha é registrada no log do servidor -- nunca fica no disco sem
+  proveniência, e nunca é silenciosamente engolida. O evento de auditoria agregado
+  `document.import_batch` grava `document_id`/`error_category` por item em `outcomes[]` (além de
+  `index`/`status`), tornando a trilha de auditoria persistida, por si só, a lineage determinística
+  entre um lote e os `Document`s que ele produziu. Interface em "Importações"
+  (`app/templates/index.html`, `app/static/app.js`) apenas exibe os campos que o backend já calculou
+  por arquivo, sem somar, parsear ou reclassificar nada no navegador; o envio de um único arquivo
+  continua usando `POST /api/imports` sem nenhuma mudança de comportamento. Testes em
+  `tests/test_batch_import.py` (dois formatos suportados em um lote, lote misto válido/inválido sem
+  contaminação cruzada, duplicidade exata dentro do lote e contra dado pré-existente, duplicidade
+  provável preservada e sinalizada, reconciliação `unknown` honesta, isolamento por família, limites de
+  quantidade/tamanho do lote, falha inesperada em um arquivo sem afetar os demais nem deixar artefato
+  criptografado órfão, mensagens de erro sem conteúdo bruto, lineage de auditoria batch → `document_id`
+  por item, regressão do envio individual); pendente revisão do engenheiro responsável antes do merge;
 - exportação Excel/PDF;
 - testes com cópias anonimizadas dos documentos reais;
 - **go-live de uso manual / fluxos financeiros do dia a dia**: consolidar uma experiência manual

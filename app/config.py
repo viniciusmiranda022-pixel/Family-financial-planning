@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     session_hours: int = 12
     max_upload_mb: int = 25
+    max_batch_files: int = 20
+    max_batch_total_mb: int = 200
     default_timezone: str = "America/Sao_Paulo"
     whisper_model: str = "tiny"
     whisper_language: str = "pt"

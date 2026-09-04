@@ -273,7 +273,7 @@
             <form id="import-form" class="form-grid">
               <label id="import-account-field">Conta ou cartão<select name="account_id" id="import-account" required></select></label>
               <label>Tipo de documento<select name="document_type" id="import-document-type"><option value="bank_statement">Extrato bancário</option><option value="credit_card">Fatura/cartão de crédito</option><option value="payroll">Holerite</option></select></label>
-              <label class="file-field full"><input type="file" name="file" accept=".pdf,.csv,.txt,.ofx,.qfx" required><span><strong>Selecionar PDF, CSV ou OFX</strong><small>Máximo de 25 MB. Holerites devem ser enviados em PDF.</small></span></label>
+              <label class="file-field full"><input type="file" name="file" accept=".pdf,.csv,.txt,.ofx,.qfx" multiple required><span><strong>Selecionar um ou vários arquivos (PDF, CSV ou OFX)</strong><small>Máximo de 25 MB por arquivo, até 20 arquivos por lote. Holerites devem ser enviados em PDF.</small></span></label>
               <button class="primary" type="submit">Importar e verificar</button>
             </form>
           </article>
@@ -289,6 +289,10 @@
             </form>
           </article>
         </div>
+        <article class="panel hidden" id="batch-results-panel">
+          <div class="panel-heading"><div><span class="step-label">RESULTADO DO LOTE</span><h2>Resultado por arquivo</h2><small>Cada linha é o resultado real calculado pelo servidor para aquele arquivo; nenhum total é recalculado aqui.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Arquivo</th><th>Status</th><th>Registros</th><th>Revisão</th><th>Conciliação</th><th>Mensagem</th></tr></thead><tbody id="batch-results-table"></tbody></table></div>
+        </article>
         <article class="panel"><div class="panel-heading"><div><span class="step-label">HISTÓRICO</span><h2>Arquivos processados</h2></div></div><div class="table-wrap"><table><thead><tr><th>Arquivo</th><th>Tipo</th><th>Status</th><th>Registros</th><th>Data</th></tr></thead><tbody id="imports-table"></tbody></table></div></article>
       </section>
 

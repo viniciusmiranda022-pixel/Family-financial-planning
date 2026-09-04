@@ -1698,13 +1698,70 @@ document.querySelector("#account-form").addEventListener("submit", async (event)
   try { await api("/accounts", { method: "POST", body: JSON.stringify(formJson(event.target)) }); event.target.reset(); event.target.elements.owner_label.value = "Família"; await loadAccounts(); toast("Conta cadastrada"); }
   catch (error) { toast(error.message, true); }
 });
+const batchStatusLabels = {
+  imported: "Importado",
+  imported_with_review: "Importado (revisão)",
+  review_required: "Revisão necessária",
+  rejected: "Rejeitado",
+};
+
+function batchStatusChipClass(status) {
+  if (status === "imported") return "ok";
+  if (status === "rejected") return "severity-critical";
+  return "warn";
+}
+
+// Renders exactly the per-file fields the backend already computed
+// (`POST /api/imports/batch`) -- this never parses, classifies, reconciles,
+// deduplicates or sums financial values on its own; the summary counts by
+// status are also backend-computed (`result.summary.by_status`), never
+// recalculated here.
+function renderBatchResults(result) {
+  const panel = document.querySelector("#batch-results-panel");
+  document.querySelector("#batch-results-table").innerHTML = result.results.map((item) => {
+    const statusLabel = batchStatusLabels[item.status] || escapeHtml(item.status);
+    const reconciliationStatus = item.reconciliation ? item.reconciliation.status : null;
+    return `<tr>
+      <td><strong>${escapeHtml(item.filename)}</strong></td>
+      <td><span class="status-chip ${batchStatusChipClass(item.status)}">${statusLabel}</span></td>
+      <td>${item.records ?? "—"}</td>
+      <td>${item.review_items ?? "—"}</td>
+      <td>${reconciliationStatus ? escapeHtml(reconciliationStatus) : "—"}</td>
+      <td><small>${item.message ? escapeHtml(item.message) : "—"}</small></td>
+    </tr>`;
+  }).join("");
+  panel.classList.remove("hidden");
+}
+
 document.querySelector("#import-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const isPayroll = event.target.elements.document_type.value === "payroll";
   if (!isPayroll && !state.accounts.length) return toast("Cadastre uma conta antes de importar", true);
+  const files = [...event.target.elements.file.files];
+  if (!files.length) return toast("Selecione ao menos um arquivo", true);
   const button = event.target.querySelector("button[type=submit]");
   button.disabled = true; button.textContent = "Processando...";
-  try { const result = await api("/imports", { method: "POST", body: new FormData(event.target) }); event.target.reset(); await loadImports(); toast(`${result.records} registros processados; ${result.review_items || 0} para revisão`); }
+  try {
+    if (files.length === 1) {
+      const result = await api("/imports", { method: "POST", body: new FormData(event.target) });
+      event.target.reset();
+      document.querySelector("#batch-results-panel").classList.add("hidden");
+      await loadImports();
+      toast(`${result.records} registros processados; ${result.review_items || 0} para revisão`);
+    } else {
+      const body = new FormData();
+      const accountId = event.target.elements.account_id.value;
+      if (accountId) body.append("account_id", accountId);
+      body.append("document_type", event.target.elements.document_type.value);
+      files.forEach((file) => body.append("files", file));
+      const result = await api("/imports/batch", { method: "POST", body });
+      event.target.reset();
+      renderBatchResults(result);
+      await loadImports();
+      const counts = Object.entries(result.summary.by_status || {}).map(([status, count]) => `${count} ${batchStatusLabels[status] || status}`).join(", ");
+      toast(`Lote com ${result.file_count} arquivo(s) processado: ${counts}`);
+    }
+  }
   catch (error) { toast(error.message, true); }
   finally { button.disabled = false; button.textContent = "Importar e verificar"; }
 });

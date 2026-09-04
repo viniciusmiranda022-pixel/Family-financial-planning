@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import uuid
 from calendar import monthrange
@@ -165,6 +166,7 @@ from app.services.smart_capture import CaptureParseError, preview_capture
 
 router = APIRouter(prefix="/api")
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 DEFAULT_CATEGORIES = (
     ("Conciliação", "#64748B", None, False),
@@ -1974,33 +1976,125 @@ def _balance_observation_response(item: AccountBalanceObservation) -> dict:
     }
 
 
-@router.post("/imports", status_code=201)
-async def import_document(
-    account_id: str | None = Form(default=None),
-    document_type: str = Form(..., pattern="^(bank_statement|credit_card|payroll)$"),
-    file: UploadFile = File(...),
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
+class _ImportRejected(Exception):
+    """A per-file precondition failure that must stop *this* file before any
+    `Document` row is persisted for it -- missing account, oversized upload,
+    or an exact-hash duplicate. Carries the same `(status_code, detail)` the
+    single-file endpoint has always raised as an `HTTPException`, so:
+
+    - the single-file route below converts it straight back into that same
+      `HTTPException` (byte-identical response to before this Work Order);
+    - the batch route catches it per file and records a truthful `rejected`
+      result for that one file while every other file in the same request
+      keeps its own, independent outcome -- one bad file never erases or
+      rewrites a sibling file's already-persisted result (Work Order
+      requirement).
+
+    `detail` is always one of the fixed, generic Portuguese messages already
+    used by the pre-existing single-file path (e.g. "Conta não encontrada"):
+    never raw file content, never a value derived from the file's bytes.
+    """
+
+    def __init__(self, status_code: int, detail: str, error_category: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+        self.error_category = error_category
+
+
+def _resolve_import_account(
+    db: Session, user: User, account_id: str | None, document_type: str
+) -> Account | None:
     account = None
     if account_id:
         account = db.scalar(
             select(Account).where(Account.id == account_id, Account.household_id == user.household_id)
         )
     if document_type != "payroll" and not account:
-        raise HTTPException(status_code=404, detail="Conta não encontrada")
-    payload = await file.read(settings.max_upload_mb * 1024 * 1024 + 1)
-    if len(payload) > settings.max_upload_mb * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Arquivo maior que {settings.max_upload_mb} MB")
+        raise _ImportRejected(404, "Conta não encontrada", "account_not_found")
+    return account
+
+
+async def _read_upload_within_limit(file: UploadFile, max_mb: int) -> bytes:
+    payload = await file.read(max_mb * 1024 * 1024 + 1)
+    if len(payload) > max_mb * 1024 * 1024:
+        raise _ImportRejected(413, f"Arquivo maior que {max_mb} MB", "file_too_large")
+    return payload
+
+
+def _reject_if_duplicate_file(db: Session, user: User, payload: bytes) -> str:
+    """Exact-file-hash duplicate check, unchanged from the single-file path.
+
+    Returns the SHA-256 digest so the caller does not hash the payload
+    twice. Because each file in a batch is persisted and committed
+    independently (see `_import_one_document`), calling this once per file
+    *in order* also correctly rejects an exact duplicate that appears twice
+    within the same batch request, not only against previously imported
+    documents -- by the time file N is checked, file N-1's `Document` row is
+    already committed and visible to this query.
+    """
+
     digest = file_sha256(payload)
     if db.scalar(
         select(Document.id).where(Document.household_id == user.household_id, Document.sha256 == digest)
     ):
-        raise HTTPException(status_code=409, detail="Este arquivo já foi importado")
+        raise _ImportRejected(409, "Este arquivo já foi importado", "duplicate_file")
+    return digest
+
+
+def _import_one_document(
+    db: Session,
+    user: User,
+    *,
+    account: Account | None,
+    document_type: str,
+    filename: str,
+    payload: bytes,
+    digest: str,
+) -> dict:
+    """Canonical per-file import pipeline: parse -> classify -> persist
+    transactions -> duplicate detection -> reconciliation -> audit, exactly
+    as the single-file `POST /imports` endpoint has always done it. Both the
+    single-file route and the batch route call this same function once per
+    file -- there is no second/parallel import policy. The caller is
+    responsible for the file-level preconditions above
+    (`_resolve_import_account`, `_read_upload_within_limit`,
+    `_reject_if_duplicate_file`) and for issuing `db.rollback()` if this
+    function raises before reaching one of its own `db.commit()` calls
+    below, so that a failure on one file cannot leave a half-written
+    transaction that could affect the next file processed on the same
+    `Session` (relevant for the batch route only; the single-file route's
+    `Session` is discarded after the request either way).
+
+    The encrypted artifact saved below is only truly owned by this
+    `Document` once that row commits. If `_persist_parsed_document` raises
+    anything unexpected (not one of its own `ValueError` parse-failure
+    paths, which already commit a truthful `review_required` `Document`),
+    the never-committed artifact this call just wrote would otherwise be
+    left on disk/object storage with no owning DB row -- an orphaned
+    encrypted financial document with no provenance and no supported
+    lifecycle. That is caught and cleaned up here, narrowly scoped to the
+    exact `document.encrypted_path` this call just produced (a fresh,
+    per-attempt path keyed by a freshly generated `document.id`), so this
+    can never remove a pre-existing or already-committed sibling document's
+    artifact. The caller's own `db.rollback()` still applies to the `Document`
+    row itself; this only keeps the filesystem consistent with it.
+
+    The failure is logged with `logger.error` (never `logger.exception`/
+    `exc_info=True`) and only fixed identifiers -- `document.id`,
+    `document_type`, a constant `unexpected_error` category. An unexpected
+    exception raised from parsing/classification/storage code can
+    legitimately carry request-derived text (a merchant description, a
+    filename fragment, parser detail) in `str(exc)` or its traceback, and
+    the Work Order forbids raw financial content/PII in logs; this never
+    serializes the exception object, its message or its traceback, so
+    there is nothing here for that content to leak through.
+    """
+
     document = Document(
         household_id=user.household_id,
         account_id=account.id if account else None,
-        original_name=file.filename or "documento",
+        original_name=filename,
         document_type=document_type,
         sha256=digest,
         encrypted_path="pending",
@@ -2008,6 +2102,39 @@ async def import_document(
     db.add(document)
     db.flush()
     document.encrypted_path = EncryptedDocumentStore().save(document.id, payload)
+    try:
+        return _persist_parsed_document(
+            db, user, document=document, account=account, document_type=document_type, payload=payload, digest=digest
+        )
+    except Exception:
+        EncryptedDocumentStore().delete(document.encrypted_path)
+        logger.error(
+            "import.unexpected_failure document_id=%s document_type=%s error_category=unexpected_error",
+            document.id,
+            document_type,
+        )
+        raise
+
+
+def _persist_parsed_document(
+    db: Session,
+    user: User,
+    *,
+    document: Document,
+    account: Account | None,
+    document_type: str,
+    payload: bytes,
+    digest: str,
+) -> dict:
+    """Parse, classify, persist and reconcile an already-created `Document`.
+
+    Extracted verbatim from `_import_one_document` so the caller above can
+    wrap it in a single `try/except` that cleans up the encrypted artifact
+    on any unexpected failure (see that function's docstring). No parsing,
+    classification, reconciliation or duplicate behavior changed by this
+    split.
+    """
+
     if document_type == "payroll":
         try:
             parsed_document = parse_payroll_document(payload)
@@ -2247,6 +2374,234 @@ async def import_document(
         "records": imported,
         "review_items": review_count,
         "reconciliation": serialize_reconciliation(reconciliation_row),
+    }
+
+
+@router.post("/imports", status_code=201)
+async def import_document(
+    account_id: str | None = Form(default=None),
+    document_type: str = Form(..., pattern="^(bank_statement|credit_card|payroll)$"),
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        account = _resolve_import_account(db, user, account_id, document_type)
+        payload = await _read_upload_within_limit(file, settings.max_upload_mb)
+        digest = _reject_if_duplicate_file(db, user, payload)
+    except _ImportRejected as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return _import_one_document(
+        db,
+        user,
+        account=account,
+        document_type=document_type,
+        filename=file.filename or "documento",
+        payload=payload,
+        digest=digest,
+    )
+
+
+def _batch_item_result(index: int, filename: str, status_code: int, error_category: str, message: str) -> dict:
+    """Shape a rejected/failed batch entry with the same field set a
+    successful entry gets below, so the frontend never has to special-case
+    which keys exist -- it only ever displays fields the backend already
+    computed (Work Order requirement: no client-side derivation).
+    """
+
+    return {
+        "index": index,
+        "filename": filename,
+        "status": "rejected",
+        "http_status": status_code,
+        "error_category": error_category,
+        "message": message,
+        "document_id": None,
+        "records": None,
+        "review_items": None,
+        "reconciliation": None,
+    }
+
+
+def _batch_size_cap_bytes() -> int:
+    """Total combined upload size allowed for one batch request, derived
+    from `settings.max_batch_total_mb`. Kept as its own function (rather
+    than inlined at the call site) so tests can pin an exact byte boundary
+    without depending on whole-megabyte granularity.
+    """
+
+    return settings.max_batch_total_mb * 1024 * 1024
+
+
+def _summarize_batch(results: list[dict]) -> dict:
+    """A count of backend-computed per-file `status` values -- never a
+    financial total. `imported`/`imported_with_review`/`review_required` are
+    the exact `Document.status` values the canonical pipeline already
+    produces; `rejected` is this route's own precondition-failure status.
+    """
+
+    counts: dict[str, int] = {}
+    for item in results:
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+    return {"total": len(results), "by_status": counts}
+
+
+@router.post("/imports/batch", status_code=201)
+async def import_documents_batch(
+    account_id: str | None = Form(default=None),
+    document_type: str = Form(..., pattern="^(bank_statement|credit_card|payroll)$"),
+    files: list[UploadFile] = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Batch import: orchestration over the same canonical per-file pipeline
+    `import_document` above uses (`_import_one_document`), called once per
+    file -- there is no second/parallel parsing, classification,
+    reconciliation or duplicate policy here.
+
+    Transaction boundary: each file is parsed, persisted and committed
+    independently (`_import_one_document` calls `db.commit()` itself, once
+    per file, exactly as the single-file endpoint already does for its one
+    file). A file that fails after partial writes only rolls back its own
+    uncommitted work (`db.rollback()` below); every previously processed
+    file in this same batch request keeps its own already-committed,
+    independent outcome. This mirrors the single-file endpoint's existing
+    architecture (each `POST /imports` call already is its own transaction)
+    rather than introducing a new, batch-only policy -- a single shared
+    transaction for the whole batch was rejected because it would let one
+    bad file roll back sibling files that had already produced a truthful,
+    independently valid result, which the Work Order explicitly forbids.
+
+    `account_id`/`document_type` apply to every file in the batch, mirroring
+    how a household actually uses this today (several statements/invoices
+    for the same account and document type in one sitting, e.g. six months
+    of the same card's PDF invoices, or a CSV and an OFX export of the same
+    checking account for the same period). Reusing the exact same
+    per-request account/type contract as the single-file endpoint -- instead
+    of inventing a second, batch-only parameter shape -- keeps the
+    documented single-file semantics (account resolution, payroll's account
+    exemption, the `document_type` pattern) identical for every file with no
+    new branch to keep in sync.
+    """
+
+    if not files:
+        raise HTTPException(status_code=400, detail="Envie ao menos um arquivo")
+    if len(files) > settings.max_batch_files:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Lote maior que {settings.max_batch_files} arquivos por envio",
+        )
+    try:
+        account = _resolve_import_account(db, user, account_id, document_type)
+    except _ImportRejected as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    batch_id = str(uuid.uuid4())
+    batch_cap_bytes = _batch_size_cap_bytes()
+    total_bytes = 0
+    batch_cap_exceeded = False
+    results: list[dict] = []
+    for index, file in enumerate(files):
+        # A safe, non-PII identifier for a file the caller left unnamed --
+        # never the raw filename guessed or fabricated, never file content.
+        filename = file.filename or f"documento-{index + 1}"
+        if batch_cap_exceeded:
+            results.append(
+                _batch_item_result(
+                    index,
+                    filename,
+                    413,
+                    "batch_too_large",
+                    "Lote excede o limite total combinado; arquivo não processado",
+                )
+            )
+            continue
+        try:
+            payload = await _read_upload_within_limit(file, settings.max_upload_mb)
+            total_bytes += len(payload)
+            if total_bytes > batch_cap_bytes:
+                raise _ImportRejected(
+                    413,
+                    f"Lote maior que {settings.max_batch_total_mb} MB combinados",
+                    "batch_too_large",
+                )
+            digest = _reject_if_duplicate_file(db, user, payload)
+        except _ImportRejected as exc:
+            db.rollback()
+            results.append(_batch_item_result(index, filename, exc.status_code, exc.error_category, exc.detail))
+            if exc.error_category == "batch_too_large":
+                batch_cap_exceeded = True
+            continue
+        try:
+            result = _import_one_document(
+                db,
+                user,
+                account=account,
+                document_type=document_type,
+                filename=filename,
+                payload=payload,
+                digest=digest,
+            )
+        except Exception:
+            # An unexpected failure processing this one file must not corrupt
+            # the shared `Session` for the files still to come, and must not
+            # leak file content/PII -- only a safe, generic category and this
+            # file's index are recorded, exactly the Work Order's error-safety
+            # requirement. `_import_one_document` already logs this failure
+            # server-side for operators, deliberately without the exception's
+            # own message or traceback (see its docstring) -- neither this
+            # response nor that log line ever carries request-derived text.
+            db.rollback()
+            results.append(
+                _batch_item_result(
+                    index,
+                    filename,
+                    500,
+                    "unexpected_error",
+                    "Falha inesperada ao processar este arquivo; os demais arquivos do lote não foram afetados",
+                )
+            )
+            continue
+        result.setdefault("review_items", None)
+        result.setdefault("message", None)
+        result["index"] = index
+        result["filename"] = filename
+        result["http_status"] = 201
+        result["error_category"] = None
+        results.append(result)
+
+    audit(
+        db,
+        user,
+        "document.import_batch",
+        None,
+        None,
+        {
+            "batch_id": batch_id,
+            "file_count": len(files),
+            # `document_id`/`error_category` make the persisted audit trail
+            # itself the deterministic batch -> Document lineage: a rejected
+            # or precondition-failed file never created a Document, so it is
+            # truthfully `document_id: None` here (matching the response's
+            # own contract), never fabricated or reconstructed later from
+            # timestamps.
+            "outcomes": [
+                {
+                    "index": item["index"],
+                    "status": item["status"],
+                    "document_id": item["document_id"],
+                    "error_category": item["error_category"],
+                }
+                for item in results
+            ],
+        },
+    )
+    db.commit()
+    return {
+        "batch_id": batch_id,
+        "file_count": len(files),
+        "results": results,
+        "summary": _summarize_batch(results),
     }
 
 
