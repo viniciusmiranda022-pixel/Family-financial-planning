@@ -42,6 +42,8 @@ from app.schemas import (
     AccountRequest,
     AdvisorRequest,
     CaptureConfirmRequest,
+    ClassificationRuleDeactivateRequest,
+    ClassificationRuleEditRequest,
     CommissionRequest,
     DuplicateResolutionRequest,
     FindingLifecycleRequest,
@@ -67,6 +69,8 @@ from app.security import (
 from app.services.classification_learning import (
     accept_classification_rule,
     classify_with_local_rules,
+    deactivate_classification_rule,
+    edit_classification_rule,
     record_confirmed_correction,
     serialize_classification_rule,
 )
@@ -2417,6 +2421,8 @@ async def create_capture_preview(
             payload=payload,
             requested_type=document_type,
             account_type=account.account_type if account else None,
+            db=db,
+            household_id=user.household_id,
         )
     except CaptureParseError as exc:
         source_type = "text"
@@ -2678,7 +2684,26 @@ def confirm_capture(
                 else:
                     category = category_for(db, user.household_id, proposal.category_name or "Revisar")
             elif movement_type == "income":
-                category = category_for(db, user.household_id, "Receitas")
+                # Mirror the expense branch: the canonical classification
+                # proposal (`parse_text_capture`/`_parsed_transaction_item`,
+                # both household-rule-aware via `classify_with_local_rules`)
+                # may have selected a category other than "Receitas" for an
+                # active household income rule. Confirmation is the
+                # persisted financial fact, so it must not silently discard
+                # that in favor of a hardcoded default -- an unmatched
+                # proposal already falls back to the classifier's own
+                # conservative "Revisar" category, not "Receitas".
+                if proposal.category_id:
+                    category = db.scalar(
+                        select(Category).where(
+                            Category.id == proposal.category_id,
+                            Category.household_id == user.household_id,
+                        )
+                    )
+                    if not category:
+                        raise HTTPException(status_code=422, detail="Categoria inválida")
+                else:
+                    category = category_for(db, user.household_id, proposal.category_name or "Revisar")
             elif movement_type in {"investment", "redemption"}:
                 transaction_type = "transfer"
                 excluded = True
@@ -3328,8 +3353,136 @@ def activate_classification_rule(
         "classification_rule",
         rule.id,
         {"confirmation_count": rule.confirmation_count},
+        # `accept_classification_rule` only succeeds when the rule was
+        # `pending_acceptance`/`active=False` (it raises `ValueError`
+        # otherwise -- see its precondition), so this before-state is
+        # deterministic, exactly like `deactivate`'s hardcoded before-state
+        # below.
+        before_state={"status": "pending_acceptance", "active": False},
         after_state={"status": rule.status, "active": rule.active},
         reason="Aceite explícito de regra após três correções consistentes",
+        source="classification_learning",
+    )
+    db.commit()
+    return serialize_classification_rule(rule, category_name or "")
+
+
+@router.patch("/classification-rules/{rule_id}")
+def edit_classification_rule_endpoint(
+    rule_id: str,
+    payload: ClassificationRuleEditRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    before = db.execute(
+        select(
+            ClassificationRule.category_id,
+            Category.name,
+            ClassificationRule.status,
+            ClassificationRule.active,
+            ClassificationRule.confirmation_count,
+        )
+        .join(Category, Category.id == ClassificationRule.category_id)
+        .where(
+            ClassificationRule.id == rule_id,
+            ClassificationRule.household_id == user.household_id,
+        )
+    ).first()
+    if before is None:
+        raise HTTPException(status_code=404, detail="Regra local não encontrada")
+    (
+        before_category_id,
+        before_category_name,
+        before_status,
+        before_active,
+        before_confirmation_count,
+    ) = before
+    try:
+        rule = edit_classification_rule(
+            db,
+            household_id=user.household_id,
+            rule_id=rule_id,
+            category_id=payload.category_id,
+        )
+        db.flush()
+    except LookupError as exc:
+        # The rule itself was already confirmed to exist above (`before`);
+        # a `LookupError` at this point can only be the requested category.
+        raise HTTPException(status_code=404, detail="Categoria não encontrada") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Já existe uma regra para este estabelecimento com esta categoria e tipo de movimento",
+        ) from exc
+    category_name = db.scalar(select(Category.name).where(Category.id == rule.category_id))
+    audit(
+        db,
+        user,
+        "classification_rule.edit",
+        "classification_rule",
+        rule.id,
+        {},
+        # A category-changing edit is also a governance/lifecycle reset
+        # (`edit_classification_rule` drops confirmation_count/status/active
+        # back to the observed/zero state -- see its docstring), so the
+        # audit trail must capture that transition, not just the category
+        # change, per the Work Order's before/after/reason/actor
+        # requirement. This does not dump the unbounded `evidence` payload
+        # into AuditEvent -- only the material lifecycle fields.
+        before_state={
+            "category_id": before_category_id,
+            "category": before_category_name,
+            "status": before_status,
+            "active": before_active,
+            "confirmation_count": before_confirmation_count,
+        },
+        after_state={
+            "category_id": rule.category_id,
+            "category": category_name,
+            "status": rule.status,
+            "active": rule.active,
+            "confirmation_count": rule.confirmation_count,
+        },
+        reason=payload.reason,
+        source="classification_learning",
+    )
+    db.commit()
+    return serialize_classification_rule(rule, category_name or "")
+
+
+@router.post("/classification-rules/{rule_id}/deactivate")
+def deactivate_classification_rule_endpoint(
+    rule_id: str,
+    payload: ClassificationRuleDeactivateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        rule = deactivate_classification_rule(
+            db,
+            household_id=user.household_id,
+            rule_id=rule_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Regra local não encontrada") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    category_name = db.scalar(select(Category.name).where(Category.id == rule.category_id))
+    audit(
+        db,
+        user,
+        "classification_rule.deactivate",
+        "classification_rule",
+        rule.id,
+        {},
+        before_state={"status": "active", "active": True},
+        after_state={"status": rule.status, "active": rule.active},
+        reason=payload.reason,
         source="classification_learning",
     )
     db.commit()

@@ -192,6 +192,48 @@
 - Regras locais de classificação precisam de três correções confirmadas e distintas para chegar a
   `pending_acceptance`; somente um administrador pode ativá-las. A ativação vale para classificações
   futuras e nunca recategoriza o histórico silenciosamente.
+- Ciclo de vida de `classification_rules.status`: `observed` (uma confirmação), `suggested` (duas),
+  `pending_acceptance` (três confirmações distintas — reconfirmar a mesma transação nunca infla a
+  contagem) e `active` (aceite explícito de um administrador via
+  `POST /classification-rules/{id}/activate`). Um administrador pode desativar uma regra `active`
+  (`POST /classification-rules/{id}/deactivate`), levando-a a `inactive`; a desativação nunca apaga
+  `confirmation_count` nem `evidence`, e nunca é revertida diretamente pelo administrador — a regra só
+  volta a `pending_acceptance` (e dali pode ser reativada) quando uma nova correção confirmada
+  genuinamente distinta chega por `record_confirmed_correction`. Um administrador também pode editar
+  apenas a `category_id` de uma regra `pending_acceptance`, `active` ou `inactive`
+  (`PATCH /classification-rules/{id}`); `movement_type` nunca é editável por essa via porque é herdado,
+  no momento da correção confirmada, do `transaction_type` já atribuído deterministicamente à transação
+  (o schema de atualização de transação não expõe `transaction_type`), nunca uma escolha livre do
+  usuário. Como `confirmation_count`/`evidence` provam apenas o resultado `(estabelecimento normalizado,
+  category_id, movement_type)` para o qual foram registrados, uma edição que muda `category_id` nunca
+  herda a contagem/evidência da categoria anterior como prova da nova: ela zera `confirmation_count`,
+  volta `status` para `observed` e `active` para `false`, e limpa `accepted_at`/`accepted_by` — a regra
+  editada precisa acumular suas próprias três correções confirmadas e distintas e uma nova aceitação
+  explícita do administrador antes de valer novamente, exatamente como uma regra nova. A evidência
+  anterior nunca é apagada ou sobrescrita; fica preservada em `evidence["history"]` para auditoria. Toda
+  ativação, desativação e edição é registrada na trilha de auditoria existente com ator, estado
+  anterior/posterior e motivo; como a edição também é um reset de ciclo de vida (zera
+  `confirmation_count`, `status` e `active`), o estado anterior/posterior registrado para
+  `classification_rule.edit` inclui `category_id`, `status`, `active` e `confirmation_count` — não
+  apenas a categoria — para que a trilha prove o reset, além da ativação registrar seu próprio estado
+  anterior determinístico (`pending_acceptance`/`active=false`).
+- Precedência determinística: uma regra local de estabelecimento só pode refinar a *categoria* de uma
+  classificação comum de receita/despesa. Ela nunca pode substituir uma classificação estrutural do
+  classificador determinístico — transferência interna (INV-001), pagamento/conciliação de fatura
+  (INV-002), movimento patrimonial de aplicação/resgate (INV-003/INV-004) ou estorno (INV-016); essas
+  continuam sempre vencendo, mesmo que uma regra ativa exista para a mesma descrição normalizada. Dentro
+  do espaço comum de receita/despesa, a regra só se aplica quando seu `movement_type` (o resultado que as
+  três correções confirmadas efetivamente provaram) é igual ao `transaction_type` que o classificador
+  determinístico atribuiria ao evento atual; uma regra aprendida de correções de despesa nunca é aplicada
+  a um evento positivo (receita) para o mesmo estabelecimento normalizado, e vice-versa — a evidência
+  nunca provou esse outro resultado. Quando a regra se aplica, o `transaction_type`/`excluded`
+  determinísticos do evento são preservados; só a categoria é substituída. Todo caminho que *classifica
+  automaticamente* uma descrição (importação de documento e captura inteligente) passa pela mesma função
+  (`classify_with_local_rules`); não existe uma segunda política de classificação na API, na UI, no
+  importador ou na captura inteligente. Lançamento manual e reclassificação manual
+  (`POST`/`PATCH /transactions`) continuam sendo escolha direta e autoritativa do usuário — não há
+  classificação automática a substituir ali. Isolamento por família: uma regra de uma `household` nunca é
+  aplicada, listada, editada ou desativada por outra.
 - A primeira baseline de anomalias usa somente meses explicitamente reconciliados e exige três
   competências distintas. O limite é `mediana + máximo(3 × MAD, 50% da mediana)`. Amostra
   insuficiente resulta em `unknown`, não em alerta inventado.

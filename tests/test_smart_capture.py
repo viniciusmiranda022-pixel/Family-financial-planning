@@ -63,6 +63,38 @@ def test_natural_language_investment_is_not_classified_as_spending() -> None:
     assert item["category_name"] == "Transferência patrimonial"
 
 
+def test_natural_language_card_payment_is_reconciliation_not_expense() -> None:
+    """`_movement_type()`'s plain keyword regex has no notion of "card-bill
+    payment" and defaults such text to "expense". The canonical classifier
+    (`classify()`/`PAYMENT_PATTERN`) does recognize it as the
+    invariant-protected "reconciliation" movement (INV-002), and
+    `parse_text_capture` must honor that structural result instead of the
+    narrower regex guess -- otherwise a card payment typed as free text
+    would be recorded as an ordinary expense."""
+    item = parse_text_capture(
+        "Fatura paga do cartão Nubank, R$ 800",
+        reference=date(2026, 8, 25),
+    )
+    assert item["amount"] == 800.0
+    assert item["movement_type"] == "reconciliation"
+    assert item["category_name"] == "Conciliação"
+
+
+def test_natural_language_fund_name_without_verb_is_still_patrimonial_transfer() -> None:
+    """A description naming an investment product by brand (e.g. "Privilège
+    DI") without any of the investir/aplicar/resgatar verbs
+    `_movement_type()` looks for still matches the canonical classifier's
+    own patrimonial-transfer pattern and must not fall back to the regex's
+    default "expense" guess."""
+    item = parse_text_capture(
+        "500 no Privilege DI",
+        reference=date(2026, 8, 25),
+    )
+    assert item["amount"] == 500.0
+    assert item["movement_type"] == "investment"
+    assert item["category_name"] == "Transferência patrimonial"
+
+
 def test_text_and_audio_default_to_message_capture() -> None:
     result = preview_capture(
         text="Recebi R$ 1.200 de comissão hoje",
@@ -102,6 +134,7 @@ def test_receipt_boleto_and_payroll_have_distinct_proposals() -> None:
     assert receipt["kind"] == "transaction"
     assert receipt["amount"] == 217.35
     assert receipt["category_name"] == "Transporte"
+    assert receipt["movement_type"] == "expense"
 
     boleto_text = (
         "ENERGIA DA RESIDÊNCIA\nVENCIMENTO 30/08/2026\n"
@@ -122,3 +155,20 @@ def test_receipt_boleto_and_payroll_have_distinct_proposals() -> None:
     assert payroll["competence"] == "2026-08-01"
     assert payroll["payment_date"] == "2026-09-05"
     assert payroll["amount"] == 4321.1
+
+
+def test_receipt_preserves_structural_reconciliation_movement() -> None:
+    """Engineer review on `86a6aab` (P0): `parse_receipt_text()` computed the
+    canonical classification through `_category_for_text()` but always
+    serialized `movement_type: "expense"`, discarding the classifier's own
+    structural `transaction_type`. A receipt whose text is structurally a
+    card-bill payment (`PAYMENT_PATTERN` -> INV-002 reconciliation) must not
+    be flattened into an ordinary expense the way an unmatched purchase
+    receipt correctly still is (see the "Transporte" case above).
+    """
+    receipt = parse_receipt_text(
+        "COMPROVANTE\nFATURA PAGA CARTAO NUBANK\nTOTAL R$ 800,00",
+        reference=date(2026, 8, 25),
+    )
+    assert receipt["movement_type"] == "reconciliation"
+    assert receipt["category_name"] == "Conciliação"
