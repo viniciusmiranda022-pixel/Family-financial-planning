@@ -519,6 +519,37 @@ async function loadReports() {
   renderReport(report);
 }
 
+// Downloads the backend-generated `.xlsx`/`.pdf` artifact for the report
+// period currently selected on screen. This never parses, sums or formats
+// a financial figure client-side -- it only requests the same canonical
+// report `loadReports()` already displays, in a different file format, and
+// hands the browser the exact bytes the backend returned.
+async function downloadReportExport(format) {
+  const endControl = document.querySelector("#report-end-month");
+  const monthsControl = document.querySelector("#report-months");
+  if (!endControl.value) endControl.value = document.querySelector("#dashboard-month").value || currentMonthKey();
+  const query = `end_month=${encodeURIComponent(endControl.value)}&months=${encodeURIComponent(monthsControl.value)}&format=${format}`;
+  const response = await fetch(`/api/reports/export?${query}`, { credentials: "same-origin" });
+  if (response.status === 401) { showAuth(true); throw new Error("Sua sessão expirou. Entre novamente."); }
+  if (!response.ok) {
+    let detail = "Não foi possível gerar o arquivo";
+    try { const payload = await response.json(); if (typeof payload.detail === "string") detail = payload.detail; } catch (_) { /* keep default */ }
+    throw new Error(detail);
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="([^"]+)"/);
+  const filename = match ? match[1] : `relatorio.${format}`;
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 async function loadImports() {
   await loadAccounts();
   const items = await api("/imports");
@@ -1566,6 +1597,8 @@ document.querySelector("#report-calendar-year").addEventListener("click", () => 
   loadReports();
 });
 document.querySelector("#report-print").addEventListener("click", () => window.print());
+document.querySelector("#report-export-xlsx").addEventListener("click", () => downloadReportExport("xlsx").catch((error) => toast(error.message, true)));
+document.querySelector("#report-export-pdf").addEventListener("click", () => downloadReportExport("pdf").catch((error) => toast(error.message, true)));
 document.querySelector("#refresh-transactions").addEventListener("click", loadTransactions);
 document.querySelector("#refresh-forecast").addEventListener("click", loadForecast);
 document.querySelector("#transaction-movement-type").addEventListener("change", updateManualTransactionFields);

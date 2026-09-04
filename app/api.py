@@ -162,6 +162,12 @@ from app.services.reconciliation import (
     serialize_reconciliation,
     unknown_reconciliation,
 )
+from app.services.report_export import (
+    REPORT_EXPORT_MEDIA_TYPES,
+    build_report_pdf,
+    build_report_workbook,
+    report_export_filename,
+)
 from app.services.smart_capture import CaptureParseError, preview_capture
 
 router = APIRouter(prefix="/api")
@@ -4854,14 +4860,19 @@ def dashboard(
     }
 
 
-@router.get("/reports")
-def reports(
-    end_month: str | None = None,
-    months: int = 6,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
-    """Build an auditable comparison for one to twelve consecutive months."""
+def _build_report_payload(db: Session, user: User, *, end_month: str | None, months: int) -> dict:
+    """Build an auditable comparison for one to twelve consecutive months.
+
+    Extracted from `GET /reports` so `GET /reports/export` (Excel/PDF) can
+    call this exact function -- the same validation, the same snapshots via
+    `build_snapshot`, the same publication helpers (`report_month_monetary_publication`,
+    `category_monetary_publication`, `report_summary_monetary_publication`,
+    `category_spending_rows`, `account_cash_flow_rows`) -- instead of a second,
+    export-only report-building policy. Every caller of this function gets the
+    identical dict `GET /reports` has always returned; nothing below is
+    HTTP-specific, and neither export format recomputes or reclassifies
+    anything this function did not already compute.
+    """
     if months < 1 or months > 12:
         raise HTTPException(status_code=422, detail="O período deve ter entre 1 e 12 meses")
 
@@ -5111,6 +5122,46 @@ def reports(
         "categories": categories,
         "accounts": report_accounts,
     }
+
+
+@router.get("/reports")
+def reports(
+    end_month: str | None = None,
+    months: int = 6,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _build_report_payload(db, user, end_month=end_month, months=months)
+
+
+@router.get("/reports/export")
+def export_report(
+    end_month: str | None = None,
+    months: int = 6,
+    format: str = Query(..., pattern="^(xlsx|pdf)$"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Export the exact same canonical report `GET /reports` returns as a
+    real `.xlsx` or `.pdf` file, generated server-side from that dict --
+    never a second calculation, never HTML/CSV renamed to look like one of
+    these formats. `format` is the only new parameter; `end_month`/`months`
+    take the identical validation and household scoping as `GET /reports`
+    because both routes call `_build_report_payload`.
+    """
+
+    report = _build_report_payload(db, user, end_month=end_month, months=months)
+    generated_at = datetime.now(UTC)
+    if format == "xlsx":
+        content = build_report_workbook(report, generated_at=generated_at)
+    else:
+        content = build_report_pdf(report, generated_at=generated_at)
+    filename = report_export_filename(report, format)
+    return Response(
+        content=content,
+        media_type=REPORT_EXPORT_MEDIA_TYPES[format],
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/advisor/status")

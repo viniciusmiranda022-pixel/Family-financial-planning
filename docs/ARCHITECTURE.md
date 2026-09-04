@@ -168,6 +168,47 @@ limite de tamanho, duplicidade de arquivo, falha inesperada) e `error_category`.
 trilha de auditoria persistida, por si só, a lineage determinística entre um lote e os `Document`s que
 ele produziu -- sem depender de reconstruir por proximidade de horário.
 
+## Exportação Excel/PDF (Fase 2)
+
+`GET /api/reports/export?format=xlsx|pdf` não é um segundo motor de relatório: `app.api._build_report_payload`
+é a mesma função que `GET /api/reports` já usava (extraída sem qualquer mudança de comportamento), e ambas
+as rotas a chamam -- mesma validação de `months`/`end_month`, mesmas snapshots via `build_snapshot`, mesmas
+funções de publicação canônica (`report_month_monetary_publication`, `category_monetary_publication`,
+`report_summary_monetary_publication`, `category_spending_rows`, `account_cash_flow_rows`). O exportador
+(`app/services/report_export.py`) recebe esse dict já pronto e apenas o renderiza; nenhuma soma, média,
+participação percentual, reclassificação, deduplicação ou reconciliação é recalculada por ele -- se um
+valor está errado no Excel/PDF, ele já estava errado no JSON de `/reports`.
+
+Duas renderizações independentes, uma única fonte:
+
+- **Excel** (`build_report_workbook`): `openpyxl` (já dependência do projeto, usada também pelo importador
+  de planilha de planejamento) escreve células de dado puro com formatação de apresentação apenas
+  (`R$ #,##0.00`, etc.) -- nunca uma fórmula de planilha, para que o Excel nunca possa se tornar uma segunda
+  fonte de verdade que recalcula um valor de forma diferente do backend. Uma aba por seção canônica:
+  Resumo, Mensal, Categorias, Contas. Todo valor textual (categoria, conta, instituição, o nome
+  configurável da reserva de liquidez, etc.) passa pelo único ponto de escrita de célula
+  (`_write_cell`), que força o tipo de dado openpyxl `'s'` (texto puro) mesmo quando o texto começa com
+  `=`, `+`, `-` ou `@` -- caracteres que o openpyxl, por padrão, classifica como fórmula na atribuição.
+  Isso neutraliza injeção de fórmula/DDE em texto de origem do usuário sem jamais alterar, normalizar ou
+  remover o valor exibido.
+- **PDF** (`build_report_pdf`): `pymupdf` (`Page.insert_htmlbox`, já dependência do projeto, usada também
+  para leitura de PDF na importação) renderiza uma string HTML montada pelo próprio backend através do
+  motor de layout nativo do PyMuPDF -- sem navegador, sem Chrome headless, sem dependência nova. É um
+  mecanismo diferente do botão "Imprimir / PDF" já existente (`window.print()` em `app/static/app.js`), que
+  depende do navegador do usuário e continua funcionando exatamente como antes, sem nenhuma mudança.
+  Cada seção tabular é paginada em blocos de até 28 linhas (nunca uma única página que estoura e corta
+  dados silenciosamente), com auto-redução de escala (`scale_low=0`) como segunda defesa independente; se
+  mesmo assim uma seção não couber, a geração falha alto (exceção) em vez de devolver um PDF que parece
+  completo mas está com dados faltando.
+
+Nenhuma migração foi necessária -- a exportação não introduz nenhum modelo, coluna ou tabela nova; ela só
+lê o mesmo dict que `/reports` já monta a partir de dados existentes. Nome de arquivo
+(`relatorio_<início>_a_<fim>.<formato>`) carrega apenas o período do próprio relatório, nunca nome de
+família, usuário ou conta -- sem PII. `Content-Disposition: attachment` força o download em vez de exibição
+inline. Autenticação e isolamento por família são os mesmos de `GET /reports` (a mesma função, o mesmo
+`user.household_id`). A interface (`app/templates/index.html`, `app/static/app.js`) só solicita o formato e
+baixa o arquivo (`downloadReportExport`); nenhum total é somado, parseado ou recalculado no navegador.
+
 ## Modelo de deduplicação
 
 Existem dois níveis:
