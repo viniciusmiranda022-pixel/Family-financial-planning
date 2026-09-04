@@ -3357,7 +3357,13 @@ def edit_classification_rule_endpoint(
 ) -> dict:
     _require_admin(user)
     before = db.execute(
-        select(ClassificationRule.category_id, Category.name)
+        select(
+            ClassificationRule.category_id,
+            Category.name,
+            ClassificationRule.status,
+            ClassificationRule.active,
+            ClassificationRule.confirmation_count,
+        )
         .join(Category, Category.id == ClassificationRule.category_id)
         .where(
             ClassificationRule.id == rule_id,
@@ -3366,7 +3372,13 @@ def edit_classification_rule_endpoint(
     ).first()
     if before is None:
         raise HTTPException(status_code=404, detail="Regra local não encontrada")
-    before_category_id, before_category_name = before
+    (
+        before_category_id,
+        before_category_name,
+        before_status,
+        before_active,
+        before_confirmation_count,
+    ) = before
     try:
         rule = edit_classification_rule(
             db,
@@ -3395,8 +3407,27 @@ def edit_classification_rule_endpoint(
         "classification_rule",
         rule.id,
         {},
-        before_state={"category_id": before_category_id, "category": before_category_name},
-        after_state={"category_id": rule.category_id, "category": category_name},
+        # A category-changing edit is also a governance/lifecycle reset
+        # (`edit_classification_rule` drops confirmation_count/status/active
+        # back to the observed/zero state -- see its docstring), so the
+        # audit trail must capture that transition, not just the category
+        # change, per the Work Order's before/after/reason/actor
+        # requirement. This does not dump the unbounded `evidence` payload
+        # into AuditEvent -- only the material lifecycle fields.
+        before_state={
+            "category_id": before_category_id,
+            "category": before_category_name,
+            "status": before_status,
+            "active": before_active,
+            "confirmation_count": before_confirmation_count,
+        },
+        after_state={
+            "category_id": rule.category_id,
+            "category": category_name,
+            "status": rule.status,
+            "active": rule.active,
+            "confirmation_count": rule.confirmation_count,
+        },
         reason=payload.reason,
         source="classification_learning",
     )
