@@ -40,10 +40,18 @@ Matching policy (single, shared with the API/UI -- no second policy):
    module-level constant for why the window is symmetric and how wide it
    is). This bounds the search space so "same amount, unrelated month" pairs
    two years apart are never silently offered as a match.
-4. Exactly one candidate on both counts is a deterministic `matched` pair,
-   safe to present as a one-click suggestion. Zero candidates is `unmatched`
-   (explicit unknown/review, never fabricated). More than one is `ambiguous`
-   -- surfaced with every candidate, never auto-resolved.
+4. A pair is a deterministic `matched` suggestion only when it is a mutual,
+   isolated one-to-one edge in the bipartite candidate graph: the checking
+   row has exactly one card candidate *and* that same card row has exactly
+   one checking candidate (see `_candidate_edges`/`_card_side_degrees`).
+   Checking one side alone is not enough -- a single card-side payment can be the sole
+   candidate for two different bank debits of the same amount in the same
+   window, and neither is then a safe one-click suggestion even though each
+   looks deterministic in isolation. Zero candidates is `unmatched` (explicit
+   unknown/review, never fabricated). Any other shape -- more than one
+   candidate on either side, including the "1 checking : 1 candidate, but
+   that candidate also serves another checking row" case above -- is
+   `ambiguous`, surfaced with every candidate, never auto-resolved.
 5. A human can still confirm a link outside the date window (a legitimately
    late payment): `link_card_payment` only enforces the amount tolerance,
    never the date window, because the operator -- not a heuristic -- is
@@ -118,6 +126,62 @@ def _money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def _candidates_for_checking(checking: Any, card_rows: list[Any], window: timedelta) -> list[Any]:
+    candidates = [
+        card
+        for card in card_rows
+        if card.linked_transaction_id is None
+        and abs(abs(card.amount) - abs(checking.amount)) <= RECONCILIATION_TOLERANCE
+        and abs(card.booked_at - checking.booked_at) <= window
+    ]
+    candidates.sort(key=lambda card: (abs(card.booked_at - checking.booked_at), card.id))
+    return candidates
+
+
+def _candidate_edges(checking_rows: list[Any], card_rows: list[Any]) -> dict[str, list[Any]]:
+    """Every unlinked checking row's amount/window-eligible unlinked card
+    candidates, keyed by checking id.
+
+    This is the whole bipartite candidate graph for the household -- built
+    once over *every* unlinked reconciliation row regardless of the `period`
+    a caller asked to display, because a card row's true cardinality (does
+    it serve one checking row or several?) depends on the household's whole
+    history, not on whichever slice of it is currently being viewed. Slicing
+    by period first and only then computing degree would let two checking
+    rows that both claim the same card row, one in-period and one out, each
+    look deterministic in isolation -- exactly the false-certainty bug this
+    function exists to close.
+
+    A checking row that already carries a `linked_transaction_id` has no
+    entry here on purpose: it is resolved, so it must never contribute a
+    phantom edge that inflates another, still-unresolved checking row's
+    card-side degree count and wrongly flags a genuine 1:1 pair as
+    `ambiguous`. `list_card_payment_reconciliations` computes its own
+    stand-alone candidate list for the one defensive corner case where a
+    row is linked but its counterpart fails to resolve.
+    """
+
+    window = timedelta(days=CARD_PAYMENT_MATCH_WINDOW_DAYS)
+    edges: dict[str, list[Any]] = {}
+    for checking in checking_rows:
+        if checking.linked_transaction_id:
+            continue
+        edges[checking.id] = _candidates_for_checking(checking, card_rows, window)
+    return edges
+
+
+def _card_side_degrees(edges: dict[str, list[Any]]) -> dict[str, int]:
+    """How many distinct checking rows currently list each card row as a
+    candidate -- the inverse-cardinality count a per-checking-row view alone
+    cannot see (see `_candidate_edges` and the module docstring, point 4)."""
+
+    degrees: dict[str, int] = {}
+    for candidates in edges.values():
+        for card in candidates:
+            degrees[card.id] = degrees.get(card.id, 0) + 1
+    return degrees
+
+
 def list_card_payment_reconciliations(
     db: Session,
     *,
@@ -128,14 +192,18 @@ def list_card_payment_reconciliations(
 
     Never mutates the database -- always recomputed from current facts, so
     it can never drift from what a fresh import or a human unlink just
-    changed. `period` filters the bank-side (checking) rows by competence
-    (`YYYY-MM`); candidates are still searched across the household's whole
-    history because a payment can land in the month after its invoice.
+    changed. `period` filters which bank-side (checking) rows are *returned*
+    by competence (`YYYY-MM`); the candidate graph itself (and therefore
+    `matched` vs `ambiguous`) is always computed across the household's
+    whole history, both because a payment can land in the month after its
+    invoice and because restricting the graph to one period would hide the
+    other checking row in a two-checkings-one-card conflict whenever that
+    row falls outside the requested period (see `_candidate_edges`).
     """
 
     from app.models import Account, Transaction
 
-    checking_query = (
+    all_checking_rows = db.scalars(
         select(Transaction)
         .join(Account, Account.id == Transaction.account_id)
         .where(
@@ -143,12 +211,17 @@ def list_card_payment_reconciliations(
             Transaction.transaction_type == "reconciliation",
             Account.account_type == "checking",
         )
-    )
-    if period:
-        checking_query = checking_query.where(Transaction.competence == period)
-    checking_rows = db.scalars(checking_query.order_by(Transaction.booked_at.desc(), Transaction.id)).all()
-    if not checking_rows:
+        .order_by(Transaction.booked_at.desc(), Transaction.id)
+    ).all()
+    if not all_checking_rows:
         return []
+
+    if period:
+        checking_rows = [row for row in all_checking_rows if row.competence == period]
+        if not checking_rows:
+            return []
+    else:
+        checking_rows = all_checking_rows
 
     card_rows = db.scalars(
         select(Transaction)
@@ -160,6 +233,10 @@ def list_card_payment_reconciliations(
         )
     ).all()
     card_by_id = {row.id: row for row in card_rows}
+
+    # Built once, over the whole household -- see `_candidate_edges`.
+    edges = _candidate_edges(all_checking_rows, card_rows)
+    card_degrees = _card_side_degrees(edges)
     window = timedelta(days=CARD_PAYMENT_MATCH_WINDOW_DAYS)
 
     results: list[CardPaymentMatch] = []
@@ -177,20 +254,34 @@ def list_card_payment_reconciliations(
                     )
                 )
                 continue
-        candidates = [
-            card
-            for card in card_rows
-            if card.linked_transaction_id is None
-            and abs(abs(card.amount) - abs(checking.amount)) <= RECONCILIATION_TOLERANCE
-            and abs(card.booked_at - checking.booked_at) <= window
-        ]
-        candidates.sort(key=lambda card: (abs(card.booked_at - checking.booked_at), card.id))
-        if len(candidates) == 1:
-            status = "matched"
-        elif len(candidates) == 0:
-            status = "unmatched"
+            # Defensive corner case: `linked_transaction_id` is set but does
+            # not resolve to a same-household counterpart (should not
+            # happen through this module's own API, which always sets/clears
+            # both sides together -- but this row has no entry in `edges`,
+            # which deliberately excludes every linked checking row, so its
+            # candidates are computed stand-alone here instead of via the
+            # shared graph). `card_degrees` below cannot see this row's own
+            # claim on its candidate, so a would-be "exactly one candidate"
+            # case can never be verified as a genuine mutual 1:1 match here
+            # -- always `ambiguous` (unless there is no candidate at all)
+            # rather than risk a false `matched` for a row whose own link
+            # state is already inconsistent.
+            candidates = _candidates_for_checking(checking, card_rows, window)
+            status = "unmatched" if not candidates else "ambiguous"
         else:
-            status = "ambiguous"
+            candidates = edges[checking.id]
+            if len(candidates) == 0:
+                status = "unmatched"
+            elif len(candidates) == 1 and card_degrees.get(candidates[0].id, 0) == 1:
+                # Mutual, isolated edge: this checking row has exactly one
+                # candidate, and that card row has no other suitor either.
+                status = "matched"
+            else:
+                # Either multiple card candidates for this checking row, or
+                # its single candidate is also claimed by another checking
+                # row -- both are globally ambiguous evidence, never
+                # auto-resolved.
+                status = "ambiguous"
         results.append(
             CardPaymentMatch(
                 checking_transaction_id=checking.id,
@@ -252,15 +343,21 @@ def serialize_card_payment_match(db: Session, match: CardPaymentMatch) -> dict[s
     return payload
 
 
-def _reconciliation_transaction_or_404(db: Session, *, household_id: str, transaction_id: str) -> Any:
+def _reconciliation_transaction_or_404(
+    db: Session, *, household_id: str, transaction_id: str, for_update: bool = False
+) -> Any:
     from app.models import Transaction
 
-    transaction = db.scalar(
-        select(Transaction).where(
-            Transaction.id == transaction_id,
-            Transaction.household_id == household_id,
-        )
+    query = select(Transaction).where(
+        Transaction.id == transaction_id,
+        Transaction.household_id == household_id,
     )
+    if for_update:
+        # No-op on SQLite (used by the test suite); on PostgreSQL this takes
+        # the row-level write lock `link_card_payment` needs -- see its
+        # docstring.
+        query = query.with_for_update()
+    transaction = db.scalar(query)
     if transaction is None:
         raise LookupError("transaction not found")
     if transaction.transaction_type != "reconciliation":
@@ -283,17 +380,31 @@ def link_card_payment(
     Raises `LookupError` (-> 404) when a transaction id does not belong to
     this household, `CardPaymentLinkError` (-> 409) for any business-rule
     conflict.
+
+    Concurrency: both candidate rows are fetched with `SELECT ... FOR
+    UPDATE` (a no-op outside PostgreSQL) *before* the `linked_transaction_id`
+    conflict check below, always in the same id-sorted order regardless of
+    which argument named which row. That ordering is what makes two
+    concurrent link attempts that reference either of the same two rows
+    serialize instead of deadlocking -- a fixed global order for
+    multi-row locks is the standard way to avoid a lock-ordering deadlock.
+    Without the lock, two requests could both read `linked_transaction_id is
+    None` for the same row before either writes, and both commit a link,
+    leaving that row's counterpart pointing at two different partners (a
+    non-symmetric pair).
     """
 
     if checking_transaction_id == card_transaction_id:
         raise CardPaymentLinkError("Selecione dois lançamentos diferentes")
 
-    checking = _reconciliation_transaction_or_404(
-        db, household_id=household_id, transaction_id=checking_transaction_id
-    )
-    card = _reconciliation_transaction_or_404(
-        db, household_id=household_id, transaction_id=card_transaction_id
-    )
+    locked_by_id = {
+        row_id: _reconciliation_transaction_or_404(
+            db, household_id=household_id, transaction_id=row_id, for_update=True
+        )
+        for row_id in sorted((checking_transaction_id, card_transaction_id))
+    }
+    checking = locked_by_id[checking_transaction_id]
+    card = locked_by_id[card_transaction_id]
     checking_type = checking.account.account_type if checking.account else None
     card_type = card.account.account_type if card.account else None
     if {checking_type, card_type} != {"checking", "credit_card"}:
@@ -321,16 +432,37 @@ def unlink_card_payment(
     household_id: str,
     transaction_id: str,
 ) -> tuple[Any, Any]:
-    """Reverse a confirmed link. Non-destructive: both rows keep existing."""
+    """Reverse a confirmed link. Non-destructive: both rows keep existing.
 
-    transaction = _reconciliation_transaction_or_404(
-        db, household_id=household_id, transaction_id=transaction_id
-    )
-    if not transaction.linked_transaction_id:
+    Concurrency: an unlocked probe read of `transaction_id` only tells us
+    who its counterpart *was* at that instant. Both rows are then re-fetched
+    with `SELECT ... FOR UPDATE`, in the same id-sorted order
+    `link_card_payment` uses -- two concurrent `unlink` calls naming either
+    end of the very same pair sort to the identical `(X, Y)` order, so they
+    serialize instead of deadlocking. After acquiring the locks we re-check
+    that `transaction`'s counterpart is still the one we probed; if a
+    concurrent request already unlinked and relinked it to a third row in
+    the gap between the probe and the lock, we fail closed with a conflict
+    instead of silently nulling out that unrelated, newer link.
+    """
+
+    probe = _reconciliation_transaction_or_404(db, household_id=household_id, transaction_id=transaction_id)
+    if not probe.linked_transaction_id:
         raise CardPaymentLinkError("Este lançamento não está vinculado")
-    counterpart = _reconciliation_transaction_or_404(
-        db, household_id=household_id, transaction_id=transaction.linked_transaction_id
-    )
+    counterpart_id = probe.linked_transaction_id
+
+    locked_by_id = {
+        row_id: _reconciliation_transaction_or_404(
+            db, household_id=household_id, transaction_id=row_id, for_update=True
+        )
+        for row_id in sorted((transaction_id, counterpart_id))
+    }
+    transaction = locked_by_id[transaction_id]
+    if transaction.linked_transaction_id != counterpart_id:
+        raise CardPaymentLinkError(
+            "O vínculo deste lançamento mudou; atualize a tela e tente novamente"
+        )
+    counterpart = locked_by_id[counterpart_id]
     transaction.linked_transaction_id = None
     counterpart.linked_transaction_id = None
     return transaction, counterpart
