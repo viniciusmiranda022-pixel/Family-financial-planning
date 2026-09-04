@@ -592,6 +592,78 @@ async function loadTransactions() {
       await loadTransactions(); await loadDashboard(); toast("Cálculo atualizado");
     } catch (error) { toast(error.message, true); }
   }));
+  await loadCardPaymentReconciliations(month);
+}
+
+function cardPaymentTransactionSummary(item) {
+  if (!item) return "";
+  return `${dateFormat.format(new Date(`${item.date}T00:00:00Z`))} · ${escapeHtml(item.description)} · ${escapeHtml(item.account || "")} · ${money.format(Number(item.amount))}`;
+}
+
+const cardPaymentStatusLabels = {
+  linked: '<span class="status-chip ok">Conciliado</span>',
+  matched: '<span class="status-chip warn">Candidato encontrado</span>',
+  ambiguous: '<span class="status-chip warn">Vários candidatos</span>',
+  unmatched: '<span class="status-chip muted">Sem candidato</span>',
+};
+
+async function loadCardPaymentReconciliations(month) {
+  const table = document.querySelector("#card-payment-reconciliation-table");
+  if (!table) return;
+  const items = await api(`/card-payment-reconciliations${month ? `?period=${month}` : ""}`);
+  table.innerHTML = items.length ? items.map((item) => {
+    const checkingId = item.checking_transaction.id;
+    let counterpart;
+    let actions;
+    if (item.status === "linked") {
+      counterpart = cardPaymentTransactionSummary(item.linked_transaction);
+      actions = `<button class="text-action unlink-card-payment" data-id="${escapeHtml(checkingId)}">Desvincular</button>`;
+    } else if (item.status === "unmatched") {
+      counterpart = '<span class="muted-copy">Nenhum lançamento de pagamento de fatura corresponde ainda.</span>';
+      actions = "";
+    } else {
+      counterpart = item.candidates.map((candidate) => `<div>${cardPaymentTransactionSummary({ ...candidate, id: candidate.transaction_id })}${candidate.difference !== "0.00" ? ` <small>(diferença ${money.format(Number(candidate.difference))})</small>` : ""}</div>`).join("");
+      actions = item.candidates.map((candidate) => `<button class="text-action link-card-payment" data-checking-id="${escapeHtml(checkingId)}" data-card-id="${escapeHtml(candidate.transaction_id)}">Confirmar vínculo${item.candidates.length > 1 ? ` (${dateFormat.format(new Date(`${candidate.date}T00:00:00Z`))})` : ""}</button>`).join("");
+    }
+    return `
+    <tr data-id="${escapeHtml(checkingId)}">
+      <td>${cardPaymentTransactionSummary(item.checking_transaction)}</td>
+      <td>${counterpart}</td>
+      <td>${cardPaymentStatusLabels[item.status] || item.status}</td>
+      <td class="right">${actions}</td>
+    </tr>
+  `;
+  }).join("") : emptyRow(4, "Nenhum pagamento de fatura importado neste período");
+  document.querySelectorAll(".link-card-payment").forEach((button) => button.addEventListener("click", async () => {
+    const reason = window.prompt("Motivo para confirmar este vínculo (obrigatório):");
+    if (reason === null) return;
+    if (reason.trim().length < 3) { toast("Motivo deve ter ao menos 3 caracteres", true); return; }
+    try {
+      await api("/card-payment-reconciliations/link", {
+        method: "POST",
+        body: JSON.stringify({
+          checking_transaction_id: button.dataset.checkingId,
+          card_transaction_id: button.dataset.cardId,
+          reason: reason.trim(),
+        }),
+      });
+      toast("Pagamento da fatura vinculado ao débito bancário");
+      await loadCardPaymentReconciliations(document.querySelector("#transaction-month").value);
+    } catch (error) { toast(error.message, true); }
+  }));
+  document.querySelectorAll(".unlink-card-payment").forEach((button) => button.addEventListener("click", async () => {
+    const reason = window.prompt("Motivo para desvincular (obrigatório):");
+    if (reason === null) return;
+    if (reason.trim().length < 3) { toast("Motivo deve ter ao menos 3 caracteres", true); return; }
+    try {
+      await api("/card-payment-reconciliations/unlink", {
+        method: "POST",
+        body: JSON.stringify({ transaction_id: button.dataset.id, reason: reason.trim() }),
+      });
+      toast("Vínculo desfeito; os lançamentos originais continuam intactos");
+      await loadCardPaymentReconciliations(document.querySelector("#transaction-month").value);
+    } catch (error) { toast(error.message, true); }
+  }));
 }
 
 async function loadReviews() {

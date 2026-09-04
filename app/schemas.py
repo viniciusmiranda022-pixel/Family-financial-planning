@@ -237,6 +237,27 @@ class MonthlyCloseReopenRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class CardPaymentLinkRequest(BaseModel):
+    """Human-confirmed link between a bank debit and a card-invoice payment.
+
+    Order of the two ids does not matter -- the service resolves which one
+    is the checking-side row and which is the credit-card-side row. `reason`
+    is mandatory, matching every other human reconciliation/lifecycle action
+    in this project (`FindingLifecycleRequest`, `DuplicateResolutionRequest`,
+    `MonthlyCloseReopenRequest`): even confirming a deterministic suggestion
+    is still the human, not the system, asserting the pair is correct.
+    """
+
+    checking_transaction_id: str = Field(min_length=1, max_length=36)
+    card_transaction_id: str = Field(min_length=1, max_length=36)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class CardPaymentUnlinkRequest(BaseModel):
+    transaction_id: str = Field(min_length=1, max_length=36)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
 class ClassificationRuleEditRequest(BaseModel):
     """Admin-only edit of an eligible local merchant rule's category.
 
