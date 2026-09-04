@@ -3334,6 +3334,12 @@ def activate_classification_rule(
         "classification_rule",
         rule.id,
         {"confirmation_count": rule.confirmation_count},
+        # `accept_classification_rule` only succeeds when the rule was
+        # `pending_acceptance`/`active=False` (it raises `ValueError`
+        # otherwise -- see its precondition), so this before-state is
+        # deterministic, exactly like `deactivate`'s hardcoded before-state
+        # below.
+        before_state={"status": "pending_acceptance", "active": False},
         after_state={"status": rule.status, "active": rule.active},
         reason="Aceite explícito de regra após três correções consistentes",
         source="classification_learning",

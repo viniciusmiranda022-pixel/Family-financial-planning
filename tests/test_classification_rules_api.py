@@ -154,16 +154,6 @@ def test_classification_rule_lifecycle_requires_admin() -> None:
             assert activated.json()["status"] == "active"
             assert activated.json()["active"] is True
 
-            # Only an active rule can be deactivated.
-            work_category_id = _create_category(household_id, "Trabalho")
-            edited = admin_client.patch(
-                f"/api/classification-rules/{rule_id}",
-                json={"category_id": work_category_id, "reason": "Categoria mais precisa"},
-            )
-            assert edited.status_code == 200
-            assert edited.json()["category_id"] == work_category_id
-            assert edited.json()["category"] == "Trabalho"
-
             deactivated = admin_client.post(
                 f"/api/classification-rules/{rule_id}/deactivate",
                 json={"reason": "Regra não é mais aplicável"},
@@ -177,6 +167,28 @@ def test_classification_rule_lifecycle_requires_admin() -> None:
                 f"/api/classification-rules/{rule_id}/deactivate", json={"reason": "de novo"}
             ).status_code == 409
 
+            # An inactive rule is still eligible for editing. Changing the
+            # category must not let the three confirmations recorded for
+            # "Transporte" pass as evidence for "Trabalho".
+            work_category_id = _create_category(household_id, "Trabalho")
+            edited = admin_client.patch(
+                f"/api/classification-rules/{rule_id}",
+                json={"category_id": work_category_id, "reason": "Categoria mais precisa"},
+            )
+            assert edited.status_code == 200
+            assert edited.json()["category_id"] == work_category_id
+            assert edited.json()["category"] == "Trabalho"
+            assert edited.json()["confirmation_count"] == 0
+            assert edited.json()["status"] == "observed"
+            assert edited.json()["active"] is False
+
+            # Regression guard: zero confirmed corrections for "Trabalho"
+            # must not be activatable just because the rule id previously
+            # had three confirmations for a different category.
+            assert (
+                admin_client.post(f"/api/classification-rules/{rule_id}/activate").status_code == 409
+            )
+
         with _TestSessionLocal() as db:
             events = db.scalars(
                 select(AuditEvent).where(AuditEvent.entity_id == rule_id)
@@ -187,6 +199,12 @@ def test_classification_rule_lifecycle_requires_admin() -> None:
                 "classification_rule.edit",
                 "classification_rule.deactivate",
             }
+            activate_event = events_by_type["classification_rule.activate"]
+            assert activate_event.before_state == {"status": "pending_acceptance", "active": False}
+            assert activate_event.after_state == {"status": "active", "active": True}
+            assert activate_event.reason == "Aceite explícito de regra após três correções consistentes"
+            assert activate_event.user_id is not None
+
             edit_event = events_by_type["classification_rule.edit"]
             assert edit_event.before_state["category_id"] == category_id
             assert edit_event.after_state["category_id"] == work_category_id
