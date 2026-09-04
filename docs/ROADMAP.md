@@ -16,7 +16,20 @@
 ## Fase 2 — Aderência e produtividade
 
 - regras editáveis de estabelecimento;
-- conciliação visual de fatura x débito bancário;
+- conciliação visual de fatura x débito bancário: `GET /api/card-payment-reconciliations`
+  (`period` opcional) mostra, para cada débito bancário já classificado como `reconciliation`
+  pelo classificador único, o pagamento de fatura correspondente já vinculado, o candidato único
+  determinístico (mesma tolerância de R$ 0,01, janela de `CARD_PAYMENT_MATCH_WINDOW_DAYS = 45`
+  dias) ou a lista completa quando há mais de um candidato -- nunca resolvida sozinha. Vincular
+  (`POST .../link`) e desvincular (`POST .../unlink`) são ações humanas, com `reason` obrigatório e
+  trilha de auditoria (`card_payment_reconciliation.link`/`.unlink`), isoladas por família, e alteram
+  somente `Transaction.linked_transaction_id` (coluna já existente desde a migração `0004`) nos dois
+  lados -- nenhuma migração nova, nenhum valor, tipo, categoria ou exclusão de lançamento é tocado, e
+  portanto nenhum efeito sobre INV-002, snapshots, relatórios ou projeção. Interface em
+  "Lançamentos" (`app/templates/index.html`, `app/static/app.js`). Testes em
+  `tests/test_card_payment_reconciliation.py` (determinístico único, ambíguo, sem candidato, fora da
+  janela, vínculo/desvínculo simétrico e não destrutivo, isolamento por família, autorização, trilha
+  de auditoria); pendente revisão do engenheiro responsável antes do merge;
 - importação em lote;
 - exportação Excel/PDF;
 - testes com cópias anonimizadas dos documentos reais.

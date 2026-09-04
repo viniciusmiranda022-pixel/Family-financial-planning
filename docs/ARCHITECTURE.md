@@ -150,6 +150,25 @@ Existem dois níveis:
 
 Essa estratégia evita dupla contagem sem apagar duas compras legítimas que eventualmente tenham o mesmo valor.
 
+## Conciliação visual de pagamento de fatura (Fase 2)
+
+Um mesmo evento real -- o pagamento de uma fatura -- pode gerar duas linhas independentes, cada
+uma já `transaction_type = "reconciliation"` pelo classificador único (`PAYMENT_PATTERN`,
+`app/services/classifier.py`) e portanto já excluída de todo total operacional antes de qualquer
+vínculo existir: a própria fatura (linha "pagamento recebido" no cartão, valor positivo) e o
+extrato bancário (débito que saiu da conta corrente, valor negativo). `app/services/
+card_payment_reconciliation.py` apenas liga essas duas linhas já canônicas para consulta humana --
+não é um novo cálculo financeiro. Um candidato só é sugerido automaticamente quando é o único
+dentro da tolerância de R$ 0,01 e da janela de 45 dias do lançamento da fatura; ausência ou mais de
+um candidato permanece `unmatched`/`ambiguous`, nunca resolvido sozinho. Confirmar (`POST
+/api/card-payment-reconciliations/link`) ou desfazer (`.../unlink`) um vínculo é sempre uma ação
+humana, com motivo obrigatório e trilha de auditoria, e altera somente a coluna já existente
+`Transaction.linked_transaction_id` (migração `0004`) nos dois lados -- nunca o valor, tipo,
+categoria ou exclusão de qualquer lançamento, por isso não pode afetar INV-002 nem nenhum
+snapshot/relatório/projeção. Dashboard, relatórios, projeção e Monthly Close continuam consumindo
+exatamente as mesmas linhas `Transaction`/`DocumentReconciliation` de sempre; esta tela não introduz
+uma segunda fonte de verdade.
+
 ## Evolução
 
 Se o volume familiar crescer, OCR e transcrição podem migrar para um worker assíncrono. O modelo `capture_drafts` preserva a compatibilidade dessa evolução sem alterar o livro financeiro.
