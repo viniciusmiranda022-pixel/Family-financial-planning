@@ -44,12 +44,33 @@ class ManualTransactionRequest(BaseModel):
     description: str = Field(min_length=2, max_length=500)
     amount: Decimal = Field(gt=0)
     movement_type: str = Field(
-        pattern="^(expense|income|investment|redemption|refund)$"
+        pattern="^(expense|income|investment|redemption|refund|transfer|reconciliation)$"
     )
     account_id: str
+    destination_account_id: str | None = None
     category_id: str | None = None
     category_name: str | None = Field(default=None, min_length=2, max_length=100)
+    installment_current: int | None = Field(default=None, ge=1, le=999)
+    installment_total: int | None = Field(default=None, ge=1, le=999)
     confirmed_large_amount: bool = False
+
+    @model_validator(mode="after")
+    def validate_movement_fields(self) -> "ManualTransactionRequest":
+        if self.movement_type == "transfer":
+            if not self.destination_account_id:
+                raise ValueError("Transferência exige a conta de destino")
+            if self.destination_account_id == self.account_id:
+                raise ValueError("A conta de destino precisa ser diferente da conta de origem")
+        elif self.destination_account_id is not None:
+            raise ValueError("Conta de destino só se aplica a transferências entre contas")
+        if self.installment_current is not None or self.installment_total is not None:
+            if self.movement_type != "expense":
+                raise ValueError("Parcelamento só se aplica a despesas")
+            if self.installment_current is None or self.installment_total is None:
+                raise ValueError("Informe a parcela atual e o total de parcelas juntos")
+            if self.installment_current > self.installment_total:
+                raise ValueError("A parcela atual não pode ser maior que o total de parcelas")
+        return self
 
 
 class AdvisorHistoryItem(BaseModel):
