@@ -352,6 +352,100 @@ def test_report_export_pdf_paginates_large_sections_without_dropping_rows() -> N
         assert f"Categoria Sintética {i:02d}" in full_text
 
 
+def test_report_export_xlsx_never_writes_formula_cells_for_user_controlled_text() -> None:
+    """P1 regression: `report_export.py::_write_cell` must force every
+    string value into openpyxl's plain-text data type, even one that starts
+    with `=` -- otherwise openpyxl itself auto-classifies it as a formula
+    cell (`data_type == 'f'`), and a spreadsheet client evaluates it when
+    the household opens the export. Category, account, institution and the
+    liquidity account name (`summary.liquidity_name`, a free-text household
+    setting) are all report-derived but not trusted literals -- covered
+    here end to end through the real export endpoint, not just the
+    internal helper, so a future call site that bypasses `_write_cell`
+    would also be caught.
+    """
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as client:
+            _setup_household(
+                client,
+                household_name="Família Export Injeção",
+                username="admin-export-7",
+                password="senha-export-segura-7",
+            )
+            malicious_account = _create_account(
+                client,
+                name="=HYPERLINK(\"https://evil.example\",\"clique\")",
+                institution="+2+2",
+                owner_label="@SUM(1,1)",
+            )
+            # Income smaller than the expense below so the month's
+            # `cash_net` ("Resultado") is a genuine negative number --
+            # exercising negative numeric cells alongside the malicious
+            # text, per the review's explicit ask that sanitization must
+            # never bleed into ordinary numeric values.
+            _add_income(client, account_id=malicious_account["id"], booked_at="2026-07-01", amount="10.00", description="Extra")
+            response = client.post(
+                "/api/transactions",
+                json={
+                    "booked_at": "2026-07-05",
+                    "description": "Compra",
+                    "amount": "42.42",
+                    "movement_type": "expense",
+                    "account_id": malicious_account["id"],
+                    "category_name": "=cmd|' /C calc'!A1",
+                },
+            )
+            assert response.status_code == 201
+
+            xlsx_response = client.get("/api/reports/export?end_month=2026-07&months=1&format=xlsx")
+            assert xlsx_response.status_code == 200
+            workbook = load_workbook(BytesIO(xlsx_response.content))
+
+            malicious_literals = {
+                '=HYPERLINK("https://evil.example","clique")',
+                "=cmd|' /C calc'!A1",
+            }
+            found_literals: set[str] = set()
+            for sheet in workbook.worksheets:
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        if isinstance(cell.value, str) and cell.value in malicious_literals:
+                            found_literals.add(cell.value)
+                            # The actual vulnerability: openpyxl marks a
+                            # leading "=" as data_type "f" (formula) on
+                            # assignment unless explicitly overridden --
+                            # that is what a spreadsheet client evaluates.
+                            assert cell.data_type != "f", (
+                                f"cell {cell.coordinate!r} in sheet {sheet.title!r} was serialized as a "
+                                "formula, not plain text"
+                            )
+                            # The literal text itself must still be
+                            # recoverable/visible -- sanitization must never
+                            # strip, escape or reinterpret the value.
+                            assert cell.value in malicious_literals
+
+            # Both malicious literals must actually have been found (the
+            # category on "Categorias", the account/institution on
+            # "Contas") -- otherwise this test would not be exercising the
+            # vulnerable path at all.
+            assert found_literals == malicious_literals
+
+            # Ordinary negative numeric financial values must remain real
+            # numeric cells, not get swept into text sanitization: income
+            # (10.00) minus expense (42.42) makes this month's `cash_net`
+            # ("Resultado") a genuine negative number.
+            monthly_rows = _xlsx_rows(xlsx_response.content, "Mensal")
+            _header, *data_rows = monthly_rows
+            assert data_rows[0][5] == -32.42  # cash_net column, still a float
+            monthly_sheet = workbook["Mensal"]
+            cash_net_cell = monthly_sheet.cell(row=2, column=6)
+            assert cash_net_cell.data_type == "n"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
 def test_report_export_rejects_invalid_format() -> None:
     app.dependency_overrides[get_db] = _override_get_db
     try:

@@ -185,7 +185,12 @@ Duas renderizações independentes, uma única fonte:
   de planilha de planejamento) escreve células de dado puro com formatação de apresentação apenas
   (`R$ #,##0.00`, etc.) -- nunca uma fórmula de planilha, para que o Excel nunca possa se tornar uma segunda
   fonte de verdade que recalcula um valor de forma diferente do backend. Uma aba por seção canônica:
-  Resumo, Mensal, Categorias, Contas.
+  Resumo, Mensal, Categorias, Contas. Todo valor textual (categoria, conta, instituição, o nome
+  configurável da reserva de liquidez, etc.) passa pelo único ponto de escrita de célula
+  (`_write_cell`), que força o tipo de dado openpyxl `'s'` (texto puro) mesmo quando o texto começa com
+  `=`, `+`, `-` ou `@` -- caracteres que o openpyxl, por padrão, classifica como fórmula na atribuição.
+  Isso neutraliza injeção de fórmula/DDE em texto de origem do usuário sem jamais alterar, normalizar ou
+  remover o valor exibido.
 - **PDF** (`build_report_pdf`): `pymupdf` (`Page.insert_htmlbox`, já dependência do projeto, usada também
   para leitura de PDF na importação) renderiza uma string HTML montada pelo próprio backend através do
   motor de layout nativo do PyMuPDF -- sem navegador, sem Chrome headless, sem dependência nova. É um

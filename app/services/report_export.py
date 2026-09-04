@@ -169,6 +169,38 @@ def _cell_value_and_format(field: str, value: Any) -> tuple[Any, str | None]:
     return str(value), None
 
 
+def _write_cell(
+    sheet: Worksheet,
+    *,
+    row: int,
+    column: int,
+    value: Any,
+    number_format: str | None = None,
+) -> Any:
+    """The single place that writes a value into an openpyxl cell.
+
+    A string value is always forced to openpyxl's plain-text data type
+    (`'s'`), even when it happens to start with `=`, `+`, `-`, `@` or a
+    leading tab/CR -- characters some spreadsheet clients treat as
+    introducing a formula or DDE payload (openpyxl itself auto-classifies a
+    leading `=` as a formula on assignment, which is exactly the P1 gap
+    this closes). This never touches the *value* itself -- no evaluating,
+    stripping, escaping or reinterpreting: a household-entered category,
+    account or institution name of literally `=HYPERLINK(...)` is still
+    shown to the household exactly as typed, just as inert text, never as
+    a formula. Numeric/boolean/None values are unaffected; report data is
+    never mutated (`report_export` still never computes or reclassifies a
+    financial fact -- this only controls how a cell's *type* is declared).
+    """
+
+    cell = sheet.cell(row=row, column=column, value=value)
+    if isinstance(value, str):
+        cell.data_type = "s"
+    if number_format:
+        cell.number_format = number_format
+    return cell
+
+
 def _write_table(
     sheet: Worksheet,
     *,
@@ -177,14 +209,12 @@ def _write_table(
 ) -> None:
     header_font = Font(bold=True)
     for col_index, (_field, label) in enumerate(columns, start=1):
-        cell = sheet.cell(row=1, column=col_index, value=label)
+        cell = _write_cell(sheet, row=1, column=col_index, value=label)
         cell.font = header_font
     for row_index, row in enumerate(rows, start=2):
         for col_index, (field, _label) in enumerate(columns, start=1):
             value, number_format = _cell_value_and_format(field, row.get(field))
-            cell = sheet.cell(row=row_index, column=col_index, value=value)
-            if number_format:
-                cell.number_format = number_format
+            _write_cell(sheet, row=row_index, column=col_index, value=value, number_format=number_format)
     for col_index in range(1, len(columns) + 1):
         sheet.column_dimensions[get_column_letter(col_index)].width = 20
 
@@ -199,8 +229,8 @@ def build_report_workbook(report: dict[str, Any], *, generated_at: datetime) -> 
 
     summary_sheet = workbook.active
     summary_sheet.title = "Resumo"
-    summary_sheet.cell(row=1, column=1, value="Campo").font = Font(bold=True)
-    summary_sheet.cell(row=1, column=2, value="Valor").font = Font(bold=True)
+    _write_cell(summary_sheet, row=1, column=1, value="Campo").font = Font(bold=True)
+    _write_cell(summary_sheet, row=1, column=2, value="Valor").font = Font(bold=True)
     # Excel's datetime cells cannot carry tzinfo; `generated_at` is always
     # UTC (see the caller in `app/api.py`), so the label says so explicitly
     # instead of silently presenting a naive value that looks local.
@@ -214,18 +244,18 @@ def build_report_workbook(report: dict[str, Any], *, generated_at: datetime) -> 
     ]
     row_index = 2
     for label, value, number_format in metadata_rows:
-        summary_sheet.cell(row=row_index, column=1, value=label)
-        cell = summary_sheet.cell(row=row_index, column=2, value=value)
-        if number_format:
-            cell.number_format = number_format
+        _write_cell(summary_sheet, row=row_index, column=1, value=label)
+        _write_cell(summary_sheet, row=row_index, column=2, value=value, number_format=number_format)
         row_index += 1
+    # `report["summary"]` values are not all trusted literals -- e.g.
+    # `liquidity_name` echoes back a household-chosen account name, so this
+    # must go through the same hardened `_write_cell` as every other
+    # textual value, not a raw `.cell(...)` call.
     for field, value in report.get("summary", {}).items():
         label = _SUMMARY_LABELS.get(field, field.replace("_", " ").capitalize())
         cell_value, number_format = _cell_value_and_format(field, value)
-        summary_sheet.cell(row=row_index, column=1, value=label)
-        cell = summary_sheet.cell(row=row_index, column=2, value=cell_value)
-        if number_format:
-            cell.number_format = number_format
+        _write_cell(summary_sheet, row=row_index, column=1, value=label)
+        _write_cell(summary_sheet, row=row_index, column=2, value=cell_value, number_format=number_format)
         row_index += 1
     summary_sheet.column_dimensions["A"].width = 34
     summary_sheet.column_dimensions["B"].width = 24
