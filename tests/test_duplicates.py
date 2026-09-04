@@ -112,7 +112,7 @@ def test_duplicate_group_preserves_rows_and_uses_source_precedence() -> None:
         assert authoritative.excluded is False
 
 
-def test_probable_same_document_match_does_not_auto_exclude() -> None:
+def test_probable_same_document_match_excludes_supporting_side_pending_resolution() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -120,6 +120,13 @@ def test_probable_same_document_match_does_not_auto_exclude() -> None:
         db.add(household)
         db.flush()
         account = Account(household_id=household.id, name="Conta", owner_label="Família")
+        admin = User(
+            household_id=household.id,
+            name="Admin",
+            username="admin-probable-same-document",
+            password_hash="hash",
+            is_admin=True,
+        )
         document = Document(
             household_id=household.id,
             account_id=account.id,
@@ -128,7 +135,7 @@ def test_probable_same_document_match_does_not_auto_exclude() -> None:
             sha256="c" * 64,
             encrypted_path="c.enc",
         )
-        db.add_all([account, document])
+        db.add_all([account, admin, document])
         db.flush()
         first = _transaction(household.id, account.id, document.id, 70)
         second = _transaction(household.id, account.id, document.id, 70)
@@ -142,10 +149,33 @@ def test_probable_same_document_match_does_not_auto_exclude() -> None:
 
         assert group is not None
         assert assessment.band == "probable"
+        # INV-014: confidence >= 0.60 pending resolution must keep totals
+        # single-counted. Equal source priority (both `bank_statement`)
+        # elects the first-registered row (`first`) canonical via the
+        # existing-vs-new tie-break in `_match_and_persist_group`; `second`
+        # -- the supporting side -- is excluded from totals until a human
+        # resolves the group, without either row being deleted or its
+        # `possible_duplicate` review flag skipped.
         assert first.excluded is False
-        assert second.excluded is False
+        assert second.excluded is True
         assert first.canonical_status == "unassigned"
         assert second.canonical_status == "unassigned"
+        assert first.possible_duplicate is True
+        assert second.possible_duplicate is True
+
+        resolve_duplicate_group(
+            db,
+            group_id=group.id,
+            household_id=household.id,
+            resolution="distinct",
+            user_id=admin.id,
+            reason="Compras distintas confirmadas manualmente",
+        )
+        # A human resolving the pair as genuinely distinct restores both to
+        # totals -- the automatic exclusion never destroys evidence or
+        # forecloses the "these are two real purchases" outcome.
+        assert first.excluded is False
+        assert second.excluded is False
 
 
 def test_discover_transaction_duplicates_persists_evidence_without_mutating_transactions() -> None:

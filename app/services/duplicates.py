@@ -353,6 +353,17 @@ def _match_and_persist_group(
     strong = Decimal(group.confidence) >= STRONG_THRESHOLD and bool(
         (group.signals or {}).get("strong_evidence")
     )
+    # INV-014 (docs/FINANCIAL_INVARIANTS.md): confidence >= PROBABLE_THRESHOLD
+    # (0.60) with resolution pending must have `included_in_totals = false`
+    # for the non-canonical side, regardless of whether the pair also clears
+    # the higher `strong` bar. By this point in the function confidence is
+    # already known to be >= PROBABLE_THRESHOLD (see the early return above),
+    # so `supporting` must always be excluded from totals while the group is
+    # open -- not only when `strong` -- so exactly one side of a pending
+    # pair (never zero, never both) counts until a human resolves it via
+    # `resolve_duplicate_group`. `strong` still gates the `role`/
+    # `canonical_status` *labels* ("canonical"/"supporting" vs "candidate"),
+    # which communicate certainty, not totals membership.
     member_policies = (
         (
             canonical,
@@ -364,7 +375,7 @@ def _match_and_persist_group(
             supporting,
             "supporting" if strong else "candidate",
             min(existing_priority, candidate_priority),
-            strong,
+            True,
         ),
     )
     for member, role, priority, excluded_by_policy in member_policies:

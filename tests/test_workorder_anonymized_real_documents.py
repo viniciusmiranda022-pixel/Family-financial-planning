@@ -688,11 +688,13 @@ def test_itau_pdf_exact_hash_duplicate_reimport_is_rejected_and_preserved() -> N
 
 # ---------------------------------------------------------------------------
 # 8. Probable (not exact-fingerprint) duplicate: below `assess_duplicate`'s
-#    `strong` threshold, `_match_and_persist_group` does not yet elect a
-#    canonical/supporting side -- both members are flagged
-#    `possible_duplicate`, and neither is excluded, pending human review.
-#    Same day/amount, partial description overlap, mirroring the CSV-only
-#    precedent in `tests/test_batch_import.py::
+#    `strong` threshold, `_match_and_persist_group` does not elect a
+#    "canonical"/"supporting" *label* (both members are labeled "candidate",
+#    pending human review) -- but INV-014 (docs/FINANCIAL_INVARIANTS.md)
+#    still requires the non-canonical side to be excluded from totals while
+#    confidence >= 0.60 and resolution is pending, exactly as it does for the
+#    `strong` band. Same day/amount, partial description overlap, mirroring
+#    the CSV-only precedent in `tests/test_batch_import.py::
 #    test_batch_import_probable_duplicate_stays_preserved_and_flagged`, but
 #    across two different documents of the same bank_statement import (a
 #    plausible real scenario: two consecutive monthly exports whose date
@@ -700,7 +702,7 @@ def test_itau_pdf_exact_hash_duplicate_reimport_is_rejected_and_preserved() -> N
 # ---------------------------------------------------------------------------
 
 
-def test_probable_duplicate_below_strong_threshold_flags_both_sides_without_exclusion() -> None:
+def test_probable_duplicate_below_strong_threshold_excludes_supporting_side() -> None:
     app.dependency_overrides[get_db] = _override_get_db
     try:
         with TestClient(app) as client:
@@ -747,16 +749,19 @@ def test_probable_duplicate_below_strong_threshold_flags_both_sides_without_excl
                 group = db.get(DuplicateGroup, second_transaction.duplicate_group_id)
                 assert Decimal("0.60") <= Decimal(group.confidence) < Decimal("0.85")
 
-                # Below `strong`: neither side is elected canonical yet --
-                # both are flagged pending review, and INV-014 keeps both
-                # included in totals only once a human resolves the group
-                # (`excluded` stays false for both, unlike the `strong`,
-                # exact-fingerprint case above where the supporting copy is
-                # immediately excluded).
+                # Below `strong`, neither side is labeled "canonical"/
+                # "supporting" (both stay "candidate", pending human
+                # review) -- but INV-014 still requires exactly one side to
+                # stay out of totals while confidence >= 0.60 and the group
+                # is unresolved. Equal source priority (both
+                # `bank_statement`) elects the first-imported document's
+                # transaction to stay counted; the second is the one
+                # excluded, mirroring the `strong`, exact-fingerprint case
+                # above where the supporting copy is immediately excluded.
                 assert first_transaction.possible_duplicate is True
                 assert second_transaction.possible_duplicate is True
                 assert first_transaction.excluded is False
-                assert second_transaction.excluded is False
+                assert second_transaction.excluded is True
     finally:
         app.dependency_overrides.pop(get_db, None)
 
