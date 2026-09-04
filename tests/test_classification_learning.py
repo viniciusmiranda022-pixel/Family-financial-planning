@@ -179,6 +179,91 @@ def test_local_rule_with_stale_protected_movement_type_is_ignored() -> None:
         assert result.transaction_type == "expense"
 
 
+def test_local_rule_never_applies_across_incompatible_movement_type() -> None:
+    """A rule's evidence proves its category only for the movement type it
+    was actually confirmed against (`record_confirmed_correction` keys
+    evidence by `(normalized_merchant, category_id, movement_type)`). An
+    active rule learned from expense corrections must never rewrite a
+    later positive (structurally `income`) event for the same normalized
+    merchant into an expense, and symmetrically for an income rule against
+    a negative event -- either direction would apply the rule's category
+    to a movement type it never proved. See
+    docs/WORK_ORDER_EDITABLE_MERCHANT_RULES.md, acceptance criteria 1/6."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household, admin = _household_with_admin(db)
+        expense_category = Category(household_id=household.id, name="Papelaria")
+        income_category = Category(household_id=household.id, name="Reembolsos recebidos")
+        db.add_all([expense_category, income_category])
+        db.flush()
+
+        expense_rule = None
+        for index in range(3):
+            expense_rule = record_confirmed_correction(
+                db,
+                household_id=household.id,
+                transaction_id=f"expense-{index}",
+                description="Papelaria Central",
+                category_id=expense_category.id,
+                movement_type="expense",
+            )
+        accept_classification_rule(
+            db, household_id=household.id, rule_id=expense_rule.id, user_id=admin.id
+        )
+
+        # The active expense rule applies to a genuine expense for the
+        # same merchant...
+        expense_event = classify_with_local_rules(
+            db, household_id=household.id, description="Papelaria Central", amount=-45.0
+        )
+        assert expense_event.source == "local_rule"
+        assert expense_event.category == "Papelaria"
+        assert expense_event.transaction_type == "expense"
+
+        # ...but must NOT rewrite a positive event for the same normalized
+        # description: `classify()` deterministically resolves an
+        # unrecognized positive amount to ordinary `income`, and the
+        # expense rule's evidence never proved anything about an income
+        # event.
+        income_event = classify_with_local_rules(
+            db, household_id=household.id, description="Papelaria Central", amount=45.0
+        )
+        assert income_event.source == "builtin_rule"
+        assert income_event.transaction_type == "income"
+        assert income_event.category != "Papelaria"
+
+        income_rule = None
+        for index in range(3):
+            income_rule = record_confirmed_correction(
+                db,
+                household_id=household.id,
+                transaction_id=f"income-{index}",
+                description="Cliente Consultoria",
+                category_id=income_category.id,
+                movement_type="income",
+            )
+        accept_classification_rule(
+            db, household_id=household.id, rule_id=income_rule.id, user_id=admin.id
+        )
+
+        applied_income = classify_with_local_rules(
+            db, household_id=household.id, description="Cliente Consultoria", amount=1200.0
+        )
+        assert applied_income.source == "local_rule"
+        assert applied_income.category == "Reembolsos recebidos"
+
+        # Symmetric direction: a negative event for the same normalized
+        # description must fall back to the deterministic expense
+        # classification, never inherit the income rule's category.
+        negative_event = classify_with_local_rules(
+            db, household_id=household.id, description="Cliente Consultoria", amount=-1200.0
+        )
+        assert negative_event.source == "builtin_rule"
+        assert negative_event.transaction_type == "expense"
+        assert negative_event.category != "Reembolsos recebidos"
+
+
 def test_classification_rule_lifecycle_deactivate_and_edit() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)

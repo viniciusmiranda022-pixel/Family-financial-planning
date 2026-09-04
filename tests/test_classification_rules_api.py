@@ -210,11 +210,92 @@ def test_classification_rule_lifecycle_requires_admin() -> None:
             assert edit_event.after_state["category_id"] == work_category_id
             assert edit_event.reason == "Categoria mais precisa"
             assert edit_event.user_id is not None
+            # The edit is also a governance/lifecycle reset (evidence no
+            # longer supports the new category -- see
+            # `edit_classification_rule`'s docstring): the audit record
+            # must prove that transition, not just the category change.
+            assert edit_event.before_state["status"] == "inactive"
+            assert edit_event.before_state["active"] is False
+            assert edit_event.before_state["confirmation_count"] == 3
+            assert edit_event.after_state["status"] == "observed"
+            assert edit_event.after_state["active"] is False
+            assert edit_event.after_state["confirmation_count"] == 0
 
             deactivate_event = events_by_type["classification_rule.deactivate"]
             assert deactivate_event.before_state == {"status": "active", "active": True}
             assert deactivate_event.after_state == {"status": "inactive", "active": False}
             assert deactivate_event.reason == "Regra não é mais aplicável"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_smart_capture_preview_rule_does_not_cross_movement_type() -> None:
+    """The canonical classification path (`classify_with_local_rules`, also
+    used by `/api/captures/preview`) must not let an active rule learned
+    from expense corrections apply to a positive event for the same
+    normalized merchant -- a rule's evidence proves its category only for
+    the movement type it was confirmed against. Exercised through the real
+    import/smart-capture endpoint, not only the service helper, per
+    acceptance criterion 4."""
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        household_id = _create_household_admin(
+            household_name="Família Captura Cruzada",
+            username="admin-capture-cross",
+            password="senha-local-segura",
+        )
+        category_id = _create_category(household_id, "Papelaria")
+        rule_id = _seed_pending_rule(
+            household_id,
+            description="Papelaria Central",
+            category_id=category_id,
+            movement_type="expense",
+        )
+
+        with TestClient(app) as client:
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin-capture-cross", "password": "senha-local-segura"},
+            )
+            activated = client.post(f"/api/classification-rules/{rule_id}/activate")
+            assert activated.status_code == 200
+
+            # A negative event for the same merchant takes the active
+            # expense rule's category.
+            expense_preview = client.post(
+                "/api/captures/preview",
+                data={"document_type": "bank_statement"},
+                files={
+                    "file": (
+                        "extrato-despesa.csv",
+                        b"date,title,amount\n2026-08-01,Papelaria Central,-45.00\n",
+                        "text/csv",
+                    )
+                },
+            )
+            assert expense_preview.status_code == 201
+            expense_item = expense_preview.json()["items"][0]
+            assert expense_item["category_name"] == "Papelaria"
+
+            # A positive event for the *same normalized merchant* must NOT
+            # inherit the expense rule's category: the rule never proved
+            # anything about an income event, and the deterministic
+            # classifier resolves an unrecognized positive amount to
+            # ordinary income.
+            income_preview = client.post(
+                "/api/captures/preview",
+                data={"document_type": "bank_statement"},
+                files={
+                    "file": (
+                        "extrato-receita.csv",
+                        b"date,title,amount\n2026-08-02,Papelaria Central,45.00\n",
+                        "text/csv",
+                    )
+                },
+            )
+            assert income_preview.status_code == 201
+            income_item = income_preview.json()["items"][0]
+            assert income_item["category_name"] != "Papelaria"
     finally:
         app.dependency_overrides.pop(get_db, None)
 

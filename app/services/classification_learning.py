@@ -24,6 +24,17 @@ CLASSIFICATION_RULES_VERSION = "2026.09.1"
 # allowed to override one of these structural results, or an admin-accepted
 # rule could silently defeat a financial invariant for every future
 # transaction that happens to share its normalized description.
+#
+# The same "refine category only" boundary also holds *within* the ordinary
+# income/expense space: a rule learned from confirmed corrections proves
+# only the category for the movement type it was actually confirmed
+# against. `classify_with_local_rules` therefore also requires
+# `rule.movement_type == fallback.transaction_type` for the *current* event
+# before applying it -- otherwise a rule learned from three expense
+# corrections for a merchant could rewrite a later positive (structurally
+# `income`) event for that same normalized description into an expense,
+# which is an unproven, wrong-ledger-type outcome the confirmations never
+# established.
 _INVARIANT_PROTECTED_TRANSACTION_TYPES = frozenset({"transfer", "reconciliation", "refund"})
 
 # Statuses in which an administrator may act on a rule at all: the rule has
@@ -71,6 +82,13 @@ def classify_with_local_rules(
             ClassificationRule.normalized_merchant == normalized,
             ClassificationRule.active.is_(True),
             ClassificationRule.status == "active",
+            # A rule's evidence proves its category only for the movement
+            # type it was actually confirmed against. Require it to match
+            # the deterministic fallback for *this* event so a rule learned
+            # from expense corrections never applies to a positive/income
+            # event for the same merchant, and vice-versa -- see module
+            # docstring.
+            ClassificationRule.movement_type == fallback.transaction_type,
         )
         .order_by(ClassificationRule.priority.desc(), ClassificationRule.updated_at.desc())
         .limit(1)
@@ -79,8 +97,13 @@ def classify_with_local_rules(
         rule, category_name = row
         return AppliedClassification(
             category=category_name,
-            transaction_type=rule.movement_type,
-            excluded=rule.movement_type in {"transfer", "reconciliation"},
+            # The rule only ever refines *category*: the deterministic
+            # transaction_type/excluded for this event are preserved
+            # unchanged (they are guaranteed equal to `rule.movement_type`
+            # by the query filter above, since a protected fallback already
+            # returned earlier).
+            transaction_type=fallback.transaction_type,
+            excluded=fallback.excluded,
             confidence=0.99,
             review_reason=None,
             source="local_rule",
