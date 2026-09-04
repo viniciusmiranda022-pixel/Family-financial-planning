@@ -357,17 +357,27 @@ def parse_receipt_text(
         raise CaptureParseError("Não encontrei o valor total no comprovante. Digite o valor na prévia.")
     description = _first_meaningful_line(text)
     classification_text = f"{description} {text[:2000]}"
+    # `"expense"` here is only the *guessed* direction fed to the canonical
+    # classifier below (a store/service receipt is, by construction, a
+    # negative event) -- it is not the receipt's final movement_type. The
+    # classifier's own structural result (transfer/reconciliation/refund
+    # per INV-001/002/003/004/016) must still win, exactly like
+    # `parse_text_capture` already does via `_movement_from_classification`.
+    # Discarding it and always serializing "expense" would let a receipt
+    # whose text matches a card-bill payment or refund pattern get
+    # persisted as an ordinary expense by `confirm_capture`.
     classification = _category_for_text(
         classification_text, amount, "expense", db=db, household_id=household_id
     )
+    movement_type = _movement_from_classification(classification, classification_text, False)
     warnings = [classification.review_reason] if classification.review_reason else []
     return {
         "kind": "transaction",
         "booked_at": _date_from_text(text, reference).isoformat(),
         "description": description,
         "amount": float(amount),
-        "movement_type": "expense",
-        "movement_label": MOVEMENT_LABELS["expense"],
+        "movement_type": movement_type,
+        "movement_label": MOVEMENT_LABELS[movement_type],
         "category_name": classification.category,
         "confidence": round(min(classification.confidence, 0.86), 4),
         "warnings": warnings,

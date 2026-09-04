@@ -704,3 +704,123 @@ def test_smart_capture_text_capture_patrimonial_transfer_survives_preview_and_co
             assert profile.investment_balance == Decimal("500.00")
     finally:
         app.dependency_overrides.pop(get_db, None)
+
+
+def test_smart_capture_receipt_path_reconciliation_survives_preview_and_confirm() -> None:
+    """Engineer review on `86a6aab` (P0): `parse_receipt_text()` calls the
+    same household-aware `_category_for_text()` the free-text path uses --
+    so it can return a structurally protected `Classification`
+    (`reconciliation`/`refund`/`transfer`) -- but always serialized
+    `"movement_type": "expense"`, discarding that structural result.
+    `confirm_capture()` trusts `proposal.movement_type` at persistence time,
+    so a receipt document (not the generic text path already covered by
+    `test_smart_capture_text_capture_reconciliation_survives_preview_and_confirm`)
+    would have been recorded as an ordinary expense regardless of what the
+    classifier determined.
+
+    Proves, through the real `receipt` document-type preview + confirm
+    endpoints, that the persisted transaction keeps the invariant-protected
+    `transaction_type` and stays excluded.
+    """
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        _create_household_admin(
+            household_name="Família Conciliação Recibo",
+            username="admin-receipt-reconciliation",
+            password="senha-local-segura",
+        )
+
+        with TestClient(app) as client:
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin-receipt-reconciliation", "password": "senha-local-segura"},
+            )
+            account = client.post(
+                "/api/accounts",
+                json={"name": "Nubank", "account_type": "credit_card", "owner_label": "Família"},
+            )
+            assert account.status_code == 201
+            account_id = account.json()["id"]
+
+            preview = client.post(
+                "/api/captures/preview",
+                data={
+                    "text": "COMPROVANTE\nFATURA PAGA CARTAO NUBANK\nTOTAL R$ 800,00",
+                    "account_id": account_id,
+                    "document_type": "receipt",
+                },
+            )
+            assert preview.status_code == 201
+            capture = preview.json()
+            assert capture["detected_type"] == "receipt"
+            item = capture["items"][0]
+            assert item["movement_type"] == "reconciliation"
+            assert item["category_name"] == "Conciliação"
+
+            confirmed = client.post(
+                f"/api/captures/{capture['id']}/confirm", json={"items": capture["items"]}
+            )
+            assert confirmed.status_code == 200
+            transaction_id = confirmed.json()["result"]["transactions"][0]
+
+        with _TestSessionLocal() as db:
+            transaction = db.get(Transaction, transaction_id)
+            assert transaction.transaction_type == "reconciliation"
+            assert transaction.excluded is True
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_smart_capture_receipt_path_ordinary_purchase_stays_expense() -> None:
+    """Regression guard for the fix above: an ordinary purchase receipt --
+    with no reconciliation/refund/transfer structural pattern in its text --
+    must remain a normal expense through the receipt document-type path,
+    exactly as before this fix, so the change does not overreach and start
+    reclassifying unrelated receipts.
+    """
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        _create_household_admin(
+            household_name="Família Recibo Comum",
+            username="admin-receipt-expense",
+            password="senha-local-segura",
+        )
+
+        with TestClient(app) as client:
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin-receipt-expense", "password": "senha-local-segura"},
+            )
+            account = client.post(
+                "/api/accounts",
+                json={"name": "Conta corrente", "account_type": "checking", "owner_label": "Família"},
+            )
+            assert account.status_code == 201
+            account_id = account.json()["id"]
+
+            preview = client.post(
+                "/api/captures/preview",
+                data={
+                    "text": "POSTO CENTRAL\nDATA 24/08/2026\nTOTAL A PAGAR R$ 217,35",
+                    "account_id": account_id,
+                    "document_type": "receipt",
+                },
+            )
+            assert preview.status_code == 201
+            capture = preview.json()
+            item = capture["items"][0]
+            assert item["movement_type"] == "expense"
+            assert item["category_name"] == "Transporte"
+
+            confirmed = client.post(
+                f"/api/captures/{capture['id']}/confirm", json={"items": capture["items"]}
+            )
+            assert confirmed.status_code == 200
+            transaction_id = confirmed.json()["result"]["transactions"][0]
+
+        with _TestSessionLocal() as db:
+            transaction = db.get(Transaction, transaction_id)
+            assert transaction.transaction_type == "expense"
+            assert transaction.excluded is False
+    finally:
+        app.dependency_overrides.pop(get_db, None)

@@ -134,6 +134,7 @@ def test_receipt_boleto_and_payroll_have_distinct_proposals() -> None:
     assert receipt["kind"] == "transaction"
     assert receipt["amount"] == 217.35
     assert receipt["category_name"] == "Transporte"
+    assert receipt["movement_type"] == "expense"
 
     boleto_text = (
         "ENERGIA DA RESIDÊNCIA\nVENCIMENTO 30/08/2026\n"
@@ -154,3 +155,20 @@ def test_receipt_boleto_and_payroll_have_distinct_proposals() -> None:
     assert payroll["competence"] == "2026-08-01"
     assert payroll["payment_date"] == "2026-09-05"
     assert payroll["amount"] == 4321.1
+
+
+def test_receipt_preserves_structural_reconciliation_movement() -> None:
+    """Engineer review on `86a6aab` (P0): `parse_receipt_text()` computed the
+    canonical classification through `_category_for_text()` but always
+    serialized `movement_type: "expense"`, discarding the classifier's own
+    structural `transaction_type`. A receipt whose text is structurally a
+    card-bill payment (`PAYMENT_PATTERN` -> INV-002 reconciliation) must not
+    be flattened into an ordinary expense the way an unmatched purchase
+    receipt correctly still is (see the "Transporte" case above).
+    """
+    receipt = parse_receipt_text(
+        "COMPROVANTE\nFATURA PAGA CARTAO NUBANK\nTOTAL R$ 800,00",
+        reference=date(2026, 8, 25),
+    )
+    assert receipt["movement_type"] == "reconciliation"
+    assert receipt["category_name"] == "Conciliação"
