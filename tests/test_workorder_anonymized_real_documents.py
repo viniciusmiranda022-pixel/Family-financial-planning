@@ -39,7 +39,23 @@ Coverage against the Work Order's minimum test list:
   4. a cross-format (CSV + OFX) reimport of the same real-world movement,
      proving non-destructive duplicate handling (INV-014/INV-015);
   5. malformed input proving no raw content leaks into the response;
-  6. household isolation reaching API + persistence.
+  6. household isolation reaching API + persistence;
+  7. a byte-identical PDF reimport, rejected against the already-persisted
+     document (the cross-format case above proves the *derived-evidence*
+     duplicate path; this one is the exact-hash path, still previously
+     untested for the PDF format specifically -- only CSV/OFX had it, in
+     `tests/test_batch_import.py`);
+  8. a *probable* (not exact-fingerprint) duplicate, below the `strong`
+     threshold -- the cross-format case above only reaches the `strong`
+     band (identical fingerprint), which resolves to a canonical/supporting
+     split; this exercises the different code path INV-014's own text
+     names explicitly ("confiança a partir de 0,60"): neither side is
+     elected canonical yet, so both are flagged pending review and neither
+     is excluded from totals;
+  9. a textual PDF carrying none of the three supported issuers' own
+     identity markers (distinct from #5's unparseable-bytes case: this one
+     *is* a well-formed PDF, and reaches `_detect_pdf_issuer` returning
+     `"unknown"` rather than `_pdf_text` itself failing).
 """
 
 import os
@@ -617,5 +633,176 @@ def test_household_isolation_for_credit_card_and_payroll_imports() -> None:
                 # reachable by its own id.
                 assert db.get(Document, card_document_id).household_id == owner["household_id"]
                 assert db.get(Document, payroll_document_id).household_id == owner["household_id"]
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+# ---------------------------------------------------------------------------
+# 7. Exact-hash PDF reimport: the same byte-identical duplicate-file check
+#    `tests/test_batch_import.py` already proves for CSV/OFX, exercised here
+#    for the PDF format specifically -- this pipeline stage hashes the raw
+#    upload before any parsing happens, so it is format-agnostic by
+#    construction, but nothing before this Work Order proved that for a PDF.
+# ---------------------------------------------------------------------------
+
+
+def test_itau_pdf_exact_hash_duplicate_reimport_is_rejected_and_preserved() -> None:
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as client:
+            _setup_household(
+                client,
+                household_name="Família Extrato Duplicado",
+                username="admin-extrato-duplicado",
+                password="senha-extrato-duplicado-1",
+            )
+            account = _create_account(client)
+            payload = fx.itau_bank_statement_pdf()
+
+            first = client.post(
+                "/api/imports",
+                data={"account_id": account["id"], "document_type": "bank_statement"},
+                files={"file": ("extrato.pdf", payload, "application/pdf")},
+            )
+            assert first.status_code == 201
+            first_document_id = first.json()["document_id"]
+
+            second = client.post(
+                "/api/imports",
+                data={"account_id": account["id"], "document_type": "bank_statement"},
+                files={"file": ("extrato-reenviado.pdf", payload, "application/pdf")},
+            )
+            assert second.status_code == 409
+            assert second.json()["detail"] == "Este arquivo já foi importado"
+
+            with _TestSessionLocal() as db:
+                documents = db.scalars(select(Document).where(Document.account_id == account["id"])).all()
+                assert [doc.id for doc in documents] == [first_document_id]
+                transactions = db.scalars(
+                    select(Transaction).where(Transaction.document_id == first_document_id)
+                ).all()
+                assert len(transactions) == 3
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+# ---------------------------------------------------------------------------
+# 8. Probable (not exact-fingerprint) duplicate: below `assess_duplicate`'s
+#    `strong` threshold, `_match_and_persist_group` does not yet elect a
+#    canonical/supporting side -- both members are flagged
+#    `possible_duplicate`, and neither is excluded, pending human review.
+#    Same day/amount, partial description overlap, mirroring the CSV-only
+#    precedent in `tests/test_batch_import.py::
+#    test_batch_import_probable_duplicate_stays_preserved_and_flagged`, but
+#    across two different documents of the same bank_statement import (a
+#    plausible real scenario: two consecutive monthly exports whose date
+#    ranges overlap by a day).
+# ---------------------------------------------------------------------------
+
+
+def test_probable_duplicate_below_strong_threshold_flags_both_sides_without_exclusion() -> None:
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as client:
+            _setup_household(
+                client,
+                household_name="Família Duplicidade Provável",
+                username="admin-duplicidade-provavel",
+                password="senha-duplicidade-provavel-1",
+            )
+            account = _create_account(client)
+
+            first_csv = _csv("2026-08-05,Compra Padaria Central,-85.40\n")
+            second_csv = _csv("2026-08-05,Compra Padaria Bairro,-85.40\n")
+
+            first = client.post(
+                "/api/imports",
+                data={"account_id": account["id"], "document_type": "bank_statement"},
+                files={"file": ("extrato-a.csv", first_csv, "text/csv")},
+            )
+            assert first.status_code == 201
+            first_document_id = first.json()["document_id"]
+
+            second = client.post(
+                "/api/imports",
+                data={"account_id": account["id"], "document_type": "bank_statement"},
+                files={"file": ("extrato-b.csv", second_csv, "text/csv")},
+            )
+            assert second.status_code == 201
+            second_body = second.json()
+            assert second_body["status"] == "imported_with_review"
+            second_document_id = second_body["document_id"]
+
+            with _TestSessionLocal() as db:
+                transactions = db.scalars(
+                    select(Transaction).where(Transaction.account_id == account["id"])
+                ).all()
+                # Both purchases preserved -- neither merged nor deleted.
+                assert len(transactions) == 2
+                by_document = {t.document_id: t for t in transactions}
+                first_transaction = by_document[first_document_id]
+                second_transaction = by_document[second_document_id]
+
+                assert first_transaction.duplicate_group_id == second_transaction.duplicate_group_id
+                group = db.get(DuplicateGroup, second_transaction.duplicate_group_id)
+                assert Decimal("0.60") <= Decimal(group.confidence) < Decimal("0.85")
+
+                # Below `strong`: neither side is elected canonical yet --
+                # both are flagged pending review, and INV-014 keeps both
+                # included in totals only once a human resolves the group
+                # (`excluded` stays false for both, unlike the `strong`,
+                # exact-fingerprint case above where the supporting copy is
+                # immediately excluded).
+                assert first_transaction.possible_duplicate is True
+                assert second_transaction.possible_duplicate is True
+                assert first_transaction.excluded is False
+                assert second_transaction.excluded is False
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+# ---------------------------------------------------------------------------
+# 9. Unsupported-issuer PDF via the real API: a well-formed textual PDF that
+#    parses fine as *text* but carries none of the three supported issuers'
+#    own identity markers. `_detect_pdf_issuer` resolves this as "unknown"
+#    and `parse_credit_card_pdf`/`parse_bank_statement_pdf` reject it for
+#    review -- already proven at the parser level in
+#    `tests/test_pdf_parsers.py`, but never through the actual import
+#    endpoint, and never checked for a content leak into the response.
+# ---------------------------------------------------------------------------
+
+
+def test_unsupported_issuer_pdf_via_api_is_review_required_without_content_leak() -> None:
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as client:
+            _setup_household(
+                client,
+                household_name="Família Emissor Não Suportado",
+                username="admin-emissor-nao-suportado",
+                password="senha-emissor-nao-suportado-1",
+            )
+            account = _create_account(client)
+
+            response = client.post(
+                "/api/imports",
+                data={"account_id": account["id"], "document_type": "bank_statement"},
+                files={
+                    "file": (
+                        "extrato-desconhecido.pdf",
+                        fx.unsupported_issuer_bank_statement_pdf(),
+                        "application/pdf",
+                    )
+                },
+            )
+            assert response.status_code == 201
+            body = response.json()
+            assert body["status"] == "review_required"
+            assert body["records"] == 0
+            assert body["reconciliation"]["status"] == "unknown"
+            rendered = str(body)
+            assert "Banco Delta" not in rendered
+            assert "Compra Loja Delta" not in rendered
+            assert "120,00" not in rendered
     finally:
         app.dependency_overrides.pop(get_db, None)
