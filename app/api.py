@@ -2079,6 +2079,16 @@ def _import_one_document(
     can never remove a pre-existing or already-committed sibling document's
     artifact. The caller's own `db.rollback()` still applies to the `Document`
     row itself; this only keeps the filesystem consistent with it.
+
+    The failure is logged with `logger.error` (never `logger.exception`/
+    `exc_info=True`) and only fixed identifiers -- `document.id`,
+    `document_type`, a constant `unexpected_error` category. An unexpected
+    exception raised from parsing/classification/storage code can
+    legitimately carry request-derived text (a merchant description, a
+    filename fragment, parser detail) in `str(exc)` or its traceback, and
+    the Work Order forbids raw financial content/PII in logs; this never
+    serializes the exception object, its message or its traceback, so
+    there is nothing here for that content to leak through.
     """
 
     document = Document(
@@ -2098,9 +2108,8 @@ def _import_one_document(
         )
     except Exception:
         EncryptedDocumentStore().delete(document.encrypted_path)
-        logger.exception(
-            "import.unexpected_failure document_id=%s document_type=%s -- encrypted artifact removed, "
-            "no Document row committed for it",
+        logger.error(
+            "import.unexpected_failure document_id=%s document_type=%s error_category=unexpected_error",
             document.id,
             document_type,
         )
@@ -2538,9 +2547,10 @@ async def import_documents_batch(
             # the shared `Session` for the files still to come, and must not
             # leak file content/PII -- only a safe, generic category and this
             # file's index are recorded, exactly the Work Order's error-safety
-            # requirement. The failure is still visible to operators through
-            # normal server-side exception logging (stack trace, no request
-            # body) outside of this response.
+            # requirement. `_import_one_document` already logs this failure
+            # server-side for operators, deliberately without the exception's
+            # own message or traceback (see its docstring) -- neither this
+            # response nor that log line ever carries request-derived text.
             db.rollback()
             results.append(
                 _batch_item_result(

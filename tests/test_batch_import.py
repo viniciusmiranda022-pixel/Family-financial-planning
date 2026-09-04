@@ -606,13 +606,110 @@ def test_batch_import_unexpected_failure_after_encrypted_save_leaves_no_orphaned
 
             # The unexpected failure actually reached the server-side logs
             # (previously swallowed silently by `except Exception`), without
-            # leaking file content/description into the log message itself.
+            # leaking file content/description anywhere in the fully rendered
+            # log output -- `caplog.text` renders each record's message *and*
+            # any attached exception/traceback, not just `getMessage()` (which
+            # would miss a leak riding along in `exc_info`).
             failure_logs = [r for r in caplog.records if "import.unexpected_failure" in r.getMessage()]
             assert failure_logs, "expected the unexpected failure to be logged server-side"
-            for record in failure_logs:
-                rendered = record.getMessage()
-                assert "GATILHO" not in rendered
-                assert "orfao.csv" not in rendered
+            assert not any(r.exc_info for r in failure_logs), (
+                "the failure must be logged without attaching the raw exception/traceback"
+            )
+            assert "GATILHO" not in caplog.text
+            assert "orfao.csv" not in caplog.text
+            assert "falha simulada" not in caplog.text
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_batch_import_unexpected_failure_log_never_leaks_exception_content(monkeypatch, caplog) -> None:
+    """Regression for the second blocking privacy finding: `logger.exception`
+    (or any logging call using `exc_info=True`) would serialize the raw
+    exception object and its traceback -- which can legitimately carry
+    request-derived text (a description, a filename, parsed content) -- into
+    the log output even though the log *message* itself only names safe
+    identifiers. This plants a synthetic secret/financial marker inside the
+    exception's own message and proves it does not survive into the fully
+    rendered captured log output (message *and* any traceback/exc_info),
+    while still preserving the no-orphan and sibling-isolation guarantees.
+    """
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as client:
+            household = _setup_household(
+                client,
+                household_name="Família Segredo No Log",
+                username="admin-lote-segredo",
+                password="senha-lote-segura-segredo",
+            )
+            account = _create_account(client)
+
+            secret_marker = "SEGREDO-FINANCEIRO-CONTA-99887766-NAO-VAZAR"
+            original_classify = api_module.classify_with_local_rules
+
+            def _boom_with_secret(db, *, household_id, description, amount, internal_aliases):
+                if "GATILHO SEGREDO" in description.upper():
+                    # The exception's own message embeds request-derived
+                    # content, exactly the shape the review warned about --
+                    # a real parser/classifier bug could just as easily put a
+                    # merchant description or account fragment here.
+                    raise RuntimeError(f"falha ao processar valor ligado a {secret_marker}")
+                return original_classify(
+                    db,
+                    household_id=household_id,
+                    description=description,
+                    amount=amount,
+                    internal_aliases=internal_aliases,
+                )
+
+            monkeypatch.setattr(api_module, "classify_with_local_rules", _boom_with_secret)
+
+            good_csv = _csv("2026-08-01,Mercado,120.50\n")
+            crashing_csv = _csv("2026-08-02,GATILHO SEGREDO,10.00\n")
+
+            documents_dir = api_module.settings.documents_dir
+            artifacts_before = {p.name for p in documents_dir.iterdir()} if documents_dir.exists() else set()
+
+            with caplog.at_level(logging.DEBUG):
+                response = client.post(
+                    "/api/imports/batch",
+                    data={"account_id": account["id"], "document_type": "bank_statement"},
+                    files=[
+                        ("files", ("boa.csv", good_csv, "text/csv")),
+                        ("files", ("segredo.csv", crashing_csv, "text/csv")),
+                    ],
+                )
+            assert response.status_code == 201
+            good_result, crash_result = response.json()["results"]
+            assert good_result["status"] in {"imported", "imported_with_review"}
+            assert crash_result["error_category"] == "unexpected_error"
+            assert crash_result["document_id"] is None
+            assert secret_marker not in crash_result["message"]
+
+            # The fully rendered captured log output -- every record's own
+            # message plus any exception/traceback formatting attached to it
+            # -- must not contain the secret, the trigger phrase, the
+            # filename, or the raw exception's message, anywhere.
+            assert secret_marker not in caplog.text
+            assert "GATILHO SEGREDO" not in caplog.text
+            assert "segredo.csv" not in caplog.text
+            assert "falha ao processar valor" not in caplog.text
+            # No record for this failure carries exc_info/traceback at all --
+            # not merely "the traceback happens not to contain the marker".
+            assert not any(r.exc_info for r in caplog.records)
+
+            with _TestSessionLocal() as db:
+                documents = db.scalars(
+                    select(Document).where(Document.household_id == household["household_id"])
+                ).all()
+                assert [doc.original_name for doc in documents] == ["boa.csv"]
+                surviving_encrypted_path = documents[0].encrypted_path
+
+            artifacts_after = {p.name for p in documents_dir.iterdir()}
+            new_artifacts = artifacts_after - artifacts_before
+            assert new_artifacts == {Path(surviving_encrypted_path).name}
+            assert Path(surviving_encrypted_path).is_file()
     finally:
         app.dependency_overrides.pop(get_db, None)
 
