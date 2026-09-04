@@ -19,6 +19,7 @@ This module gives itself a fully isolated database via a FastAPI
 
 import os
 import uuid
+from decimal import Decimal
 
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
@@ -32,7 +33,14 @@ os.environ.setdefault("DATA_DIR", f"/tmp/ffp-classification-rules-api-data-{uuid
 
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import AuditEvent, Category, Household, User  # noqa: E402
+from app.models import (  # noqa: E402
+    AuditEvent,
+    Category,
+    FinancialProfile,
+    Household,
+    Transaction,
+    User,
+)
 from app.security import hash_password  # noqa: E402
 from app.services.classification_learning import record_confirmed_correction  # noqa: E402
 
@@ -470,5 +478,229 @@ def test_smart_capture_preview_uses_active_household_rule() -> None:
             )
             assert preview_after.status_code == 201
             assert preview_after.json()["items"][0]["category_name"] != "Assinaturas do escritório"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_smart_capture_confirm_preserves_active_income_rule_category() -> None:
+    """Engineer review on `df37ee5` (P0): an active household income rule
+    was applied by `POST /api/captures/preview` but silently discarded by
+    `POST /api/captures/{id}/confirm`, whose income branch hardcoded
+    `category_for(db, household_id, "Receitas")` and ignored
+    `proposal.category_id`/`proposal.category_name`, unlike the expense
+    branch. The persisted `Transaction` is the financial fact; a
+    preview-only effect proves nothing about the system's real behavior.
+
+    Proves, round-tripping the exact preview items through confirm exactly
+    as the real client does:
+    1. an active income-typed rule's category survives confirmation instead
+       of being overwritten by the removed "Receitas" shortcut;
+    2. an income event with no matching active rule persists with the
+       canonical classifier's own conservative "Revisar" category -- an
+       unmatched proposal must not be silently promoted to any rule's
+       category, nor to "Receitas".
+    """
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        household_id = _create_household_admin(
+            household_name="Família Confirmação Receita",
+            username="admin-confirm-income",
+            password="senha-local-segura",
+        )
+        income_category_id = _create_category(household_id, "Consultoria recorrente")
+        rule_id = _seed_pending_rule(
+            household_id,
+            description="Recebi 500 de Consultoria Alfa",
+            category_id=income_category_id,
+            movement_type="income",
+        )
+
+        with TestClient(app) as client:
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin-confirm-income", "password": "senha-local-segura"},
+            )
+            account = client.post(
+                "/api/accounts",
+                json={"name": "Conta corrente", "account_type": "checking", "owner_label": "Família"},
+            )
+            assert account.status_code == 201
+            account_id = account.json()["id"]
+
+            assert client.post(f"/api/classification-rules/{rule_id}/activate").status_code == 200
+
+            preview = client.post(
+                "/api/captures/preview",
+                data={
+                    "text": "Recebi 500 de Consultoria Alfa",
+                    "account_id": account_id,
+                    "document_type": "auto",
+                },
+            )
+            assert preview.status_code == 201
+            capture = preview.json()
+            item = capture["items"][0]
+            assert item["movement_type"] == "income"
+            assert item["category_name"] == "Consultoria recorrente"
+
+            confirmed = client.post(
+                f"/api/captures/{capture['id']}/confirm", json={"items": capture["items"]}
+            )
+            assert confirmed.status_code == 200
+            transaction_id = confirmed.json()["result"]["transactions"][0]
+
+            unmatched_preview = client.post(
+                "/api/captures/preview",
+                data={
+                    "text": "Recebi 300 de Cliente Desconhecido",
+                    "account_id": account_id,
+                    "document_type": "auto",
+                },
+            )
+            assert unmatched_preview.status_code == 201
+            unmatched_capture = unmatched_preview.json()
+            unmatched_item = unmatched_capture["items"][0]
+            assert unmatched_item["movement_type"] == "income"
+            assert unmatched_item["category_name"] == "Revisar"
+
+            unmatched_confirmed = client.post(
+                f"/api/captures/{unmatched_capture['id']}/confirm",
+                json={"items": unmatched_capture["items"]},
+            )
+            assert unmatched_confirmed.status_code == 200
+            unmatched_transaction_id = unmatched_confirmed.json()["result"]["transactions"][0]
+
+        with _TestSessionLocal() as db:
+            transaction = db.get(Transaction, transaction_id)
+            assert transaction.transaction_type == "income"
+            assert transaction.category_id == income_category_id
+
+            unmatched_transaction = db.get(Transaction, unmatched_transaction_id)
+            assert unmatched_transaction.transaction_type == "income"
+            unmatched_category = db.get(Category, unmatched_transaction.category_id)
+            assert unmatched_category.name == "Revisar"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_smart_capture_text_capture_reconciliation_survives_preview_and_confirm() -> None:
+    """Engineer review on `df37ee5` (P0): `_category_for_text()` classified
+    free text through the canonical classifier but discarded its structural
+    `transaction_type`/`excluded`, so `parse_text_capture()` kept whatever
+    the separate, narrower `_movement_type()` regex guessed instead. A
+    card-bill payment description that regex guesses as ordinary "expense"
+    is exactly the invariant-protected "reconciliation" movement (INV-002)
+    the canonical classifier itself already recognizes (`PAYMENT_PATTERN`).
+    Silently keeping the regex guess would let a free-text capture record a
+    card payment as an ordinary expense.
+
+    Proves, through the real text-capture preview + confirm endpoints, that
+    the persisted transaction keeps the invariant-protected `transaction_type`
+    and stays excluded, and is not counted as an ordinary expense.
+    """
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        _create_household_admin(
+            household_name="Família Conciliação Texto",
+            username="admin-text-reconciliation",
+            password="senha-local-segura",
+        )
+
+        with TestClient(app) as client:
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin-text-reconciliation", "password": "senha-local-segura"},
+            )
+            account = client.post(
+                "/api/accounts",
+                json={"name": "Nubank", "account_type": "credit_card", "owner_label": "Família"},
+            )
+            assert account.status_code == 201
+            account_id = account.json()["id"]
+
+            preview = client.post(
+                "/api/captures/preview",
+                data={
+                    "text": "Fatura paga do cartão Nubank, R$ 800",
+                    "account_id": account_id,
+                    "document_type": "auto",
+                },
+            )
+            assert preview.status_code == 201
+            capture = preview.json()
+            item = capture["items"][0]
+            assert item["movement_type"] == "reconciliation"
+            assert item["category_name"] == "Conciliação"
+
+            confirmed = client.post(
+                f"/api/captures/{capture['id']}/confirm", json={"items": capture["items"]}
+            )
+            assert confirmed.status_code == 200
+            transaction_id = confirmed.json()["result"]["transactions"][0]
+
+        with _TestSessionLocal() as db:
+            transaction = db.get(Transaction, transaction_id)
+            assert transaction.transaction_type == "reconciliation"
+            assert transaction.excluded is True
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_smart_capture_text_capture_patrimonial_transfer_survives_preview_and_confirm() -> None:
+    """Same P0 as above, for the "transfer" structural outcome: free text
+    naming an investment product (e.g. "Privilège DI") without any of the
+    explicit investir/aplicar/resgatar verbs `_movement_type()` recognizes
+    still matches the canonical classifier's own patrimonial-transfer
+    pattern. That structural result must not be silently discarded into an
+    ordinary expense either.
+    """
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        household_id = _create_household_admin(
+            household_name="Família Transferência Texto",
+            username="admin-text-transfer",
+            password="senha-local-segura",
+        )
+
+        with TestClient(app) as client:
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin-text-transfer", "password": "senha-local-segura"},
+            )
+            account = client.post(
+                "/api/accounts",
+                json={"name": "Conta corrente", "account_type": "checking", "owner_label": "Família"},
+            )
+            assert account.status_code == 201
+            account_id = account.json()["id"]
+
+            preview = client.post(
+                "/api/captures/preview",
+                data={
+                    "text": "500 no Privilege DI",
+                    "account_id": account_id,
+                    "document_type": "auto",
+                },
+            )
+            assert preview.status_code == 201
+            capture = preview.json()
+            item = capture["items"][0]
+            assert item["movement_type"] == "investment"
+            assert item["category_name"] == "Transferência patrimonial"
+
+            confirmed = client.post(
+                f"/api/captures/{capture['id']}/confirm", json={"items": capture["items"]}
+            )
+            assert confirmed.status_code == 200
+            transaction_id = confirmed.json()["result"]["transactions"][0]
+
+        with _TestSessionLocal() as db:
+            transaction = db.get(Transaction, transaction_id)
+            assert transaction.transaction_type == "transfer"
+            assert transaction.excluded is True
+            profile = db.scalar(
+                select(FinancialProfile).where(FinancialProfile.household_id == household_id)
+            )
+            assert profile.investment_balance == Decimal("500.00")
     finally:
         app.dependency_overrides.pop(get_db, None)

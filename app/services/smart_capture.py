@@ -221,16 +221,25 @@ def _category_for_text(
     *,
     db: "Session | None" = None,
     household_id: str | None = None,
-) -> tuple[str, float, list[str]]:
+) -> Classification:
+    """Classify free-captured text through the one canonical, household-aware path.
+
+    Returns the full `Classification` -- not just a category -- so callers
+    can honor its structural `transaction_type`/`excluded`, exactly like
+    `_parsed_transaction_item` already does for document-parsed rows.
+    Discarding those and keeping only the category would leave two
+    financial-movement policies alive: this classifier's own structural
+    determination, and the caller's independent guess.
+    """
     # `investment`/`redemption`/`refund` are structural outcomes the
     # deterministic classifier itself protects (INV-003/INV-004/INV-016) --
     # they are not "ordinary income/expense" in the sense
     # docs/FINANCIAL_RULES.md uses, so a household merchant rule must never
     # be consulted for them; the fixed category is correct here.
     if movement_type in {"investment", "redemption"}:
-        return "Transferência patrimonial", 0.99, []
+        return Classification("Transferência patrimonial", "transfer", True, 0.99)
     if movement_type == "refund":
-        return "Reembolsos e estornos", 0.94, []
+        return Classification("Reembolsos e estornos", "refund", False, 0.94)
     # Ordinary income and ordinary expense are both "common income/expense
     # classification" per docs/FINANCIAL_RULES.md and must both go through
     # the one canonical, household-aware path (`_classify`, which defers to
@@ -241,9 +250,31 @@ def _category_for_text(
     # the deterministic fallback carries the movement's direction: positive
     # for income, negative for expense.
     signed_amount = abs(amount) if movement_type == "income" else -abs(amount)
-    classification = _classify(text, float(signed_amount), db=db, household_id=household_id)
-    warnings = [classification.review_reason] if classification.review_reason else []
-    return classification.category, classification.confidence, warnings
+    return _classify(text, float(signed_amount), db=db, household_id=household_id)
+
+
+def _movement_from_classification(
+    classification: Classification, description: str, is_credit: bool
+) -> str:
+    """Map a canonical `Classification`'s structural result to a capture movement_type.
+
+    This is the one place that mapping happens for every capture path --
+    document parsing and free text alike -- so it cannot silently drift
+    into two different policies (docs/WORK_ORDER_EDITABLE_MERCHANT_RULES.md:
+    "no second classification policy"). `is_credit` is the sign of the
+    amount that was actually fed to the classifier (positive for income,
+    negative for expense), not a separate guess.
+    """
+    if classification.transaction_type == "refund":
+        return "refund"
+    if classification.transaction_type == "reconciliation":
+        return "reconciliation"
+    if classification.transaction_type == "transfer":
+        if classification.category == "Transferência patrimonial":
+            normalized = normalize_description(description)
+            return "redemption" if is_credit and "RESGATE" in normalized else "investment"
+        return "transfer"
+    return "income" if is_credit else "expense"
 
 
 def parse_text_capture(
@@ -258,11 +289,29 @@ def parse_text_capture(
     candidates = _money_candidates(cleaned, allow_shorthand=True)
     if not candidates:
         raise CaptureParseError("Não encontrei um valor. Exemplo: ‘Gastei R$ 150 com combustível’. ")
-    movement_type = _movement_type(cleaned)
+    guessed_movement_type = _movement_type(cleaned)
     amount = candidates[0][0]
-    category, confidence, warnings = _category_for_text(
-        cleaned, amount, movement_type, db=db, household_id=household_id
-    )
+    classification = _category_for_text(cleaned, amount, guessed_movement_type, db=db, household_id=household_id)
+    category = classification.category
+    confidence = classification.confidence
+    warnings = [classification.review_reason] if classification.review_reason else []
+    # `guessed_movement_type` (a plain keyword regex) only decided which
+    # sign to feed the canonical classifier above, and short-circuited the
+    # investment/redemption/refund cases it recognizes on its own. For the
+    # remaining ordinary income/expense guess, the classifier's own
+    # structural `transaction_type` is authoritative and may reclassify the
+    # text into an invariant-protected movement (reconciliation/refund/
+    # transfer) the regex guess never considered -- e.g. "Fatura paga do
+    # cartão Nubank" guesses "expense" but is a card-bill reconciliation
+    # (INV-002). Silently keeping the regex guess here would resurrect the
+    # exact "second classification policy" this canonical path exists to
+    # eliminate.
+    if guessed_movement_type in {"income", "expense"}:
+        movement_type = _movement_from_classification(
+            classification, cleaned, guessed_movement_type == "income"
+        )
+    else:
+        movement_type = guessed_movement_type
     if len(candidates) > 1:
         confidence = min(confidence, 0.62)
         warnings.append("Encontrei mais de um valor; confirme o valor correto antes de gravar")
@@ -308,9 +357,10 @@ def parse_receipt_text(
         raise CaptureParseError("Não encontrei o valor total no comprovante. Digite o valor na prévia.")
     description = _first_meaningful_line(text)
     classification_text = f"{description} {text[:2000]}"
-    category, confidence, warnings = _category_for_text(
+    classification = _category_for_text(
         classification_text, amount, "expense", db=db, household_id=household_id
     )
+    warnings = [classification.review_reason] if classification.review_reason else []
     return {
         "kind": "transaction",
         "booked_at": _date_from_text(text, reference).isoformat(),
@@ -318,8 +368,8 @@ def parse_receipt_text(
         "amount": float(amount),
         "movement_type": "expense",
         "movement_label": MOVEMENT_LABELS["expense"],
-        "category_name": category,
-        "confidence": round(min(confidence, 0.86), 4),
+        "category_name": classification.category,
+        "confidence": round(min(classification.confidence, 0.86), 4),
         "warnings": warnings,
         "selected": True,
     }
@@ -390,18 +440,8 @@ def _parsed_transaction_item(
     db: "Session | None" = None,
     household_id: str | None = None,
 ) -> dict:
-    movement = "income" if item.amount > 0 else "expense"
     classification = _classify(item.description, float(item.amount), db=db, household_id=household_id)
-    if classification.transaction_type == "refund":
-        movement = "refund"
-    elif classification.transaction_type == "reconciliation":
-        movement = "reconciliation"
-    elif classification.transaction_type == "transfer":
-        normalized = normalize_description(item.description)
-        if classification.category == "Transferência patrimonial":
-            movement = "redemption" if item.amount > 0 and "RESGATE" in normalized else "investment"
-        else:
-            movement = "transfer"
+    movement = _movement_from_classification(classification, item.description, item.amount > 0)
     category = classification.category
     return {
         "kind": "transaction",

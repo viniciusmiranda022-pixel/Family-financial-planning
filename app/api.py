@@ -2684,7 +2684,26 @@ def confirm_capture(
                 else:
                     category = category_for(db, user.household_id, proposal.category_name or "Revisar")
             elif movement_type == "income":
-                category = category_for(db, user.household_id, "Receitas")
+                # Mirror the expense branch: the canonical classification
+                # proposal (`parse_text_capture`/`_parsed_transaction_item`,
+                # both household-rule-aware via `classify_with_local_rules`)
+                # may have selected a category other than "Receitas" for an
+                # active household income rule. Confirmation is the
+                # persisted financial fact, so it must not silently discard
+                # that in favor of a hardcoded default -- an unmatched
+                # proposal already falls back to the classifier's own
+                # conservative "Revisar" category, not "Receitas".
+                if proposal.category_id:
+                    category = db.scalar(
+                        select(Category).where(
+                            Category.id == proposal.category_id,
+                            Category.household_id == user.household_id,
+                        )
+                    )
+                    if not category:
+                        raise HTTPException(status_code=422, detail="Categoria inválida")
+                else:
+                    category = category_for(db, user.household_id, proposal.category_name or "Revisar")
             elif movement_type in {"investment", "redemption"}:
                 transaction_type = "transfer"
                 excluded = True

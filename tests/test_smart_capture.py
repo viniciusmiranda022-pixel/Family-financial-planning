@@ -63,6 +63,38 @@ def test_natural_language_investment_is_not_classified_as_spending() -> None:
     assert item["category_name"] == "Transferência patrimonial"
 
 
+def test_natural_language_card_payment_is_reconciliation_not_expense() -> None:
+    """`_movement_type()`'s plain keyword regex has no notion of "card-bill
+    payment" and defaults such text to "expense". The canonical classifier
+    (`classify()`/`PAYMENT_PATTERN`) does recognize it as the
+    invariant-protected "reconciliation" movement (INV-002), and
+    `parse_text_capture` must honor that structural result instead of the
+    narrower regex guess -- otherwise a card payment typed as free text
+    would be recorded as an ordinary expense."""
+    item = parse_text_capture(
+        "Fatura paga do cartão Nubank, R$ 800",
+        reference=date(2026, 8, 25),
+    )
+    assert item["amount"] == 800.0
+    assert item["movement_type"] == "reconciliation"
+    assert item["category_name"] == "Conciliação"
+
+
+def test_natural_language_fund_name_without_verb_is_still_patrimonial_transfer() -> None:
+    """A description naming an investment product by brand (e.g. "Privilège
+    DI") without any of the investir/aplicar/resgatar verbs
+    `_movement_type()` looks for still matches the canonical classifier's
+    own patrimonial-transfer pattern and must not fall back to the regex's
+    default "expense" guess."""
+    item = parse_text_capture(
+        "500 no Privilege DI",
+        reference=date(2026, 8, 25),
+    )
+    assert item["amount"] == 500.0
+    assert item["movement_type"] == "investment"
+    assert item["category_name"] == "Transferência patrimonial"
+
+
 def test_text_and_audio_default_to_message_capture() -> None:
     result = preview_capture(
         text="Recebi R$ 1.200 de comissão hoje",
