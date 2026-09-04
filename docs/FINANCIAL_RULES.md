@@ -204,8 +204,16 @@
   (`PATCH /classification-rules/{id}`); `movement_type` nunca é editável por essa via porque é herdado,
   no momento da correção confirmada, do `transaction_type` já atribuído deterministicamente à transação
   (o schema de atualização de transação não expõe `transaction_type`), nunca uma escolha livre do
-  usuário. Toda ativação, desativação e edição é registrada na trilha de auditoria existente com ator,
-  estado anterior/posterior e motivo.
+  usuário. Como `confirmation_count`/`evidence` provam apenas o resultado `(estabelecimento normalizado,
+  category_id, movement_type)` para o qual foram registrados, uma edição que muda `category_id` nunca
+  herda a contagem/evidência da categoria anterior como prova da nova: ela zera `confirmation_count`,
+  volta `status` para `observed` e `active` para `false`, e limpa `accepted_at`/`accepted_by` — a regra
+  editada precisa acumular suas próprias três correções confirmadas e distintas e uma nova aceitação
+  explícita do administrador antes de valer novamente, exatamente como uma regra nova. A evidência
+  anterior nunca é apagada ou sobrescrita; fica preservada em `evidence["history"]` para auditoria. Toda
+  ativação, desativação e edição é registrada na trilha de auditoria existente com ator, estado
+  anterior/posterior (inclusive o estado anterior da ativação, `pending_acceptance`/`active=false`) e
+  motivo.
 - Precedência determinística: uma regra local de estabelecimento só pode refinar a *categoria* de uma
   classificação comum de receita/despesa. Ela nunca pode substituir uma classificação estrutural do
   classificador determinístico — transferência interna (INV-001), pagamento/conciliação de fatura

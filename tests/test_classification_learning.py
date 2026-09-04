@@ -206,18 +206,11 @@ def test_classification_rule_lifecycle_deactivate_and_edit() -> None:
         with pytest.raises(ValueError):
             deactivate_classification_rule(db, household_id=household.id, rule_id=rule.id)
 
-        edited = edit_classification_rule(
-            db, household_id=household.id, rule_id=rule.id, category_id=corrected_category.id
-        )
-        assert edited.category_id == corrected_category.id
-        # movement_type is untouched by edit; only the category changes.
-        assert edited.movement_type == "expense"
-
         accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
         applied = classify_with_local_rules(
             db, household_id=household.id, description="Posto Avenida", amount=-80.0
         )
-        assert applied.category == "Trabalho"
+        assert applied.category == "Transporte"
         assert applied.rule_id == rule.id
 
         deactivated = deactivate_classification_rule(db, household_id=household.id, rule_id=rule.id)
@@ -236,19 +229,70 @@ def test_classification_rule_lifecycle_deactivate_and_edit() -> None:
         with pytest.raises(ValueError):
             accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
 
-        # A genuinely new confirmed correction re-promotes it to
-        # `pending_acceptance`, from which it can be activated again.
+        # An inactive rule is still eligible for editing. Changing the
+        # category must NOT let the three confirmations recorded for
+        # "Transporte" stand in as proof for "Trabalho": that would let an
+        # admin activate a category with zero confirmed corrections ever
+        # supporting it. See docs/FINANCIAL_RULES.md and the Work Order's
+        # lifecycle/evidence-model requirement.
+        edited = edit_classification_rule(
+            db, household_id=household.id, rule_id=rule.id, category_id=corrected_category.id
+        )
+        assert edited.category_id == corrected_category.id
+        # movement_type is untouched by edit; only the category changes.
+        assert edited.movement_type == "expense"
+        assert edited.confirmation_count == 0
+        assert edited.status == "observed"
+        assert edited.active is False
+        assert edited.accepted_at is None
+        assert edited.accepted_by is None
+        # The superseded evidence for "Transporte" is preserved, not
+        # deleted, so the original three confirmations remain auditable.
+        history = edited.evidence["history"]
+        assert len(history) == 1
+        assert history[0]["category_id"] == original_category.id
+        assert history[0]["confirmation_count"] == 3
+        assert len(history[0]["evidence"]["transaction_ids"]) == 3
+
+        # The regression this guards against: three confirmations for
+        # category A must never activate category B. With zero
+        # confirmations recorded for "Trabalho", acceptance is rejected.
+        with pytest.raises(ValueError):
+            accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
+        still_builtin = classify_with_local_rules(
+            db, household_id=household.id, description="Posto Avenida", amount=-80.0
+        )
+        assert still_builtin.source == "builtin_rule"
+
+        # Only three genuinely new, distinct confirmed corrections for the
+        # edited category re-promote it to `pending_acceptance`.
+        for index in (1, 2):
+            record_confirmed_correction(
+                db,
+                household_id=household.id,
+                transaction_id=f"tx-trabalho-{index}",
+                description="Posto Avenida",
+                category_id=corrected_category.id,
+                movement_type="expense",
+            )
+        with pytest.raises(ValueError):
+            accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
         reconfirmed = record_confirmed_correction(
             db,
             household_id=household.id,
-            transaction_id="tx-4",
+            transaction_id="tx-trabalho-3",
             description="Posto Avenida",
             category_id=corrected_category.id,
             movement_type="expense",
         )
         assert reconfirmed.status == "pending_acceptance"
+        assert reconfirmed.confirmation_count == 3
         accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
         assert rule.status == "active"
+        applied_after_edit = classify_with_local_rules(
+            db, household_id=household.id, description="Posto Avenida", amount=-80.0
+        )
+        assert applied_after_edit.category == "Trabalho"
 
 
 def test_classification_rule_edit_rejects_unknown_category() -> None:
@@ -364,10 +408,14 @@ def test_rule_activation_and_edit_never_mutate_existing_transactions() -> None:
                 movement_type="expense",
             )
         accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
+        # Deactivate before editing: editing resets confirmation evidence
+        # for the new category (see test_classification_rule_lifecycle_
+        # deactivate_and_edit), so it no longer leaves the rule `active`
+        # for `deactivate_classification_rule` to act on afterward.
+        deactivate_classification_rule(db, household_id=household.id, rule_id=rule.id)
         edit_classification_rule(
             db, household_id=household.id, rule_id=rule.id, category_id=corrected_category.id
         )
-        deactivate_classification_rule(db, household_id=household.id, rule_id=rule.id)
 
         after = {
             "category_id": historical.category_id,

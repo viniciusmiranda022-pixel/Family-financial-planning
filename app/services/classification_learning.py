@@ -223,6 +223,25 @@ def edit_classification_rule(
     (its invariant-protection guard), or worse, into a category that
     contradicts the rule's own evidence. Only the category is genuinely
     editable without touching financial semantics.
+
+    Changing the category resets the evidence threshold. `evidence` and
+    `confirmation_count` are keyed, via `record_confirmed_correction`, to
+    the exact `(normalized_merchant, category_id, movement_type)` outcome
+    the confirmations were recorded against -- they prove that outcome and
+    nothing else. If an edit that changes `category_id` kept the old
+    `confirmation_count`/`status`/`active`, an admin could turn three
+    confirmed corrections for category A into an immediately-active rule
+    for category B with zero confirmed corrections ever supporting B,
+    which violates the normative three-distinct-confirmation threshold
+    (`docs/FINANCIAL_RULES.md`) and defeats the acceptance evidence model.
+    So a category change here always resets `confirmation_count` to 0,
+    `status` to `observed`, `active` to `False`, and clears
+    `accepted_at`/`accepted_by`: the edited rule must earn its own three
+    distinct confirmed corrections and a fresh administrator acceptance
+    before it can apply again, exactly like a new rule. The prior
+    evidence is never deleted or overwritten -- it is preserved under
+    `evidence["history"]` for audit purposes. A no-op edit (the requested
+    category is already the current one) changes nothing.
     """
     from app.models import Category, ClassificationRule
 
@@ -244,7 +263,30 @@ def edit_classification_rule(
     )
     if category is None:
         raise LookupError("category not found")
+    if category.id == rule.category_id:
+        return rule
+
+    history_entry = {
+        "category_id": rule.category_id,
+        "confirmation_count": rule.confirmation_count,
+        "status": rule.status,
+        "active": rule.active,
+        "evidence": rule.evidence,
+        "accepted_at": rule.accepted_at.isoformat() if rule.accepted_at else None,
+        "accepted_by": rule.accepted_by,
+        "superseded_at": datetime.now(UTC).isoformat(),
+    }
+    history = list((rule.evidence or {}).get("history", []))
+    history.append(history_entry)
+
     rule.category_id = category.id
+    rule.confirmation_count = 0
+    rule.status = "observed"
+    rule.active = False
+    rule.accepted_at = None
+    rule.accepted_by = None
+    rule.last_confirmed_at = datetime.now(UTC)
+    rule.evidence = {"transaction_ids": [], "history": history}
     return rule
 
 
