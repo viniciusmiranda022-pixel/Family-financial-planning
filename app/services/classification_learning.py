@@ -13,6 +13,25 @@ from app.services.classifier import Classification, classify, normalize_descript
 
 CLASSIFICATION_RULES_VERSION = "2026.09.1"
 
+# `classify()` (app/services/classifier.py) assigns these transaction types
+# only through structural, invariant-bound detection: PAYMENT_PATTERN (card
+# bill payment -> INV-002 reconciliation), the PRIVILEGE/RESGATE pattern and
+# the internal-alias PIX/TED/TRANSF match (INV-001 transfer, INV-003/004
+# patrimonial movement), and REFUND_PATTERN plus the positive-amount
+# expense-to-refund flip (INV-016 refund). A household local merchant rule
+# (docs/WORK_ORDER_EDITABLE_MERCHANT_RULES.md) may only ever refine the
+# *category* of an ordinary income/expense classification; it must never be
+# allowed to override one of these structural results, or an admin-accepted
+# rule could silently defeat a financial invariant for every future
+# transaction that happens to share its normalized description.
+_INVARIANT_PROTECTED_TRANSACTION_TYPES = frozenset({"transfer", "reconciliation", "refund"})
+
+# Statuses in which an administrator may act on a rule at all: the rule has
+# already cleared the three-distinct-confirmation evidence bar (or was
+# active and is now being reconsidered). `observed`/`suggested` are still
+# organically accumulating evidence and are not yet a governance surface.
+_ADMIN_ELIGIBLE_STATUSES = frozenset({"pending_acceptance", "active", "inactive"})
+
 
 @dataclass(frozen=True, slots=True)
 class AppliedClassification:
@@ -36,6 +55,13 @@ def classify_with_local_rules(
 ) -> AppliedClassification:
     from app.models import Category, ClassificationRule
 
+    fallback = classify(description, amount, internal_aliases)
+    if fallback.transaction_type in _INVARIANT_PROTECTED_TRANSACTION_TYPES:
+        # Deterministic structural classification wins unconditionally: a
+        # household rule can never recategorize a transfer, a card-payment
+        # reconciliation or a refund (see module docstring/constant above).
+        return _from_fallback(fallback)
+
     normalized = normalize_description(description)
     row = db.execute(
         select(ClassificationRule, Category.name)
@@ -49,7 +75,7 @@ def classify_with_local_rules(
         .order_by(ClassificationRule.priority.desc(), ClassificationRule.updated_at.desc())
         .limit(1)
     ).first()
-    if row:
+    if row and row[0].movement_type not in _INVARIANT_PROTECTED_TRANSACTION_TYPES:
         rule, category_name = row
         return AppliedClassification(
             category=category_name,
@@ -61,7 +87,6 @@ def classify_with_local_rules(
             version=CLASSIFICATION_RULES_VERSION,
             rule_id=rule.id,
         )
-    fallback = classify(description, amount, internal_aliases)
     return _from_fallback(fallback)
 
 
@@ -139,6 +164,87 @@ def accept_classification_rule(
     rule.active = True
     rule.accepted_at = datetime.now(UTC)
     rule.accepted_by = user_id
+    return rule
+
+
+def deactivate_classification_rule(
+    db: Session,
+    *,
+    household_id: str,
+    rule_id: str,
+) -> Any:
+    """Turn off an active local rule for future classification only.
+
+    This never touches `Transaction` rows: turning a rule off changes only
+    `classification_rules.status`/`active`, so nothing that was already
+    classified is recategorized. Deactivation is deliberately one-way from
+    the admin's perspective -- it does not reset `confirmation_count` or
+    `evidence`, so the historical evidence stays intact and auditable, but
+    an admin cannot simply flip it back on without new evidence: a rule can
+    only return to `pending_acceptance` (and from there be activated again
+    through `accept_classification_rule`) when `record_confirmed_correction`
+    observes a genuinely new confirmed correction (see the `not rule.active`
+    branch above), never as a side effect of this function.
+    """
+    from app.models import ClassificationRule
+
+    rule = db.scalar(
+        select(ClassificationRule).where(
+            ClassificationRule.id == rule_id,
+            ClassificationRule.household_id == household_id,
+        )
+    )
+    if rule is None:
+        raise LookupError("classification rule not found")
+    if rule.status != "active":
+        raise ValueError("only an active classification rule can be deactivated")
+    rule.status = "inactive"
+    rule.active = False
+    return rule
+
+
+def edit_classification_rule(
+    db: Session,
+    *,
+    household_id: str,
+    rule_id: str,
+    category_id: str,
+) -> Any:
+    """Let an administrator correct the category an eligible rule applies.
+
+    `movement_type` is intentionally not editable here: it is inherited,
+    at correction time, from the deterministic `transaction_type` the
+    built-in classifier (or an earlier local rule) already assigned to the
+    confirming transaction (see `record_confirmed_correction` and the
+    `TransactionUpdate` schema, which has no `transaction_type` field). If
+    an administrator could freely set `movement_type` through this edit
+    surface, a rule could be turned into a transfer/reconciliation/refund
+    rule that `classify_with_local_rules` would then have to reject anyway
+    (its invariant-protection guard), or worse, into a category that
+    contradicts the rule's own evidence. Only the category is genuinely
+    editable without touching financial semantics.
+    """
+    from app.models import Category, ClassificationRule
+
+    rule = db.scalar(
+        select(ClassificationRule).where(
+            ClassificationRule.id == rule_id,
+            ClassificationRule.household_id == household_id,
+        )
+    )
+    if rule is None:
+        raise LookupError("classification rule not found")
+    if rule.status not in _ADMIN_ELIGIBLE_STATUSES:
+        raise ValueError("classification rule is not yet eligible for administrator review")
+    category = db.scalar(
+        select(Category).where(
+            Category.id == category_id,
+            Category.household_id == household_id,
+        )
+    )
+    if category is None:
+        raise LookupError("category not found")
+    rule.category_id = category.id
     return rule
 
 
