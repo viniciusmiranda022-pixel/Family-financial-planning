@@ -300,15 +300,18 @@
 
       <section id="view-transactions" class="view">
         <article class="panel">
-          <div class="panel-heading"><div><span class="step-label">LANÇAMENTO RÁPIDO</span><h2>Registrar movimentação</h2><small>Despesas entram no teto; aplicações e resgates atualizam o saldo da conta central de liquidez sem virar receita ou gasto.</small></div></div>
+          <div class="panel-heading"><div><span class="step-label">LANÇAMENTO RÁPIDO</span><h2>Registrar movimentação</h2><small>Despesas entram no teto; aplicações e resgates atualizam o saldo da conta central de liquidez; transferências e pagamento de fatura movimentam contas sem virar receita ou gasto.</small></div></div>
           <form id="transaction-form" class="form-grid three">
             <label>Data<input type="date" name="booked_at" required></label>
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Abastecimento no posto"></label>
-            <label>Tipo de movimentação<select name="movement_type" id="transaction-movement-type"><option value="expense">Despesa</option><option value="income">Receita</option><option value="investment">Aplicação/investimento</option><option value="redemption">Resgate de investimento</option><option value="refund">Reembolso/estorno</option></select></label>
+            <label>Tipo de movimentação<select name="movement_type" id="transaction-movement-type"><option value="expense">Despesa</option><option value="income">Receita</option><option value="investment">Aplicação/investimento</option><option value="redemption">Resgate de investimento</option><option value="refund">Reembolso/estorno</option><option value="transfer">Transferência entre contas</option><option value="reconciliation">Pagamento de fatura/conciliação</option></select></label>
             <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
-            <label>Conta<select name="account_id" id="transaction-account" required></select></label>
+            <label id="transaction-account-field">Conta<select name="account_id" id="transaction-account" required></select></label>
+            <label id="transaction-destination-account-field" class="hidden">Conta de destino<select name="destination_account_id" id="transaction-destination-account" disabled></select></label>
             <label id="transaction-category-field">Natureza / categoria<select name="category_id" id="transaction-category" required></select></label>
             <label id="transaction-custom-category-field" class="hidden">Qual é a nova categoria?<input name="category_name" id="transaction-custom-category" maxlength="100" placeholder="Ex.: Jardinagem"></label>
+            <label id="transaction-installment-current-field" class="hidden">Parcela atual<input type="number" name="installment_current" id="transaction-installment-current" min="1" max="999" step="1" disabled></label>
+            <label id="transaction-installment-total-field" class="hidden">Total de parcelas<input type="number" name="installment_total" id="transaction-installment-total" min="1" max="999" step="1" disabled></label>
             <button class="primary" type="submit">Adicionar lançamento</button>
           </form>
         </article>

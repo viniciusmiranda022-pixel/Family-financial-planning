@@ -198,6 +198,9 @@ async function loadAccounts() {
   transactionSelect.innerHTML = state.accounts.length
     ? state.accounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("")
     : '<option value="">Cadastre uma conta primeiro</option>';
+  const destinationSelect = document.querySelector("#transaction-destination-account");
+  destinationSelect.innerHTML = '<option value="">Escolha a conta de destino</option>'
+    + state.accounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("");
   const captureSelect = document.querySelector("#capture-account");
   if (captureSelect) {
     const selected = captureSelect.value;
@@ -588,6 +591,29 @@ function updateManualTransactionFields() {
   category.required = needsCategory;
   categoryField.classList.toggle("muted-field", !needsCategory);
   updateCustomCategoryField();
+
+  const accountField = document.querySelector("#transaction-account-field");
+  const destinationField = document.querySelector("#transaction-destination-account-field");
+  const destinationSelect = document.querySelector("#transaction-destination-account");
+  const isTransfer = movementType === "transfer";
+  destinationField.classList.toggle("hidden", !isTransfer);
+  destinationSelect.disabled = !isTransfer;
+  destinationSelect.required = isTransfer;
+  accountField.firstChild.textContent = isTransfer ? "Conta de origem" : "Conta";
+
+  const isExpense = movementType === "expense";
+  const installmentCurrentField = document.querySelector("#transaction-installment-current-field");
+  const installmentTotalField = document.querySelector("#transaction-installment-total-field");
+  const installmentCurrent = document.querySelector("#transaction-installment-current");
+  const installmentTotal = document.querySelector("#transaction-installment-total");
+  installmentCurrentField.classList.toggle("hidden", !isExpense);
+  installmentTotalField.classList.toggle("hidden", !isExpense);
+  installmentCurrent.disabled = !isExpense;
+  installmentTotal.disabled = !isExpense;
+  if (!isExpense) {
+    installmentCurrent.value = "";
+    installmentTotal.value = "";
+  }
 }
 
 async function loadTransactions() {
@@ -1711,6 +1737,8 @@ document.querySelector("#transaction-form").addEventListener("submit", async (ev
     const payload = formJson(event.target, ["amount"]);
     if (payload.category_id === "__other__") payload.category_id = null;
     else payload.category_name = null;
+    if (payload.installment_current != null) payload.installment_current = Number(payload.installment_current);
+    if (payload.installment_total != null) payload.installment_total = Number(payload.installment_total);
     const largeConfirmation = confirmLargeTransactions([{ ...payload, kind: "transaction" }]);
     if (!largeConfirmation.allowed) return toast("Lançamento cancelado; use o Consultor para simulações", true);
     payload.confirmed_large_amount = largeConfirmation.confirmed;
