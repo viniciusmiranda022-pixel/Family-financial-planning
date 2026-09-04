@@ -265,6 +265,16 @@ def edit_classification_rule(
     evidence is never deleted or overwritten -- it is preserved under
     `evidence["history"]` for audit purposes. A no-op edit (the requested
     category is already the current one) changes nothing.
+
+    Each history entry stores only that superseded version's own
+    `transaction_ids` -- never the raw `evidence` blob it was cut from.
+    `rule.evidence` at edit time may itself already carry a `"history"`
+    key from an earlier edit; embedding it whole would nest every prior
+    edit's history inside the new entry, growing the serialized evidence
+    roughly multiplicatively with each successive edit even though no new
+    financial evidence was created. The top-level `history` list already
+    preserves every earlier version once, in order, so each entry only
+    needs its own bounded facts.
     """
     from app.models import Category, ClassificationRule
 
@@ -289,17 +299,18 @@ def edit_classification_rule(
     if category.id == rule.category_id:
         return rule
 
+    previous_evidence = dict(rule.evidence or {})
     history_entry = {
         "category_id": rule.category_id,
         "confirmation_count": rule.confirmation_count,
         "status": rule.status,
         "active": rule.active,
-        "evidence": rule.evidence,
+        "transaction_ids": list(previous_evidence.get("transaction_ids", [])),
         "accepted_at": rule.accepted_at.isoformat() if rule.accepted_at else None,
         "accepted_by": rule.accepted_by,
         "superseded_at": datetime.now(UTC).isoformat(),
     }
-    history = list((rule.evidence or {}).get("history", []))
+    history = list(previous_evidence.get("history", []))
     history.append(history_entry)
 
     rule.category_id = category.id

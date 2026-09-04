@@ -337,7 +337,12 @@ def test_classification_rule_lifecycle_deactivate_and_edit() -> None:
         assert len(history) == 1
         assert history[0]["category_id"] == original_category.id
         assert history[0]["confirmation_count"] == 3
-        assert len(history[0]["evidence"]["transaction_ids"]) == 3
+        assert len(history[0]["transaction_ids"]) == 3
+        # Each history entry carries only its own bounded facts, never the
+        # raw evidence blob it was cut from -- see
+        # test_classification_rule_edit_history_does_not_nest_recursively.
+        assert "evidence" not in history[0]
+        assert "history" not in history[0]
 
         # The regression this guards against: three confirmations for
         # category A must never activate category B. With zero
@@ -378,6 +383,71 @@ def test_classification_rule_lifecycle_deactivate_and_edit() -> None:
             db, household_id=household.id, description="Posto Avenida", amount=-80.0
         )
         assert applied_after_edit.category == "Trabalho"
+
+
+def test_classification_rule_edit_history_does_not_nest_recursively() -> None:
+    """Repeated admin edits must keep serialized evidence growth linear.
+
+    `edit_classification_rule` preserves each superseded version under
+    `evidence["history"]`. Before the fix, the history entry captured the
+    *entire* prior `evidence` blob -- which, from the second edit onward,
+    already contained its own `"history"` key. Each subsequent edit then
+    nested another full copy of all earlier history inside the new entry
+    while also keeping it at the top level, so the JSON payload grew
+    roughly multiplicatively per edit. This proves three successive edits
+    keep `history` at exactly one entry per edit, with no entry embedding
+    a `"history"` or raw `"evidence"` sub-tree.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household, admin = _household_with_admin(db)
+        categories = [
+            Category(household_id=household.id, name=name)
+            for name in ("Transporte", "Trabalho", "Lazer", "Alimentação")
+        ]
+        db.add_all(categories)
+        db.flush()
+
+        rule = None
+        for index in (1, 2, 3):
+            rule = record_confirmed_correction(
+                db,
+                household_id=household.id,
+                transaction_id=f"tx-0-{index}",
+                description="Loja Multiuso",
+                category_id=categories[0].id,
+                movement_type="expense",
+            )
+        accept_classification_rule(db, household_id=household.id, rule_id=rule.id, user_id=admin.id)
+
+        for step, next_category in enumerate(categories[1:], start=1):
+            edited = edit_classification_rule(
+                db, household_id=household.id, rule_id=rule.id, category_id=next_category.id
+            )
+            history = edited.evidence["history"]
+            assert len(history) == step
+            for entry in history:
+                assert "history" not in entry
+                assert "evidence" not in entry
+            # Earn three fresh confirmations so the next edit starts from
+            # an eligible (non-`observed`) status, matching real usage.
+            for index in (1, 2, 3):
+                record_confirmed_correction(
+                    db,
+                    household_id=household.id,
+                    transaction_id=f"tx-{step}-{index}",
+                    description="Loja Multiuso",
+                    category_id=next_category.id,
+                    movement_type="expense",
+                )
+
+        assert len(rule.evidence["history"]) == 3
+        assert [entry["category_id"] for entry in rule.evidence["history"]] == [
+            categories[0].id,
+            categories[1].id,
+            categories[2].id,
+        ]
 
 
 def test_classification_rule_edit_rejects_unknown_category() -> None:
