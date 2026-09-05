@@ -40,6 +40,8 @@ const pageNames = {
   dashboard: "Visão geral",
   reports: "Relatórios e análises",
   capture: "Lançar agora",
+  entradas: "Entradas",
+  saidas: "Saídas",
   imports: "Importações",
   transactions: "Lançamentos",
   reviews: "Revisar",
@@ -172,6 +174,8 @@ async function navigate(view) {
     dashboard: loadDashboard,
     reports: loadReports,
     capture: loadCapture,
+    entradas: loadEntradas,
+    saidas: loadSaidas,
     imports: loadImports,
     transactions: loadTransactions,
     reviews: loadReviews,
@@ -194,13 +198,12 @@ async function loadAccounts() {
   select.innerHTML = state.accounts.length
     ? state.accounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("")
     : '<option value="">Cadastre uma conta primeiro</option>';
-  const transactionSelect = document.querySelector("#transaction-account");
-  transactionSelect.innerHTML = state.accounts.length
+  const accountOptions = state.accounts.length
     ? state.accounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("")
     : '<option value="">Cadastre uma conta primeiro</option>';
-  const destinationSelect = document.querySelector("#transaction-destination-account");
-  destinationSelect.innerHTML = '<option value="">Escolha a conta de destino</option>'
-    + state.accounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("");
+  document.querySelector("#transaction-account").innerHTML = accountOptions;
+  document.querySelector("#income-entry-account").innerHTML = accountOptions;
+  document.querySelector("#expense-entry-account").innerHTML = accountOptions;
   const captureSelect = document.querySelector("#capture-account");
   if (captureSelect) {
     const selected = captureSelect.value;
@@ -211,7 +214,7 @@ async function loadAccounts() {
 
 async function loadCategories() {
   state.categories = await api("/categories");
-  document.querySelector("#transaction-category").innerHTML = manualCategoryOptions();
+  document.querySelector("#expense-entry-category").innerHTML = manualCategoryOptions();
 }
 
 function emptyRow(columns, text = "Nenhum registro encontrado") {
@@ -572,48 +575,72 @@ function manualCategoryOptions(selected) {
     + '<option value="__other__">Outra categoria...</option>';
 }
 
-function updateCustomCategoryField() {
-  const select = document.querySelector("#transaction-category");
-  const field = document.querySelector("#transaction-custom-category-field");
-  const input = document.querySelector("#transaction-custom-category");
-  const custom = select.value === "__other__" && !select.disabled;
+function updateExpenseCustomCategoryField() {
+  const select = document.querySelector("#expense-entry-category");
+  const field = document.querySelector("#expense-entry-custom-category-field");
+  const input = document.querySelector("#expense-entry-custom-category");
+  const custom = select.value === "__other__";
   field.classList.toggle("hidden", !custom);
   input.disabled = !custom;
   input.required = custom;
 }
 
-function updateManualTransactionFields() {
-  const movementType = document.querySelector("#transaction-movement-type").value;
-  const category = document.querySelector("#transaction-category");
-  const categoryField = document.querySelector("#transaction-category-field");
-  const needsCategory = movementType === "expense";
-  category.disabled = !needsCategory;
-  category.required = needsCategory;
-  categoryField.classList.toggle("muted-field", !needsCategory);
-  updateCustomCategoryField();
+function movementEntryRow(item, columns) {
+  const actionCell = item.manual
+    ? `<button class="danger-button delete-movement-entry" data-id="${escapeHtml(item.id)}">Excluir</button>`
+    : '<span class="muted-copy">Importado</span>';
+  return `<tr data-id="${escapeHtml(item.id)}">${columns(item)}<td class="right">${actionCell}</td></tr>`;
+}
 
-  const accountField = document.querySelector("#transaction-account-field");
-  const destinationField = document.querySelector("#transaction-destination-account-field");
-  const destinationSelect = document.querySelector("#transaction-destination-account");
-  const isTransfer = movementType === "transfer";
-  destinationField.classList.toggle("hidden", !isTransfer);
-  destinationSelect.disabled = !isTransfer;
-  destinationSelect.required = isTransfer;
-  accountField.firstChild.textContent = isTransfer ? "Conta de origem" : "Conta";
+async function loadMovementEntries({ month, type, tableSelector, columns, columnCount, emptyText }) {
+  const items = (await api(`/transactions?limit=500${month ? `&month=${month}` : ""}`)).filter(
+    (item) => item.type === type,
+  );
+  const table = document.querySelector(tableSelector);
+  table.innerHTML = items.length ? items.map((item) => movementEntryRow(item, columns)).join("") : emptyRow(columnCount, emptyText);
+  table.querySelectorAll(".delete-movement-entry").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("Excluir definitivamente este lançamento manual?")) return;
+    try {
+      await api(`/transactions/${button.dataset.id}`, { method: "DELETE" });
+      await Promise.all([loadEntradas(), loadSaidas(), loadDashboard()]);
+      toast("Lançamento excluído");
+    } catch (error) { toast(error.message, true); }
+  }));
+}
 
-  const isExpense = movementType === "expense";
-  const installmentCurrentField = document.querySelector("#transaction-installment-current-field");
-  const installmentTotalField = document.querySelector("#transaction-installment-total-field");
-  const installmentCurrent = document.querySelector("#transaction-installment-current");
-  const installmentTotal = document.querySelector("#transaction-installment-total");
-  installmentCurrentField.classList.toggle("hidden", !isExpense);
-  installmentTotalField.classList.toggle("hidden", !isExpense);
-  installmentCurrent.disabled = !isExpense;
-  installmentTotal.disabled = !isExpense;
-  if (!isExpense) {
-    installmentCurrent.value = "";
-    installmentTotal.value = "";
-  }
+async function loadEntradas() {
+  const month = document.querySelector("#income-entry-month").value;
+  await loadMovementEntries({
+    month,
+    type: "income",
+    tableSelector: "#income-entries-table",
+    columnCount: 5,
+    emptyText: "Nenhuma entrada registrada",
+    columns: (item) => `
+      <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
+      <td><strong>${escapeHtml(item.description)}</strong></td>
+      <td>${escapeHtml(item.account)}</td>
+      <td class="right amount-income">${money.format(item.amount)}</td>
+    `,
+  });
+}
+
+async function loadSaidas() {
+  const month = document.querySelector("#expense-entry-month").value;
+  await loadMovementEntries({
+    month,
+    type: "expense",
+    tableSelector: "#expense-entries-table",
+    columnCount: 6,
+    emptyText: "Nenhuma saída registrada",
+    columns: (item) => `
+      <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
+      <td><strong>${escapeHtml(item.description)}</strong>${item.installment ? `<br><small>Parcela ${escapeHtml(item.installment)}</small>` : ""}</td>
+      <td>${escapeHtml(item.category)}</td>
+      <td>${escapeHtml(item.account)}</td>
+      <td class="right amount-expense">${money.format(item.amount)}</td>
+    `,
+  });
 }
 
 async function loadTransactions() {
@@ -1627,8 +1654,9 @@ document.querySelector("#report-export-xlsx").addEventListener("click", () => do
 document.querySelector("#report-export-pdf").addEventListener("click", () => downloadReportExport("pdf").catch((error) => toast(error.message, true)));
 document.querySelector("#refresh-transactions").addEventListener("click", loadTransactions);
 document.querySelector("#refresh-forecast").addEventListener("click", loadForecast);
-document.querySelector("#transaction-movement-type").addEventListener("change", updateManualTransactionFields);
-document.querySelector("#transaction-category").addEventListener("change", updateCustomCategoryField);
+document.querySelector("#refresh-income-entries").addEventListener("click", loadEntradas);
+document.querySelector("#refresh-expense-entries").addEventListener("click", loadSaidas);
+document.querySelector("#expense-entry-category").addEventListener("change", updateExpenseCustomCategoryField);
 
 document.querySelector("#capture-record").addEventListener("click", toggleAudioRecording);
 document.querySelector("#capture-clear-audio").addEventListener("click", clearCaptureAudio);
@@ -1735,6 +1763,43 @@ document.querySelector("#transaction-form").addEventListener("submit", async (ev
   event.preventDefault();
   try {
     const payload = formJson(event.target, ["amount"]);
+    const largeConfirmation = confirmLargeTransactions([{ ...payload, kind: "transaction" }]);
+    if (!largeConfirmation.allowed) return toast("Lançamento cancelado; use o Consultor para simulações", true);
+    payload.confirmed_large_amount = largeConfirmation.confirmed;
+    await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
+    const month = payload.booked_at.slice(0, 7);
+    event.target.reset();
+    event.target.elements.booked_at.value = currentDateKey();
+    document.querySelector("#transaction-month").value = month;
+    await loadTransactions();
+    toast("Lançamento registrado");
+  } catch (error) { toast(error.message, true); }
+});
+
+document.querySelector("#income-entry-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const payload = formJson(event.target, ["amount"]);
+    payload.movement_type = "income";
+    const largeConfirmation = confirmLargeTransactions([{ ...payload, kind: "transaction" }]);
+    if (!largeConfirmation.allowed) return toast("Lançamento cancelado; use o Consultor para simulações", true);
+    payload.confirmed_large_amount = largeConfirmation.confirmed;
+    await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
+    const month = payload.booked_at.slice(0, 7);
+    event.target.reset();
+    event.target.elements.booked_at.value = currentDateKey();
+    document.querySelector("#income-entry-month").value = month;
+    await loadEntradas();
+    await loadDashboard();
+    toast("Entrada registrada");
+  } catch (error) { toast(error.message, true); }
+});
+
+document.querySelector("#expense-entry-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const payload = formJson(event.target, ["amount"]);
+    payload.movement_type = "expense";
     if (payload.category_id === "__other__") payload.category_id = null;
     else payload.category_name = null;
     if (payload.installment_current != null) payload.installment_current = Number(payload.installment_current);
@@ -1746,11 +1811,12 @@ document.querySelector("#transaction-form").addEventListener("submit", async (ev
     const month = payload.booked_at.slice(0, 7);
     event.target.reset();
     event.target.elements.booked_at.value = currentDateKey();
-    document.querySelector("#transaction-month").value = month;
+    document.querySelector("#expense-entry-month").value = month;
     await loadCategories();
-    updateManualTransactionFields();
-    await loadTransactions();
-    toast("Lançamento registrado");
+    updateExpenseCustomCategoryField();
+    await loadSaidas();
+    await loadDashboard();
+    toast("Saída registrada");
   } catch (error) { toast(error.message, true); }
 });
 
@@ -1927,5 +1993,7 @@ window.addEventListener("resize", () => {
 });
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") setMobileMenu(false); });
 document.querySelector("#transaction-form").elements.booked_at.value = currentDateKey();
-updateManualTransactionFields();
+document.querySelector("#income-entry-form").elements.booked_at.value = currentDateKey();
+document.querySelector("#expense-entry-form").elements.booked_at.value = currentDateKey();
+updateExpenseCustomCategoryField();
 bootstrap();
