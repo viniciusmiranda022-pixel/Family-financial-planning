@@ -399,6 +399,45 @@ def test_manual_transaction_rejects_account_from_another_household():
         assert response.status_code == 404
 
 
+def test_deleting_a_manual_transaction_is_isolated_by_household():
+    """A user logged into a different household must never be able to
+    delete another household's manual entry, even by guessing its id."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente")
+        created = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-10",
+                "description": "Salário",
+                "amount": 100,
+                "movement_type": "income",
+                "account_id": itau,
+            },
+        )
+        assert created.status_code == 201, created.text
+        transaction_id = created.json()["id"]
+
+        _create_household_admin(
+            session_factory,
+            household_name="Outra Família",
+            username="admin-outra-delete",
+            password="outra-senha-segura",
+        )
+        login = client.post(
+            "/api/auth/login",
+            json={"username": "admin-outra-delete", "password": "outra-senha-segura"},
+        )
+        assert login.status_code == 200, login.text
+
+        response = client.delete(f"/api/transactions/{transaction_id}")
+        assert response.status_code == 404
+
+        with session_factory() as db:
+            assert db.get(Transaction, transaction_id) is not None
+
+
 def test_manual_transaction_requires_authentication():
     client, _ = _client()
     with client:
