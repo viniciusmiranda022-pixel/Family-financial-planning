@@ -3447,6 +3447,58 @@ def create_manual_transaction(
     return {"id": transaction.id}
 
 
+@router.get("/transactions/manual/installment-preview")
+def preview_manual_installment(
+    amount: Decimal = Query(..., gt=0),
+    booked_at: date = Query(...),
+    installment_current: int = Query(..., ge=1, le=999),
+    installment_total: int = Query(..., ge=1, le=999),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Read-only preview for the `Saídas` installment fields, shown before
+    confirmation (`docs/GO_LIVE_MANUAL_UX_PLAN.md`): the per-installment
+    value, the remaining schedule of future months, and how that schedule
+    changes the canonical projection's future `installments` load per month.
+
+    No transaction is created and no state is written; the schedule and the
+    "before/after" comparison both come from `_installment_remaining_schedule`
+    / `_future_installments`, the exact same functions the canonical
+    projection engine (`app.services.projection_engine.build_projection`)
+    already consumes via `ForecastInput.installments` once the purchase is
+    actually persisted -- the UI never computes this itself.
+    """
+    if installment_current > installment_total:
+        raise HTTPException(
+            status_code=422, detail="A parcela atual não pode ser maior que o total de parcelas"
+        )
+    schedule = _installment_remaining_schedule(
+        amount=amount,
+        installment_current=installment_current,
+        installment_total=installment_total,
+        booked_at=booked_at,
+    )
+    baseline = _future_installments(db, user.household_id)
+    projected = dict(baseline)
+    for month, value in schedule:
+        projected[month] = projected.get(month, Decimal("0")) + value
+    affected_months = sorted(set(baseline) | {month for month, _ in schedule})
+    return {
+        "monthly_payment": decimal_value(money(abs(amount))),
+        "installment_current": installment_current,
+        "installment_total": installment_total,
+        "schedule": [{"month": month, "amount": decimal_value(value)} for month, value in schedule],
+        "canonical_projection_effect": [
+            {
+                "month": month,
+                "installments_before": decimal_value(baseline.get(month, Decimal("0"))),
+                "installments_after": decimal_value(projected.get(month, Decimal("0"))),
+            }
+            for month in affected_months
+        ],
+    }
+
+
 @router.patch("/transactions/{transaction_id}")
 def update_transaction(
     transaction_id: str,
@@ -4176,6 +4228,30 @@ def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
     return values
 
 
+def _installment_remaining_schedule(
+    *, amount: Decimal, installment_current: int, installment_total: int, booked_at: date
+) -> list[tuple[str, Decimal]]:
+    """Canonical month -> amount schedule for the installments that remain
+    *after* `installment_current`, given the confirmed per-installment
+    `amount` and the `booked_at` of that installment.
+
+    This is the single source of truth for "which future months this
+    commitment adds and how much": `_future_installments` (already-persisted
+    purchases feeding the canonical projection) and the pre-confirmation
+    `Saídas` preview (`GET /transactions/manual/installment-preview`) both
+    call this exact function, so the number shown before confirming can
+    never drift from the number the projection engine uses afterwards --
+    the UI is never allowed to compute this on its own (no parallel formula
+    in JS).
+    """
+    remaining = max(0, installment_total - installment_current)
+    value = money(abs(amount))
+    return [
+        (month_key(add_months(booked_at.replace(day=1), offset)), value)
+        for offset in range(1, remaining + 1)
+    ]
+
+
 def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
     values: dict[str, Decimal] = {}
     rows = db.scalars(
@@ -4212,10 +4288,13 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
         ):
             latest_by_series[series] = item
     for item in latest_by_series.values():
-        remaining = max(0, (item.installment_total or 0) - (item.installment_current or 0))
-        for offset in range(1, remaining + 1):
-            key = month_key(add_months(item.booked_at.replace(day=1), offset))
-            values[key] = values.get(key, Decimal("0")) + abs(item.amount)
+        for key, value in _installment_remaining_schedule(
+            amount=item.amount,
+            installment_current=item.installment_current or 0,
+            installment_total=item.installment_total or 0,
+            booked_at=item.booked_at,
+        ):
+            values[key] = values.get(key, Decimal("0")) + value
     return values
 
 

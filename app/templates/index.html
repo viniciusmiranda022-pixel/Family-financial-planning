@@ -327,8 +327,10 @@
             <label>Conta ou cartão<select name="account_id" id="expense-entry-account" required></select></label>
             <label>Natureza / categoria<select name="category_id" id="expense-entry-category" required></select></label>
             <label id="expense-entry-custom-category-field" class="hidden">Qual é a nova categoria?<input name="category_name" id="expense-entry-custom-category" maxlength="100" placeholder="Ex.: Jardinagem"></label>
+            <label id="expense-entry-competence-field">Competência (mês da fatura)<input type="month" name="competence" id="expense-entry-competence"><small id="expense-entry-competence-hint"></small></label>
             <label>Parcela atual (se parcelada)<input type="number" name="installment_current" id="expense-entry-installment-current" min="1" max="999" step="1"></label>
             <label>Total de parcelas (se parcelada)<input type="number" name="installment_total" id="expense-entry-installment-total" min="1" max="999" step="1"></label>
+            <div id="expense-entry-installment-preview" class="capture-notes full hidden"></div>
             <button class="primary" type="submit">Registrar saída</button>
           </form>
         </article>

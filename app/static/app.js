@@ -204,6 +204,7 @@ async function loadAccounts() {
   document.querySelector("#transaction-account").innerHTML = accountOptions;
   document.querySelector("#income-entry-account").innerHTML = accountOptions;
   document.querySelector("#expense-entry-account").innerHTML = accountOptions;
+  updateExpenseCompetenceField();
   const captureSelect = document.querySelector("#capture-account");
   if (captureSelect) {
     const selected = captureSelect.value;
@@ -583,6 +584,73 @@ function updateExpenseCustomCategoryField() {
   field.classList.toggle("hidden", !custom);
   input.disabled = !custom;
   input.required = custom;
+}
+
+function selectedExpenseEntryAccount() {
+  const id = document.querySelector("#expense-entry-account").value;
+  return state.accounts.find((item) => item.id === id) || null;
+}
+
+// INV-017: a card purchase's competence is the invoice's, not necessarily
+// the purchase date's month, and this app has no invoice entity yet to
+// derive it automatically. So the field is always editable and, for a
+// card account, required -- the user must explicitly confirm it instead of
+// the backend fabricating it from `booked_at` (see `create_manual_transaction`).
+function updateExpenseCompetenceField() {
+  const field = document.querySelector("#expense-entry-competence");
+  const hint = document.querySelector("#expense-entry-competence-hint");
+  const bookedAt = document.querySelector("#expense-entry-form").elements.booked_at.value;
+  const isCard = selectedExpenseEntryAccount()?.account_type === "credit_card";
+  field.required = isCard;
+  hint.textContent = isCard
+    ? "Compra no cartão: confirme o mês da fatura em que ela deve entrar; não é sempre o mês da compra (INV-017)."
+    : "Preenchida com o mês da data por padrão; ajuste se a competência for outra.";
+  if (!field.value && bookedAt) field.value = bookedAt.slice(0, 7);
+}
+
+let installmentPreviewRequestId = 0;
+
+// Fetches the canonical schedule/projection effect from the backend
+// (`GET /transactions/manual/installment-preview`) instead of computing it
+// in JS -- the plan requires the prévia to derive from the backend's own
+// projection path, never a parallel formula in the browser.
+async function refreshExpenseInstallmentPreview() {
+  const form = document.querySelector("#expense-entry-form");
+  const panel = document.querySelector("#expense-entry-installment-preview");
+  const amount = form.elements.amount.value;
+  const bookedAt = form.elements.booked_at.value;
+  const current = form.elements.installment_current.value;
+  const total = form.elements.installment_total.value;
+  if (!amount || !bookedAt || !current || !total) {
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return;
+  }
+  const requestId = ++installmentPreviewRequestId;
+  try {
+    const query = new URLSearchParams({
+      amount,
+      booked_at: bookedAt,
+      installment_current: current,
+      installment_total: total,
+    });
+    const preview = await api(`/transactions/manual/installment-preview?${query.toString()}`);
+    if (requestId !== installmentPreviewRequestId) return;
+    const affectedMonths = new Set(preview.schedule.map((item) => item.month));
+    const effect = preview.canonical_projection_effect.filter((row) => affectedMonths.has(row.month));
+    const scheduleLine = preview.schedule.length
+      ? preview.schedule.map((item) => `${escapeHtml(monthLabel(item.month))}: ${escapeHtml(money.format(item.amount))}`).join(" · ")
+      : "nenhum -- esta é a última parcela";
+    const effectLine = effect.length
+      ? effect.map((row) => `${escapeHtml(monthLabel(row.month))} passa de ${escapeHtml(money.format(row.installments_before))} para ${escapeHtml(money.format(row.installments_after))} em parcelas`).join(" · ")
+      : "sem novos meses na projeção canônica de parcelas";
+    panel.innerHTML = `<strong>Parcela ${escapeHtml(String(preview.installment_current))}/${escapeHtml(String(preview.installment_total))}</strong> de ${escapeHtml(money.format(preview.monthly_payment))}.<br>Meses futuros afetados: ${scheduleLine}.<br>Efeito na projeção canônica: ${effectLine}.`;
+    panel.classList.remove("hidden");
+  } catch (error) {
+    if (requestId !== installmentPreviewRequestId) return;
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+  }
 }
 
 function movementEntryRow(item, columns) {
@@ -1657,6 +1725,11 @@ document.querySelector("#refresh-forecast").addEventListener("click", loadForeca
 document.querySelector("#refresh-income-entries").addEventListener("click", loadEntradas);
 document.querySelector("#refresh-expense-entries").addEventListener("click", loadSaidas);
 document.querySelector("#expense-entry-category").addEventListener("change", updateExpenseCustomCategoryField);
+document.querySelector("#expense-entry-account").addEventListener("change", updateExpenseCompetenceField);
+document.querySelector("#expense-entry-form").elements.booked_at.addEventListener("change", updateExpenseCompetenceField);
+["amount", "booked_at", "installment_current", "installment_total"].forEach((field) => {
+  document.querySelector("#expense-entry-form").elements[field].addEventListener("input", refreshExpenseInstallmentPreview);
+});
 
 document.querySelector("#capture-record").addEventListener("click", toggleAudioRecording);
 document.querySelector("#capture-clear-audio").addEventListener("click", clearCaptureAudio);
@@ -1814,6 +1887,8 @@ document.querySelector("#expense-entry-form").addEventListener("submit", async (
     document.querySelector("#expense-entry-month").value = month;
     await loadCategories();
     updateExpenseCustomCategoryField();
+    updateExpenseCompetenceField();
+    await refreshExpenseInstallmentPreview();
     await loadSaidas();
     await loadDashboard();
     toast("Saída registrada");

@@ -565,3 +565,121 @@ def test_manual_transaction_requires_authentication():
             },
         )
         assert response.status_code == 401
+
+
+def test_installment_preview_exposes_canonical_schedule_before_confirmation():
+    """`docs/GO_LIVE_MANUAL_UX_PLAN.md`: the `Saídas` installment prévia must
+    show the per-installment value, current/total, the future months and the
+    effect on the canonical projection *before* the purchase is confirmed --
+    derived from the same backend path `_future_installments` uses, not a
+    JS formula. Nothing is persisted by the preview call."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+
+        preview = client.get(
+            "/api/transactions/manual/installment-preview",
+            params={
+                "amount": "100.00",
+                "booked_at": "2026-08-05",
+                "installment_current": 2,
+                "installment_total": 4,
+            },
+        )
+        assert preview.status_code == 200, preview.text
+        body = preview.json()
+        assert body["monthly_payment"] == 100.0
+        assert body["installment_current"] == 2
+        assert body["installment_total"] == 4
+        # Two installments remain after the 2nd of 4: September and October.
+        assert body["schedule"] == [
+            {"month": "2026-09", "amount": 100.0},
+            {"month": "2026-10", "amount": 100.0},
+        ]
+        effect_by_month = {row["month"]: row for row in body["canonical_projection_effect"]}
+        assert effect_by_month["2026-09"]["installments_before"] == 0.0
+        assert effect_by_month["2026-09"]["installments_after"] == 100.0
+        assert effect_by_month["2026-10"]["installments_before"] == 0.0
+        assert effect_by_month["2026-10"]["installments_after"] == 100.0
+
+        # No transaction was created by the preview.
+        with session_factory() as db:
+            household_id = db.scalar(select(User.household_id))
+            assert _future_installments(db, household_id) == {}
+
+
+def test_installment_preview_reflects_already_persisted_commitments():
+    """The "before" side of the preview's canonical effect must reflect
+    commitments already persisted (via `_future_installments`), so the
+    prévia for a *second* parcelled purchase shows its real cumulative
+    effect on the same future month, not just its own isolated schedule."""
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        category_id = _non_system_category_id(client)
+
+        first = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-05",
+                "description": "Geladeira parcelada",
+                "amount": 100,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "installment_current": 1,
+                "installment_total": 3,
+                "competence": "2026-08",
+            },
+        )
+        assert first.status_code == 201, first.text
+
+        # A second, unrelated purchase whose remaining schedule also lands
+        # on 2026-09.
+        preview = client.get(
+            "/api/transactions/manual/installment-preview",
+            params={
+                "amount": "50.00",
+                "booked_at": "2026-08-20",
+                "installment_current": 1,
+                "installment_total": 2,
+            },
+        )
+        assert preview.status_code == 200, preview.text
+        effect_by_month = {row["month"]: row for row in preview.json()["canonical_projection_effect"]}
+        # Already-persisted purchase alone contributes 100.00 in 2026-09.
+        assert effect_by_month["2026-09"]["installments_before"] == 100.0
+        # Adding the previewed purchase's own 50.00 for that month.
+        assert effect_by_month["2026-09"]["installments_after"] == 150.0
+
+
+def test_installment_preview_rejects_current_greater_than_total():
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        response = client.get(
+            "/api/transactions/manual/installment-preview",
+            params={
+                "amount": "100.00",
+                "booked_at": "2026-08-05",
+                "installment_current": 5,
+                "installment_total": 3,
+            },
+        )
+        assert response.status_code == 422
+
+
+def test_installment_preview_requires_authentication():
+    client, _ = _client()
+    with client:
+        response = client.get(
+            "/api/transactions/manual/installment-preview",
+            params={
+                "amount": "100.00",
+                "booked_at": "2026-08-05",
+                "installment_current": 1,
+                "installment_total": 3,
+            },
+        )
+        assert response.status_code == 401
