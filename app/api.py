@@ -3260,118 +3260,10 @@ def transactions(
                 if item.installment_current and item.installment_total
                 else None
             ),
-            "transfer_group_id": item.transfer_group_id,
             "manual": item.document_id is None,
         }
         for item in rows
     ]
-
-
-def _create_manual_transfer(
-    db: Session,
-    user: User,
-    payload: ManualTransactionRequest,
-    origin_account: Account,
-    destination_account: Account,
-) -> dict:
-    """Create the two paired legs of a real transfer between two of the
-    household's own accounts.
-
-    Both legs are persisted as `transaction_type="transfer"` and
-    `excluded=True` (INV-001), the same treatment `create_manual_transaction`
-    and `confirm_capture` already give single-leg patrimonial movements
-    (investment/redemption) -- no new financial policy, just a genuine
-    second leg. They share `transfer_group_id` (`Transaction.transfer_group_id`,
-    a column that has existed since migration 0004 but was never populated by
-    any code path) so both sides of one real-world transfer stay traceable to
-    each other for audit and ledger display. Both rows are added and flushed
-    in the same DB session/commit as this request: a failure on either side
-    (including duplicate-detection bookkeeping) rolls back the whole request,
-    never leaving one account showing the movement without the other.
-    """
-    category = category_for(db, user.household_id, "Transferência interna")
-    transfer_group_id = str(uuid.uuid4())
-    legs: list[Transaction] = []
-    for target_account, signed_amount in (
-        (origin_account, -abs(payload.amount)),
-        (destination_account, abs(payload.amount)),
-    ):
-        parsed = ParsedTransaction(
-            booked_at=payload.booked_at,
-            description=payload.description,
-            amount=money(signed_amount),
-            source_line=1,
-            occurred_at=payload.booked_at,
-        )
-        transaction = Transaction(
-            household_id=user.household_id,
-            account_id=target_account.id,
-            category_id=category.id,
-            booked_at=payload.booked_at,
-            description=payload.description,
-            normalized_description=normalize_description(payload.description),
-            amount=money(signed_amount),
-            transaction_type="transfer",
-            owner_label=target_account.owner_label,
-            fingerprint=transaction_fingerprint(target_account.id, parsed, target_account.owner_label),
-            occurred_at=payload.booked_at,
-            competence=payload.booked_at.strftime("%Y-%m"),
-            classification_source="manual_confirmed",
-            classification_version=PARSER_CONTRACT_VERSION,
-            canonical_status="unassigned",
-            trace_id=str(uuid.uuid4()),
-            transfer_group_id=transfer_group_id,
-            source_priority=source_priority("manual"),
-            confidence=Decimal("1"),
-            excluded=True,
-            reviewed=True,
-        )
-        db.add(transaction)
-        db.flush()
-        duplicate_group, duplicate_assessment = register_transaction_duplicates(
-            db,
-            transaction=transaction,
-            household_id=user.household_id,
-        )
-        if duplicate_group is not None:
-            transaction.reviewed = False
-            db.add(
-                ReviewItem(
-                    household_id=user.household_id,
-                    transaction_id=transaction.id,
-                    reason="possible_duplicate",
-                    details=(
-                        "Lançamento manual agrupado como possível repetição "
-                        f"({duplicate_assessment.band}, confiança "
-                        f"{duplicate_assessment.confidence})"
-                        if duplicate_assessment
-                        else "Lançamento manual coincide com um lançamento existente"
-                    ),
-                )
-            )
-        legs.append(transaction)
-
-    origin_transaction, destination_transaction = legs
-    audit(
-        db,
-        user,
-        "transaction.create_manual_transfer",
-        "transaction",
-        origin_transaction.id,
-        {
-            "amount": str(abs(payload.amount)),
-            "origin_account_id": origin_account.id,
-            "destination_account_id": destination_account.id,
-            "linked_transaction_id": destination_transaction.id,
-            "transfer_group_id": transfer_group_id,
-        },
-    )
-    db.commit()
-    return {
-        "id": origin_transaction.id,
-        "linked_id": destination_transaction.id,
-        "transfer_group_id": transfer_group_id,
-    }
 
 
 @router.post("/transactions", status_code=201)
@@ -3400,18 +3292,6 @@ def create_manual_transaction(
                 f"R$ {large_threshold:,.2f}."
             ),
         )
-
-    if payload.movement_type == "transfer":
-        destination_account = db.scalar(
-            select(Account).where(
-                Account.id == payload.destination_account_id,
-                Account.household_id == user.household_id,
-                Account.active.is_(True),
-            )
-        )
-        if not destination_account:
-            raise HTTPException(status_code=404, detail="Conta de destino não encontrada")
-        return _create_manual_transfer(db, user, payload, account, destination_account)
 
     category = None
     transaction_type = "expense"
@@ -3468,17 +3348,13 @@ def create_manual_transaction(
         transaction_type = "refund"
         amount = abs(payload.amount)
         category = category_for(db, user.household_id, "Reembolsos e estornos")
-    elif payload.movement_type == "reconciliation":
-        transaction_type = "reconciliation"
-        excluded = True
-        category = category_for(db, user.household_id, "Conciliação")
 
     parsed = ParsedTransaction(
         booked_at=payload.booked_at,
         description=payload.description,
         amount=money(amount),
         source_line=1,
-        card_last_four=account.last_four if payload.installment_current else None,
+        card_last_four=account.last_four,
         installment_current=payload.installment_current,
         installment_total=payload.installment_total,
         occurred_at=payload.booked_at,
@@ -3494,7 +3370,7 @@ def create_manual_transaction(
         amount=money(amount),
         transaction_type=transaction_type,
         owner_label=account.owner_label,
-        card_last_four=account.last_four if payload.installment_current else None,
+        card_last_four=account.last_four,
         installment_current=payload.installment_current,
         installment_total=payload.installment_total,
         fingerprint=transaction_fingerprint(account.id, parsed, account.owner_label),
@@ -3639,23 +3515,7 @@ def delete_manual_transaction(
     )
     if not transaction:
         raise HTTPException(status_code=404, detail="Lançamento não encontrado")
-    # A real transfer (see `_create_manual_transfer`) is two paired legs
-    # sharing `transfer_group_id`. Deleting only one leg would leave the
-    # other side of the movement stranded with no counterpart -- an
-    # inconsistent half-transfer that no longer matches what the user
-    # actually did. Both legs are therefore always deleted together, in the
-    # same commit, never one without the other.
-    group = (
-        db.scalars(
-            select(Transaction).where(
-                Transaction.household_id == user.household_id,
-                Transaction.transfer_group_id == transaction.transfer_group_id,
-            )
-        ).all()
-        if transaction.transfer_group_id
-        else [transaction]
-    )
-    if any(item.document_id is not None for item in group):
+    if transaction.document_id is not None:
         raise HTTPException(
             status_code=409,
             detail="Lançamentos importados não são apagados; use Ignorar para preservar a auditoria",
@@ -3666,28 +3526,23 @@ def delete_manual_transaction(
         "transaction.delete_manual",
         "transaction",
         transaction.id,
-        {
-            "description": transaction.description,
-            "amount": str(transaction.amount),
-            "linked_transaction_ids": [item.id for item in group if item.id != transaction.id],
-        },
+        {"description": transaction.description, "amount": str(transaction.amount)},
     )
-    for item in group:
-        if (
-            item.transaction_type == "transfer"
-            and item.category
-            and item.category.name == "Transferência patrimonial"
-        ):
-            profile = profile_for(db, user.household_id)
-            if item.amount < 0:
-                profile.investment_balance = max(
-                    Decimal("0"), profile.investment_balance - abs(item.amount)
-                )
-            elif item.amount > 0:
-                profile.investment_balance += item.amount
-        db.delete(item)
+    if (
+        transaction.transaction_type == "transfer"
+        and transaction.category
+        and transaction.category.name == "Transferência patrimonial"
+    ):
+        profile = profile_for(db, user.household_id)
+        if transaction.amount < 0:
+            profile.investment_balance = max(
+                Decimal("0"), profile.investment_balance - abs(transaction.amount)
+            )
+        elif transaction.amount > 0:
+            profile.investment_balance += transaction.amount
+    db.delete(transaction)
     db.commit()
-    return {"ok": True, "deleted_ids": [item.id for item in group]}
+    return {"ok": True}
 
 
 @router.get("/reviews")

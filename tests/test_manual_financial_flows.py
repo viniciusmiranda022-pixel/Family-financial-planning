@@ -1,22 +1,22 @@
-"""Tests for the manual go-live financial flows.
+"""Tests for the manual go-live financial flows -- slice 1: Navegação + Entradas/Saídas.
 
 Work Order: `docs/WORK_ORDER_MANUAL_FINANCIAL_FLOWS_GO_LIVE.md`.
 
-Scope covered here (see the Technical Challenge on PR 47 for the slices
-deliberately deferred): closing the gap `docs/ROADMAP.md` names explicitly --
-the manual quick-entry form (`POST /api/transactions`) only accepted
-`expense|income|investment|redemption|refund`, while `transfer` and
-`reconciliation` were only reachable through the Central Inteligente
-capture-confirm flow. This adds:
+Scope covered here (see the Technical Challenge / engineering review on PR 47
+for the slices deliberately deferred -- `transfer`, `reconciliation`, invoice
+payment and the associated `transfer_group_id` index belong to slices 2/3 and
+are not implemented in this file): the manual quick-entry command
+(`POST /api/transactions`, reused by the new structured `Entradas`/`Saídas`
+screens) already supported `expense|income|investment|redemption|refund`.
+This slice adds:
 
-- a real, paired, double-entry `transfer` between two of the household's own
-  accounts (INV-001: zero operational effect, both legs traceable via the
-  previously-unused `Transaction.transfer_group_id`);
-- manual `reconciliation` (invoice payment as a brand-new fact, INV-002:
-  never a second expense);
-- installment fields on manual expense creation, reusing the existing
-  `installment_current`/`installment_total` columns and projection dedup
-  logic already exercised by the capture/import paths.
+- installment fields (`installment_current`/`installment_total`) on manual
+  expense creation, reusing the existing columns and the canonical
+  `_future_installments` projection function already exercised by the
+  capture/import paths -- no parallel calculation engine;
+- `card_last_four` populated the same way `confirm_capture` and the document
+  import path already do (`account.last_four`), so a manually entered card
+  purchase carries the same lineage as an imported one (INV-017).
 
 Uses the same isolated-engine + `TestClient` + `/api/auth/setup` pattern as
 `tests/test_card_payment_reconciliation.py::test_http_endpoints_authorize_isolate_and_audit`.
@@ -25,6 +25,7 @@ Uses the same isolated-engine + `TestClient` + `/api/auth/setup` pattern as
 import json
 import os
 import uuid
+from decimal import Decimal
 
 from cryptography.fernet import Fernet
 from sqlalchemy import create_engine, select
@@ -37,6 +38,7 @@ os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app.api import _future_installments  # noqa: E402
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import AuditEvent, Household, Transaction, User  # noqa: E402
@@ -73,10 +75,22 @@ def _setup_household(client, *, household_name="Família Fluxos", username="admi
     return setup.json()
 
 
-def _create_account(client, *, name, account_type="checking"):
-    response = client.post("/api/accounts", json={"name": name, "account_type": account_type})
+def _create_account(client, *, name, account_type="checking", last_four=None):
+    payload = {"name": name, "account_type": account_type}
+    if last_four is not None:
+        payload["last_four"] = last_four
+    response = client.post("/api/accounts", json=payload)
     assert response.status_code == 201, response.text
     return response.json()["id"]
+
+
+def _non_system_category_id(client) -> str:
+    categories = client.get("/api/categories").json()
+    return next(
+        item["id"]
+        for item in categories
+        if item["name"] not in {"Conciliação", "Transferência patrimonial", "Transferência interna", "Receitas"}
+    )
 
 
 def _create_household_admin(session_factory, *, household_name, username, password):
@@ -96,220 +110,109 @@ def _create_household_admin(session_factory, *, household_name, username, passwo
         db.commit()
 
 
-def test_manual_transfer_creates_paired_legs_with_zero_operational_effect():
+def test_manual_income_creates_real_income_without_parallel_policy():
+    """`Entradas` posts to the same canonical command as before; income is
+    unaffected by this slice's changes (no card/installment fields apply)."""
     client, session_factory = _client()
     with client:
         _setup_household(client)
         itau = _create_account(client, name="Itaú Corrente")
-        nubank = _create_account(client, name="Nubank Conta")
 
         before = client.get("/api/dashboard?month=2026-08").json()
-
         response = client.post(
             "/api/transactions",
             json={
                 "booked_at": "2026-08-10",
-                "description": "Transferência Itaú -> Nubank",
-                "amount": 500,
-                "movement_type": "transfer",
-                "account_id": itau,
-                "destination_account_id": nubank,
-            },
-        )
-        assert response.status_code == 201, response.text
-        body = response.json()
-        assert body["id"] != body["linked_id"]
-        assert body["transfer_group_id"]
-
-        after = client.get("/api/dashboard?month=2026-08").json()
-        # INV-001: a transfer between the household's own accounts never
-        # changes income, expense/spending or operational cash flow.
-        assert after["cash_in"] == before["cash_in"]
-        assert after["cash_out"] == before["cash_out"]
-        assert after["spending"] == before["spending"]
-
-        rows = client.get("/api/transactions?month=2026-08").json()
-        origin_row = next(item for item in rows if item["id"] == body["id"])
-        destination_row = next(item for item in rows if item["id"] == body["linked_id"])
-        assert origin_row["type"] == "transfer"
-        assert destination_row["type"] == "transfer"
-        assert origin_row["excluded"] is True
-        assert destination_row["excluded"] is True
-        assert origin_row["amount"] == -500
-        assert destination_row["amount"] == 500
-        assert origin_row["transfer_group_id"] == destination_row["transfer_group_id"] == body["transfer_group_id"]
-
-        with session_factory() as db:
-            event = db.scalar(
-                select(AuditEvent).where(AuditEvent.event_type == "transaction.create_manual_transfer")
-            )
-            assert event is not None
-            details = json.loads(event.details)
-            assert details["origin_account_id"] == itau
-            assert details["destination_account_id"] == nubank
-            assert details["linked_transaction_id"] == body["linked_id"]
-
-
-def test_manual_transfer_requires_distinct_destination_account():
-    client, _ = _client()
-    with client:
-        _setup_household(client)
-        itau = _create_account(client, name="Itaú Corrente")
-        response = client.post(
-            "/api/transactions",
-            json={
-                "booked_at": "2026-08-10",
-                "description": "Transferência para a mesma conta",
-                "amount": 100,
-                "movement_type": "transfer",
-                "account_id": itau,
-                "destination_account_id": itau,
-            },
-        )
-        assert response.status_code == 422
-
-
-def test_manual_transfer_requires_destination_account():
-    client, _ = _client()
-    with client:
-        _setup_household(client)
-        itau = _create_account(client, name="Itaú Corrente")
-        response = client.post(
-            "/api/transactions",
-            json={
-                "booked_at": "2026-08-10",
-                "description": "Transferência sem destino",
-                "amount": 100,
-                "movement_type": "transfer",
-                "account_id": itau,
-            },
-        )
-        assert response.status_code == 422
-
-
-def test_destination_account_id_rejected_outside_transfer():
-    client, _ = _client()
-    with client:
-        _setup_household(client)
-        itau = _create_account(client, name="Itaú Corrente")
-        nubank = _create_account(client, name="Nubank Conta")
-        response = client.post(
-            "/api/transactions",
-            json={
-                "booked_at": "2026-08-10",
-                "description": "Receita com destino indevido",
-                "amount": 100,
+                "description": "Salário",
+                "amount": 4000,
                 "movement_type": "income",
                 "account_id": itau,
-                "destination_account_id": nubank,
-            },
-        )
-        assert response.status_code == 422
-
-
-def test_manual_transfer_rejects_destination_account_from_another_household():
-    client, session_factory = _client()
-    with client:
-        _setup_household(client)
-        itau = _create_account(client, name="Itaú Corrente")
-
-        _create_household_admin(
-            session_factory,
-            household_name="Outra Família",
-            username="admin-outra-fluxos",
-            password="outra-senha-segura",
-        )
-        with session_factory() as db:
-            other_household_id = db.scalar(select(User.household_id).where(User.username == "admin-outra-fluxos"))
-        from app.models import Account
-
-        with session_factory() as db:
-            foreign_account = Account(household_id=other_household_id, name="Conta de outra família", account_type="checking")
-            db.add(foreign_account)
-            db.commit()
-            foreign_account_id = foreign_account.id
-
-        response = client.post(
-            "/api/transactions",
-            json={
-                "booked_at": "2026-08-10",
-                "description": "Transferência para conta de outra família",
-                "amount": 100,
-                "movement_type": "transfer",
-                "account_id": itau,
-                "destination_account_id": foreign_account_id,
-            },
-        )
-        assert response.status_code == 404
-
-
-def test_deleting_one_leg_of_transfer_deletes_both_legs():
-    client, session_factory = _client()
-    with client:
-        _setup_household(client)
-        itau = _create_account(client, name="Itaú Corrente")
-        nubank = _create_account(client, name="Nubank Conta")
-        created = client.post(
-            "/api/transactions",
-            json={
-                "booked_at": "2026-08-10",
-                "description": "Transferência a apagar",
-                "amount": 300,
-                "movement_type": "transfer",
-                "account_id": itau,
-                "destination_account_id": nubank,
-            },
-        ).json()
-
-        delete = client.delete(f"/api/transactions/{created['id']}")
-        assert delete.status_code == 200
-        assert sorted(delete.json()["deleted_ids"]) == sorted([created["id"], created["linked_id"]])
-
-        with session_factory() as db:
-            remaining = db.scalars(
-                select(Transaction).where(Transaction.transfer_group_id == created["transfer_group_id"])
-            ).all()
-            assert remaining == []
-
-
-def test_manual_reconciliation_creates_excluded_transaction_without_expense_effect():
-    client, session_factory = _client()
-    with client:
-        _setup_household(client)
-        itau = _create_account(client, name="Itaú Corrente")
-
-        before = client.get("/api/dashboard?month=2026-08").json()
-        response = client.post(
-            "/api/transactions",
-            json={
-                "booked_at": "2026-08-15",
-                "description": "Pagamento da fatura Itaú",
-                "amount": 5000,
-                "movement_type": "reconciliation",
-                "account_id": itau,
-                "confirmed_large_amount": True,
             },
         )
         assert response.status_code == 201, response.text
         transaction_id = response.json()["id"]
 
         after = client.get("/api/dashboard?month=2026-08").json()
-        # INV-002: paying an invoice is conciliation, never a new expense.
-        assert after["spending"] == before["spending"]
-        assert after["cash_out"] == before["cash_out"]
+        assert after["cash_in"] == before["cash_in"] + 4000
 
         rows = client.get("/api/transactions?month=2026-08").json()
         row = next(item for item in rows if item["id"] == transaction_id)
-        assert row["type"] == "reconciliation"
-        assert row["excluded"] is True
-        assert row["amount"] == -5000
-        assert row["category"] == "Conciliação"
+        assert row["type"] == "income"
+        assert row["amount"] == 4000
+        assert row["category"] == "Receitas"
 
         with session_factory() as db:
             event = db.scalar(
                 select(AuditEvent).where(AuditEvent.event_type == "transaction.create_manual")
             )
-            assert json.loads(event.details)["movement_type"] == "reconciliation"
+            assert event is not None
+            assert json.loads(event.details)["movement_type"] == "income"
+
+
+def test_manual_expense_at_sight_in_checking_account():
+    """`Saídas` posts an ordinary at-sight expense to a checking account."""
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente", account_type="checking")
+        category_id = _non_system_category_id(client)
+
+        before = client.get("/api/dashboard?month=2026-08").json()
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-12",
+                "description": "Supermercado",
+                "amount": 250,
+                "movement_type": "expense",
+                "account_id": itau,
+                "category_id": category_id,
+            },
+        )
+        assert response.status_code == 201, response.text
+        transaction_id = response.json()["id"]
+
+        after = client.get("/api/dashboard?month=2026-08").json()
+        assert after["spending"] == before["spending"] + 250
+
+        rows = client.get("/api/transactions?month=2026-08").json()
+        row = next(item for item in rows if item["id"] == transaction_id)
+        assert row["type"] == "expense"
+        assert row["amount"] == -250
+        assert row["installment"] is None
+
+
+def test_manual_expense_in_credit_card_account_carries_card_lineage():
+    """A card expense (no installment) still records `card_last_four` from
+    the account, the same lineage `confirm_capture`/document import already
+    attach -- not a parallel rule invented for the manual form."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(
+            client, name="Nubank Cartão", account_type="credit_card", last_four="4242"
+        )
+        category_id = _non_system_category_id(client)
+
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-05",
+                "description": "Farmácia",
+                "amount": 80,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+            },
+        )
+        assert response.status_code == 201, response.text
+        transaction_id = response.json()["id"]
+
+        with session_factory() as db:
+            transaction = db.get(Transaction, transaction_id)
+            assert transaction.installment_current is None
+            assert transaction.installment_total is None
+            assert transaction.card_last_four == "4242"
 
 
 def test_manual_installment_expense_populates_installment_and_card_fields():
@@ -317,10 +220,7 @@ def test_manual_installment_expense_populates_installment_and_card_fields():
     with client:
         _setup_household(client)
         nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
-        categories = client.get("/api/categories").json()
-        category_id = next(item["id"] for item in categories if item["name"] not in {
-            "Conciliação", "Transferência patrimonial", "Transferência interna", "Receitas",
-        })
+        category_id = _non_system_category_id(client)
 
         response = client.post(
             "/api/transactions",
@@ -349,6 +249,57 @@ def test_manual_installment_expense_populates_installment_and_card_fields():
         assert row["installment"] == "2/10"
 
 
+def test_manual_installment_feeds_canonical_projection_without_duplicating_observed_installment():
+    """The manual command must feed the same `_future_installments` the
+    capture/import paths already use (no parallel calculation), and a later
+    *observed* installment of the same purchase must not sum on top of the
+    earlier one's own future projection -- INV-014/INV-015 style dedup."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        category_id = _non_system_category_id(client)
+
+        # Parcela 2/4 observed in August.
+        first = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-05",
+                "description": "Geladeira parcelada",
+                "amount": 100,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "installment_current": 2,
+                "installment_total": 4,
+            },
+        )
+        assert first.status_code == 201, first.text
+
+        # Parcela 3/4 of the *same* purchase, observed the following month.
+        second = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-09-05",
+                "description": "Geladeira parcelada",
+                "amount": 100,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "installment_current": 3,
+                "installment_total": 4,
+            },
+        )
+        assert second.status_code == 201, second.text
+
+        with session_factory() as db:
+            household_id = db.scalar(select(User.household_id).where(User.username == "admin-fluxos"))
+            # Only the latest observed installment (3/4) should seed the
+            # projection: one remaining month (October), not the union of
+            # both installments' own remaining schedules.
+            assert _future_installments(db, household_id) == {"2026-10": Decimal("100.00")}
+
+
 def test_installment_fields_require_expense_movement_type():
     client, _ = _client()
     with client:
@@ -374,8 +325,7 @@ def test_installment_current_cannot_exceed_total():
     with client:
         _setup_household(client)
         itau = _create_account(client, name="Itaú Corrente")
-        categories = client.get("/api/categories").json()
-        category_id = categories[0]["id"]
+        category_id = _non_system_category_id(client)
         response = client.post(
             "/api/transactions",
             json={
@@ -397,8 +347,7 @@ def test_installment_current_and_total_must_be_provided_together():
     with client:
         _setup_household(client)
         itau = _create_account(client, name="Itaú Corrente")
-        categories = client.get("/api/categories").json()
-        category_id = categories[0]["id"]
+        category_id = _non_system_category_id(client)
         response = client.post(
             "/api/transactions",
             json={
@@ -412,3 +361,57 @@ def test_installment_current_and_total_must_be_provided_together():
             },
         )
         assert response.status_code == 422
+
+
+def test_manual_transaction_rejects_account_from_another_household():
+    """Household isolation: an account id that exists but belongs to a
+    different household must never be usable for a manual entry."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+
+        _create_household_admin(
+            session_factory,
+            household_name="Outra Família",
+            username="admin-outra-fluxos",
+            password="outra-senha-segura",
+        )
+        with session_factory() as db:
+            other_household_id = db.scalar(select(User.household_id).where(User.username == "admin-outra-fluxos"))
+        from app.models import Account
+
+        with session_factory() as db:
+            foreign_account = Account(household_id=other_household_id, name="Conta de outra família", account_type="checking")
+            db.add(foreign_account)
+            db.commit()
+            foreign_account_id = foreign_account.id
+
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-10",
+                "description": "Receita em conta de outra família",
+                "amount": 100,
+                "movement_type": "income",
+                "account_id": foreign_account_id,
+            },
+        )
+        assert response.status_code == 404
+
+
+def test_manual_transaction_requires_authentication():
+    client, _ = _client()
+    with client:
+        # No session cookie yet: the manual-entry command must reject before
+        # ever looking at accounts/categories.
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-10",
+                "description": "Sem sessão",
+                "amount": 100,
+                "movement_type": "income",
+                "account_id": "does-not-matter",
+            },
+        )
+        assert response.status_code == 401

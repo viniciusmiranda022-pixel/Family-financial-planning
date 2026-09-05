@@ -44,10 +44,9 @@ class ManualTransactionRequest(BaseModel):
     description: str = Field(min_length=2, max_length=500)
     amount: Decimal = Field(gt=0)
     movement_type: str = Field(
-        pattern="^(expense|income|investment|redemption|refund|transfer|reconciliation)$"
+        pattern="^(expense|income|investment|redemption|refund)$"
     )
     account_id: str
-    destination_account_id: str | None = None
     category_id: str | None = None
     category_name: str | None = Field(default=None, min_length=2, max_length=100)
     installment_current: int | None = Field(default=None, ge=1, le=999)
@@ -56,13 +55,6 @@ class ManualTransactionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_movement_fields(self) -> "ManualTransactionRequest":
-        if self.movement_type == "transfer":
-            if not self.destination_account_id:
-                raise ValueError("Transferência exige a conta de destino")
-            if self.destination_account_id == self.account_id:
-                raise ValueError("A conta de destino precisa ser diferente da conta de origem")
-        elif self.destination_account_id is not None:
-            raise ValueError("Conta de destino só se aplica a transferências entre contas")
         if self.installment_current is not None or self.installment_total is not None:
             if self.movement_type != "expense":
                 raise ValueError("Parcelamento só se aplica a despesas")

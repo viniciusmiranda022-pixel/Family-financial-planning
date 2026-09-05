@@ -143,7 +143,7 @@ class Transaction(Base, TimestampMixin):
     linked_transaction_id: Mapped[str | None] = mapped_column(
         ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True
     )
-    transfer_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    transfer_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     source_priority: Mapped[int] = mapped_column(Integer, default=50)
     confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4), default=Decimal("1"))
