@@ -3349,6 +3349,27 @@ def create_manual_transaction(
         amount = abs(payload.amount)
         category = category_for(db, user.household_id, "Reembolsos e estornos")
 
+    if payload.movement_type == "expense" and account.account_type == "credit_card":
+        # INV-017: a card purchase's competence is the invoice's canonical
+        # competence, not necessarily the purchase date's month. This app has
+        # no invoice/fatura entity yet to derive that automatically (it lands
+        # with the "Contas a pagar" slice), so fabricating
+        # `booked_at.strftime("%Y-%m")` here would violate the invariant for
+        # any purchase near a statement's closing date. Fail closed instead:
+        # require the human to explicitly confirm the competence: booked_at
+        # stays untouched as the lineage date either way.
+        if payload.competence is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Compra no cartão exige confirmar a competência da fatura; ela não é "
+                    "derivada automaticamente da data da compra (INV-017)."
+                ),
+            )
+        competence = payload.competence
+    else:
+        competence = payload.competence or payload.booked_at.strftime("%Y-%m")
+
     parsed = ParsedTransaction(
         booked_at=payload.booked_at,
         description=payload.description,
@@ -3375,7 +3396,7 @@ def create_manual_transaction(
         installment_total=payload.installment_total,
         fingerprint=transaction_fingerprint(account.id, parsed, account.owner_label),
         occurred_at=payload.booked_at,
-        competence=payload.booked_at.strftime("%Y-%m"),
+        competence=competence,
         classification_source="manual_confirmed",
         classification_version=PARSER_CONTRACT_VERSION,
         canonical_status="unassigned",
@@ -3418,6 +3439,8 @@ def create_manual_transaction(
             "movement_type": payload.movement_type,
             "amount": str(transaction.amount),
             "account_id": account.id,
+            "competence": transaction.competence,
+            "competence_explicitly_confirmed": payload.competence is not None,
         },
     )
     db.commit()

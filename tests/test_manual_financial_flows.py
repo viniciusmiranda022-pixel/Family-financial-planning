@@ -182,6 +182,113 @@ def test_manual_expense_at_sight_in_checking_account():
         assert row["installment"] is None
 
 
+def test_checking_account_expense_defaults_competence_to_booked_at_month():
+    """No invoice competence concern for a checking account (INV-017 is
+    specifically about the *card* purchase); omitting `competence` here must
+    keep the pre-existing, backward-compatible fallback to `booked_at`'s
+    month -- this slice must not force an explicit competence where the
+    contract never required one."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente", account_type="checking")
+        category_id = _non_system_category_id(client)
+
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-12",
+                "description": "Supermercado",
+                "amount": 250,
+                "movement_type": "expense",
+                "account_id": itau,
+                "category_id": category_id,
+            },
+        )
+        assert response.status_code == 201, response.text
+
+        with session_factory() as db:
+            transaction = db.get(Transaction, response.json()["id"])
+            assert transaction.competence == "2026-08"
+
+
+def test_credit_card_expense_without_explicit_competence_is_rejected():
+    """INV-017: a card purchase's competence follows the invoice, not
+    necessarily the purchase date. This app has no invoice entity yet to
+    derive that automatically (lands with the "Contas a pagar" slice), so
+    the command must fail closed instead of fabricating
+    `booked_at.strftime("%Y-%m")` -- see the engineering review on PR 47."""
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        category_id = _non_system_category_id(client)
+
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-29",
+                "description": "Compra perto do fechamento da fatura",
+                "amount": 80,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+            },
+        )
+        assert response.status_code == 422
+        assert "competência" in response.json()["detail"].lower()
+
+
+def test_credit_card_expense_persists_explicitly_confirmed_competence():
+    """The confirmed competence is persisted verbatim even when it differs
+    from `booked_at`'s month (e.g. a purchase near the statement's closing
+    date that lands in the *following* month's invoice) -- `booked_at`
+    itself is untouched, preserving it as lineage per INV-017."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        category_id = _non_system_category_id(client)
+
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-29",
+                "description": "Compra perto do fechamento da fatura",
+                "amount": 80,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "competence": "2026-09",
+            },
+        )
+        assert response.status_code == 201, response.text
+
+        with session_factory() as db:
+            transaction = db.get(Transaction, response.json()["id"])
+            assert transaction.booked_at.isoformat() == "2026-08-29"
+            assert transaction.competence == "2026-09"
+
+
+def test_explicit_competence_rejected_outside_expense_movement_type():
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente")
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-10",
+                "description": "Receita não tem competência de fatura",
+                "amount": 100,
+                "movement_type": "income",
+                "account_id": itau,
+                "competence": "2026-08",
+            },
+        )
+        assert response.status_code == 422
+
+
 def test_manual_expense_in_credit_card_account_carries_card_lineage():
     """A card expense (no installment) still records `card_last_four` from
     the account, the same lineage `confirm_capture`/document import already
@@ -203,6 +310,7 @@ def test_manual_expense_in_credit_card_account_carries_card_lineage():
                 "movement_type": "expense",
                 "account_id": nubank_card,
                 "category_id": category_id,
+                "competence": "2026-08",
             },
         )
         assert response.status_code == 201, response.text
@@ -233,6 +341,7 @@ def test_manual_installment_expense_populates_installment_and_card_fields():
                 "category_id": category_id,
                 "installment_current": 2,
                 "installment_total": 10,
+                "competence": "2026-08",
             },
         )
         assert response.status_code == 201, response.text
@@ -272,6 +381,7 @@ def test_manual_installment_feeds_canonical_projection_without_duplicating_obser
                 "category_id": category_id,
                 "installment_current": 2,
                 "installment_total": 4,
+                "competence": "2026-08",
             },
         )
         assert first.status_code == 201, first.text
@@ -288,6 +398,7 @@ def test_manual_installment_feeds_canonical_projection_without_duplicating_obser
                 "category_id": category_id,
                 "installment_current": 3,
                 "installment_total": 4,
+                "competence": "2026-09",
             },
         )
         assert second.status_code == 201, second.text

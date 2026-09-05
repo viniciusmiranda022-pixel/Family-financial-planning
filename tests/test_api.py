@@ -647,6 +647,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                 "movement_type": "expense",
                 "account_id": account.json()["id"],
                 "category_id": restaurant_category["id"],
+                "competence": "2026-08",
             },
         )
         assert manual_expense.status_code == 201
@@ -760,6 +761,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                 "account_id": account.json()["id"],
                 "category_id": restaurant_category["id"],
                 "confirmed_large_amount": True,
+                "competence": "2026-08",
             },
         )
         assert uncovered_expense.status_code == 201
@@ -800,6 +802,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                 "movement_type": "expense",
                 "account_id": account.json()["id"],
                 "category_name": "Paisagismo",
+                "competence": "2026-08",
             },
         )
         assert custom_expense.status_code == 201
