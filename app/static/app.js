@@ -621,6 +621,7 @@ async function refreshExpenseInstallmentPreview() {
   const bookedAt = form.elements.booked_at.value;
   const current = form.elements.installment_current.value;
   const total = form.elements.installment_total.value;
+  const competence = form.elements.competence.value;
   if (!amount || !bookedAt || !current || !total) {
     panel.classList.add("hidden");
     panel.innerHTML = "";
@@ -634,6 +635,11 @@ async function refreshExpenseInstallmentPreview() {
       installment_current: current,
       installment_total: total,
     });
+    // INV-017: for a card purchase this is the confirmed invoice competence,
+    // not booked_at's month -- forward it so the prévia anchors the
+    // schedule the same way `create_manual_transaction`/`_future_installments`
+    // will once the purchase is actually persisted (see `_installment_anchor_month`).
+    if (competence) query.set("competence", competence);
     const preview = await api(`/transactions/manual/installment-preview?${query.toString()}`);
     if (requestId !== installmentPreviewRequestId) return;
     const affectedMonths = new Set(preview.schedule.map((item) => item.month));
@@ -1727,7 +1733,7 @@ document.querySelector("#refresh-expense-entries").addEventListener("click", loa
 document.querySelector("#expense-entry-category").addEventListener("change", updateExpenseCustomCategoryField);
 document.querySelector("#expense-entry-account").addEventListener("change", updateExpenseCompetenceField);
 document.querySelector("#expense-entry-form").elements.booked_at.addEventListener("change", updateExpenseCompetenceField);
-["amount", "booked_at", "installment_current", "installment_total"].forEach((field) => {
+["amount", "booked_at", "installment_current", "installment_total", "competence"].forEach((field) => {
   document.querySelector("#expense-entry-form").elements[field].addEventListener("input", refreshExpenseInstallmentPreview);
 });
 
