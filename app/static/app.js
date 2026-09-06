@@ -627,13 +627,14 @@ async function refreshExpenseInstallmentPreview() {
   const form = document.querySelector("#expense-entry-form");
   const panel = document.querySelector("#expense-entry-installment-preview");
   const accountId = form.elements.account_id.value;
+  const description = form.elements.description.value;
   const amount = form.elements.amount.value;
   const bookedAt = form.elements.booked_at.value;
   const current = form.elements.installment_current.value;
   const total = form.elements.installment_total.value;
   const isCard = selectedExpenseEntryAccount()?.account_type === "credit_card";
   const competence = form.elements.competence.value;
-  if (!accountId || !amount || !bookedAt || !current || !total) {
+  if (!accountId || !description || !amount || !bookedAt || !current || !total) {
     panel.classList.add("hidden");
     panel.innerHTML = "";
     return;
@@ -642,6 +643,11 @@ async function refreshExpenseInstallmentPreview() {
   try {
     const query = new URLSearchParams({
       account_id: accountId,
+      // Required so the backend can recognize this candidate as the *next
+      // observed installment of an existing series* and simulate the same
+      // replacement `_future_installments` applies once persisted, instead
+      // of double-counting it (see `_project_installments`).
+      description,
       amount,
       booked_at: bookedAt,
       installment_current: current,
@@ -1750,7 +1756,7 @@ document.querySelector("#expense-entry-account").addEventListener("change", () =
   refreshExpenseInstallmentPreview();
 });
 document.querySelector("#expense-entry-form").elements.booked_at.addEventListener("change", updateExpenseCompetenceField);
-["amount", "booked_at", "installment_current", "installment_total", "competence"].forEach((field) => {
+["description", "amount", "booked_at", "installment_current", "installment_total", "competence"].forEach((field) => {
   document.querySelector("#expense-entry-form").elements[field].addEventListener("input", refreshExpenseInstallmentPreview);
 });
 

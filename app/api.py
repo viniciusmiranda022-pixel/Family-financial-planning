@@ -5,6 +5,7 @@ import uuid
 from calendar import monthrange
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import case, func, or_, select
@@ -3438,6 +3439,7 @@ def create_manual_transaction(
 @router.get("/transactions/manual/installment-preview")
 def preview_manual_installment(
     account_id: str = Query(...),
+    description: str = Query(..., min_length=2, max_length=500),
     amount: Decimal = Query(..., gt=0),
     booked_at: date = Query(...),
     installment_current: int = Query(..., ge=1, le=999),
@@ -3461,12 +3463,20 @@ def preview_manual_installment(
     schedule anchored on a month the POST would refuse -- this endpoint
     must never carry a second, looser policy.
 
-    No transaction is created and no state is written; the schedule and the
-    "before/after" comparison both come from `_installment_remaining_schedule`
-    / `_future_installments`, the exact same functions the canonical
-    projection engine (`app.services.projection_engine.build_projection`)
-    already consumes via `ForecastInput.installments` once the purchase is
-    actually persisted -- the UI never computes this itself.
+    `description` is required too (engineering review on PR 47, head
+    `0f82ce8`): the "before/after" comparison simulates the candidate
+    purchase as an in-memory item alongside the already-persisted rows and
+    runs both through `_project_installments` -- the exact series
+    identification and latest-observation-wins logic `_future_installments`
+    always applies. Without `description` the candidate could never be
+    recognized as the *next observed installment of an existing series*, so
+    a naive `baseline + schedule` would double-count a commitment that
+    `_future_installments` would actually replace once persisted (this was
+    the bug the review caught). No transaction is created and no state is
+    written; the projection engine
+    (`app.services.projection_engine.build_projection`) consumes the exact
+    same `_future_installments` once the purchase is actually persisted --
+    the UI never computes any of this itself.
     """
     if installment_current > installment_total:
         raise HTTPException(
@@ -3493,11 +3503,20 @@ def preview_manual_installment(
         installment_total=installment_total,
         anchor_month=anchor_month,
     )
-    baseline = _future_installments(db, user.household_id)
-    projected = dict(baseline)
-    for month, value in schedule:
-        projected[month] = projected.get(month, Decimal("0")) + value
-    affected_months = sorted(set(baseline) | {month for month, _ in schedule})
+    persisted_rows = _persisted_installment_rows(db, user.household_id)
+    candidate = SimpleNamespace(
+        account_id=account.id,
+        card_last_four=account.last_four,
+        description=description,
+        amount=money(abs(amount)),
+        installment_current=installment_current,
+        installment_total=installment_total,
+        competence=resolved_competence,
+        booked_at=booked_at,
+    )
+    baseline = _project_installments(persisted_rows)
+    projected = _project_installments([*persisted_rows, candidate])
+    affected_months = sorted(set(baseline) | set(projected) | {month for month, _ in schedule})
     return {
         "monthly_payment": decimal_value(money(abs(amount))),
         "installment_current": installment_current,
@@ -4333,35 +4352,63 @@ def _installment_remaining_schedule(
     ]
 
 
-def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
-    values: dict[str, Decimal] = {}
-    rows = db.scalars(
-        select(Transaction).where(
-            Transaction.household_id == household_id,
-            Transaction.excluded.is_(False),
-            Transaction.installment_current.is_not(None),
-            Transaction.installment_total.is_not(None),
-        )
-    ).all()
-    latest_by_series: dict[tuple, Transaction] = {}
-    for item in rows:
+def _installment_series_key(
+    *, account_id: str, card_last_four: str | None, description: str, amount: Decimal, installment_total: int, origin_month: date
+) -> tuple:
+    """Identity of an installment commitment across its repeated monthly
+    observations, shared by `_project_installments` for both a persisted
+    `Transaction` and an in-memory not-yet-persisted candidate -- the exact
+    same tuple must be computed the same way in both cases, or a genuinely
+    later observation of the same purchase would never be recognized as
+    such."""
+    stripped_description = re.sub(
+        r"(?:PARCELA\s*)?\d{1,2}\s*/\s*\d{1,2}",
+        " ",
+        description,
+        flags=re.IGNORECASE,
+    )
+    return (
+        account_id,
+        card_last_four or "",
+        normalize_description(stripped_description),
+        money(abs(amount)),
+        installment_total,
+        month_key(origin_month),
+    )
+
+
+def _project_installments(items) -> dict[str, Decimal]:
+    """Canonical month -> amount projection for a set of installment facts.
+
+    `items` may mix persisted `Transaction` rows with a single in-memory,
+    not-yet-persisted candidate (a `SimpleNamespace` carrying the same
+    `account_id`/`card_last_four`/`description`/`amount`/
+    `installment_current`/`installment_total`/`competence`/`booked_at`
+    attributes) -- this is the one place that groups observations into a
+    series (`_installment_series_key`) and keeps only the latest one by
+    `(booked_at, installment_current)`, so a later observation of an
+    existing series *replaces* the earlier one's projected schedule instead
+    of adding to it (the same fact observed twice must never be counted
+    twice). `_future_installments` (already-persisted commitments) and the
+    `Saídas` installment prévia (`GET /transactions/manual/installment-preview`,
+    simulating "as if the candidate were persisted" without writing
+    anything) both go through this exact function with the exact same
+    policy, so the two can never drift on how a series is identified or
+    which observation of it wins.
+    """
+    latest_by_series: dict[tuple, object] = {}
+    for item in items:
         current = item.installment_current or 0
         total = item.installment_total or 0
-        description = re.sub(
-            r"(?:PARCELA\s*)?\d{1,2}\s*/\s*\d{1,2}",
-            " ",
-            item.description,
-            flags=re.IGNORECASE,
-        )
         anchor = _installment_anchor_month(competence=item.competence, booked_at=item.booked_at)
         origin = add_months(anchor, -(max(1, current) - 1))
-        series = (
-            item.account_id,
-            item.card_last_four or "",
-            normalize_description(description),
-            money(abs(item.amount)),
-            total,
-            month_key(origin),
+        series = _installment_series_key(
+            account_id=item.account_id,
+            card_last_four=item.card_last_four,
+            description=item.description,
+            amount=item.amount,
+            installment_total=total,
+            origin_month=origin,
         )
         previous = latest_by_series.get(series)
         if previous is None or (item.booked_at, current) > (
@@ -4369,6 +4416,7 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
             previous.installment_current or 0,
         ):
             latest_by_series[series] = item
+    values: dict[str, Decimal] = {}
     for item in latest_by_series.values():
         anchor = _installment_anchor_month(competence=item.competence, booked_at=item.booked_at)
         for key, value in _installment_remaining_schedule(
@@ -4379,6 +4427,23 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
         ):
             values[key] = values.get(key, Decimal("0")) + value
     return values
+
+
+def _persisted_installment_rows(db: Session, household_id: str) -> list[Transaction]:
+    return list(
+        db.scalars(
+            select(Transaction).where(
+                Transaction.household_id == household_id,
+                Transaction.excluded.is_(False),
+                Transaction.installment_current.is_not(None),
+                Transaction.installment_total.is_not(None),
+            )
+        )
+    )
+
+
+def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
+    return _project_installments(_persisted_installment_rows(db, household_id))
 
 
 def _build_projection_gate_checks(

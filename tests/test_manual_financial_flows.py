@@ -738,6 +738,7 @@ def test_installment_preview_exposes_canonical_schedule_before_confirmation():
             "/api/transactions/manual/installment-preview",
             params={
                 "account_id": itau,
+                "description": "Geladeira parcelada",
                 "amount": "100.00",
                 "booked_at": "2026-08-05",
                 "installment_current": 2,
@@ -800,6 +801,7 @@ def test_installment_preview_reflects_already_persisted_commitments():
             "/api/transactions/manual/installment-preview",
             params={
                 "account_id": itau,
+                "description": "Compra avulsa",
                 "amount": "50.00",
                 "booked_at": "2026-08-20",
                 "installment_current": 1,
@@ -835,6 +837,7 @@ def test_installment_preview_anchors_on_confirmed_competence_not_booked_at():
             "/api/transactions/manual/installment-preview",
             params={
                 "account_id": nubank_card,
+                "description": "Compra perto do fechamento da fatura",
                 "amount": "90.00",
                 "booked_at": "2026-08-29",
                 "installment_current": 1,
@@ -862,6 +865,7 @@ def test_installment_preview_matches_persisted_projection_for_divergent_competen
 
         params = {
             "account_id": nubank_card,
+            "description": "Compra perto do fechamento da fatura",
             "amount": "90.00",
             "booked_at": "2026-08-29",
             "installment_current": 1,
@@ -876,7 +880,7 @@ def test_installment_preview_matches_persisted_projection_for_divergent_competen
             "/api/transactions",
             json={
                 "booked_at": params["booked_at"],
-                "description": "Compra perto do fechamento da fatura",
+                "description": params["description"],
                 "amount": float(params["amount"]),
                 "movement_type": "expense",
                 "account_id": nubank_card,
@@ -896,6 +900,92 @@ def test_installment_preview_matches_persisted_projection_for_divergent_competen
         assert previewed_schedule == persisted_schedule == {"2026-10": 90.0, "2026-11": 90.0}
 
 
+def test_installment_preview_simulates_series_replacement_for_next_observed_installment():
+    """Engineering review on PR 47 (head `0f82ce8`): a bare `baseline +
+    schedule` only holds for a brand-new, unrelated purchase. When the
+    previewed purchase is actually the *next* observed installment of an
+    existing series, `_future_installments` replaces the earlier
+    observation's projected schedule with the new one's instead of adding to
+    it (`latest_by_series`/`_project_installments`) -- the prévia must
+    simulate that same replacement, not double-count the commitment.
+
+    Reproduction from the review: card purchase 1/3, R$ 90.00, competence
+    2026-09, already persisted -- schedule 2026-10 and 2026-11. The user is
+    about to confirm the observed 2/3, same series, competence 2026-10. The
+    correct `installments_after` is {2026-11: 90} -- never
+    {2026-10: 90, 2026-11: 180}."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        category_id = _non_system_category_id(client)
+
+        first = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-29",
+                "description": "Geladeira parcelada",
+                "amount": 90,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "installment_current": 1,
+                "installment_total": 3,
+                "competence": "2026-09",
+            },
+        )
+        assert first.status_code == 201, first.text
+
+        preview = client.get(
+            "/api/transactions/manual/installment-preview",
+            params={
+                "account_id": nubank_card,
+                "description": "Geladeira parcelada",
+                "amount": "90.00",
+                "booked_at": "2026-09-29",
+                "installment_current": 2,
+                "installment_total": 3,
+                "competence": "2026-10",
+            },
+        )
+        assert preview.status_code == 200, preview.text
+        body = preview.json()
+        # The candidate's own remaining schedule is exactly its next month.
+        assert body["schedule"] == [{"month": "2026-11", "amount": 90.0}]
+        effect_by_month = {row["month"]: row for row in body["canonical_projection_effect"]}
+        assert effect_by_month["2026-10"]["installments_before"] == 90.0
+        # The old observation's contribution to 2026-10 is gone once the
+        # newer observation of the same series is simulated as persisted --
+        # never left standing alongside the new one's 2026-11.
+        assert effect_by_month["2026-10"]["installments_after"] == 0.0
+        assert effect_by_month["2026-11"]["installments_before"] == 90.0
+        assert effect_by_month["2026-11"]["installments_after"] == 90.0
+
+        # Persisting the observed 2/3 must produce exactly what the prévia
+        # showed -- proof the two can never drift.
+        second = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-09-29",
+                "description": "Geladeira parcelada",
+                "amount": 90,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "installment_current": 2,
+                "installment_total": 3,
+                "competence": "2026-10",
+            },
+        )
+        assert second.status_code == 201, second.text
+        with session_factory() as db:
+            household_id = db.scalar(select(User.household_id).where(User.username == "admin-fluxos"))
+            persisted = {
+                month: float(value) for month, value in _future_installments(db, household_id).items()
+            }
+        assert persisted == {"2026-11": 90.0}
+
+
 def test_installment_preview_rejects_current_greater_than_total():
     client, _ = _client()
     with client:
@@ -905,6 +995,7 @@ def test_installment_preview_rejects_current_greater_than_total():
             "/api/transactions/manual/installment-preview",
             params={
                 "account_id": itau,
+                "description": "Compra qualquer",
                 "amount": "100.00",
                 "booked_at": "2026-08-05",
                 "installment_current": 5,
@@ -921,6 +1012,7 @@ def test_installment_preview_requires_authentication():
             "/api/transactions/manual/installment-preview",
             params={
                 "account_id": "irrelevant-without-auth",
+                "description": "Compra qualquer",
                 "amount": "100.00",
                 "booked_at": "2026-08-05",
                 "installment_current": 1,
@@ -938,6 +1030,7 @@ def test_installment_preview_requires_known_account():
             "/api/transactions/manual/installment-preview",
             params={
                 "account_id": "does-not-exist",
+                "description": "Compra qualquer",
                 "amount": "100.00",
                 "booked_at": "2026-08-05",
                 "installment_current": 1,
@@ -962,6 +1055,7 @@ def test_installment_preview_rejects_competence_diverging_from_booked_at_for_non
             "/api/transactions/manual/installment-preview",
             params={
                 "account_id": itau,
+                "description": "Compra qualquer",
                 "amount": "90.00",
                 "booked_at": "2026-08-12",
                 "installment_current": 1,
@@ -985,6 +1079,7 @@ def test_installment_preview_requires_competence_for_card_account():
             "/api/transactions/manual/installment-preview",
             params={
                 "account_id": nubank_card,
+                "description": "Compra qualquer",
                 "amount": "90.00",
                 "booked_at": "2026-08-29",
                 "installment_current": 1,
