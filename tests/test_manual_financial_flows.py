@@ -270,6 +270,67 @@ def test_credit_card_expense_persists_explicitly_confirmed_competence():
             assert transaction.competence == "2026-09"
 
 
+def test_checking_account_expense_rejects_competence_diverging_from_booked_at():
+    """Engineering review on PR 47 (head `5671ac0`): `docs/FINANCIAL_RULES.md`
+    is explicit that checking accounts use the exact date of the entry, not a
+    human-adjustable competence like a card's invoice month (INV-017 is
+    specific to `credit_card`). `create_manual_transaction` must not silently
+    persist a checking-account expense under a fabricated period that
+    contradicts its own `booked_at` -- it must fail closed (422) instead."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente", account_type="checking")
+        category_id = _non_system_category_id(client)
+
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-12",
+                "description": "Supermercado",
+                "amount": 250,
+                "movement_type": "expense",
+                "account_id": itau,
+                "category_id": category_id,
+                "competence": "2026-09",
+            },
+        )
+        assert response.status_code == 422
+        assert "competência" in response.json()["detail"].lower()
+
+        with session_factory() as db:
+            assert db.scalar(select(Transaction)) is None
+
+
+def test_checking_account_expense_accepts_competence_equal_to_booked_at_month():
+    """A competence that merely restates `booked_at`'s own month is not a
+    divergence and must not be rejected -- only a genuinely different period
+    is forbidden for non-card accounts."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente", account_type="checking")
+        category_id = _non_system_category_id(client)
+
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-12",
+                "description": "Supermercado",
+                "amount": 250,
+                "movement_type": "expense",
+                "account_id": itau,
+                "category_id": category_id,
+                "competence": "2026-08",
+            },
+        )
+        assert response.status_code == 201, response.text
+
+        with session_factory() as db:
+            transaction = db.get(Transaction, response.json()["id"])
+            assert transaction.competence == "2026-08"
+
+
 def test_explicit_competence_rejected_outside_expense_movement_type():
     client, _ = _client()
     with client:
@@ -671,10 +732,12 @@ def test_installment_preview_exposes_canonical_schedule_before_confirmation():
     client, session_factory = _client()
     with client:
         _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente", account_type="checking")
 
         preview = client.get(
             "/api/transactions/manual/installment-preview",
             params={
+                "account_id": itau,
                 "amount": "100.00",
                 "booked_at": "2026-08-05",
                 "installment_current": 2,
@@ -712,6 +775,7 @@ def test_installment_preview_reflects_already_persisted_commitments():
     with client:
         _setup_household(client)
         nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        itau = _create_account(client, name="Itaú Corrente", account_type="checking")
         category_id = _non_system_category_id(client)
 
         first = client.post(
@@ -730,11 +794,12 @@ def test_installment_preview_reflects_already_persisted_commitments():
         )
         assert first.status_code == 201, first.text
 
-        # A second, unrelated purchase whose remaining schedule also lands
-        # on 2026-09.
+        # A second, unrelated purchase (in a different, non-card account)
+        # whose remaining schedule also lands on 2026-09.
         preview = client.get(
             "/api/transactions/manual/installment-preview",
             params={
+                "account_id": itau,
                 "amount": "50.00",
                 "booked_at": "2026-08-20",
                 "installment_current": 1,
@@ -764,10 +829,12 @@ def test_installment_preview_anchors_on_confirmed_competence_not_booked_at():
     client, _ = _client()
     with client:
         _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
 
         preview = client.get(
             "/api/transactions/manual/installment-preview",
             params={
+                "account_id": nubank_card,
                 "amount": "90.00",
                 "booked_at": "2026-08-29",
                 "installment_current": 1,
@@ -794,6 +861,7 @@ def test_installment_preview_matches_persisted_projection_for_divergent_competen
         category_id = _non_system_category_id(client)
 
         params = {
+            "account_id": nubank_card,
             "amount": "90.00",
             "booked_at": "2026-08-29",
             "installment_current": 1,
@@ -832,9 +900,11 @@ def test_installment_preview_rejects_current_greater_than_total():
     client, _ = _client()
     with client:
         _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente", account_type="checking")
         response = client.get(
             "/api/transactions/manual/installment-preview",
             params={
+                "account_id": itau,
                 "amount": "100.00",
                 "booked_at": "2026-08-05",
                 "installment_current": 5,
@@ -850,6 +920,7 @@ def test_installment_preview_requires_authentication():
         response = client.get(
             "/api/transactions/manual/installment-preview",
             params={
+                "account_id": "irrelevant-without-auth",
                 "amount": "100.00",
                 "booked_at": "2026-08-05",
                 "installment_current": 1,
@@ -857,3 +928,68 @@ def test_installment_preview_requires_authentication():
             },
         )
         assert response.status_code == 401
+
+
+def test_installment_preview_requires_known_account():
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        response = client.get(
+            "/api/transactions/manual/installment-preview",
+            params={
+                "account_id": "does-not-exist",
+                "amount": "100.00",
+                "booked_at": "2026-08-05",
+                "installment_current": 1,
+                "installment_total": 3,
+            },
+        )
+        assert response.status_code == 404
+
+
+def test_installment_preview_rejects_competence_diverging_from_booked_at_for_non_card_account():
+    """Engineering review on PR 47 (head `5671ac0`, gap 1): without knowing
+    the account, the prévia could show a schedule anchored on a competence
+    the POST would reject outright. A checking account's prévia must apply
+    the exact same `_resolve_expense_competence` policy `create_manual_transaction`
+    does -- reject a competence diverging from `booked_at`'s month instead of
+    silently anchoring the schedule on it."""
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente", account_type="checking")
+        response = client.get(
+            "/api/transactions/manual/installment-preview",
+            params={
+                "account_id": itau,
+                "amount": "90.00",
+                "booked_at": "2026-08-12",
+                "installment_current": 1,
+                "installment_total": 3,
+                "competence": "2026-09",
+            },
+        )
+        assert response.status_code == 422
+        assert "competência" in response.json()["detail"].lower()
+
+
+def test_installment_preview_requires_competence_for_card_account():
+    """The prévia must fail closed exactly like `create_manual_transaction`
+    when a card purchase omits the explicitly confirmed invoice competence
+    (INV-017) -- never fabricate one from `booked_at` to show a schedule."""
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        response = client.get(
+            "/api/transactions/manual/installment-preview",
+            params={
+                "account_id": nubank_card,
+                "amount": "90.00",
+                "booked_at": "2026-08-29",
+                "installment_current": 1,
+                "installment_total": 3,
+            },
+        )
+        assert response.status_code == 422
+        assert "competência" in response.json()["detail"].lower()

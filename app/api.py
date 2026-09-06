@@ -3349,26 +3349,14 @@ def create_manual_transaction(
         amount = abs(payload.amount)
         category = category_for(db, user.household_id, "Reembolsos e estornos")
 
-    if payload.movement_type == "expense" and account.account_type == "credit_card":
-        # INV-017: a card purchase's competence is the invoice's canonical
-        # competence, not necessarily the purchase date's month. This app has
-        # no invoice/fatura entity yet to derive that automatically (it lands
-        # with the "Contas a pagar" slice), so fabricating
-        # `booked_at.strftime("%Y-%m")` here would violate the invariant for
-        # any purchase near a statement's closing date. Fail closed instead:
-        # require the human to explicitly confirm the competence: booked_at
-        # stays untouched as the lineage date either way.
-        if payload.competence is None:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Compra no cartão exige confirmar a competência da fatura; ela não é "
-                    "derivada automaticamente da data da compra (INV-017)."
-                ),
-            )
-        competence = payload.competence
+    if payload.movement_type == "expense":
+        competence = _resolve_expense_competence(
+            account_type=account.account_type,
+            competence=payload.competence,
+            booked_at=payload.booked_at,
+        )
     else:
-        competence = payload.competence or payload.booked_at.strftime("%Y-%m")
+        competence = payload.booked_at.strftime("%Y-%m")
 
     parsed = ParsedTransaction(
         booked_at=payload.booked_at,
@@ -3449,6 +3437,7 @@ def create_manual_transaction(
 
 @router.get("/transactions/manual/installment-preview")
 def preview_manual_installment(
+    account_id: str = Query(...),
     amount: Decimal = Query(..., gt=0),
     booked_at: date = Query(...),
     installment_current: int = Query(..., ge=1, le=999),
@@ -3462,13 +3451,15 @@ def preview_manual_installment(
     value, the remaining schedule of future months, and how that schedule
     changes the canonical projection's future `installments` load per month.
 
-    `competence` is the same explicitly confirmed invoice competence
-    `create_manual_transaction` requires for a card expense (INV-017); when
-    present it anchors the schedule instead of `booked_at`'s month, via the
-    same `_installment_anchor_month` the persisted path uses, so the prévia
-    can never diverge from what gets fed into `_future_installments` once
-    the purchase is confirmed. Omitted for non-card entries, where
-    `booked_at`'s month is already the competence.
+    `account_id` is required so the prévia can apply the exact same
+    competence policy `create_manual_transaction` will enforce when the
+    purchase is actually confirmed (`_resolve_expense_competence`): a card
+    account requires an explicitly confirmed invoice competence (INV-017,
+    which may diverge from `booked_at`'s month), while every other account
+    type is always anchored on `booked_at`'s month and rejects a diverging
+    `competence`. Without knowing the account, the prévia could show a
+    schedule anchored on a month the POST would refuse -- this endpoint
+    must never carry a second, looser policy.
 
     No transaction is created and no state is written; the schedule and the
     "before/after" comparison both come from `_installment_remaining_schedule`
@@ -3481,7 +3472,21 @@ def preview_manual_installment(
         raise HTTPException(
             status_code=422, detail="A parcela atual não pode ser maior que o total de parcelas"
         )
-    anchor_month = _installment_anchor_month(competence=competence, booked_at=booked_at)
+    account = db.scalar(
+        select(Account).where(
+            Account.id == account_id,
+            Account.household_id == user.household_id,
+            Account.active.is_(True),
+        )
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Conta não encontrada")
+    resolved_competence = _resolve_expense_competence(
+        account_type=account.account_type,
+        competence=competence,
+        booked_at=booked_at,
+    )
+    anchor_month = _installment_anchor_month(competence=resolved_competence, booked_at=booked_at)
     schedule = _installment_remaining_schedule(
         amount=amount,
         installment_current=installment_current,
@@ -4236,6 +4241,50 @@ def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
             if item.recurrence_months == 0:
                 break
     return values
+
+
+def _resolve_expense_competence(*, account_type: str, competence: str | None, booked_at: date) -> str:
+    """Single source of truth for the competence (`YYYY-MM`) a manual expense
+    is recorded under, shared by `create_manual_transaction` and the
+    installment preview so the two can never diverge on the same policy.
+
+    `docs/FINANCIAL_RULES.md`: cartões são conciliados pela competência da
+    fatura; contas correntes usam a data exata do lançamento. So:
+    - `credit_card`: INV-017 -- the invoice's canonical competence is not
+      necessarily `booked_at`'s month, and this app has no invoice/fatura
+      entity yet to derive it automatically (lands with the "Contas a pagar"
+      slice). Fail closed instead of fabricating it: require the human to
+      explicitly confirm the competence.
+    - every other account type: competence is always `booked_at`'s month.
+      An explicitly provided `competence` that diverges from it is rejected
+      (422) rather than silently accepted/rewritten -- accepting it would
+      let a checking-account fact carry a fabricated period that contradicts
+      the bank statement's own date, which the reconciliation/projection
+      engines assume never happens for non-card accounts.
+    `booked_at` itself is never altered either way; it stays intact as the
+    lineage date.
+    """
+    booked_month = booked_at.strftime("%Y-%m")
+    if account_type == "credit_card":
+        if competence is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Compra no cartão exige confirmar a competência da fatura; ela não é "
+                    "derivada automaticamente da data da compra (INV-017)."
+                ),
+            )
+        return competence
+    if competence is not None and competence != booked_month:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Competência divergente da data do lançamento só é permitida para compras "
+                "no cartão (INV-017); contas correntes usam a data exata do lançamento "
+                "(docs/FINANCIAL_RULES.md)."
+            ),
+        )
+    return booked_month
 
 
 def _installment_anchor_month(*, competence: str | None, booked_at: date) -> date:

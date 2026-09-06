@@ -591,21 +591,30 @@ function selectedExpenseEntryAccount() {
   return state.accounts.find((item) => item.id === id) || null;
 }
 
-// INV-017: a card purchase's competence is the invoice's, not necessarily
-// the purchase date's month, and this app has no invoice entity yet to
-// derive it automatically. So the field is always editable and, for a
-// card account, required -- the user must explicitly confirm it instead of
-// the backend fabricating it from `booked_at` (see `create_manual_transaction`).
+// docs/FINANCIAL_RULES.md: cartões são conciliados pela competência da
+// fatura; contas correntes usam a data exata do lançamento. So the field is
+// only editable/required for a card account, where the user must explicitly
+// confirm the invoice competence (INV-017) instead of the backend
+// fabricating it from `booked_at` (see `create_manual_transaction`). For any
+// other account type it is disabled and locked to `booked_at`'s month --
+// disabled fields are excluded from `FormData` (`formJson`), so the backend
+// never even receives an explicit `competence` for a non-card submission,
+// matching `_resolve_expense_competence`'s policy without a second rule here.
 function updateExpenseCompetenceField() {
   const field = document.querySelector("#expense-entry-competence");
   const hint = document.querySelector("#expense-entry-competence-hint");
   const bookedAt = document.querySelector("#expense-entry-form").elements.booked_at.value;
   const isCard = selectedExpenseEntryAccount()?.account_type === "credit_card";
   field.required = isCard;
+  field.disabled = !isCard;
   hint.textContent = isCard
     ? "Compra no cartão: confirme o mês da fatura em que ela deve entrar; não é sempre o mês da compra (INV-017)."
-    : "Preenchida com o mês da data por padrão; ajuste se a competência for outra.";
-  if (!field.value && bookedAt) field.value = bookedAt.slice(0, 7);
+    : "Contas correntes usam sempre o mês da data do lançamento; não é editável (docs/FINANCIAL_RULES.md).";
+  if (isCard) {
+    if (!field.value && bookedAt) field.value = bookedAt.slice(0, 7);
+  } else {
+    field.value = bookedAt ? bookedAt.slice(0, 7) : "";
+  }
 }
 
 let installmentPreviewRequestId = 0;
@@ -617,12 +626,14 @@ let installmentPreviewRequestId = 0;
 async function refreshExpenseInstallmentPreview() {
   const form = document.querySelector("#expense-entry-form");
   const panel = document.querySelector("#expense-entry-installment-preview");
+  const accountId = form.elements.account_id.value;
   const amount = form.elements.amount.value;
   const bookedAt = form.elements.booked_at.value;
   const current = form.elements.installment_current.value;
   const total = form.elements.installment_total.value;
+  const isCard = selectedExpenseEntryAccount()?.account_type === "credit_card";
   const competence = form.elements.competence.value;
-  if (!amount || !bookedAt || !current || !total) {
+  if (!accountId || !amount || !bookedAt || !current || !total) {
     panel.classList.add("hidden");
     panel.innerHTML = "";
     return;
@@ -630,16 +641,19 @@ async function refreshExpenseInstallmentPreview() {
   const requestId = ++installmentPreviewRequestId;
   try {
     const query = new URLSearchParams({
+      account_id: accountId,
       amount,
       booked_at: bookedAt,
       installment_current: current,
       installment_total: total,
     });
-    // INV-017: for a card purchase this is the confirmed invoice competence,
-    // not booked_at's month -- forward it so the prévia anchors the
-    // schedule the same way `create_manual_transaction`/`_future_installments`
-    // will once the purchase is actually persisted (see `_installment_anchor_month`).
-    if (competence) query.set("competence", competence);
+    // INV-017: only a card purchase may anchor on a confirmed invoice
+    // competence diverging from booked_at's month -- forward it only then,
+    // so the prévia asks the backend the same question
+    // `create_manual_transaction`/`_resolve_expense_competence` will answer
+    // when the purchase is actually persisted. For any other account type
+    // the backend always anchors on booked_at's month by itself.
+    if (isCard && competence) query.set("competence", competence);
     const preview = await api(`/transactions/manual/installment-preview?${query.toString()}`);
     if (requestId !== installmentPreviewRequestId) return;
     const affectedMonths = new Set(preview.schedule.map((item) => item.month));
@@ -1731,7 +1745,10 @@ document.querySelector("#refresh-forecast").addEventListener("click", loadForeca
 document.querySelector("#refresh-income-entries").addEventListener("click", loadEntradas);
 document.querySelector("#refresh-expense-entries").addEventListener("click", loadSaidas);
 document.querySelector("#expense-entry-category").addEventListener("change", updateExpenseCustomCategoryField);
-document.querySelector("#expense-entry-account").addEventListener("change", updateExpenseCompetenceField);
+document.querySelector("#expense-entry-account").addEventListener("change", () => {
+  updateExpenseCompetenceField();
+  refreshExpenseInstallmentPreview();
+});
 document.querySelector("#expense-entry-form").elements.booked_at.addEventListener("change", updateExpenseCompetenceField);
 ["amount", "booked_at", "installment_current", "installment_total", "competence"].forEach((field) => {
   document.querySelector("#expense-entry-form").elements[field].addEventListener("input", refreshExpenseInstallmentPreview);
