@@ -3453,6 +3453,7 @@ def preview_manual_installment(
     booked_at: date = Query(...),
     installment_current: int = Query(..., ge=1, le=999),
     installment_total: int = Query(..., ge=1, le=999),
+    competence: str | None = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -3460,6 +3461,14 @@ def preview_manual_installment(
     confirmation (`docs/GO_LIVE_MANUAL_UX_PLAN.md`): the per-installment
     value, the remaining schedule of future months, and how that schedule
     changes the canonical projection's future `installments` load per month.
+
+    `competence` is the same explicitly confirmed invoice competence
+    `create_manual_transaction` requires for a card expense (INV-017); when
+    present it anchors the schedule instead of `booked_at`'s month, via the
+    same `_installment_anchor_month` the persisted path uses, so the prévia
+    can never diverge from what gets fed into `_future_installments` once
+    the purchase is confirmed. Omitted for non-card entries, where
+    `booked_at`'s month is already the competence.
 
     No transaction is created and no state is written; the schedule and the
     "before/after" comparison both come from `_installment_remaining_schedule`
@@ -3472,11 +3481,12 @@ def preview_manual_installment(
         raise HTTPException(
             status_code=422, detail="A parcela atual não pode ser maior que o total de parcelas"
         )
+    anchor_month = _installment_anchor_month(competence=competence, booked_at=booked_at)
     schedule = _installment_remaining_schedule(
         amount=amount,
         installment_current=installment_current,
         installment_total=installment_total,
-        booked_at=booked_at,
+        anchor_month=anchor_month,
     )
     baseline = _future_installments(db, user.household_id)
     projected = dict(baseline)
@@ -4228,26 +4238,48 @@ def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
     return values
 
 
+def _installment_anchor_month(*, competence: str | None, booked_at: date) -> date:
+    """First-of-month this installment fact is anchored to for
+    schedule/projection purposes.
+
+    INV-017: a card purchase's competence is the invoice's canonical
+    competence, not necessarily `booked_at`'s month (see
+    `create_manual_transaction`). Once a `competence` has been explicitly
+    confirmed, it -- not `booked_at` -- is the source of truth for "which
+    month does this observed installment belong to"; `booked_at` keeps being
+    recorded as lineage but must never be (mis)used as a stand-in for
+    competence here. Falls back to `booked_at`'s month only when there is no
+    confirmed competence (legacy rows, or non-card accounts where the two
+    already coincide by the `create_manual_transaction` fallback).
+    """
+    if competence:
+        return datetime.strptime(competence, "%Y-%m").date().replace(day=1)
+    return booked_at.replace(day=1)
+
+
 def _installment_remaining_schedule(
-    *, amount: Decimal, installment_current: int, installment_total: int, booked_at: date
+    *, amount: Decimal, installment_current: int, installment_total: int, anchor_month: date
 ) -> list[tuple[str, Decimal]]:
     """Canonical month -> amount schedule for the installments that remain
     *after* `installment_current`, given the confirmed per-installment
-    `amount` and the `booked_at` of that installment.
+    `amount` and `anchor_month` -- the first-of-month this installment is
+    effectively competence-anchored to (`_installment_anchor_month`), which
+    is *not* necessarily `booked_at`'s calendar month.
 
     This is the single source of truth for "which future months this
     commitment adds and how much": `_future_installments` (already-persisted
     purchases feeding the canonical projection) and the pre-confirmation
     `Saídas` preview (`GET /transactions/manual/installment-preview`) both
-    call this exact function, so the number shown before confirming can
-    never drift from the number the projection engine uses afterwards --
-    the UI is never allowed to compute this on its own (no parallel formula
-    in JS).
+    call this exact function with the same anchor resolution, so the number
+    shown before confirming can never drift from the number the projection
+    engine uses afterwards -- the UI is never allowed to compute this on its
+    own (no parallel formula in JS), and there is no second formula here
+    either for the competence-vs-booked_at distinction.
     """
     remaining = max(0, installment_total - installment_current)
     value = money(abs(amount))
     return [
-        (month_key(add_months(booked_at.replace(day=1), offset)), value)
+        (month_key(add_months(anchor_month.replace(day=1), offset)), value)
         for offset in range(1, remaining + 1)
     ]
 
@@ -4272,7 +4304,8 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
             item.description,
             flags=re.IGNORECASE,
         )
-        origin = add_months(item.booked_at.replace(day=1), -(max(1, current) - 1))
+        anchor = _installment_anchor_month(competence=item.competence, booked_at=item.booked_at)
+        origin = add_months(anchor, -(max(1, current) - 1))
         series = (
             item.account_id,
             item.card_last_four or "",
@@ -4288,11 +4321,12 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
         ):
             latest_by_series[series] = item
     for item in latest_by_series.values():
+        anchor = _installment_anchor_month(competence=item.competence, booked_at=item.booked_at)
         for key, value in _installment_remaining_schedule(
             amount=item.amount,
             installment_current=item.installment_current or 0,
             installment_total=item.installment_total or 0,
-            booked_at=item.booked_at,
+            anchor_month=anchor,
         ):
             values[key] = values.get(key, Decimal("0")) + value
     return values

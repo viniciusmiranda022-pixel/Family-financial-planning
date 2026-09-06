@@ -411,6 +411,101 @@ def test_manual_installment_feeds_canonical_projection_without_duplicating_obser
             assert _future_installments(db, household_id) == {"2026-10": Decimal("100.00")}
 
 
+def test_future_installments_anchors_schedule_on_confirmed_competence_not_booked_at():
+    """INV-017 regression (engineering review on PR 47, head `7c8a25e`): the
+    remaining-installment schedule fed into the canonical projection must be
+    anchored on the *confirmed* invoice competence, not on `booked_at`'s
+    calendar month, whenever they diverge.
+
+    Reproduction from the review: a card purchase booked 2026-08-29 with
+    invoice competence confirmed as 2026-09 and installment 1/3 belongs to
+    September's invoice. Its two remaining installments must land on October
+    and November -- anchoring on `booked_at` instead would (incorrectly)
+    schedule September and October, making September appear simultaneously
+    as the observed installment's own competence and as a projected future
+    installment (double counting the same fact)."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        category_id = _non_system_category_id(client)
+
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-29",
+                "description": "Compra perto do fechamento da fatura",
+                "amount": 90,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "installment_current": 1,
+                "installment_total": 3,
+                "competence": "2026-09",
+            },
+        )
+        assert response.status_code == 201, response.text
+
+        with session_factory() as db:
+            household_id = db.scalar(select(User.household_id).where(User.username == "admin-fluxos"))
+            assert _future_installments(db, household_id) == {
+                "2026-10": Decimal("90.00"),
+                "2026-11": Decimal("90.00"),
+            }
+
+
+def test_future_installments_replaces_observed_competence_month_without_duplication():
+    """Continuation of the scenario above: once the September installment
+    (2/3) is itself observed with its own confirmed competence, it must
+    replace the first observation's projection instead of adding to it, and
+    the September competence must never reappear as a projected month."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        category_id = _non_system_category_id(client)
+
+        first = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-29",
+                "description": "Compra perto do fechamento da fatura",
+                "amount": 90,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "installment_current": 1,
+                "installment_total": 3,
+                "competence": "2026-09",
+            },
+        )
+        assert first.status_code == 201, first.text
+
+        second = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-09-29",
+                "description": "Compra perto do fechamento da fatura",
+                "amount": 90,
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "installment_current": 2,
+                "installment_total": 3,
+                "competence": "2026-10",
+            },
+        )
+        assert second.status_code == 201, second.text
+
+        with session_factory() as db:
+            household_id = db.scalar(select(User.household_id).where(User.username == "admin-fluxos"))
+            # Only the latest observed installment (2/3, competence 2026-10)
+            # seeds the projection: one remaining month (November) -- not
+            # the union with the first observation's own schedule, and never
+            # 2026-09 or 2026-10 themselves (already-observed competences).
+            assert _future_installments(db, household_id) == {"2026-11": Decimal("90.00")}
+
+
 def test_installment_fields_require_expense_movement_type():
     client, _ = _client()
     with client:
@@ -652,6 +747,85 @@ def test_installment_preview_reflects_already_persisted_commitments():
         assert effect_by_month["2026-09"]["installments_before"] == 100.0
         # Adding the previewed purchase's own 50.00 for that month.
         assert effect_by_month["2026-09"]["installments_after"] == 150.0
+
+
+def test_installment_preview_anchors_on_confirmed_competence_not_booked_at():
+    """INV-017 regression (engineering review on PR 47, head `7c8a25e`): when
+    the confirmed invoice competence diverges from `booked_at`'s month, the
+    prévia must anchor the remaining schedule on the competence, exactly as
+    `_future_installments` does once the purchase is persisted -- otherwise
+    the prévia and the canonical projection would disagree about which
+    months are affected for the very same fact.
+
+    Same reproduction the review used: booked 2026-08-29, competence
+    confirmed 2026-09, installment 1/3 -- remaining installments must be
+    2026-10 and 2026-11, never 2026-09 (the observed installment's own
+    competence) or 2026-08 (`booked_at`'s month)."""
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+
+        preview = client.get(
+            "/api/transactions/manual/installment-preview",
+            params={
+                "amount": "90.00",
+                "booked_at": "2026-08-29",
+                "installment_current": 1,
+                "installment_total": 3,
+                "competence": "2026-09",
+            },
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["schedule"] == [
+            {"month": "2026-10", "amount": 90.0},
+            {"month": "2026-11", "amount": 90.0},
+        ]
+
+
+def test_installment_preview_matches_persisted_projection_for_divergent_competence():
+    """End-to-end proof that preview and `_future_installments` never drift:
+    the prévia for a not-yet-confirmed purchase must show the exact same
+    schedule that `_future_installments` reports once that same purchase is
+    actually persisted with a competence diverging from `booked_at`."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        category_id = _non_system_category_id(client)
+
+        params = {
+            "amount": "90.00",
+            "booked_at": "2026-08-29",
+            "installment_current": 1,
+            "installment_total": 3,
+            "competence": "2026-09",
+        }
+        preview = client.get("/api/transactions/manual/installment-preview", params=params)
+        assert preview.status_code == 200, preview.text
+        previewed_schedule = {row["month"]: row["amount"] for row in preview.json()["schedule"]}
+
+        created = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": params["booked_at"],
+                "description": "Compra perto do fechamento da fatura",
+                "amount": float(params["amount"]),
+                "movement_type": "expense",
+                "account_id": nubank_card,
+                "category_id": category_id,
+                "installment_current": params["installment_current"],
+                "installment_total": params["installment_total"],
+                "competence": params["competence"],
+            },
+        )
+        assert created.status_code == 201, created.text
+
+        with session_factory() as db:
+            household_id = db.scalar(select(User.household_id).where(User.username == "admin-fluxos"))
+            persisted_schedule = {
+                month: float(value) for month, value in _future_installments(db, household_id).items()
+            }
+        assert previewed_schedule == persisted_schedule == {"2026-10": 90.0, "2026-11": 90.0}
 
 
 def test_installment_preview_rejects_current_greater_than_total():
