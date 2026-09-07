@@ -149,6 +149,77 @@ def test_manual_income_creates_real_income_without_parallel_policy():
             assert json.loads(event.details)["movement_type"] == "income"
 
 
+def test_manual_refund_offsets_expense_without_becoming_income():
+    """Slice 5 (`docs/WORK_ORDER_MANUAL_E2E_GO_LIVE.md`, fluxo 11) closes the
+    one flow of the 12 minimum go-live flows that, unlike income, expense,
+    transfer, investment, redemption and card payment, had no
+    dashboard-before/after assertion exercised through the manual API
+    (`POST /api/transactions`, `movement_type=refund`). INV-016
+    (`docs/FINANCIAL_INVARIANTS.md`) is proven at the invariant-evaluator
+    level by `tests/test_financial_invariants.py::
+    test_refund_offsets_expense_without_creating_income`; this test proves
+    the same property end-to-end through the actual manual-entry command
+    and `GET /dashboard`, matching the rigor already applied to the other
+    11 flows in this file and in `tests/test_manual_transfers.py`.
+
+    `_operating_expenses = max(0, expenses - refunds)`
+    (`app/services/financial_snapshots.py`), so a refund must reduce
+    `spending` by exactly its amount and must never touch `cash_in` -- an
+    estorno is a expense offset, never operational income."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente")
+        category_id = _non_system_category_id(client)
+
+        expense = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-10",
+                "description": "Compra na loja",
+                "amount": 300,
+                "movement_type": "expense",
+                "account_id": itau,
+                "category_id": category_id,
+            },
+        )
+        assert expense.status_code == 201, expense.text
+
+        before = client.get("/api/dashboard?month=2026-08").json()
+        response = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-12",
+                "description": "Estorno da loja",
+                "amount": 100,
+                "movement_type": "refund",
+                "account_id": itau,
+            },
+        )
+        assert response.status_code == 201, response.text
+        transaction_id = response.json()["id"]
+
+        after = client.get("/api/dashboard?month=2026-08").json()
+        assert after["spending"] == before["spending"] - 100
+        assert after["cash_in"] == before["cash_in"]
+
+        rows = client.get("/api/transactions?month=2026-08").json()
+        row = next(item for item in rows if item["id"] == transaction_id)
+        assert row["type"] == "refund"
+        assert row["amount"] == 100
+        assert row["category"] == "Reembolsos e estornos"
+
+        with session_factory() as db:
+            event = db.scalar(
+                select(AuditEvent).where(
+                    AuditEvent.event_type == "transaction.create_manual",
+                    AuditEvent.entity_id == transaction_id,
+                )
+            )
+            assert event is not None
+            assert json.loads(event.details)["movement_type"] == "refund"
+
+
 def test_manual_expense_at_sight_in_checking_account():
     """`Saídas` posts an ordinary at-sight expense to a checking account."""
     client, _ = _client()
