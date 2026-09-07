@@ -159,6 +159,45 @@ def _card_invoice_line(
         return line.id
 
 
+def _legacy_transfer_row(
+    session_factory,
+    *,
+    household_id: str,
+    account_id: str | None,
+    category_id: str | None,
+    amount: str = "150.00",
+    description: str = "Transferência legada",
+    day: int = 6,
+) -> str:
+    """A `transaction_type="transfer"` row persisted the way data predating
+    the canonical `/api/transfers` category convention (or any other
+    inconsistent/unresolved reference) would look: never produced by a
+    slice 1-3 canonical command, but a real state the read model must not
+    silently mislabel. No API in this codebase creates this shape -- it is
+    inserted directly to reproduce exactly the historical/legacy fact the
+    PR #50 review flagged."""
+    with session_factory() as db:
+        row = Transaction(
+            household_id=household_id,
+            account_id=account_id,
+            category_id=category_id,
+            booked_at=date(2026, 8, day),
+            occurred_at=date(2026, 8, day),
+            description=description,
+            normalized_description=description.upper(),
+            amount=Decimal(amount),
+            transaction_type="transfer",
+            classification_source="legacy",
+            fingerprint=f"legacytransfer{uuid.uuid4().hex}".ljust(64, "0")[:64],
+            source_priority=50,
+            confidence=Decimal("1"),
+            reviewed=True,
+        )
+        db.add(row)
+        db.commit()
+        return row.id
+
+
 def _csv(rows: str) -> bytes:
     return ("date,title,amount\n" + rows).encode()
 
@@ -347,6 +386,219 @@ def test_ledger_movement_type_filter_matches_exactly_without_double_counting() -
         assert redemption["id"] not in {row["id"] for row in transfer_rows}
         assert transfer["from_transaction_id"] not in {row["id"] for row in investment_rows}
         assert transfer["from_transaction_id"] not in {row["id"] for row in redemption_rows}
+
+
+def test_ledger_transfer_filter_includes_legacy_and_uncategorized_rows() -> None:
+    """Regression for the PR #50 review finding: `_ledger_movement_type`
+    labels *any* `transaction_type="transfer"` row without a household-scoped
+    "Transferência patrimonial" category as `movement_type="transfer"` -- a
+    legacy row tagged with a different/older category, or with no resolvable
+    category at all, is still `"transfer"` in the unfiltered listing. The
+    `movement_type=transfer` filter must select exactly that same set
+    (acceptance item 1 from the review): it must never require the row to
+    additionally carry the "Transferência interna" category name, since that
+    name is only what the *current* `/api/transfers` canonical command
+    happens to use -- it is not part of the label's own definition."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        checking = _create_account(client, name="Itaú Corrente")
+        savings = _create_account(client, name="Poupança")
+        with session_factory() as db:
+            household_id = db.scalar(select(User.household_id).where(User.username == "admin-ledger"))
+        legacy_category_id = _non_system_category_id(client)
+
+        legacy_categorized = _legacy_transfer_row(
+            session_factory,
+            household_id=household_id,
+            account_id=checking,
+            category_id=legacy_category_id,
+            description="Transferência com categoria legada",
+        )
+        legacy_uncategorized = _legacy_transfer_row(
+            session_factory,
+            household_id=household_id,
+            account_id=savings,
+            category_id=None,
+            description="Transferência sem categoria",
+        )
+
+        canonical_transfer = client.post(
+            "/api/transfers",
+            json={
+                "booked_at": "2026-08-15",
+                "description": "Transferência canônica",
+                "amount": 150,
+                "from_account_id": checking,
+                "to_account_id": savings,
+            },
+        ).json()
+
+        unfiltered = {row["id"]: row for row in _ledger(client, month="2026-08", limit=500)}
+        assert unfiltered[legacy_categorized]["movement_type"] == "transfer"
+        assert unfiltered[legacy_uncategorized]["movement_type"] == "transfer"
+
+        transfer_filtered_ids = {row["id"] for row in _ledger(client, movement_type="transfer", limit=500)}
+        assert legacy_categorized in transfer_filtered_ids
+        assert legacy_uncategorized in transfer_filtered_ids
+        assert canonical_transfer["from_transaction_id"] in transfer_filtered_ids
+        assert canonical_transfer["to_transaction_id"] in transfer_filtered_ids
+
+        # Neither legacy row is patrimonial: it must never leak into
+        # investment/redemption just because it shares `transaction_type`.
+        investment_or_redemption_ids = {
+            row["id"]
+            for row in _ledger(client, movement_type="investment", limit=500)
+            + _ledger(client, movement_type="redemption", limit=500)
+        }
+        assert legacy_categorized not in investment_or_redemption_ids
+        assert legacy_uncategorized not in investment_or_redemption_ids
+
+
+def test_ledger_movement_type_filter_union_covers_every_labeled_row_without_gap() -> None:
+    """Regression for the PR #50 review finding, acceptance item 2: the union
+    of the seven `movement_type` filter results must equal exactly the set of
+    row ids the unfiltered listing itself labels with each corresponding
+    value -- no row whose own label says one thing is unreachable by the
+    filter for that same value, across every canonical flow plus the
+    legacy/uncategorized shapes a real household's history can contain."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        checking = _create_account(client, name="Itaú Corrente")
+        savings = _create_account(client, name="Poupança")
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card", last_four="4321")
+        category_id = _non_system_category_id(client)
+        with session_factory() as db:
+            household_id = db.scalar(select(User.household_id).where(User.username == "admin-ledger"))
+
+        _create_manual_transaction(
+            client, movement_type="income", amount=1000, account_id=checking, description="Salário"
+        )
+        _create_manual_transaction(
+            client,
+            movement_type="expense",
+            amount=90,
+            account_id=checking,
+            category_id=category_id,
+            description="Conta de luz",
+        )
+        _create_manual_transaction(
+            client, movement_type="investment", amount=600, account_id=savings, description="Aplicação"
+        )
+        _create_manual_transaction(
+            client, movement_type="redemption", amount=200, account_id=savings, description="Resgate"
+        )
+        _create_manual_transaction(
+            client, movement_type="refund", amount=30, account_id=checking, description="Estorno"
+        )
+        client.post(
+            "/api/transfers",
+            json={
+                "booked_at": "2026-08-15",
+                "description": "Transferência canônica",
+                "amount": 150,
+                "from_account_id": checking,
+                "to_account_id": savings,
+            },
+        )
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household_id, credit_card_account_id=cartao, amount="500.00"
+        )
+        client.post(
+            "/api/card-payment-reconciliations/pay",
+            json={
+                "card_transaction_id": invoice_id,
+                "paying_account_id": checking,
+                "amount": 500,
+                "booked_at": "2026-08-20",
+                "description": "Pagamento da fatura",
+                "confirmed": True,
+            },
+        )
+        _legacy_transfer_row(
+            session_factory,
+            household_id=household_id,
+            account_id=checking,
+            category_id=category_id,
+            description="Transferência com categoria legada",
+        )
+        _legacy_transfer_row(
+            session_factory,
+            household_id=household_id,
+            account_id=savings,
+            category_id=None,
+            description="Transferência sem categoria",
+        )
+
+        rows = _ledger(client, month="2026-08", limit=500)
+        labeled_ids_by_type: dict[str, set[str]] = {}
+        for row in rows:
+            labeled_ids_by_type.setdefault(row["movement_type"], set()).add(row["id"])
+
+        for movement_type, expected_ids in labeled_ids_by_type.items():
+            filtered_ids = {row["id"] for row in _ledger(client, movement_type=movement_type, limit=500)}
+            assert filtered_ids == expected_ids, (
+                f"movement_type={movement_type!r} filter diverges from the unfiltered label: "
+                f"filter={filtered_ids!r} label={expected_ids!r}"
+            )
+
+        # Union across all seven filters accounts for every row the
+        # unfiltered listing itself carries a movement_type for -- no gap.
+        union_of_filters: set[str] = set()
+        for movement_type in sorted(labeled_ids_by_type):
+            union_of_filters |= {row["id"] for row in _ledger(client, movement_type=movement_type, limit=500)}
+        assert union_of_filters == {row["id"] for row in rows}
+
+
+def test_ledger_transfer_filter_household_isolation_holds_for_legacy_rows() -> None:
+    """Regression for the PR #50 review finding, acceptance item 4: the fixed
+    `movement_type=transfer` predicate joins through `Category` -- it must
+    keep scoping strictly by the caller's own household, including for a
+    legacy row whose category (or absence of one) sits outside the
+    "Transferência interna"/"Transferência patrimonial" pair this filter
+    used to hard-code."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client, household_name="Família A", username="admin-a-legacy")
+        checking_a = _create_account(client, name="Conta A")
+        with session_factory() as db:
+            household_a_id = db.scalar(select(User.household_id).where(User.username == "admin-a-legacy"))
+        legacy_a = _legacy_transfer_row(
+            session_factory,
+            household_id=household_a_id,
+            account_id=checking_a,
+            category_id=None,
+            description="Transferência legada da família A",
+        )
+
+        household_b_id = _create_household_admin(
+            session_factory, household_name="Família B", username="admin-b-legacy", password="senha-local-segura"
+        )
+        login_b = client.post(
+            "/api/auth/login", json={"username": "admin-b-legacy", "password": "senha-local-segura"}
+        )
+        assert login_b.status_code == 200
+        checking_b = _create_account(client, name="Conta B")
+        legacy_b = _legacy_transfer_row(
+            session_factory,
+            household_id=household_b_id,
+            account_id=checking_b,
+            category_id=None,
+            description="Transferência legada da família B",
+        )
+
+        transfer_rows_b = {row["id"] for row in _ledger(client, movement_type="transfer", limit=500)}
+        assert legacy_b in transfer_rows_b
+        assert legacy_a not in transfer_rows_b
+
+        login_a = client.post(
+            "/api/auth/login", json={"username": "admin-a-legacy", "password": "senha-local-segura"}
+        )
+        assert login_a.status_code == 200
+        transfer_rows_a = {row["id"] for row in _ledger(client, movement_type="transfer", limit=500)}
+        assert legacy_a in transfer_rows_a
+        assert legacy_b not in transfer_rows_a
 
 
 def test_ledger_origin_filter_matches_classification_source_channel() -> None:

@@ -3224,7 +3224,6 @@ def confirm_capture(
 
 
 _LEDGER_PATRIMONIAL_CATEGORY_NAME = "Transferência patrimonial"
-_LEDGER_INTERNAL_TRANSFER_CATEGORY_NAME = "Transferência interna"
 _LEDGER_MOVEMENT_TYPES = frozenset(
     {"income", "expense", "transfer", "investment", "redemption", "refund", "reconciliation"}
 )
@@ -3309,19 +3308,37 @@ def transactions(
         query = query.where(Transaction.reviewed.is_(False))
     if movement_type in {"income", "expense", "refund", "reconciliation"}:
         query = query.where(Transaction.transaction_type == movement_type)
-    elif movement_type == "transfer":
-        query = query.join(Category, Transaction.category_id == Category.id).where(
-            Transaction.transaction_type == "transfer",
-            Category.household_id == user.household_id,
-            Category.name == _LEDGER_INTERNAL_TRANSFER_CATEGORY_NAME,
+    elif movement_type in {"transfer", "investment", "redemption"}:
+        # Single canonical predicate for the patrimonial (investment/redemption)
+        # subset, shared by both the "transfer" and "investment"/"redemption"
+        # branches below, so this filter can never diverge from
+        # `_ledger_movement_type` the way an independent SQL predicate did
+        # before (see PR #50 review): that helper labels a `transfer` row as
+        # "transfer" for *any* category that isn't a household-scoped
+        # "Transferência patrimonial" match -- including a legacy/different
+        # category name, an unresolved reference, or no category at all --
+        # never only rows tagged "Transferência interna".
+        patrimonial_ids = (
+            select(Transaction.id)
+            .join(Category, Transaction.category_id == Category.id)
+            .where(
+                Transaction.household_id == user.household_id,
+                Transaction.transaction_type == "transfer",
+                Category.household_id == user.household_id,
+                Category.name == _LEDGER_PATRIMONIAL_CATEGORY_NAME,
+            )
         )
-    elif movement_type in {"investment", "redemption"}:
-        query = query.join(Category, Transaction.category_id == Category.id).where(
-            Transaction.transaction_type == "transfer",
-            Category.household_id == user.household_id,
-            Category.name == _LEDGER_PATRIMONIAL_CATEGORY_NAME,
-            Transaction.amount < 0 if movement_type == "investment" else Transaction.amount > 0,
-        )
+        if movement_type == "transfer":
+            query = query.where(
+                Transaction.transaction_type == "transfer",
+                Transaction.id.notin_(patrimonial_ids),
+            )
+        else:
+            query = query.where(
+                Transaction.transaction_type == "transfer",
+                Transaction.id.in_(patrimonial_ids),
+                Transaction.amount < 0 if movement_type == "investment" else Transaction.amount > 0,
+            )
     if origin == "manual":
         query = query.where(Transaction.classification_source == "manual_confirmed")
     elif origin == "capture":
