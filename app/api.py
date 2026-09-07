@@ -61,6 +61,7 @@ from app.schemas import (
     SemanticAuditRequest,
     SetupRequest,
     TransactionUpdate,
+    TransferRequest,
     UserCreateRequest,
 )
 from app.security import (
@@ -170,6 +171,7 @@ from app.services.report_export import (
     report_export_filename,
 )
 from app.services.smart_capture import CaptureParseError, preview_capture
+from app.services.transfers import TransferError, create_internal_transfer
 
 router = APIRouter(prefix="/api")
 settings = get_settings()
@@ -3262,6 +3264,7 @@ def transactions(
                 else None
             ),
             "manual": item.document_id is None,
+            "transfer_group_id": item.transfer_group_id,
         }
         for item in rows
     ]
@@ -3436,6 +3439,113 @@ def create_manual_transaction(
     return {"id": transaction.id}
 
 
+@router.post("/transfers", status_code=201)
+def create_manual_transfer(
+    payload: TransferRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Structured transfer between two accounts of the same household.
+
+    `docs/GO_LIVE_MANUAL_UX_PLAN.md` ("Transferências") and
+    `docs/WORK_ORDER_MANUAL_TRANSFERS_INVESTMENT_REDEMPTION.md`: the only
+    canonical command that creates a linked pair of `transaction_type =
+    "transfer"` rows (INV-001) -- origin and destination are both explicit,
+    human-confirmed account ids from this household; neither is inferred.
+    Reuses `create_internal_transfer` (`app/services/transfers.py`), the
+    same category (`Transferência interna`, already used by the Central
+    Inteligente `transfer` proposal in `confirm_capture`) and the same
+    duplicate-detection/audit building blocks every other manual command
+    already uses -- no parallel financial engine.
+    """
+    from_account = db.scalar(
+        select(Account).where(
+            Account.id == payload.from_account_id,
+            Account.household_id == user.household_id,
+            Account.active.is_(True),
+        )
+    )
+    if not from_account:
+        raise HTTPException(status_code=404, detail="Conta de origem não encontrada")
+    to_account = db.scalar(
+        select(Account).where(
+            Account.id == payload.to_account_id,
+            Account.household_id == user.household_id,
+            Account.active.is_(True),
+        )
+    )
+    if not to_account:
+        raise HTTPException(status_code=404, detail="Conta de destino não encontrada")
+
+    profile = profile_for(db, user.household_id)
+    large_threshold = _large_entry_threshold(profile)
+    if payload.amount >= large_threshold and not payload.confirmed_large_amount:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Este valor exige confirmação adicional. Confirme apenas se a transferência "
+                f"aconteceu de verdade; use o Consultor para simulações. Limite de confirmação: "
+                f"R$ {large_threshold:,.2f}."
+            ),
+        )
+
+    category = category_for(db, user.household_id, "Transferência interna")
+    try:
+        result = create_internal_transfer(
+            db,
+            household_id=user.household_id,
+            from_account=from_account,
+            to_account=to_account,
+            category=category,
+            amount=payload.amount,
+            booked_at=payload.booked_at,
+            description=payload.description,
+        )
+    except TransferError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    review_count = 0
+    for leg in (result.debit, result.credit):
+        if leg.duplicate_assessment is not None:
+            review_count += 1
+            db.add(
+                ReviewItem(
+                    household_id=user.household_id,
+                    transaction_id=leg.transaction.id,
+                    reason="possible_duplicate",
+                    details=(
+                        "Transferência manual agrupada como possível repetição "
+                        f"({leg.duplicate_assessment.band}, confiança "
+                        f"{leg.duplicate_assessment.confidence})"
+                    ),
+                )
+            )
+
+    audit(
+        db,
+        user,
+        "transfer.create",
+        "transaction",
+        result.debit.transaction.id,
+        {
+            "transfer_group_id": result.transfer_group_id,
+            "from_account_id": from_account.id,
+            "to_account_id": to_account.id,
+            "amount": str(money(payload.amount)),
+            "debit_transaction_id": result.debit.transaction.id,
+            "credit_transaction_id": result.credit.transaction.id,
+        },
+        trace_id=result.transfer_group_id,
+    )
+    db.commit()
+    return {
+        "transfer_group_id": result.transfer_group_id,
+        "from_transaction_id": result.debit.transaction.id,
+        "to_transaction_id": result.credit.transaction.id,
+        "review_items": review_count,
+    }
+
+
 @router.get("/transactions/manual/installment-preview")
 def preview_manual_installment(
     account_id: str = Query(...),
@@ -3555,6 +3665,26 @@ def update_transaction(
         "owner_label": transaction.owner_label,
     }
     changes = payload.model_dump(exclude_unset=True)
+    if transaction.transfer_group_id is not None and (
+        "excluded" in changes or "category_id" in changes
+    ):
+        # Both legs of a structured transfer (`POST /transfers`) must stay
+        # symmetric -- INV-001 depends on the pair having the same
+        # `excluded`/category treatment. Editing only one leg's `excluded`
+        # or `category_id` would silently break that pairing (one side
+        # still zero-effect, the other now counted, or reclassified away
+        # from "Transferência interna" while its twin isn't) without
+        # touching the other leg, which this endpoint has no way to do
+        # atomically. `reviewed`/`possible_duplicate`/`owner_label` stay
+        # editable -- they carry no operational-effect meaning.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Uma perna de transferência não pode ter categoria ou inclusão nos totais "
+                "alteradas isoladamente; exclua a transferência e registre novamente se o "
+                "vínculo estiver incorreto"
+            ),
+        )
     if "category_id" in changes and changes["category_id"]:
         category = db.scalar(
             select(Category).where(
@@ -3629,6 +3759,36 @@ def delete_manual_transaction(
             status_code=409,
             detail="Lançamentos importados não são apagados; use Ignorar para preservar a auditoria",
         )
+    if transaction.transfer_group_id is not None:
+        # A structured transfer (`POST /transfers`) is two atomically-linked
+        # legs (INV-001); deleting only the requested id would orphan its
+        # twin. Delete the whole group together, in this single commit, so
+        # there is never a state with just one leg persisted -- the same
+        # atomicity guarantee `create_internal_transfer` gives on creation.
+        group = db.scalars(
+            select(Transaction).where(
+                Transaction.household_id == user.household_id,
+                Transaction.transfer_group_id == transaction.transfer_group_id,
+            )
+        ).all()
+        audit(
+            db,
+            user,
+            "transfer.delete",
+            "transaction",
+            transaction.id,
+            {
+                "transfer_group_id": transaction.transfer_group_id,
+                "transaction_ids": [item.id for item in group],
+                "amounts": [str(item.amount) for item in group],
+            },
+            trace_id=transaction.transfer_group_id,
+        )
+        for item in group:
+            db.delete(item)
+        db.commit()
+        return {"ok": True, "deleted_transaction_ids": [item.id for item in group]}
+
     audit(
         db,
         user,
