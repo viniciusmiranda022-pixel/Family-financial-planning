@@ -894,3 +894,86 @@ def test_pay_invoice_ignores_already_linked_checking_row_as_evidence() -> None:
         with session_factory() as db:
             assert db.get(Transaction, already_linked_checking_id).linked_transaction_id == other_invoice_id
             assert db.get(Transaction, new_checking_id).linked_transaction_id == invoice_id
+
+
+def test_pay_invoice_rejects_deterministic_match_on_a_different_account_than_confirmed() -> None:
+    """REQUEST_CHANGES 2026-09-07 (`BLOQUEIO DE MERGE` #2): `paying_account_id`
+    is the user's explicit, confirmed fact for which account paid the
+    invoice (Work Order: conta pagadora nunca é inferida). A deterministic
+    1:1 bank-debit candidate that exists on a *different* checking account
+    (B) than the one confirmed in the request (A) must never be silently
+    linked -- that would substitute the confirmed account with an inferred
+    one -- and must never be silently bypassed by fabricating a manual leg
+    on A either, which would duplicate the very same real-world debit
+    already sitting unlinked on B. The endpoint must fail closed."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        conta_a = _create_account(client, name="Conta A Corrente")
+        conta_b = _create_account(client, name="Conta B Corrente")
+        cartao = _create_account(client, name="Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        # The only deterministic candidate for this invoice sits on B, not A.
+        debit_on_b = _bank_debit_line(
+            session_factory, household_id=household, checking_account_id=conta_b, amount="-1500.00", day=10
+        )
+
+        response = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(card_transaction_id=invoice_id, paying_account_id=conta_a, amount="1500.00"),
+        )
+        assert response.status_code == 409, response.text
+        assert "outra conta corrente" in response.json()["detail"]
+
+        with session_factory() as db:
+            # Nothing was linked, and no new row was fabricated on A.
+            assert db.get(Transaction, invoice_id).linked_transaction_id is None
+            assert db.get(Transaction, debit_on_b).linked_transaction_id is None
+            transactions = set(db.scalars(select(Transaction.id)).all())
+            assert transactions == {invoice_id, debit_on_b}
+            assert db.scalar(select(DuplicateGroup)) is None
+
+
+def test_pay_invoice_links_bank_debit_only_on_the_confirmed_paying_account() -> None:
+    """Positive counterpart of the test above: when the deterministic 1:1
+    candidate sits on the very account the user confirmed (A), it is reused
+    (linked) exactly as before -- a second, unrelated checking account (B)
+    in the same household must not interfere with or block that link."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        conta_a = _create_account(client, name="Conta A Corrente")
+        conta_b = _create_account(client, name="Conta B Corrente")
+        cartao = _create_account(client, name="Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        debit_on_a = _bank_debit_line(
+            session_factory, household_id=household, checking_account_id=conta_a, amount="-1500.00", day=10
+        )
+        # Present on B, but wrong amount -- never a candidate for this
+        # invoice; proves B's mere existence in the household does not
+        # perturb the deterministic match found on the confirmed account A.
+        unrelated_debit_on_b = _bank_debit_line(
+            session_factory, household_id=household, checking_account_id=conta_b, amount="-42.00", day=10
+        )
+
+        with session_factory() as db:
+            transactions_before = set(db.scalars(select(Transaction.id)).all())
+
+        response = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(card_transaction_id=invoice_id, paying_account_id=conta_a, amount="1500.00"),
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["checking_transaction_id"] == debit_on_a
+
+        with session_factory() as db:
+            transactions_after = set(db.scalars(select(Transaction.id)).all())
+            assert transactions_after == transactions_before  # zero new rows
+            assert db.get(Transaction, invoice_id).linked_transaction_id == debit_on_a
+            assert db.get(Transaction, debit_on_a).account_id == conta_a
+            assert db.get(Transaction, unrelated_debit_on_b).linked_transaction_id is None
+            assert db.scalar(select(DuplicateGroup)) is None

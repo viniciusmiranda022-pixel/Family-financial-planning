@@ -564,7 +564,7 @@ def serialize_card_invoice_obligation(item: CardInvoiceObligation) -> dict[str, 
 
 
 def _deterministic_bank_evidence_for_card(
-    db: Session, *, household_id: str, card: Any
+    db: Session, *, household_id: str, card: Any, paying_account_id: str
 ) -> tuple[str, Any | None]:
     """Whether an already-observed, unlinked checking-side reconciliation row
     already evidences the payment of this specific card invoice.
@@ -575,16 +575,38 @@ def _deterministic_bank_evidence_for_card(
     global candidate graph `list_card_payment_reconciliations` computes
     (`_candidate_edges`/`_card_side_degrees`) instead of a second policy --
     same query shape, same amount/direction/window filter, same mutual
-    1:1-isolated-edge rule for what counts as deterministic.
+    1:1-isolated-edge rule for what counts as deterministic. The graph itself
+    is always built over *every* checking account in the household (exactly
+    like `list_card_payment_reconciliations`), never only `paying_account_id`
+    -- narrowing the query would let a genuinely ambiguous card (candidates
+    split across two accounts) look spuriously "unmatched" or "matched" from
+    one account's point of view alone.
+
+    Second review round (2026-09-07, `BLOQUEIO DE MERGE` #2): a deterministic
+    global match is not, by itself, permission to link. `paying_account_id`
+    is the household's explicit, human-confirmed fact for *which* account
+    paid this invoice (Work Order: "conta pagadora ... é sempre confirmada
+    pelo usuário"; never inferred). If the one deterministic candidate sits
+    on a *different* checking account than the one the user just confirmed,
+    honoring it would silently substitute the confirmed account with
+    whatever the graph happens to name -- exactly the inference this feature
+    must never perform, even though the pairing is otherwise unambiguous.
 
     Returns:
     - `("unmatched", None)`: no checking row lists `card` as a candidate --
       no bank fact exists yet. The caller may create the manual leg.
     - `("matched", checking)`: exactly one checking row lists `card` as a
-      candidate *and* that pairing is a mutual, isolated 1:1 edge (the same
+      candidate, that pairing is a mutual, isolated 1:1 edge (the same
       "matched" status `list_card_payment_reconciliations` would report for
-      it). The caller must link that already-observed fact
-      (`link_card_payment`), never create a second leg for the same debit.
+      it), *and* that checking row belongs to `paying_account_id`. The
+      caller must link that already-observed fact (`link_card_payment`),
+      never create a second leg for the same debit.
+    - `("wrong_account", checking)`: the same deterministic 1:1 match exists,
+      but on a checking account other than `paying_account_id`. Never
+      linked and never silently superseded by a new manual leg on the
+      confirmed account (that would duplicate the very same real-world
+      debit this check exists to catch) -- the caller must fail closed and
+      require an explicit human decision.
     - `("ambiguous", None)`: any other shape -- more than one checking row
       claims this card, or the single one that does also has other card
       candidates. Never auto-resolved; the caller must require an explicit
@@ -630,9 +652,11 @@ def _deterministic_bank_evidence_for_card(
     if len(claimants) > 1:
         return "ambiguous", None
     checking = checking_by_id[claimants[0]]
-    if len(edges[claimants[0]]) == 1 and card_degrees.get(card.id, 0) == 1:
-        return "matched", checking
-    return "ambiguous", None
+    if len(edges[claimants[0]]) != 1 or card_degrees.get(card.id, 0) != 1:
+        return "ambiguous", None
+    if checking.account_id != paying_account_id:
+        return "wrong_account", checking
+    return "matched", checking
 
 
 def pay_card_invoice(
@@ -660,14 +684,24 @@ def pay_card_invoice(
     policy -- whether an already-imported, unlinked checking-side
     reconciliation row already evidences this exact debit:
 
-    - `"matched"` (a mutual, isolated 1:1 candidate already exists): this
-      call *is* the human's explicit confirmation that the invoice is
-      settled (`confirmed=True` is mandatory on the request), so it links
-      that already-observed fact via `link_card_payment` and returns it --
-      no new leg, no `register_transaction_duplicates` call, so this can
-      never create an artificial `DuplicateGroup` or displace the imported
-      row's canonical precedence with the manual source's higher
-      `source_priority`.
+    - `"matched"` (a mutual, isolated 1:1 candidate already exists *on the
+      confirmed `paying_account`*): this call *is* the human's explicit
+      confirmation that the invoice is settled (`confirmed=True` is
+      mandatory on the request), so it links that already-observed fact via
+      `link_card_payment` and returns it -- no new leg, no
+      `register_transaction_duplicates` call, so this can never create an
+      artificial `DuplicateGroup` or displace the imported row's canonical
+      precedence with the manual source's higher `source_priority`.
+    - `"wrong_account"` (second review round, 2026-09-07, `BLOQUEIO DE
+      MERGE` #2): the same deterministic 1:1 candidate exists, but on a
+      checking account other than the one the user just confirmed as
+      `paying_account`. Silently linking it would substitute the confirmed
+      account with an inferred one; silently falling through to create a
+      manual leg on `paying_account` would duplicate the very same
+      real-world debit this check exists to catch. Neither is acceptable --
+      raises `CardPaymentLinkError` naming the account holding the evidence
+      and requiring the human to either correct `paying_account_id` or
+      resolve it explicitly via `POST /card-payment-reconciliations/link`.
     - `"ambiguous"` (more than one candidate, on either side of the graph):
       never auto-resolved and never silently bypassed by fabricating a
       second leg. Raises `CardPaymentLinkError` -- a human must resolve the
@@ -758,13 +792,20 @@ def pay_card_invoice(
         )
 
     evidence_status, evidence_checking = _deterministic_bank_evidence_for_card(
-        db, household_id=household_id, card=card
+        db, household_id=household_id, card=card, paying_account_id=paying_account.id
     )
     if evidence_status == "ambiguous":
         raise CardPaymentLinkError(
             "Existem lançamentos bancários já importados que podem corresponder a esta fatura, mas "
             "de forma ambígua; revise e vincule manualmente o lançamento correto em "
             "POST /card-payment-reconciliations/link antes de registrar um novo pagamento"
+        )
+    if evidence_status == "wrong_account":
+        raise CardPaymentLinkError(
+            "Já existe um lançamento bancário importado que corresponde a esta fatura, mas em "
+            f"outra conta corrente (conta {evidence_checking.account_id}), não na conta pagadora "
+            "confirmada; corrija a conta pagadora ou vincule explicitamente o lançamento correto "
+            "em POST /card-payment-reconciliations/link antes de registrar um novo pagamento"
         )
     if evidence_status == "matched":
         # A bank-observed debit already proves this invoice was paid --
