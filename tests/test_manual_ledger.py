@@ -116,6 +116,12 @@ def _non_system_category_id(client) -> str:
     return _non_system_category_ids(client, 1)[0]
 
 
+def _patrimonial_category_id(client) -> str:
+    categories = client.get("/api/categories").json()
+    (category,) = (item for item in categories if item["name"] == "Transferência patrimonial")
+    return category["id"]
+
+
 def _card_invoice_line(
     session_factory,
     *,
@@ -549,6 +555,58 @@ def test_ledger_movement_type_filter_union_covers_every_labeled_row_without_gap(
         for movement_type in sorted(labeled_ids_by_type):
             union_of_filters |= {row["id"] for row in _ledger(client, movement_type=movement_type, limit=500)}
         assert union_of_filters == {row["id"] for row in rows}
+
+
+def test_ledger_redemption_filter_includes_patrimonial_zero_amount_row() -> None:
+    """Regression for the PR #50 review finding, BLOQUEIO DE MERGE #2:
+    `_ledger_movement_type` labels a `transaction_type="transfer"` row whose
+    category resolves to "Transferência patrimonial" as `"redemption"`
+    whenever `amount` is not negative -- including `amount == 0` -- but the
+    `movement_type=redemption` filter used to require `amount > 0`, so a
+    zero-amount patrimonial row appeared in the unfiltered listing labeled
+    `"redemption"` yet vanished under its own filter. No current manual/
+    capture command can create `amount == 0` (both require `amount > 0`),
+    but `Transaction.amount` carries no `CHECK != 0` constraint, so this is a
+    real legacy/inconsistent state the read model must not silently drop
+    from the filter that its own label promises."""
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        checking = _create_account(client, name="Itaú Corrente")
+        patrimonial_category_id = _patrimonial_category_id(client)
+        with session_factory() as db:
+            household_id = db.scalar(select(User.household_id).where(User.username == "admin-ledger"))
+
+        zero_amount_row = _legacy_transfer_row(
+            session_factory,
+            household_id=household_id,
+            account_id=checking,
+            category_id=patrimonial_category_id,
+            amount="0.00",
+            description="Resgate patrimonial legado de valor zero",
+        )
+
+        unfiltered = {row["id"]: row for row in _ledger(client, month="2026-08", limit=500)}
+        assert unfiltered[zero_amount_row]["movement_type"] == "redemption"
+
+        redemption_ids = {row["id"] for row in _ledger(client, movement_type="redemption", limit=500)}
+        assert zero_amount_row in redemption_ids
+
+        investment_ids = {row["id"] for row in _ledger(client, movement_type="investment", limit=500)}
+        assert zero_amount_row not in investment_ids
+
+        # The label <-> filter union property (acceptance item 2) must keep
+        # holding once a zero-amount patrimonial row is part of the data.
+        rows = _ledger(client, month="2026-08", limit=500)
+        labeled_ids_by_type: dict[str, set[str]] = {}
+        for row in rows:
+            labeled_ids_by_type.setdefault(row["movement_type"], set()).add(row["id"])
+        for movement_type, expected_ids in labeled_ids_by_type.items():
+            filtered_ids = {row["id"] for row in _ledger(client, movement_type=movement_type, limit=500)}
+            assert filtered_ids == expected_ids, (
+                f"movement_type={movement_type!r} filter diverges from the unfiltered label: "
+                f"filter={filtered_ids!r} label={expected_ids!r}"
+            )
 
 
 def test_ledger_transfer_filter_household_isolation_holds_for_legacy_rows() -> None:

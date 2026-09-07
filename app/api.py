@@ -3337,7 +3337,17 @@ def transactions(
             query = query.where(
                 Transaction.transaction_type == "transfer",
                 Transaction.id.in_(patrimonial_ids),
-                Transaction.amount < 0 if movement_type == "investment" else Transaction.amount > 0,
+                # Sign boundary must match `_ledger_movement_type` exactly
+                # (see PR #50 review, BLOQUEIO DE MERGE #2): that helper's
+                # `else` branch -- `amount < 0` -> "investment", anything
+                # else (including `amount == 0`) -> "redemption" -- is not
+                # reachable by two independent open intervals. A patrimonial
+                # row with `amount == 0` (never produced by the current
+                # manual/capture commands, which both require `amount > 0`,
+                # but not excluded by the persisted schema and therefore a
+                # possible legacy/inconsistent fact) must land on the same
+                # side here as it does in the unfiltered label.
+                Transaction.amount < 0 if movement_type == "investment" else Transaction.amount >= 0,
             )
     if origin == "manual":
         query = query.where(Transaction.classification_source == "manual_confirmed")
