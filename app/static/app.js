@@ -16,6 +16,22 @@ const compactMoney = new Intl.NumberFormat("pt-BR", { style: "currency", currenc
 const dateFormat = new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" });
 const monthFormat = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
 const accountTypeLabels = { checking: "Conta corrente", credit_card: "Cartão de crédito", investment: "Conta de liquidez / investimento", cash: "Dinheiro", other: "Outros" };
+// Livro-razão (Lançamentos, go-live manual slice 4): pure display labels for
+// the already-canonical `movement_type`/`document_type` values `GET
+// /transactions` returns -- translation only, never a second classification.
+// `movement_type` itself is computed once, server-side
+// (`app.api._ledger_movement_type`), from fields the backend already
+// persisted; this map only turns that value into Portuguese text.
+const ledgerMovementLabels = {
+  income: "Receita",
+  expense: "Despesa",
+  transfer: "Transferência",
+  investment: "Aplicação",
+  redemption: "Resgate",
+  refund: "Estorno",
+  reconciliation: "Conciliação / pagamento de fatura",
+};
+const documentTypeLabels = { bank_statement: "Extrato", credit_card: "Cartão", payroll: "Holerite" };
 
 function largeEntryThreshold() {
   return Math.max(5000, Number(state.dashboard?.cash_cap || 0) * 2);
@@ -573,9 +589,8 @@ async function downloadReportExport(format) {
 async function loadImports() {
   await loadAccounts();
   const items = await api("/imports");
-  const labels = { bank_statement: "Extrato", credit_card: "Cartão", payroll: "Holerite" };
   document.querySelector("#imports-table").innerHTML = items.length ? items.map((item) => `
-    <tr><td><strong>${escapeHtml(item.name)}</strong>${item.notes ? `<br><small>${escapeHtml(item.notes)}</small>` : ""}</td><td>${labels[item.type] || escapeHtml(item.type)}</td><td><span class="status-chip ${item.status.includes("review") ? "warn" : "ok"}">${escapeHtml(item.status)}</span></td><td>${item.records}</td><td>${new Date(item.created_at).toLocaleString("pt-BR")}</td></tr>
+    <tr><td><strong>${escapeHtml(item.name)}</strong>${item.notes ? `<br><small>${escapeHtml(item.notes)}</small>` : ""}</td><td>${documentTypeLabels[item.type] || escapeHtml(item.type)}</td><td><span class="status-chip ${item.status.includes("review") ? "warn" : "ok"}">${escapeHtml(item.status)}</span></td><td>${item.records}</td><td>${new Date(item.created_at).toLocaleString("pt-BR")}</td></tr>
   `).join("") : emptyRow(5, "Nenhum arquivo importado");
 }
 
@@ -832,22 +847,69 @@ async function loadTransferencias() {
   `).join("") : emptyRow(5, "Nenhuma transferência ou movimentação patrimonial neste mês");
 }
 
+function ledgerProvenanceCell(item) {
+  // Livro-razão provenance (go-live manual slice 4): every value here is
+  // already computed/persisted by the backend (`_ledger_movement_type`,
+  // `classification_source`/`origin_label`, `document_name`/`document_type`,
+  // `linked_description`/`linked_date`) -- this only lays them out, it
+  // never derives or infers a new financial fact.
+  const movementLabel = ledgerMovementLabels[item.movement_type] || item.movement_type;
+  const parts = [
+    `<strong>${escapeHtml(movementLabel)}</strong><br><small>${escapeHtml(item.origin_label || item.classification_source || "")}</small>`,
+  ];
+  if (item.document_name) {
+    const typeLabel = documentTypeLabels[item.document_type] || "Documento";
+    parts.push(`<br><small>${escapeHtml(typeLabel)}: ${escapeHtml(item.document_name)}</small>`);
+  }
+  if (item.linked_description) {
+    const linkedDate = item.linked_date ? ` · ${dateFormat.format(new Date(`${item.linked_date}T00:00:00Z`))}` : "";
+    parts.push(`<br><small>Vinculado a: ${escapeHtml(item.linked_description)}${linkedDate}</small>`);
+  }
+  return parts.join("");
+}
+
 async function loadTransactions() {
   const month = document.querySelector("#transaction-month").value;
-  const items = await api(`/transactions?limit=500${month ? `&month=${month}` : ""}`);
-  document.querySelector("#transactions-table").innerHTML = items.length ? items.map((item) => `
+  const movementType = document.querySelector("#transaction-movement-filter").value;
+  const origin = document.querySelector("#transaction-origin-filter").value;
+  const query = new URLSearchParams({ limit: "500" });
+  if (month) query.set("month", month);
+  if (movementType) query.set("movement_type", movementType);
+  if (origin) query.set("origin", origin);
+  const items = await api(`/transactions?${query.toString()}`);
+  document.querySelector("#transactions-table").innerHTML = items.length ? items.map((item) => {
+    // A reconciliation leg created by the manual invoice-payment command
+    // (`POST /card-payment-reconciliations/pay`) is `manual` (no
+    // `document_id`) but linked without a `transfer_group_id` -- the one
+    // shape `DELETE /transactions/{id}` always rejects with 409 until it is
+    // unlinked first (see `delete_manual_transaction`). Showing that as
+    // plain text here is a UX hint mirroring that existing server guard,
+    // never a second copy of it: the backend still enforces the rule
+    // unconditionally regardless of what this button shows.
+    const isLinkedReconciliation = item.manual && item.linked_transaction_id && !item.transfer_group_id;
+    // A structured transfer leg (`transfer_group_id` set) has its
+    // `category_id`/`excluded` changes rejected together by
+    // `update_transaction` -- disabling the category select mirrors that
+    // same guard instead of guaranteeing a 422 on every attempt.
+    const categoryLocked = Boolean(item.transfer_group_id);
+    const actions = !item.manual
+      ? `<button class="text-action toggle-transaction" data-id="${escapeHtml(item.id)}" data-excluded="${item.excluded}">${item.excluded ? "Reconsiderar" : "Ignorar"}</button>`
+      : isLinkedReconciliation
+        ? '<small class="muted-copy">Vinculado a pagamento de fatura — desvincule em Contas a pagar antes de excluir</small>'
+        : `<button class="danger-button delete-transaction" data-id="${escapeHtml(item.id)}">Excluir</button>`;
+    return `
     <tr data-id="${escapeHtml(item.id)}">
       <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
       <td><strong>${escapeHtml(item.description)}</strong>${item.installment ? `<br><small>Parcela ${escapeHtml(item.installment)}</small>` : ""}</td>
-      <td><select class="category-select" data-id="${escapeHtml(item.id)}">${categoryOptions(item.category_id)}</select></td>
+      <td><select class="category-select" data-id="${escapeHtml(item.id)}" ${categoryLocked ? `disabled title="Uma perna de transferência não pode ter a categoria alterada isoladamente"` : ""}>${categoryOptions(item.category_id)}</select></td>
       <td>${escapeHtml(item.owner)}</td><td>${escapeHtml(item.account)}</td>
+      <td>${ledgerProvenanceCell(item)}</td>
       <td>${item.possible_duplicate ? '<span class="status-chip warn">Possível duplicidade</span>' : item.excluded ? `<span class="status-chip muted">${item.manual ? "Fora do teto" : "Ignorado no cálculo"}</span>` : '<span class="status-chip ok">Considerado</span>'}</td>
       <td class="right ${item.amount < 0 ? "amount-expense" : "amount-income"}">${money.format(item.amount)}</td>
-      <td class="right">${item.manual
-        ? `<button class="danger-button delete-transaction" data-id="${escapeHtml(item.id)}">Excluir</button>`
-        : `<button class="text-action toggle-transaction" data-id="${escapeHtml(item.id)}" data-excluded="${item.excluded}">${item.excluded ? "Reconsiderar" : "Ignorar"}</button>`}</td>
+      <td class="right">${actions}</td>
     </tr>
-  `).join("") : emptyRow(8);
+  `;
+  }).join("") : emptyRow(9);
   document.querySelectorAll(".category-select").forEach((select) => select.addEventListener("change", async (event) => {
     try {
       await api(`/transactions/${event.target.dataset.id}`, { method: "PATCH", body: JSON.stringify({ category_id: event.target.value, reviewed: true }) });
