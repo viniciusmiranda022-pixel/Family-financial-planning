@@ -717,13 +717,17 @@ def test_paid_invoice_appears_in_ledger_without_double_counting_purchases() -> N
         assert rows[payment.json()["checking_transaction_id"]]["type"] == "reconciliation"
 
 
-def test_pay_invoice_links_existing_unique_bank_debit_instead_of_creating_new_leg() -> None:
-    """REQUEST_CHANGES 2026-09-07 (`BLOQUEIO DE MERGE`), regression (a) + (d):
-    a single already-imported, unlinked checking-side debit that
-    deterministically matches the invoice must be linked -- never
-    duplicated with a second, manually-created leg for the very same
-    real-world payment -- and must not spawn an artificial `DuplicateGroup`
-    or override the imported row's own classification."""
+def test_pay_invoice_rejects_deterministic_bank_evidence_without_explicit_link_confirmation() -> None:
+    """REQUEST_CHANGES 2026-09-07 (`BLOQUEIO DE MERGE` #3): a single
+    already-imported, unlinked checking-side debit that deterministically
+    matches the invoice -- even on the confirmed paying account -- must
+    never be auto-linked by a generic `confirmed=True` on `/pay`. That
+    would elevate a generic "pay this invoice" confirmation into a specific
+    confirmation of *this* imported row as the matching lineage fact, which
+    only `POST /card-payment-reconciliations/link` (mandatory `reason`) is
+    allowed to capture. `/pay` must fail closed, name the candidate, create
+    no new row and link nothing -- exactly like the `ambiguous`/
+    `wrong_account` cases."""
     client, session_factory = _client()
     with client:
         household = _setup_household(client, session_factory)
@@ -744,10 +748,9 @@ def test_pay_invoice_links_existing_unique_bank_debit_instead_of_creating_new_le
             "/api/card-payment-reconciliations/pay",
             json=_pay_payload(card_transaction_id=invoice_id, paying_account_id=itau, amount="1500.00"),
         )
-        assert response.status_code == 201, response.text
-        body = response.json()
-        assert body["checking_transaction_id"] == bank_debit_id
-        assert body["review_items"] == 0
+        assert response.status_code == 409, response.text
+        assert bank_debit_id in response.json()["detail"]
+        assert "/card-payment-reconciliations/link" in response.json()["detail"]
 
         with session_factory() as db:
             transactions_after = set(db.scalars(select(Transaction.id)).all())
@@ -755,15 +758,104 @@ def test_pay_invoice_links_existing_unique_bank_debit_instead_of_creating_new_le
 
             invoice = db.get(Transaction, invoice_id)
             bank_debit = db.get(Transaction, bank_debit_id)
+            assert invoice.linked_transaction_id is None
+            assert bank_debit.linked_transaction_id is None
+            assert db.scalar(select(DuplicateGroup)) is None
+
+
+def test_pay_invoice_rejects_deterministic_match_even_when_request_date_diverges() -> None:
+    """REQUEST_CHANGES 2026-09-07 (`BLOQUEIO DE MERGE` #3), point 4: proves
+    there is no silent auto-link even when the confirmed request's
+    `booked_at` differs from the already-imported candidate's own date --
+    exactly the scenario the review flagged, where success could otherwise
+    be reported while the audited fact silently diverges from what the
+    human just confirmed. `/pay` must still fail closed rather than
+    honoring the candidate's date over the request's, or vice versa."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        itau = _create_account(client, name="Itaú Corrente")
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        bank_debit_id = _bank_debit_line(
+            session_factory, household_id=household, checking_account_id=itau, amount="-1500.00", day=10
+        )
+
+        response = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(
+                card_transaction_id=invoice_id,
+                paying_account_id=itau,
+                amount="1500.00",
+                booked_at="2026-08-22",  # diverges from the imported debit's day=10
+            ),
+        )
+        assert response.status_code == 409, response.text
+        assert bank_debit_id in response.json()["detail"]
+
+        with session_factory() as db:
+            assert db.get(Transaction, invoice_id).linked_transaction_id is None
+            assert db.get(Transaction, bank_debit_id).linked_transaction_id is None
+            transactions = set(db.scalars(select(Transaction.id)).all())
+            assert transactions == {invoice_id, bank_debit_id}  # no new row
+
+
+def test_pay_invoice_settles_after_explicit_link_confirmation_and_creates_nothing_twice() -> None:
+    """Full resolution path for the `matched` block above: the human
+    resolves it explicitly via `POST /card-payment-reconciliations/link`
+    (mandatory `reason`), and only then is the invoice considered paid. A
+    subsequent `/pay` call for the same invoice must recognize it is
+    already settled and create nothing -- not silently succeed a second
+    time."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        itau = _create_account(client, name="Itaú Corrente")
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        bank_debit_id = _bank_debit_line(
+            session_factory, household_id=household, checking_account_id=itau, amount="-1500.00", day=10
+        )
+
+        blocked = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(card_transaction_id=invoice_id, paying_account_id=itau, amount="1500.00"),
+        )
+        assert blocked.status_code == 409, blocked.text
+
+        link_response = client.post(
+            "/api/card-payment-reconciliations/link",
+            json={
+                "checking_transaction_id": bank_debit_id,
+                "card_transaction_id": invoice_id,
+                "reason": "Conferido manualmente contra o extrato do Itaú",
+            },
+        )
+        assert link_response.status_code == 201, link_response.text
+
+        with session_factory() as db:
+            transactions_before_retry = set(db.scalars(select(Transaction.id)).all())
+
+        retry = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(
+                card_transaction_id=invoice_id, paying_account_id=itau, amount="1500.00", booked_at="2026-08-11"
+            ),
+        )
+        assert retry.status_code == 409, retry.text
+        assert "já está paga" in retry.json()["detail"]
+
+        with session_factory() as db:
+            transactions_after_retry = set(db.scalars(select(Transaction.id)).all())
+            assert transactions_after_retry == transactions_before_retry  # nothing created twice
+            invoice = db.get(Transaction, invoice_id)
+            bank_debit = db.get(Transaction, bank_debit_id)
             assert invoice.linked_transaction_id == bank_debit.id
             assert bank_debit.linked_transaction_id == invoice.id
-
-            # (d): no artificial DuplicateGroup, no source-precedence override --
-            # `link_card_payment` only ever touches `linked_transaction_id`.
-            assert db.scalar(select(DuplicateGroup)) is None
-            assert bank_debit.canonical_status == "unassigned"
-            assert bank_debit.possible_duplicate is False
-            assert bank_debit.account_id == itau
 
 
 def test_pay_invoice_rejects_ambiguous_bank_evidence_without_creating_or_auto_resolving() -> None:
@@ -936,11 +1028,13 @@ def test_pay_invoice_rejects_deterministic_match_on_a_different_account_than_con
             assert db.scalar(select(DuplicateGroup)) is None
 
 
-def test_pay_invoice_links_bank_debit_only_on_the_confirmed_paying_account() -> None:
-    """Positive counterpart of the test above: when the deterministic 1:1
-    candidate sits on the very account the user confirmed (A), it is reused
-    (linked) exactly as before -- a second, unrelated checking account (B)
-    in the same household must not interfere with or block that link."""
+def test_pay_invoice_rejects_deterministic_match_on_the_confirmed_paying_account_too() -> None:
+    """Counterpart of the `wrong_account` rejection: even when the
+    deterministic 1:1 candidate sits on the very account the user confirmed
+    (A), `/pay` must still fail closed rather than auto-link it (third
+    review round, `BLOQUEIO DE MERGE` #3) -- a second, unrelated checking
+    account (B) in the same household must not interfere with or change
+    that outcome."""
     client, session_factory = _client()
     with client:
         household = _setup_household(client, session_factory)
@@ -967,13 +1061,13 @@ def test_pay_invoice_links_bank_debit_only_on_the_confirmed_paying_account() -> 
             "/api/card-payment-reconciliations/pay",
             json=_pay_payload(card_transaction_id=invoice_id, paying_account_id=conta_a, amount="1500.00"),
         )
-        assert response.status_code == 201, response.text
-        assert response.json()["checking_transaction_id"] == debit_on_a
+        assert response.status_code == 409, response.text
+        assert debit_on_a in response.json()["detail"]
 
         with session_factory() as db:
             transactions_after = set(db.scalars(select(Transaction.id)).all())
             assert transactions_after == transactions_before  # zero new rows
-            assert db.get(Transaction, invoice_id).linked_transaction_id == debit_on_a
-            assert db.get(Transaction, debit_on_a).account_id == conta_a
+            assert db.get(Transaction, invoice_id).linked_transaction_id is None
+            assert db.get(Transaction, debit_on_a).linked_transaction_id is None
             assert db.get(Transaction, unrelated_debit_on_b).linked_transaction_id is None
             assert db.scalar(select(DuplicateGroup)) is None

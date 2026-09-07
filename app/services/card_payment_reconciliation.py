@@ -592,15 +592,35 @@ def _deterministic_bank_evidence_for_card(
     whatever the graph happens to name -- exactly the inference this feature
     must never perform, even though the pairing is otherwise unambiguous.
 
+    Third review round (2026-09-07, `BLOQUEIO DE MERGE` #3): a deterministic
+    1:1 candidate on the confirmed account is still not, by itself,
+    permission to link. `POST /card-payment-reconciliations/pay`'s
+    `confirmed=True` is the human's confirmation that *this invoice* is
+    being paid from *this account* on *this date/amount* -- it is not proof
+    the human has seen and confirmed *this specific already-imported bank
+    row* as the matching lineage fact, which is exactly the confirmation
+    `link_card_payment`'s own contract (and its dedicated `POST
+    /card-payment-reconciliations/link` endpoint, which requires a textual
+    `reason`) exists to capture. Concretely, `booked_at` is a mandatory,
+    explicit field of the `/pay` request; silently linking a matched row
+    whose own date can be up to `CARD_PAYMENT_MATCH_WINDOW_DAYS` away would
+    let the response report success while the audited fact (the linked
+    row's real date) silently diverges from the date the human just
+    confirmed. So a `matched` candidate is treated the same as
+    `wrong_account` below: never auto-linked, always a fail-closed 409
+    naming the candidate so the caller can resolve it explicitly.
+
     Returns:
     - `("unmatched", None)`: no checking row lists `card` as a candidate --
       no bank fact exists yet. The caller may create the manual leg.
     - `("matched", checking)`: exactly one checking row lists `card` as a
       candidate, that pairing is a mutual, isolated 1:1 edge (the same
       "matched" status `list_card_payment_reconciliations` would report for
-      it), *and* that checking row belongs to `paying_account_id`. The
-      caller must link that already-observed fact (`link_card_payment`),
-      never create a second leg for the same debit.
+      it), and that checking row belongs to `paying_account_id`. Still not
+      auto-linked (see the third review round above) -- the caller must
+      fail closed and require an explicit `POST
+      /card-payment-reconciliations/link` confirmation naming this exact
+      pair before the invoice can be considered settled.
     - `("wrong_account", checking)`: the same deterministic 1:1 match exists,
       but on a checking account other than `paying_account_id`. Never
       linked and never silently superseded by a new manual leg on the
@@ -685,13 +705,18 @@ def pay_card_invoice(
     reconciliation row already evidences this exact debit:
 
     - `"matched"` (a mutual, isolated 1:1 candidate already exists *on the
-      confirmed `paying_account`*): this call *is* the human's explicit
-      confirmation that the invoice is settled (`confirmed=True` is
-      mandatory on the request), so it links that already-observed fact via
-      `link_card_payment` and returns it -- no new leg, no
-      `register_transaction_duplicates` call, so this can never create an
-      artificial `DuplicateGroup` or displace the imported row's canonical
-      precedence with the manual source's higher `source_priority`.
+      confirmed `paying_account`*): third review round (2026-09-07,
+      `BLOQUEIO DE MERGE` #3) -- a generic `confirmed=True` on the payment
+      request is confirmation of *the invoice being paid*, not of *this
+      specific already-imported bank row being the matching lineage fact*
+      (see `_deterministic_bank_evidence_for_card`'s docstring). Never
+      auto-linked and never silently bypassed by fabricating a second leg
+      either -- raises `CardPaymentLinkError` naming the candidate
+      transaction and requiring the human to confirm that exact pair
+      explicitly via `POST /card-payment-reconciliations/link` (which
+      already requires a `reason`). Once linked that way, a repeat call to
+      `/pay` for the same invoice hits the "already paid" guard below and
+      creates nothing.
     - `"wrong_account"` (second review round, 2026-09-07, `BLOQUEIO DE
       MERGE` #2): the same deterministic 1:1 candidate exists, but on a
       checking account other than the one the user just confirmed as
@@ -808,16 +833,22 @@ def pay_card_invoice(
             "em POST /card-payment-reconciliations/link antes de registrar um novo pagamento"
         )
     if evidence_status == "matched":
-        # A bank-observed debit already proves this invoice was paid --
-        # link it instead of fabricating a second leg for the same
-        # real-world event (see the docstring's "matched" branch above).
-        checking_leg, card = link_card_payment(
-            db,
-            household_id=household_id,
-            checking_transaction_id=evidence_checking.id,
-            card_transaction_id=card.id,
+        # A bank-observed debit already proves this invoice was paid, but a
+        # generic `confirmed=True` on this request is not the human's
+        # explicit confirmation of *this specific* already-imported row as
+        # the matching lineage fact (third review round, 2026-09-07,
+        # `BLOQUEIO DE MERGE` #3 -- see the docstring above and
+        # `_deterministic_bank_evidence_for_card`'s). Fail closed instead of
+        # auto-linking or fabricating a second leg: the human must confirm
+        # this exact pair explicitly via `POST
+        # /card-payment-reconciliations/link` (which already requires a
+        # `reason`) before the invoice can be considered settled.
+        raise CardPaymentLinkError(
+            "Existe um lançamento bancário já importado que corresponde a esta fatura na conta "
+            f"pagadora confirmada (lançamento {evidence_checking.id}); confirme explicitamente esse "
+            "vínculo em POST /card-payment-reconciliations/link (informando reason) antes de "
+            "registrar o pagamento"
         )
-        return checking_leg, card, None
 
     parsed = ParsedTransaction(
         booked_at=booked_at,
