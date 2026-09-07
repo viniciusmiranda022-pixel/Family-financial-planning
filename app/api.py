@@ -3399,7 +3399,7 @@ def transactions(
                 "amount": decimal_value(item.amount),
                 "type": item.transaction_type,
                 "movement_type": _ledger_movement_type(item.transaction_type, category_name, item.amount),
-                "category_id": item.category_id,
+                "category_id": category.id if category else None,
                 "category": category_name,
                 "owner": item.owner_label,
                 "account": account.name if account else "",
