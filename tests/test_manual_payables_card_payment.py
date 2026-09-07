@@ -40,7 +40,15 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Account, AuditEvent, Category, Household, Transaction, User  # noqa: E402
+from app.models import (  # noqa: E402
+    Account,
+    AuditEvent,
+    Category,
+    DuplicateGroup,
+    Household,
+    Transaction,
+    User,
+)
 from app.security import hash_password  # noqa: E402
 
 
@@ -145,6 +153,56 @@ def _card_invoice_line(
             amount=Decimal(amount),
             transaction_type="reconciliation",
             fingerprint=f"invoiceline{uuid.uuid4().hex}".ljust(64, "0")[:64],
+            source_priority=70,
+            confidence=Decimal("1"),
+            excluded=True,
+            reviewed=True,
+        )
+        db.add(line)
+        db.commit()
+        return line.id
+
+
+def _bank_debit_line(
+    session_factory,
+    *,
+    household_id: str,
+    checking_account_id: str,
+    amount: str,
+    day: int = 10,
+    month: int = 8,
+    year: int = 2026,
+    competence: str = "2026-08",
+    description: str = "Débito fatura",
+) -> str:
+    """An already-imported bank-statement debit: negative amount, `checking`
+    account, `transaction_type="reconciliation"`, unlinked -- exactly the
+    kind of row a real Itaú/Nubank bank-statement import would leave
+    sitting unlinked in `list_card_payment_reconciliations`. This is the
+    bank fact `pay_card_invoice` must now reuse (link) instead of
+    duplicating with a second, manually-created leg for the very same
+    real-world debit (REQUEST_CHANGES 2026-09-07, `BLOQUEIO DE MERGE`)."""
+
+    with session_factory() as db:
+        category = db.scalar(
+            select(Category).where(Category.household_id == household_id, Category.name == "Conciliação")
+        )
+        if category is None:
+            category = Category(household_id=household_id, name="Conciliação", color="#64748B")
+            db.add(category)
+            db.flush()
+        line = Transaction(
+            household_id=household_id,
+            account_id=checking_account_id,
+            category_id=category.id,
+            booked_at=date(year, month, day),
+            occurred_at=date(year, month, day),
+            competence=competence,
+            description=description,
+            normalized_description=description.upper(),
+            amount=Decimal(amount),
+            transaction_type="reconciliation",
+            fingerprint=f"bankdebit{uuid.uuid4().hex}".ljust(64, "0")[:64],
             source_priority=70,
             confidence=Decimal("1"),
             excluded=True,
@@ -657,3 +715,182 @@ def test_paid_invoice_appears_in_ledger_without_double_counting_purchases() -> N
         assert purchase.json()["id"] in rows
         assert payment.json()["checking_transaction_id"] in rows
         assert rows[payment.json()["checking_transaction_id"]]["type"] == "reconciliation"
+
+
+def test_pay_invoice_links_existing_unique_bank_debit_instead_of_creating_new_leg() -> None:
+    """REQUEST_CHANGES 2026-09-07 (`BLOQUEIO DE MERGE`), regression (a) + (d):
+    a single already-imported, unlinked checking-side debit that
+    deterministically matches the invoice must be linked -- never
+    duplicated with a second, manually-created leg for the very same
+    real-world payment -- and must not spawn an artificial `DuplicateGroup`
+    or override the imported row's own classification."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        itau = _create_account(client, name="Itaú Corrente")
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        bank_debit_id = _bank_debit_line(
+            session_factory, household_id=household, checking_account_id=itau, amount="-1500.00", day=10
+        )
+
+        with session_factory() as db:
+            transactions_before = set(db.scalars(select(Transaction.id)).all())
+        assert transactions_before == {invoice_id, bank_debit_id}
+
+        response = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(card_transaction_id=invoice_id, paying_account_id=itau, amount="1500.00"),
+        )
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["checking_transaction_id"] == bank_debit_id
+        assert body["review_items"] == 0
+
+        with session_factory() as db:
+            transactions_after = set(db.scalars(select(Transaction.id)).all())
+            assert transactions_after == transactions_before  # zero new rows
+
+            invoice = db.get(Transaction, invoice_id)
+            bank_debit = db.get(Transaction, bank_debit_id)
+            assert invoice.linked_transaction_id == bank_debit.id
+            assert bank_debit.linked_transaction_id == invoice.id
+
+            # (d): no artificial DuplicateGroup, no source-precedence override --
+            # `link_card_payment` only ever touches `linked_transaction_id`.
+            assert db.scalar(select(DuplicateGroup)) is None
+            assert bank_debit.canonical_status == "unassigned"
+            assert bank_debit.possible_duplicate is False
+            assert bank_debit.account_id == itau
+
+
+def test_pay_invoice_rejects_ambiguous_bank_evidence_without_creating_or_auto_resolving() -> None:
+    """REQUEST_CHANGES 2026-09-07, regression (b): two equally eligible
+    bank-debit candidates for the same invoice must never be auto-resolved
+    nor papered over by fabricating a third, manual leg -- the human must
+    resolve the ambiguity explicitly via `POST
+    /card-payment-reconciliations/link` first."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        itau = _create_account(client, name="Itaú Corrente")
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        debit_one = _bank_debit_line(
+            session_factory,
+            household_id=household,
+            checking_account_id=itau,
+            amount="-1500.00",
+            day=10,
+            description="Débito 1",
+        )
+        debit_two = _bank_debit_line(
+            session_factory,
+            household_id=household,
+            checking_account_id=itau,
+            amount="-1500.00",
+            day=12,
+            description="Débito 2",
+        )
+
+        response = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(card_transaction_id=invoice_id, paying_account_id=itau, amount="1500.00"),
+        )
+        assert response.status_code == 409, response.text
+        assert "ambígua" in response.json()["detail"]
+
+        with session_factory() as db:
+            assert db.get(Transaction, invoice_id).linked_transaction_id is None
+            assert db.get(Transaction, debit_one).linked_transaction_id is None
+            assert db.get(Transaction, debit_two).linked_transaction_id is None
+            transactions = set(db.scalars(select(Transaction.id)).all())
+            assert transactions == {invoice_id, debit_one, debit_two}  # no new row
+            assert db.scalar(select(DuplicateGroup)) is None
+
+
+def test_pay_invoice_creates_manual_leg_when_no_bank_evidence_matches() -> None:
+    """REQUEST_CHANGES 2026-09-07, regression (c): an existing checking-side
+    reconciliation row that does not match this invoice (wrong amount) must
+    not block, or get hijacked into, a manual payment -- the manual leg is
+    still created exactly as before this review round."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        itau = _create_account(client, name="Itaú Corrente")
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        unrelated_debit_id = _bank_debit_line(
+            session_factory, household_id=household, checking_account_id=itau, amount="-42.00", day=10
+        )
+
+        response = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(card_transaction_id=invoice_id, paying_account_id=itau, amount="1500.00"),
+        )
+        assert response.status_code == 201, response.text
+        checking_id = response.json()["checking_transaction_id"]
+        assert checking_id not in (invoice_id, unrelated_debit_id)
+
+        with session_factory() as db:
+            leg = db.get(Transaction, checking_id)
+            assert leg.account_id == itau
+            assert leg.amount == Decimal("-1500.00")
+            assert leg.linked_transaction_id == invoice_id
+            assert db.get(Transaction, unrelated_debit_id).linked_transaction_id is None
+            transactions = set(db.scalars(select(Transaction.id)).all())
+            assert transactions == {invoice_id, unrelated_debit_id, checking_id}
+
+
+def test_pay_invoice_ignores_already_linked_checking_row_as_evidence() -> None:
+    """A checking-side reconciliation row that is already linked to a
+    *different* card invoice must never count as a candidate for this one --
+    `_deterministic_bank_evidence_for_card` mirrors
+    `list_card_payment_reconciliations`'s own exclusion of resolved rows
+    from the candidate graph."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        itau = _create_account(client, name="Itaú Corrente")
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        other_invoice_id = _card_invoice_line(
+            session_factory,
+            household_id=household,
+            credit_card_account_id=cartao,
+            amount="1500.00",
+            day=1,
+            competence="2026-07",
+            description="Fatura de julho",
+        )
+        pay_other = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(
+                card_transaction_id=other_invoice_id,
+                paying_account_id=itau,
+                amount="1500.00",
+                booked_at="2026-07-10",
+            ),
+        )
+        assert pay_other.status_code == 201, pay_other.text
+        already_linked_checking_id = pay_other.json()["checking_transaction_id"]
+
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        response = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(card_transaction_id=invoice_id, paying_account_id=itau, amount="1500.00"),
+        )
+        assert response.status_code == 201, response.text
+        new_checking_id = response.json()["checking_transaction_id"]
+        assert new_checking_id != already_linked_checking_id
+
+        with session_factory() as db:
+            assert db.get(Transaction, already_linked_checking_id).linked_transaction_id == other_invoice_id
+            assert db.get(Transaction, new_checking_id).linked_transaction_id == invoice_id

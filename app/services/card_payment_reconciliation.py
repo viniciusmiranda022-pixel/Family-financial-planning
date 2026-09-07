@@ -563,6 +563,78 @@ def serialize_card_invoice_obligation(item: CardInvoiceObligation) -> dict[str, 
     }
 
 
+def _deterministic_bank_evidence_for_card(
+    db: Session, *, household_id: str, card: Any
+) -> tuple[str, Any | None]:
+    """Whether an already-observed, unlinked checking-side reconciliation row
+    already evidences the payment of this specific card invoice.
+
+    Go-live manual slice 3 review round (2026-09-07, `BLOQUEIO DE MERGE`):
+    `pay_card_invoice` must never fabricate a second bank leg for a debit the
+    household's bank statement already contains. This reuses the exact same
+    global candidate graph `list_card_payment_reconciliations` computes
+    (`_candidate_edges`/`_card_side_degrees`) instead of a second policy --
+    same query shape, same amount/direction/window filter, same mutual
+    1:1-isolated-edge rule for what counts as deterministic.
+
+    Returns:
+    - `("unmatched", None)`: no checking row lists `card` as a candidate --
+      no bank fact exists yet. The caller may create the manual leg.
+    - `("matched", checking)`: exactly one checking row lists `card` as a
+      candidate *and* that pairing is a mutual, isolated 1:1 edge (the same
+      "matched" status `list_card_payment_reconciliations` would report for
+      it). The caller must link that already-observed fact
+      (`link_card_payment`), never create a second leg for the same debit.
+    - `("ambiguous", None)`: any other shape -- more than one checking row
+      claims this card, or the single one that does also has other card
+      candidates. Never auto-resolved; the caller must require an explicit
+      human decision (`POST /card-payment-reconciliations/link`) before a
+      manual leg may be considered.
+    """
+
+    from app.models import Account, Transaction
+
+    all_checking_rows = db.scalars(
+        select(Transaction)
+        .join(Account, Account.id == Transaction.account_id)
+        .where(
+            Transaction.household_id == household_id,
+            Transaction.transaction_type == "reconciliation",
+            Account.account_type == "checking",
+        )
+    ).all()
+    if not all_checking_rows:
+        return "unmatched", None
+
+    card_rows = db.scalars(
+        select(Transaction)
+        .join(Account, Account.id == Transaction.account_id)
+        .where(
+            Transaction.household_id == household_id,
+            Transaction.transaction_type == "reconciliation",
+            Account.account_type == "credit_card",
+        )
+    ).all()
+
+    edges = _candidate_edges(all_checking_rows, card_rows)
+    card_degrees = _card_side_degrees(edges)
+    checking_by_id = {row.id: row for row in all_checking_rows}
+
+    claimants = [
+        checking_id
+        for checking_id, candidates in edges.items()
+        if any(candidate.id == card.id for candidate in candidates)
+    ]
+    if not claimants:
+        return "unmatched", None
+    if len(claimants) > 1:
+        return "ambiguous", None
+    checking = checking_by_id[claimants[0]]
+    if len(edges[claimants[0]]) == 1 and card_degrees.get(card.id, 0) == 1:
+        return "matched", checking
+    return "ambiguous", None
+
+
 def pay_card_invoice(
     db: Session,
     *,
@@ -577,11 +649,34 @@ def pay_card_invoice(
     """Manual payment of a card invoice -- go-live manual slice 3.
 
     `docs/WORK_ORDER_MANUAL_PAYABLES_CARD_PAYMENT.md`, "Pagamento manual de
-    fatura": creates the checking-side (bank-debit) reconciliation leg for a
-    payment that has not been imported yet, and links it to the invoice's
-    existing payment-received line in the same atomic call -- one command
-    instead of "create a transaction" followed by a separate "link" step
-    that could be left half-done.
+    fatura": settles the invoice by reusing whatever bank fact already
+    proves the debit happened, and only fabricates a new checking-side
+    (bank-debit) reconciliation leg when no such fact exists yet.
+
+    Review round (2026-09-07, `BLOQUEIO DE MERGE`): before this function ever
+    builds a new `Transaction`, it asks
+    `_deterministic_bank_evidence_for_card` -- the same global candidate
+    graph `list_card_payment_reconciliations` already computes, not a second
+    policy -- whether an already-imported, unlinked checking-side
+    reconciliation row already evidences this exact debit:
+
+    - `"matched"` (a mutual, isolated 1:1 candidate already exists): this
+      call *is* the human's explicit confirmation that the invoice is
+      settled (`confirmed=True` is mandatory on the request), so it links
+      that already-observed fact via `link_card_payment` and returns it --
+      no new leg, no `register_transaction_duplicates` call, so this can
+      never create an artificial `DuplicateGroup` or displace the imported
+      row's canonical precedence with the manual source's higher
+      `source_priority`.
+    - `"ambiguous"` (more than one candidate, on either side of the graph):
+      never auto-resolved and never silently bypassed by fabricating a
+      second leg. Raises `CardPaymentLinkError` -- a human must resolve the
+      ambiguity explicitly via `POST /card-payment-reconciliations/link`
+      (choosing the correct pair with a mandatory `reason`) before this
+      invoice can be settled.
+    - `"unmatched"` (no candidate at all): no bank fact exists yet, so this
+      is the only case that reaches the leg-creation path below, exactly as
+      before this review round.
 
     Reuses `link_card_payment`'s exact tolerance/direction contract instead
     of inventing a second one: the amount paid must match the invoice's own
@@ -600,18 +695,23 @@ def pay_card_invoice(
     ever treats as the bank/debit side of a card payment
     (`list_card_payment_reconciliations`, `_is_card_payment_direction`).
     Widening that to other account types would be a second, looser
-    direction policy, which this slice's Work Order forbids.
+    direction policy, which this slice's Work Order forbids. (When the
+    `"matched"` branch above applies, the already-imported leg's own
+    account -- not `paying_account` -- is the historical fact; the
+    validation above still runs because it is meaningful input validation
+    independent of which branch resolves the payment.)
 
     Raises `LookupError` (-> 404) when `card_transaction_id` does not
     resolve to a reconciliation row of this household, `CardPaymentLinkError`
     (-> 409) for any business-rule conflict (not a credit-card invoice line,
     already paid, wrong direction, amount outside tolerance, inactive/foreign
-    paying account, wrong account type).
+    paying account, wrong account type, ambiguous bank evidence).
 
     Atomicity: like `create_internal_transfer`, nothing here calls
-    `db.commit()` -- the caller commits once after this call and its
-    duplicate-detection pass succeed, so there is no intermediate state with
-    only the new leg persisted and no link, or vice versa.
+    `db.commit()` -- the caller commits once after this call (and, in the
+    `"unmatched"` leg-creation path, its duplicate-detection pass) succeed,
+    so there is no intermediate state with only the new leg persisted and no
+    link, or vice versa.
     """
 
     import uuid
@@ -656,6 +756,27 @@ def pay_card_invoice(
         raise CardPaymentLinkError(
             "A fatura selecionada não está no formato de pagamento recebido esperado para conciliação"
         )
+
+    evidence_status, evidence_checking = _deterministic_bank_evidence_for_card(
+        db, household_id=household_id, card=card
+    )
+    if evidence_status == "ambiguous":
+        raise CardPaymentLinkError(
+            "Existem lançamentos bancários já importados que podem corresponder a esta fatura, mas "
+            "de forma ambígua; revise e vincule manualmente o lançamento correto em "
+            "POST /card-payment-reconciliations/link antes de registrar um novo pagamento"
+        )
+    if evidence_status == "matched":
+        # A bank-observed debit already proves this invoice was paid --
+        # link it instead of fabricating a second leg for the same
+        # real-world event (see the docstring's "matched" branch above).
+        checking_leg, card = link_card_payment(
+            db,
+            household_id=household_id,
+            checking_transaction_id=evidence_checking.id,
+            card_transaction_id=card.id,
+        )
+        return checking_leg, card, None
 
     parsed = ParsedTransaction(
         booked_at=booked_at,
