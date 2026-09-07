@@ -49,7 +49,29 @@ class ManualTransactionRequest(BaseModel):
     account_id: str
     category_id: str | None = None
     category_name: str | None = Field(default=None, min_length=2, max_length=100)
+    installment_current: int | None = Field(default=None, ge=1, le=999)
+    installment_total: int | None = Field(default=None, ge=1, le=999)
+    # Explicit month (`YYYY-MM`) the user confirms this expense belongs to.
+    # Only meaningful for `expense`: INV-017 requires a card purchase to keep
+    # the canonical invoice competence, which this app has no invoice entity
+    # to derive automatically yet (that lands with the "Contas a pagar"
+    # slice), so it must be a human-confirmed fact instead of one silently
+    # fabricated from `booked_at` -- see `create_manual_transaction`.
+    competence: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     confirmed_large_amount: bool = False
+
+    @model_validator(mode="after")
+    def validate_movement_fields(self) -> "ManualTransactionRequest":
+        if self.installment_current is not None or self.installment_total is not None:
+            if self.movement_type != "expense":
+                raise ValueError("Parcelamento só se aplica a despesas")
+            if self.installment_current is None or self.installment_total is None:
+                raise ValueError("Informe a parcela atual e o total de parcelas juntos")
+            if self.installment_current > self.installment_total:
+                raise ValueError("A parcela atual não pode ser maior que o total de parcelas")
+        if self.competence is not None and self.movement_type != "expense":
+            raise ValueError("Competência explícita só se aplica a despesas")
+        return self
 
 
 class AdvisorHistoryItem(BaseModel):

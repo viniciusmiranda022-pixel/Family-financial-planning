@@ -181,8 +181,11 @@
 - Observações de saldo são imutáveis. Uma correção cria nova observação, aponta `supersedes_id` e
   invalida a anterior com usuário, data e justificativa; nenhuma linha histórica é apagada.
 - Duplicidades são agrupadas sem remover lançamentos. Sinais ponderados geram bandas `low`,
-  `probable` e `strong`; a banda provável permanece incluída até decisão humana. Evidência forte
-  pode aplicar precedência canônica persistida, mantendo a cópia de suporte auditável e excluída
+  `probable` e `strong`. A partir da banda provável (confiança >= 0,60), enquanto a resolução
+  estiver pendente, o lado não canônico do par fica excluído dos totais (`included_in_totals =
+  false`, INV-014) -- nunca ambos os lados, nunca nenhum -- preservado e auditável até decisão
+  humana (`resolve_duplicate_group`). Evidência forte também aplica precedência canônica
+  persistida aos papéis `canonical`/`supporting`, mantendo a cópia de suporte auditável e excluída
   apenas dos totais derivados.
 - A precedência de fonte é: planilha financeira consolidada (100), lançamento manual confirmado
   (90), documento financeiro (70), captura confirmada (60) e legado/desconhecido (50).

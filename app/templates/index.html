@@ -56,6 +56,8 @@
         <button data-view="dashboard" class="active"><span>⌂</span>Visão geral</button>
         <button data-view="reports"><span>▥</span>Relatórios</button>
         <button data-view="capture"><span>●</span>Lançar agora</button>
+        <button data-view="entradas"><span>↓</span>Entradas</button>
+        <button data-view="saidas"><span>↑</span>Saídas</button>
         <button data-view="imports"><span>⇧</span>Importações</button>
         <button data-view="transactions"><span>≡</span>Lançamentos</button>
         <button data-view="reviews"><span>!</span>Revisar <b id="nav-review-count" class="badge">0</b></button>
@@ -298,17 +300,55 @@
         <article class="panel"><div class="panel-heading"><div><span class="step-label">HISTÓRICO</span><h2>Arquivos processados</h2></div></div><div class="table-wrap"><table><thead><tr><th>Arquivo</th><th>Tipo</th><th>Status</th><th>Registros</th><th>Data</th></tr></thead><tbody id="imports-table"></tbody></table></div></article>
       </section>
 
+      <section id="view-entradas" class="view">
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">RECEITA</span><h2>Registrar entrada</h2><small>Só renda econômica real: salário, comissão, recebimento eventual. Dinheiro que apenas entrou por transferência, resgate de investimento ou estorno não pode virar receita aqui.</small></div></div>
+          <form id="income-entry-form" class="form-grid three">
+            <label>Data<input type="date" name="booked_at" required></label>
+            <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Salário de agosto" maxlength="500"></label>
+            <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
+            <label>Conta<select name="account_id" id="income-entry-account" required></select></label>
+            <button class="primary" type="submit">Registrar entrada</button>
+          </form>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">ÚLTIMAS ENTRADAS</span><h2>Receitas do mês</h2></div><div class="filters"><input type="month" id="income-entry-month"><button id="refresh-income-entries" class="secondary">Atualizar</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Conta</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="income-entries-table"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-saidas" class="view">
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">DESPESA</span><h2>Registrar saída</h2><small>Despesa à vista em conta ou cartão, com categoria e competência. Para compra parcelada, informe parcela atual e total; a prévia de parcelas futuras usa a mesma projeção canônica do painel de Planejamento.</small></div></div>
+          <form id="expense-entry-form" class="form-grid three">
+            <label>Data<input type="date" name="booked_at" required></label>
+            <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Supermercado" maxlength="500"></label>
+            <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
+            <label>Conta ou cartão<select name="account_id" id="expense-entry-account" required></select></label>
+            <label>Natureza / categoria<select name="category_id" id="expense-entry-category" required></select></label>
+            <label id="expense-entry-custom-category-field" class="hidden">Qual é a nova categoria?<input name="category_name" id="expense-entry-custom-category" maxlength="100" placeholder="Ex.: Jardinagem"></label>
+            <label id="expense-entry-competence-field">Competência (mês da fatura)<input type="month" name="competence" id="expense-entry-competence"><small id="expense-entry-competence-hint"></small></label>
+            <label>Parcela atual (se parcelada)<input type="number" name="installment_current" id="expense-entry-installment-current" min="1" max="999" step="1"></label>
+            <label>Total de parcelas (se parcelada)<input type="number" name="installment_total" id="expense-entry-installment-total" min="1" max="999" step="1"></label>
+            <div id="expense-entry-installment-preview" class="capture-notes full hidden"></div>
+            <button class="primary" type="submit">Registrar saída</button>
+          </form>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">ÚLTIMAS SAÍDAS</span><h2>Despesas do mês</h2></div><div class="filters"><input type="month" id="expense-entry-month"><button id="refresh-expense-entries" class="secondary">Atualizar</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Conta</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="expense-entries-table"></tbody></table></div>
+        </article>
+      </section>
+
       <section id="view-transactions" class="view">
         <article class="panel">
-          <div class="panel-heading"><div><span class="step-label">LANÇAMENTO RÁPIDO</span><h2>Registrar movimentação</h2><small>Despesas entram no teto; aplicações e resgates atualizam o saldo da conta central de liquidez sem virar receita ou gasto.</small></div></div>
+          <div class="panel-heading"><div><span class="step-label">MOVIMENTAÇÃO PATRIMONIAL</span><h2>Aplicação, resgate e estorno</h2><small>Receita e despesa têm telas próprias em Entradas e Saídas; aqui ficam apenas aplicação/resgate de investimento e estorno, que não são receita nem despesa.</small></div></div>
           <form id="transaction-form" class="form-grid three">
             <label>Data<input type="date" name="booked_at" required></label>
-            <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Abastecimento no posto"></label>
-            <label>Tipo de movimentação<select name="movement_type" id="transaction-movement-type"><option value="expense">Despesa</option><option value="income">Receita</option><option value="investment">Aplicação/investimento</option><option value="redemption">Resgate de investimento</option><option value="refund">Reembolso/estorno</option></select></label>
+            <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Resgate para pagar fatura"></label>
+            <label>Tipo de movimentação<select name="movement_type" id="transaction-movement-type"><option value="investment">Aplicação/investimento</option><option value="redemption">Resgate de investimento</option><option value="refund">Reembolso/estorno</option></select></label>
             <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
             <label>Conta<select name="account_id" id="transaction-account" required></select></label>
-            <label id="transaction-category-field">Natureza / categoria<select name="category_id" id="transaction-category" required></select></label>
-            <label id="transaction-custom-category-field" class="hidden">Qual é a nova categoria?<input name="category_name" id="transaction-custom-category" maxlength="100" placeholder="Ex.: Jardinagem"></label>
             <button class="primary" type="submit">Adicionar lançamento</button>
           </form>
         </article>

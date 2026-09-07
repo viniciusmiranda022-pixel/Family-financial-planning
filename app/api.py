@@ -5,6 +5,7 @@ import uuid
 from calendar import monthrange
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import case, func, or_, select
@@ -3349,11 +3350,23 @@ def create_manual_transaction(
         amount = abs(payload.amount)
         category = category_for(db, user.household_id, "Reembolsos e estornos")
 
+    if payload.movement_type == "expense":
+        competence = _resolve_expense_competence(
+            account_type=account.account_type,
+            competence=payload.competence,
+            booked_at=payload.booked_at,
+        )
+    else:
+        competence = payload.booked_at.strftime("%Y-%m")
+
     parsed = ParsedTransaction(
         booked_at=payload.booked_at,
         description=payload.description,
         amount=money(amount),
         source_line=1,
+        card_last_four=account.last_four,
+        installment_current=payload.installment_current,
+        installment_total=payload.installment_total,
         occurred_at=payload.booked_at,
     )
     transaction_trace_id = str(uuid.uuid4())
@@ -3367,9 +3380,12 @@ def create_manual_transaction(
         amount=money(amount),
         transaction_type=transaction_type,
         owner_label=account.owner_label,
+        card_last_four=account.last_four,
+        installment_current=payload.installment_current,
+        installment_total=payload.installment_total,
         fingerprint=transaction_fingerprint(account.id, parsed, account.owner_label),
         occurred_at=payload.booked_at,
-        competence=payload.booked_at.strftime("%Y-%m"),
+        competence=competence,
         classification_source="manual_confirmed",
         classification_version=PARSER_CONTRACT_VERSION,
         canonical_status="unassigned",
@@ -3412,10 +3428,109 @@ def create_manual_transaction(
             "movement_type": payload.movement_type,
             "amount": str(transaction.amount),
             "account_id": account.id,
+            "competence": transaction.competence,
+            "competence_explicitly_confirmed": payload.competence is not None,
         },
     )
     db.commit()
     return {"id": transaction.id}
+
+
+@router.get("/transactions/manual/installment-preview")
+def preview_manual_installment(
+    account_id: str = Query(...),
+    description: str = Query(..., min_length=2, max_length=500),
+    amount: Decimal = Query(..., gt=0),
+    booked_at: date = Query(...),
+    installment_current: int = Query(..., ge=1, le=999),
+    installment_total: int = Query(..., ge=1, le=999),
+    competence: str | None = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Read-only preview for the `Saídas` installment fields, shown before
+    confirmation (`docs/GO_LIVE_MANUAL_UX_PLAN.md`): the per-installment
+    value, the remaining schedule of future months, and how that schedule
+    changes the canonical projection's future `installments` load per month.
+
+    `account_id` is required so the prévia can apply the exact same
+    competence policy `create_manual_transaction` will enforce when the
+    purchase is actually confirmed (`_resolve_expense_competence`): a card
+    account requires an explicitly confirmed invoice competence (INV-017,
+    which may diverge from `booked_at`'s month), while every other account
+    type is always anchored on `booked_at`'s month and rejects a diverging
+    `competence`. Without knowing the account, the prévia could show a
+    schedule anchored on a month the POST would refuse -- this endpoint
+    must never carry a second, looser policy.
+
+    `description` is required too (engineering review on PR 47, head
+    `0f82ce8`): the "before/after" comparison simulates the candidate
+    purchase as an in-memory item alongside the already-persisted rows and
+    runs both through `_project_installments` -- the exact series
+    identification and latest-observation-wins logic `_future_installments`
+    always applies. Without `description` the candidate could never be
+    recognized as the *next observed installment of an existing series*, so
+    a naive `baseline + schedule` would double-count a commitment that
+    `_future_installments` would actually replace once persisted (this was
+    the bug the review caught). No transaction is created and no state is
+    written; the projection engine
+    (`app.services.projection_engine.build_projection`) consumes the exact
+    same `_future_installments` once the purchase is actually persisted --
+    the UI never computes any of this itself.
+    """
+    if installment_current > installment_total:
+        raise HTTPException(
+            status_code=422, detail="A parcela atual não pode ser maior que o total de parcelas"
+        )
+    account = db.scalar(
+        select(Account).where(
+            Account.id == account_id,
+            Account.household_id == user.household_id,
+            Account.active.is_(True),
+        )
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Conta não encontrada")
+    resolved_competence = _resolve_expense_competence(
+        account_type=account.account_type,
+        competence=competence,
+        booked_at=booked_at,
+    )
+    anchor_month = _installment_anchor_month(competence=resolved_competence, booked_at=booked_at)
+    schedule = _installment_remaining_schedule(
+        amount=amount,
+        installment_current=installment_current,
+        installment_total=installment_total,
+        anchor_month=anchor_month,
+    )
+    persisted_rows = _persisted_installment_rows(db, user.household_id)
+    candidate = SimpleNamespace(
+        account_id=account.id,
+        card_last_four=account.last_four,
+        description=description,
+        amount=money(abs(amount)),
+        installment_current=installment_current,
+        installment_total=installment_total,
+        competence=resolved_competence,
+        booked_at=booked_at,
+    )
+    baseline = _project_installments(persisted_rows)
+    projected = _project_installments([*persisted_rows, candidate])
+    affected_months = sorted(set(baseline) | set(projected) | {month for month, _ in schedule})
+    return {
+        "monthly_payment": decimal_value(money(abs(amount))),
+        "installment_current": installment_current,
+        "installment_total": installment_total,
+        "schedule": [{"month": month, "amount": decimal_value(value)} for month, value in schedule],
+        "canonical_projection_effect": [
+            {
+                "month": month,
+                "installments_before": decimal_value(baseline.get(month, Decimal("0"))),
+                "installments_after": decimal_value(projected.get(month, Decimal("0"))),
+            }
+            for month in affected_months
+        ],
+    }
 
 
 @router.patch("/transactions/{transaction_id}")
@@ -4147,34 +4262,153 @@ def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
     return values
 
 
-def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
-    values: dict[str, Decimal] = {}
-    rows = db.scalars(
-        select(Transaction).where(
-            Transaction.household_id == household_id,
-            Transaction.excluded.is_(False),
-            Transaction.installment_current.is_not(None),
-            Transaction.installment_total.is_not(None),
+def _resolve_expense_competence(*, account_type: str, competence: str | None, booked_at: date) -> str:
+    """Single source of truth for the competence (`YYYY-MM`) a manual expense
+    is recorded under, shared by `create_manual_transaction` and the
+    installment preview so the two can never diverge on the same policy.
+
+    `docs/FINANCIAL_RULES.md`: cartões são conciliados pela competência da
+    fatura; contas correntes usam a data exata do lançamento. So:
+    - `credit_card`: INV-017 -- the invoice's canonical competence is not
+      necessarily `booked_at`'s month, and this app has no invoice/fatura
+      entity yet to derive it automatically (lands with the "Contas a pagar"
+      slice). Fail closed instead of fabricating it: require the human to
+      explicitly confirm the competence.
+    - every other account type: competence is always `booked_at`'s month.
+      An explicitly provided `competence` that diverges from it is rejected
+      (422) rather than silently accepted/rewritten -- accepting it would
+      let a checking-account fact carry a fabricated period that contradicts
+      the bank statement's own date, which the reconciliation/projection
+      engines assume never happens for non-card accounts.
+    `booked_at` itself is never altered either way; it stays intact as the
+    lineage date.
+    """
+    booked_month = booked_at.strftime("%Y-%m")
+    if account_type == "credit_card":
+        if competence is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Compra no cartão exige confirmar a competência da fatura; ela não é "
+                    "derivada automaticamente da data da compra (INV-017)."
+                ),
+            )
+        return competence
+    if competence is not None and competence != booked_month:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Competência divergente da data do lançamento só é permitida para compras "
+                "no cartão (INV-017); contas correntes usam a data exata do lançamento "
+                "(docs/FINANCIAL_RULES.md)."
+            ),
         )
-    ).all()
-    latest_by_series: dict[tuple, Transaction] = {}
-    for item in rows:
+    return booked_month
+
+
+def _installment_anchor_month(*, competence: str | None, booked_at: date) -> date:
+    """First-of-month this installment fact is anchored to for
+    schedule/projection purposes.
+
+    INV-017: a card purchase's competence is the invoice's canonical
+    competence, not necessarily `booked_at`'s month (see
+    `create_manual_transaction`). Once a `competence` has been explicitly
+    confirmed, it -- not `booked_at` -- is the source of truth for "which
+    month does this observed installment belong to"; `booked_at` keeps being
+    recorded as lineage but must never be (mis)used as a stand-in for
+    competence here. Falls back to `booked_at`'s month only when there is no
+    confirmed competence (legacy rows, or non-card accounts where the two
+    already coincide by the `create_manual_transaction` fallback).
+    """
+    if competence:
+        return datetime.strptime(competence, "%Y-%m").date().replace(day=1)
+    return booked_at.replace(day=1)
+
+
+def _installment_remaining_schedule(
+    *, amount: Decimal, installment_current: int, installment_total: int, anchor_month: date
+) -> list[tuple[str, Decimal]]:
+    """Canonical month -> amount schedule for the installments that remain
+    *after* `installment_current`, given the confirmed per-installment
+    `amount` and `anchor_month` -- the first-of-month this installment is
+    effectively competence-anchored to (`_installment_anchor_month`), which
+    is *not* necessarily `booked_at`'s calendar month.
+
+    This is the single source of truth for "which future months this
+    commitment adds and how much": `_future_installments` (already-persisted
+    purchases feeding the canonical projection) and the pre-confirmation
+    `Saídas` preview (`GET /transactions/manual/installment-preview`) both
+    call this exact function with the same anchor resolution, so the number
+    shown before confirming can never drift from the number the projection
+    engine uses afterwards -- the UI is never allowed to compute this on its
+    own (no parallel formula in JS), and there is no second formula here
+    either for the competence-vs-booked_at distinction.
+    """
+    remaining = max(0, installment_total - installment_current)
+    value = money(abs(amount))
+    return [
+        (month_key(add_months(anchor_month.replace(day=1), offset)), value)
+        for offset in range(1, remaining + 1)
+    ]
+
+
+def _installment_series_key(
+    *, account_id: str, card_last_four: str | None, description: str, amount: Decimal, installment_total: int, origin_month: date
+) -> tuple:
+    """Identity of an installment commitment across its repeated monthly
+    observations, shared by `_project_installments` for both a persisted
+    `Transaction` and an in-memory not-yet-persisted candidate -- the exact
+    same tuple must be computed the same way in both cases, or a genuinely
+    later observation of the same purchase would never be recognized as
+    such."""
+    stripped_description = re.sub(
+        r"(?:PARCELA\s*)?\d{1,2}\s*/\s*\d{1,2}",
+        " ",
+        description,
+        flags=re.IGNORECASE,
+    )
+    return (
+        account_id,
+        card_last_four or "",
+        normalize_description(stripped_description),
+        money(abs(amount)),
+        installment_total,
+        month_key(origin_month),
+    )
+
+
+def _project_installments(items) -> dict[str, Decimal]:
+    """Canonical month -> amount projection for a set of installment facts.
+
+    `items` may mix persisted `Transaction` rows with a single in-memory,
+    not-yet-persisted candidate (a `SimpleNamespace` carrying the same
+    `account_id`/`card_last_four`/`description`/`amount`/
+    `installment_current`/`installment_total`/`competence`/`booked_at`
+    attributes) -- this is the one place that groups observations into a
+    series (`_installment_series_key`) and keeps only the latest one by
+    `(booked_at, installment_current)`, so a later observation of an
+    existing series *replaces* the earlier one's projected schedule instead
+    of adding to it (the same fact observed twice must never be counted
+    twice). `_future_installments` (already-persisted commitments) and the
+    `Saídas` installment prévia (`GET /transactions/manual/installment-preview`,
+    simulating "as if the candidate were persisted" without writing
+    anything) both go through this exact function with the exact same
+    policy, so the two can never drift on how a series is identified or
+    which observation of it wins.
+    """
+    latest_by_series: dict[tuple, object] = {}
+    for item in items:
         current = item.installment_current or 0
         total = item.installment_total or 0
-        description = re.sub(
-            r"(?:PARCELA\s*)?\d{1,2}\s*/\s*\d{1,2}",
-            " ",
-            item.description,
-            flags=re.IGNORECASE,
-        )
-        origin = add_months(item.booked_at.replace(day=1), -(max(1, current) - 1))
-        series = (
-            item.account_id,
-            item.card_last_four or "",
-            normalize_description(description),
-            money(abs(item.amount)),
-            total,
-            month_key(origin),
+        anchor = _installment_anchor_month(competence=item.competence, booked_at=item.booked_at)
+        origin = add_months(anchor, -(max(1, current) - 1))
+        series = _installment_series_key(
+            account_id=item.account_id,
+            card_last_four=item.card_last_four,
+            description=item.description,
+            amount=item.amount,
+            installment_total=total,
+            origin_month=origin,
         )
         previous = latest_by_series.get(series)
         if previous is None or (item.booked_at, current) > (
@@ -4182,12 +4416,34 @@ def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
             previous.installment_current or 0,
         ):
             latest_by_series[series] = item
+    values: dict[str, Decimal] = {}
     for item in latest_by_series.values():
-        remaining = max(0, (item.installment_total or 0) - (item.installment_current or 0))
-        for offset in range(1, remaining + 1):
-            key = month_key(add_months(item.booked_at.replace(day=1), offset))
-            values[key] = values.get(key, Decimal("0")) + abs(item.amount)
+        anchor = _installment_anchor_month(competence=item.competence, booked_at=item.booked_at)
+        for key, value in _installment_remaining_schedule(
+            amount=item.amount,
+            installment_current=item.installment_current or 0,
+            installment_total=item.installment_total or 0,
+            anchor_month=anchor,
+        ):
+            values[key] = values.get(key, Decimal("0")) + value
     return values
+
+
+def _persisted_installment_rows(db: Session, household_id: str) -> list[Transaction]:
+    return list(
+        db.scalars(
+            select(Transaction).where(
+                Transaction.household_id == household_id,
+                Transaction.excluded.is_(False),
+                Transaction.installment_current.is_not(None),
+                Transaction.installment_total.is_not(None),
+            )
+        )
+    )
+
+
+def _future_installments(db: Session, household_id: str) -> dict[str, Decimal]:
+    return _project_installments(_persisted_installment_rows(db, household_id))
 
 
 def _build_projection_gate_checks(
