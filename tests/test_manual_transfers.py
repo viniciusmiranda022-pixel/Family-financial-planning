@@ -11,8 +11,13 @@ between two accounts of the same household (INV-001) -- `transfer` and the
 `tests/test_manual_financial_flows.py`'s module docstring) to this slice.
 Also covers the required regression checks for the already-existing
 `investment`/`redemption` movement types on `POST /api/transactions`
-(INV-003/INV-004), which this slice reuses unchanged rather than
-duplicating into a second command.
+(INV-003/INV-004). This slice reuses that same command (no second, parallel
+command was created) but stopped it from silently mutating
+`FinancialProfile.investment_balance` -- a round-1 engineering review found
+that side effect violated the Work Order's acceptance criteria and
+docs/INTEGRITY_IMPLEMENTATION_PLAN.md's documented risk for that field; see
+the "investment"/"redemption" branches of `create_manual_transaction` in
+`app/api.py` for the corrected behavior.
 
 Uses the same isolated-engine + `TestClient` + `/api/auth/setup` pattern as
 `tests/test_manual_financial_flows.py`.
@@ -68,6 +73,16 @@ def _setup_household(client, *, household_name="Família Transferências", usern
     )
     assert setup.status_code == 201
     return setup.json()
+
+
+def _set_investment_balance(client, value: Decimal) -> None:
+    """Explicitly declare `FinancialProfile.investment_balance` via the
+    canonical `PUT /profile` contract -- the only way that field may change,
+    per docs/INTEGRITY_IMPLEMENTATION_PLAN.md and this slice's Work Order."""
+    current = client.get("/api/profile").json()
+    current["investment_balance"] = str(value)
+    response = client.put("/api/profile", json=current)
+    assert response.status_code == 200, response.text
 
 
 def _create_account(client, *, name, account_type="checking", last_four=None):
@@ -503,12 +518,18 @@ def test_transfer_large_amount_requires_confirmation() -> None:
 
 def test_application_movement_type_has_zero_operating_effect() -> None:
     """INV-003 regression for the already-existing `investment` movement
-    type on `POST /transactions`, reused unchanged by this slice: applying
-    to the investment pool never shows up as spending or budget cap usage."""
+    type on `POST /transactions`: applying to the investment pool never
+    shows up as spending or budget cap usage, and -- per the engineering
+    review that blocked this slice's first round -- must not silently
+    mutate `FinancialProfile.investment_balance` either. That field is a
+    plain, unreconciled column (docs/INTEGRITY_IMPLEMENTATION_PLAN.md);
+    only an explicit `PUT /profile` may change it. The canonical,
+    auditable fact is the `Transaction` recorded below."""
     client, _ = _client()
     with client:
         _setup_household(client)
         itau = _create_account(client, name="Itaú Corrente")
+        _set_investment_balance(client, Decimal("5000.00"))
 
         before = client.get("/api/dashboard?month=2026-08").json()
         response = client.post(
@@ -525,6 +546,7 @@ def test_application_movement_type_has_zero_operating_effect() -> None:
         after = client.get("/api/dashboard?month=2026-08").json()
         assert after["spending"] == before["spending"]
         assert after["cash_in"] == before["cash_in"]
+        assert after["investment_balance"] == before["investment_balance"] == 5000.0
 
         rows = client.get("/api/transactions?month=2026-08").json()
         row = next(item for item in rows if item["id"] == response.json()["id"])
@@ -532,15 +554,24 @@ def test_application_movement_type_has_zero_operating_effect() -> None:
         assert row["category"] == "Transferência patrimonial"
         assert row["amount"] == -1000.0
 
+        assert client.delete(f"/api/transactions/{response.json()['id']}").status_code == 200
+        assert (
+            client.get("/api/dashboard?month=2026-08").json()["investment_balance"] == 5000.0
+        )
+
 
 def test_redemption_movement_type_has_zero_operating_income_effect() -> None:
     """INV-004 regression for the already-existing `redemption` movement
     type on `POST /transactions`: redeeming from the investment pool never
-    shows up as real income."""
+    shows up as real income, and -- same rationale as the `investment` test
+    above -- must not silently mutate `FinancialProfile.investment_balance`,
+    including on delete (no orphaned reversal of a mutation that never
+    happened)."""
     client, _ = _client()
     with client:
         _setup_household(client)
         itau = _create_account(client, name="Itaú Corrente")
+        _set_investment_balance(client, Decimal("5000.00"))
 
         before = client.get("/api/dashboard?month=2026-08").json()
         response = client.post(
@@ -557,12 +588,18 @@ def test_redemption_movement_type_has_zero_operating_income_effect() -> None:
         after = client.get("/api/dashboard?month=2026-08").json()
         assert after["cash_in"] == before["cash_in"]
         assert after["spending"] == before["spending"]
+        assert after["investment_balance"] == before["investment_balance"] == 5000.0
 
         rows = client.get("/api/transactions?month=2026-08").json()
         row = next(item for item in rows if item["id"] == response.json()["id"])
         assert row["type"] == "transfer"
         assert row["category"] == "Transferência patrimonial"
         assert row["amount"] == 400.0
+
+        assert client.delete(f"/api/transactions/{response.json()['id']}").status_code == 200
+        assert (
+            client.get("/api/dashboard?month=2026-08").json()["investment_balance"] == 5000.0
+        )
 
 
 def test_structured_transfer_endpoint_parity_with_backend_canonical_command() -> None:

@@ -3043,7 +3043,6 @@ def confirm_capture(
             )
             excluded = False
             transaction_type = movement_type
-            investment_movement: str | None = None
             if movement_type == "expense":
                 if proposal.category_id:
                     category = db.scalar(
@@ -3081,7 +3080,9 @@ def confirm_capture(
                 transaction_type = "transfer"
                 excluded = True
                 category = category_for(db, user.household_id, "Transferência patrimonial")
-                investment_movement = movement_type
+                # No `FinancialProfile.investment_balance` mutation here --
+                # see `create_manual_transaction`'s "investment"/"redemption"
+                # branches for why.
             elif movement_type == "transfer":
                 transaction_type = "transfer"
                 excluded = True
@@ -3142,14 +3143,6 @@ def confirm_capture(
             )
             duplicate = duplicate_group is not None
             transaction.reviewed = not duplicate
-            if investment_movement and not duplicate:
-                profile = profile_for(db, user.household_id)
-                if investment_movement == "investment":
-                    profile.investment_balance += abs(proposal.amount)
-                else:
-                    profile.investment_balance = max(
-                        Decimal("0"), profile.investment_balance - abs(proposal.amount)
-                    )
             result["transactions"].append(transaction.id)
             if duplicate:
                 db.add(
@@ -3339,15 +3332,21 @@ def create_manual_transaction(
         transaction_type = "transfer"
         excluded = True
         category = category_for(db, user.household_id, "Transferência patrimonial")
-        profile = profile_for(db, user.household_id)
-        profile.investment_balance += abs(payload.amount)
+        # Deliberately does not touch `FinancialProfile.investment_balance`.
+        # docs/INTEGRITY_IMPLEMENTATION_PLAN.md documents that field as an
+        # unreconciled mutable counter outside the ledger, and the Work
+        # Order for this slice forbids using investment/redemption to
+        # silently change it. The `Transaction` recorded below is the
+        # canonical, auditable fact; the household's investment balance
+        # remains whatever it last explicitly declared via `PUT /profile`,
+        # or is derived from an `AccountBalanceObservation` when one
+        # exists (see `_opening_balance` in financial_snapshots.py).
     elif payload.movement_type == "redemption":
         transaction_type = "transfer"
         amount = abs(payload.amount)
         excluded = True
         category = category_for(db, user.household_id, "Transferência patrimonial")
-        profile = profile_for(db, user.household_id)
-        profile.investment_balance = max(Decimal("0"), profile.investment_balance - abs(payload.amount))
+        # See the "investment" branch above: no `FinancialProfile` mutation.
     elif payload.movement_type == "refund":
         transaction_type = "refund"
         amount = abs(payload.amount)
@@ -3797,18 +3796,12 @@ def delete_manual_transaction(
         transaction.id,
         {"description": transaction.description, "amount": str(transaction.amount)},
     )
-    if (
-        transaction.transaction_type == "transfer"
-        and transaction.category
-        and transaction.category.name == "Transferência patrimonial"
-    ):
-        profile = profile_for(db, user.household_id)
-        if transaction.amount < 0:
-            profile.investment_balance = max(
-                Decimal("0"), profile.investment_balance - abs(transaction.amount)
-            )
-        elif transaction.amount > 0:
-            profile.investment_balance += transaction.amount
+    # No `FinancialProfile.investment_balance` reversal here: creating an
+    # investment/redemption ("Transferência patrimonial") transaction no
+    # longer mutates that field (see the "investment"/"redemption" branches
+    # of `create_manual_transaction` and `confirm_capture`), so undoing a
+    # mutation that never happened would silently corrupt the value instead
+    # of restoring it.
     db.delete(transaction)
     db.commit()
     return {"ok": True}

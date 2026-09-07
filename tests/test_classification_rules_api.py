@@ -701,7 +701,12 @@ def test_smart_capture_text_capture_patrimonial_transfer_survives_preview_and_co
             profile = db.scalar(
                 select(FinancialProfile).where(FinancialProfile.household_id == household_id)
             )
-            assert profile.investment_balance == Decimal("500.00")
+            # Confirming an "investment" capture records the canonical,
+            # auditable `Transaction` above but must not silently mutate
+            # `FinancialProfile.investment_balance` -- see
+            # docs/INTEGRITY_IMPLEMENTATION_PLAN.md and
+            # docs/WORK_ORDER_MANUAL_TRANSFERS_INVESTMENT_REDEMPTION.md.
+            assert profile.investment_balance == Decimal("0.00")
     finally:
         app.dependency_overrides.pop(get_db, None)
 
