@@ -189,6 +189,36 @@ def test_orphaned_link_reference_falls_back_without_crashing() -> None:
     assert match.candidates[0].transaction_id == card_line.id
 
 
+def test_linked_status_requires_reciprocal_pointer_not_one_sided() -> None:
+    """A `linked_transaction_id` that resolves to a real, same-household
+    `reconciliation` row on the right account type is still not proof of a
+    link unless that row points back. Go-live manual slice 3 review round
+    (2026-09-07, `BLOQUEIO DE MERGE`, "`paid` precisa significar quitação
+    comprovada, não apenas ponteiro não nulo") applies symmetrically here:
+    a one-sided pointer is corruption, not lineage, on either side of the
+    pair -- `_verified_reconciliation_counterpart` is the single check
+    both `list_card_payment_reconciliations` and `list_card_invoice_
+    obligations` share, so this must never report `linked` any more than
+    the card-side read model may report `paid` for the same shape."""
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    checking = household.transactions["card_payment"]
+    card_line = _card_side_payment_line(household)
+    db.add(card_line)
+    db.flush()
+    checking.linked_transaction_id = card_line.id
+    # `card_line.linked_transaction_id` is intentionally left `None` -- a
+    # one-sided pointer, not the symmetric pair `link_card_payment` always
+    # writes on both rows together.
+    db.flush()
+
+    match = _checking_match(db, household)
+    assert match.status == "ambiguous"
+    assert match.linked_transaction_id is None
+    assert match.candidates[0].transaction_id == card_line.id
+
+
 def test_two_checking_debits_one_card_candidate_never_both_matched() -> None:
     """P0 regression: a single card-side payment cannot be the deterministic
     `matched` suggestion for two different bank debits at once. Each

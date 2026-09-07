@@ -211,6 +211,85 @@ def _card_side_degrees(edges: dict[str, list[Any]]) -> dict[str, int]:
     return degrees
 
 
+def _verified_reconciliation_counterpart(
+    db: Session,
+    *,
+    household_id: str,
+    row: Any,
+    counterpart_account_type: str,
+    counterpart_hint: Any | None = None,
+) -> Any | None:
+    """Resolve `row.linked_transaction_id` into a genuine, reciprocal
+    card-payment counterpart, or `None` if the pointer does not actually
+    prove one.
+
+    Go-live manual slice 3 review round (2026-09-07, `BLOQUEIO DE MERGE` --
+    "`paid` precisa significar quitação comprovada, não apenas ponteiro não
+    nulo"): a non-null `linked_transaction_id` is, by itself, not evidence
+    of a card-payment pair -- it only becomes evidence once the counterpart
+    is checked against the exact same contract `link_card_payment` enforces
+    *before* ever writing that column. Every pair this module's own API
+    (`link_card_payment`/`pay_card_invoice`) creates already satisfies every
+    check below by construction; this function exists purely to defend
+    both `list_card_payment_reconciliations` (the checking-side `linked`
+    status) and `list_card_invoice_obligations` (the card-side `paid`
+    status) against a pointer that reached this state some other way -- a
+    bug, a manual data fix, a future schema change -- so that neither ever
+    reports a lineage/quitação fact the data does not actually prove
+    (`docs/FINANCIAL_INVARIANTS.md`: absence or inconsistency of evidence is
+    never fabricated into success; it must stay explicit).
+
+    Checks:
+    - the counterpart transaction exists;
+    - it belongs to the same household (lineage never crosses households,
+      and the row is never loaded/serialized before this check passes);
+    - it is itself `transaction_type == "reconciliation"`;
+    - its account is `counterpart_account_type` -- `checking` when
+      validating a card-side row's link, `credit_card` when validating a
+      checking-side row's link (the same two-sided shape every genuine pair
+      has);
+    - the link is reciprocal, `counterpart.linked_transaction_id == row.id`
+      -- a one-sided pointer is not lineage, it is corruption;
+    - the pair satisfies the same amount tolerance and financial-direction
+      contract `link_card_payment` itself enforces
+      (`RECONCILIATION_TOLERANCE`, `_is_card_payment_direction`).
+
+    `counterpart_hint` lets a caller that already loaded the household's
+    card/checking rows (e.g. `card_by_id` in `list_card_payment_
+    reconciliations`) skip a redundant `db.get` -- it is only trusted when
+    its id actually matches `row.linked_transaction_id`; every other check
+    below still runs against it.
+    """
+
+    from app.models import Transaction
+
+    if not row.linked_transaction_id:
+        return None
+    counterpart = (
+        counterpart_hint
+        if counterpart_hint is not None and counterpart_hint.id == row.linked_transaction_id
+        else db.get(Transaction, row.linked_transaction_id)
+    )
+    if counterpart is None or counterpart.household_id != household_id:
+        return None
+    if counterpart.transaction_type != "reconciliation":
+        return None
+    counterpart_type = counterpart.account.account_type if counterpart.account else None
+    if counterpart_type != counterpart_account_type:
+        return None
+    if counterpart.linked_transaction_id != row.id:
+        return None
+    if counterpart_account_type == "checking":
+        checking_amount, card_amount = counterpart.amount, row.amount
+    else:
+        checking_amount, card_amount = row.amount, counterpart.amount
+    if abs(abs(checking_amount) - abs(card_amount)) > RECONCILIATION_TOLERANCE:
+        return None
+    if not _is_card_payment_direction(checking_amount=checking_amount, card_amount=card_amount):
+        return None
+    return counterpart
+
+
 def list_card_payment_reconciliations(
     db: Session,
     *,
@@ -271,10 +350,14 @@ def list_card_payment_reconciliations(
     results: list[CardPaymentMatch] = []
     for checking in checking_rows:
         if checking.linked_transaction_id:
-            linked = card_by_id.get(checking.linked_transaction_id) or db.get(
-                Transaction, checking.linked_transaction_id
+            linked = _verified_reconciliation_counterpart(
+                db,
+                household_id=household_id,
+                row=checking,
+                counterpart_account_type="credit_card",
+                counterpart_hint=card_by_id.get(checking.linked_transaction_id),
             )
-            if linked is not None and linked.household_id == household_id:
+            if linked is not None:
                 results.append(
                     CardPaymentMatch(
                         checking_transaction_id=checking.id,
@@ -284,17 +367,18 @@ def list_card_payment_reconciliations(
                 )
                 continue
             # Defensive corner case: `linked_transaction_id` is set but does
-            # not resolve to a same-household counterpart (should not
-            # happen through this module's own API, which always sets/clears
-            # both sides together -- but this row has no entry in `edges`,
-            # which deliberately excludes every linked checking row, so its
-            # candidates are computed stand-alone here instead of via the
-            # shared graph). `card_degrees` below cannot see this row's own
-            # claim on its candidate, so a would-be "exactly one candidate"
-            # case can never be verified as a genuine mutual 1:1 match here
-            # -- always `ambiguous` (unless there is no candidate at all)
-            # rather than risk a false `matched` for a row whose own link
-            # state is already inconsistent.
+            # not resolve to a genuine, reciprocal card-payment counterpart
+            # (should not happen through this module's own API, which
+            # always sets/clears both sides together in lockstep -- but this
+            # row has no entry in `edges`, which deliberately excludes every
+            # linked checking row, so its candidates are computed stand-alone
+            # here instead of via the shared graph). `card_degrees` below
+            # cannot see this row's own claim on its candidate, so a
+            # would-be "exactly one candidate" case can never be verified as
+            # a genuine mutual 1:1 match here -- always `ambiguous` (unless
+            # there is no candidate at all) rather than risk a false
+            # `matched` for a row whose own link state is already
+            # inconsistent.
             candidates = _candidates_for_checking(checking, card_rows, window)
             status = "unmatched" if not candidates else "ambiguous"
         else:
@@ -470,14 +554,19 @@ class CardInvoiceObligation:
     manual slice 3 (`docs/WORK_ORDER_MANUAL_PAYABLES_CARD_PAYMENT.md`,
     "Contas a pagar").
 
-    `status` is a direct read of `Transaction.linked_transaction_id`, the
-    same canonical proof `list_card_payment_reconciliations` already uses --
-    never fabricated, never inferred from amount, date or any heuristic:
+    `status` is derived from `Transaction.linked_transaction_id` through
+    `_verified_reconciliation_counterpart`, the same canonical proof
+    `list_card_payment_reconciliations` already uses -- never fabricated,
+    never inferred from amount, date or any heuristic, and never a bare
+    non-null check on the pointer alone:
 
-    - `paid`: linked to a checking-side reconciliation leg (whether that
-      leg was imported from a bank statement or created by
-      `pay_card_invoice` below) -- an actual quitação fact exists.
-    - `pending`: no link yet.
+    - `paid`: linked to a genuine, reciprocal, same-household checking-side
+      reconciliation leg (whether that leg was imported from a bank
+      statement or created by `pay_card_invoice` below) -- an actual
+      quitação fact exists and has been verified, not merely pointed to.
+    - `pending`: no link yet, or `linked_transaction_id` is set but does not
+      resolve to such a counterpart (an inconsistent pointer proves no
+      payment, so it is never surfaced as `paid`).
 
     This never buckets a pending invoice into "a vencer"/"vencida" the way
     `app/api.py::_obligation_timing` does for the generic `Obligation`
@@ -532,18 +621,28 @@ def list_card_invoice_obligations(
 
     results: list[CardInvoiceObligation] = []
     for row in rows:
-        paid_transaction = db.get(Transaction, row.linked_transaction_id) if row.linked_transaction_id else None
+        # `paid` must mean a proven quitação fact, not merely a non-null
+        # pointer -- see `_verified_reconciliation_counterpart` (go-live
+        # manual slice 3 review round, "`paid` precisa significar quitação
+        # comprovada, não apenas ponteiro não nulo"). A `linked_transaction_id`
+        # that fails to resolve to a genuine, reciprocal, same-household
+        # checking-side counterpart proves no payment -- it stays `pending`,
+        # exactly like an invoice with no link at all, instead of leaking an
+        # inconsistent or cross-household fact into this read model.
+        paid_transaction = _verified_reconciliation_counterpart(
+            db, household_id=household_id, row=row, counterpart_account_type="checking"
+        )
         results.append(
             CardInvoiceObligation(
                 card_transaction_id=row.id,
-                status="paid" if row.linked_transaction_id else "pending",
+                status="paid" if paid_transaction is not None else "pending",
                 amount=row.amount,
                 booked_at=row.booked_at.isoformat(),
                 competence=row.competence,
                 description=row.description,
                 account=row.account.name if row.account else "",
-                paid_transaction_id=row.linked_transaction_id,
-                paid_booked_at=paid_transaction.booked_at.isoformat() if paid_transaction else None,
+                paid_transaction_id=paid_transaction.id if paid_transaction is not None else None,
+                paid_booked_at=paid_transaction.booked_at.isoformat() if paid_transaction is not None else None,
             )
         )
     return results

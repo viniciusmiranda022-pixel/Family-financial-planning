@@ -587,6 +587,144 @@ def test_card_invoice_obligations_reflect_only_provable_states() -> None:
         assert by_id[paid_id]["paid_transaction_id"] == pay.json()["checking_transaction_id"]
 
 
+def test_card_invoice_obligation_stays_pending_for_orphaned_link_reference() -> None:
+    """A `linked_transaction_id` that fails to resolve to any transaction at
+    all (unreachable through this module's own API, which always keeps both
+    sides symmetric) must never be reported as `paid`, and must not crash
+    the read model (BLOQUEIO DE MERGE 2026-09-07, "`paid` precisa
+    significar quitação comprovada, não apenas ponteiro não nulo")."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(session_factory, household_id=household, credit_card_account_id=cartao)
+
+        with session_factory() as db:
+            invoice = db.get(Transaction, invoice_id)
+            invoice.linked_transaction_id = "does-not-exist"
+            db.commit()
+
+        items = client.get("/api/card-payment-reconciliations/invoices").json()
+        by_id = {item["card_transaction_id"]: item for item in items}
+        assert by_id[invoice_id]["status"] == "pending"
+        assert by_id[invoice_id]["paid_transaction_id"] is None
+        assert by_id[invoice_id]["paid_date"] is None
+
+
+def test_card_invoice_obligation_stays_pending_for_cross_household_link_reference() -> None:
+    """A `linked_transaction_id` pointing at a real transaction that belongs
+    to a *different* household must never be surfaced as `paid`, and that
+    other household's transaction id/date must never leak into this
+    household's read model."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+
+        _create_household_admin(
+            session_factory,
+            household_name="Outra Família Invoices",
+            username="admin-outra-invoices",
+            password="outra-senha-segura",
+        )
+        with session_factory() as db:
+            other_household_id = db.scalar(
+                select(User.household_id).where(User.username == "admin-outra-invoices")
+            )
+            other_checking = Account(
+                household_id=other_household_id, name="Conta de outra família", account_type="checking"
+            )
+            db.add(other_checking)
+            db.commit()
+            other_checking_id = other_checking.id
+
+        foreign_debit_id = _bank_debit_line(
+            session_factory,
+            household_id=other_household_id,
+            checking_account_id=other_checking_id,
+            amount="-1500.00",
+        )
+        with session_factory() as db:
+            invoice = db.get(Transaction, invoice_id)
+            invoice.linked_transaction_id = foreign_debit_id
+            db.commit()
+
+        items = client.get("/api/card-payment-reconciliations/invoices").json()
+        by_id = {item["card_transaction_id"]: item for item in items}
+        assert by_id[invoice_id]["status"] == "pending"
+        assert by_id[invoice_id]["paid_transaction_id"] is None
+        assert by_id[invoice_id]["paid_date"] is None
+
+
+def test_card_invoice_obligation_stays_pending_for_non_reciprocal_link_reference() -> None:
+    """A `linked_transaction_id` that points at a real, same-household
+    checking-side reconciliation row is still not proof of payment unless
+    that row points back -- a one-sided pointer is corruption, not
+    lineage, no matter how well the amount/direction otherwise line up."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        itau = _create_account(client, name="Itaú Corrente")
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        debit_id = _bank_debit_line(
+            session_factory, household_id=household, checking_account_id=itau, amount="-1500.00"
+        )
+
+        with session_factory() as db:
+            invoice = db.get(Transaction, invoice_id)
+            invoice.linked_transaction_id = debit_id
+            # `debit`'s own `linked_transaction_id` is intentionally left
+            # `None` -- the pointer is one-sided.
+            db.commit()
+
+        items = client.get("/api/card-payment-reconciliations/invoices").json()
+        by_id = {item["card_transaction_id"]: item for item in items}
+        assert by_id[invoice_id]["status"] == "pending"
+        assert by_id[invoice_id]["paid_transaction_id"] is None
+        assert by_id[invoice_id]["paid_date"] is None
+
+
+def test_card_invoice_obligation_stays_pending_for_wrong_account_type_link_reference() -> None:
+    """A `linked_transaction_id` reciprocally pointing at another
+    `reconciliation` row is still not proof of payment unless that row
+    sits on a `checking` account -- the two-sided shape a genuine
+    card-payment pair always has."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        cartao_b = _create_account(client, name="Outro Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+        other_card_row_id = _card_invoice_line(
+            session_factory,
+            household_id=household,
+            credit_card_account_id=cartao_b,
+            amount="1500.00",
+            day=5,
+        )
+
+        with session_factory() as db:
+            invoice = db.get(Transaction, invoice_id)
+            other_row = db.get(Transaction, other_card_row_id)
+            invoice.linked_transaction_id = other_row.id
+            other_row.linked_transaction_id = invoice.id
+            db.commit()
+
+        items = client.get("/api/card-payment-reconciliations/invoices").json()
+        by_id = {item["card_transaction_id"]: item for item in items}
+        assert by_id[invoice_id]["status"] == "pending"
+        assert by_id[invoice_id]["paid_transaction_id"] is None
+        assert by_id[invoice_id]["paid_date"] is None
+
+
 def test_combined_redemption_then_payment_flow_creates_two_separate_facts() -> None:
     """`docs/GO_LIVE_MANUAL_UX_PLAN.md`'s worked example: resgatar do
     Privilège DI, depois pagar a fatura -- two independent canonical calls
