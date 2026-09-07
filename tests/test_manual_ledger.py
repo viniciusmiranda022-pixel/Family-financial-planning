@@ -638,3 +638,49 @@ def test_ledger_reflects_manual_edit_with_audit_trail() -> None:
                 )
             ).all()
             assert len(events) == 1
+
+
+def test_ledger_shows_installment_facts_without_duplication() -> None:
+    """Fluxo mínimo 3 (`docs/GO_LIVE_MANUAL_UX_PLAN.md`): the ledger is a
+    read of persisted `Transaction` rows only -- it never adds a synthetic
+    "projected" row for a future installment. Two real installments of the
+    same parcelada purchase show up as exactly two rows, each carrying its
+    own `installment_current/total`, never merged, inflated or duplicated
+    by the ledger's own query/serialization."""
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card", last_four="4321")
+        category_id = _non_system_category_id(client)
+
+        first = _create_manual_transaction(
+            client,
+            movement_type="expense",
+            amount=100,
+            account_id=cartao,
+            category_id=category_id,
+            description="Compra parcelada",
+            installment_current=1,
+            installment_total=3,
+            competence="2026-08",
+        )
+        second = _create_manual_transaction(
+            client,
+            movement_type="expense",
+            amount=100,
+            account_id=cartao,
+            category_id=category_id,
+            description="Compra parcelada",
+            installment_current=2,
+            installment_total=3,
+            competence="2026-09",
+        )
+
+        rows = _ledger(client, limit=500)
+        matching = {row["id"]: row for row in rows if row["description"] == "Compra parcelada"}
+        # Exactly the two real installments -- never a third, projected row
+        # for the still-future 3/3 installment, and neither row merged or
+        # duplicated by the ledger's own query/serialization.
+        assert set(matching) == {first["id"], second["id"]}
+        assert matching[first["id"]]["installment"] == "1/3"
+        assert matching[second["id"]]["installment"] == "2/3"
