@@ -58,6 +58,7 @@
         <button data-view="capture"><span>●</span>Lançar agora</button>
         <button data-view="entradas"><span>↓</span>Entradas</button>
         <button data-view="saidas"><span>↑</span>Saídas</button>
+        <button data-view="payables"><span>▤</span>Contas a pagar</button>
         <button data-view="transferencias"><span>⇄</span>Transferências</button>
         <button data-view="imports"><span>⇧</span>Importações</button>
         <button data-view="transactions"><span>≡</span>Lançamentos</button>
@@ -338,6 +339,36 @@
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">ÚLTIMAS SAÍDAS</span><h2>Despesas do mês</h2></div><div class="filters"><input type="month" id="expense-entry-month"><button id="refresh-expense-entries" class="secondary">Atualizar</button></div></div>
           <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Conta</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="expense-entries-table"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-payables" class="view">
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">COMPROMISSOS</span><h2>Obrigações cadastradas</h2><small>A vencer, próximas do vencimento ou vencidas, conforme fatos já registrados. Cadastro e exclusão continuam em Planejamento.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Próximo vencimento</th><th>Nome</th><th>Status</th><th class="right">Valor</th></tr></thead><tbody id="payables-obligations-table"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">FATURAS PENDENTES</span><h2>Faturas de cartão aguardando pagamento</h2><small>Só aparecem aqui faturas já importadas (linha de pagamento recebido do próprio extrato/PDF). Escolha "Pagar" para iniciar a quitação a partir da fatura.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Data de referência</th><th>Cartão</th><th>Descrição</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="payables-pending-invoices-table"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">PAGAMENTO DE FATURA</span><h2>Registrar pagamento manual</h2><small>Pagamento de fatura é conciliação, nunca uma nova despesa (INV-002); as compras da fatura continuam sendo os fatos de despesa. Origem dos recursos, conta pagadora e fatura são sempre confirmadas por você.</small></div></div>
+          <form id="pay-invoice-form" class="form-grid three">
+            <input type="hidden" name="card_transaction_id">
+            <label class="full-on-mobile">Fatura selecionada<input id="pay-invoice-summary" disabled placeholder="Escolha uma fatura pendente acima"></label>
+            <label>Conta pagadora<select name="paying_account_id" id="pay-invoice-account" required></select></label>
+            <label>Valor pago<input type="number" name="amount" step="0.01" min="0.01" required></label>
+            <label>Data do pagamento<input type="date" name="booked_at" required></label>
+            <label class="full-on-mobile">Descrição<input name="description" required maxlength="500" placeholder="Ex.: Pagamento da fatura Itaú"></label>
+            <label class="full"><input type="checkbox" name="confirmed" required> Confirmo que este pagamento realmente aconteceu</label>
+            <label class="full"><input type="checkbox" id="pay-invoice-with-redemption"> Resgatar do Privilège DI antes de pagar</label>
+            <label id="pay-invoice-redemption-amount-field" class="hidden">Valor a resgatar<input type="number" id="pay-invoice-redemption-amount" step="0.01" min="0.01"></label>
+            <button class="primary" type="submit">Registrar pagamento</button>
+          </form>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">HISTÓRICO</span><h2>Faturas já pagas</h2></div><div class="filters"><input type="month" id="payables-month"><button id="refresh-payables" class="secondary">Atualizar</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Data de referência</th><th>Descrição</th><th class="right">Valor</th><th>Pago em</th></tr></thead><tbody id="payables-paid-invoices-table"></tbody></table></div>
         </article>
       </section>
 

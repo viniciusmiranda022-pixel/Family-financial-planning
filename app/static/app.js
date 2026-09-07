@@ -42,6 +42,7 @@ const pageNames = {
   capture: "Lançar agora",
   entradas: "Entradas",
   saidas: "Saídas",
+  payables: "Contas a pagar",
   transferencias: "Transferências",
   imports: "Importações",
   transactions: "Lançamentos",
@@ -177,6 +178,7 @@ async function navigate(view) {
     capture: loadCapture,
     entradas: loadEntradas,
     saidas: loadSaidas,
+    payables: loadPayables,
     transferencias: loadTransferencias,
     imports: loadImports,
     transactions: loadTransactions,
@@ -208,6 +210,13 @@ async function loadAccounts() {
   document.querySelector("#expense-entry-account").innerHTML = accountOptions;
   document.querySelector("#transfer-from-account").innerHTML = accountOptions;
   document.querySelector("#transfer-to-account").innerHTML = accountOptions;
+  // Payment of a card invoice only ever reconciles against a `checking`
+  // account -- the same direction contract `pay_card_invoice` enforces
+  // server-side; the UI never offers an account the backend would reject.
+  const checkingAccounts = state.accounts.filter((item) => item.account_type === "checking");
+  document.querySelector("#pay-invoice-account").innerHTML = checkingAccounts.length
+    ? checkingAccounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("")
+    : '<option value="">Cadastre uma conta corrente primeiro</option>';
   updateExpenseCompetenceField();
   const captureSelect = document.querySelector("#capture-account");
   if (captureSelect) {
@@ -739,6 +748,67 @@ async function loadSaidas() {
       <td class="right amount-expense">${money.format(item.amount)}</td>
     `,
   });
+}
+
+function payablesObligationRow(item) {
+  return `
+    <tr>
+      <td>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))}</td>
+      <td><strong>${escapeHtml(item.name)}</strong></td>
+      <td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td>
+      <td class="right amount-expense">${money.format(item.amount)}</td>
+    </tr>
+  `;
+}
+
+const payableInvoiceStatusLabels = {
+  pending: '<span class="status-chip warn">Pendente</span>',
+  paid: '<span class="status-chip ok">Paga</span>',
+};
+
+async function loadPayables() {
+  // "Contas a pagar": centro de obrigações e pagamentos (go-live manual
+  // slice 3). Every table here reads an already-canonical service --
+  // `GET /obligations` (unchanged, slice-1-era) and
+  // `GET /card-payment-reconciliations/invoices` (this slice) -- no new
+  // calculation happens in this screen.
+  const month = document.querySelector("#payables-month").value;
+  const [obligations, invoices] = await Promise.all([
+    api("/obligations"),
+    api(`/card-payment-reconciliations/invoices${month ? `?period=${month}` : ""}`),
+  ]);
+
+  document.querySelector("#payables-obligations-table").innerHTML = obligations.length
+    ? obligations.map(payablesObligationRow).join("")
+    : emptyRow(4, "Nenhuma obrigação cadastrada. Cadastre em Planejamento.");
+
+  const pending = invoices.filter((item) => item.status === "pending");
+  document.querySelector("#payables-pending-invoices-table").innerHTML = pending.length ? pending.map((item) => `
+    <tr>
+      <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
+      <td>${escapeHtml(item.account)}</td>
+      <td>${escapeHtml(item.description)}</td>
+      <td class="right">${money.format(Number(item.amount))}</td>
+      <td class="right"><button class="text-action pay-invoice" data-id="${escapeHtml(item.card_transaction_id)}" data-amount="${escapeHtml(item.amount)}" data-description="${escapeHtml(item.description)}" data-account="${escapeHtml(item.account)}">Pagar</button></td>
+    </tr>
+  `).join("") : emptyRow(5, "Nenhuma fatura pendente de pagamento");
+  document.querySelectorAll(".pay-invoice").forEach((button) => button.addEventListener("click", () => {
+    const form = document.querySelector("#pay-invoice-form");
+    form.elements.card_transaction_id.value = button.dataset.id;
+    form.elements.amount.value = button.dataset.amount;
+    document.querySelector("#pay-invoice-summary").value = `${button.dataset.account} • ${button.dataset.description} • ${money.format(Number(button.dataset.amount))}`;
+    form.elements.booked_at.focus();
+  }));
+
+  const paid = invoices.filter((item) => item.status === "paid");
+  document.querySelector("#payables-paid-invoices-table").innerHTML = paid.length ? paid.map((item) => `
+    <tr>
+      <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
+      <td>${escapeHtml(item.description)}</td>
+      <td class="right">${money.format(Number(item.amount))}</td>
+      <td>${item.paid_date ? dateFormat.format(new Date(`${item.paid_date}T00:00:00Z`)) : ""}</td>
+    </tr>
+  `).join("") : emptyRow(4, "Nenhuma fatura paga neste período");
 }
 
 async function loadTransferencias() {
@@ -1926,6 +1996,68 @@ document.querySelector("#transfer-form").addEventListener("submit", async (event
 
 document.querySelector("#refresh-transferencias").addEventListener("click", loadTransferencias);
 
+document.querySelector("#pay-invoice-with-redemption").addEventListener("change", (event) => {
+  document.querySelector("#pay-invoice-redemption-amount-field").classList.toggle("hidden", !event.target.checked);
+  if (!event.target.checked) document.querySelector("#pay-invoice-redemption-amount").value = "";
+});
+
+document.querySelector("#pay-invoice-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  if (!form.elements.card_transaction_id.value) {
+    return toast("Escolha uma fatura pendente em \"Faturas pendentes\" antes de registrar o pagamento", true);
+  }
+  const withRedemption = document.querySelector("#pay-invoice-with-redemption").checked;
+  const redemptionAmount = Number(document.querySelector("#pay-invoice-redemption-amount").value || 0);
+  if (withRedemption && redemptionAmount <= 0) {
+    return toast("Informe o valor a resgatar do Privilège DI", true);
+  }
+  const payload = {
+    card_transaction_id: form.elements.card_transaction_id.value,
+    paying_account_id: form.elements.paying_account_id.value,
+    amount: Number(form.elements.amount.value),
+    booked_at: form.elements.booked_at.value,
+    description: form.elements.description.value,
+    confirmed: form.elements.confirmed.checked,
+  };
+  const amountsToConfirm = [{ amount: payload.amount, kind: "transaction" }];
+  if (withRedemption) amountsToConfirm.push({ amount: redemptionAmount, kind: "transaction" });
+  const largeConfirmation = confirmLargeTransactions(amountsToConfirm);
+  if (!largeConfirmation.allowed) return toast("Pagamento cancelado; use o Consultor para simulações", true);
+  payload.confirmed_large_amount = largeConfirmation.confirmed;
+  try {
+    // Fluxo combinado (`docs/GO_LIVE_MANUAL_UX_PLAN.md`): resgate e
+    // pagamento são dois comandos canônicos independentes, chamados em
+    // sequência -- nunca um único endpoint novo. Se o resgate falhar, o
+    // pagamento nunca é enviado; se o resgate for confirmado e o pagamento
+    // falhar depois, o resgate já registrado permanece como fato auditável
+    // e o usuário pode repetir apenas o pagamento.
+    if (withRedemption) {
+      await api("/transactions", {
+        method: "POST",
+        body: JSON.stringify({
+          booked_at: payload.booked_at,
+          description: `Resgate do Privilège DI para pagar fatura: ${payload.description}`,
+          amount: redemptionAmount,
+          movement_type: "redemption",
+          account_id: payload.paying_account_id,
+          confirmed_large_amount: largeConfirmation.confirmed,
+        }),
+      });
+    }
+    await api("/card-payment-reconciliations/pay", { method: "POST", body: JSON.stringify(payload) });
+    form.reset();
+    document.querySelector("#pay-invoice-summary").value = "";
+    document.querySelector("#pay-invoice-redemption-amount-field").classList.add("hidden");
+    form.elements.booked_at.value = currentDateKey();
+    await loadPayables();
+    await loadDashboard();
+    toast(withRedemption ? "Resgate e pagamento da fatura registrados" : "Pagamento da fatura registrado");
+  } catch (error) { toast(error.message, true); }
+});
+
+document.querySelector("#refresh-payables").addEventListener("click", loadPayables);
+
 document.querySelector("#income-entry-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
@@ -2146,6 +2278,7 @@ window.addEventListener("resize", () => {
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") setMobileMenu(false); });
 document.querySelector("#transaction-form").elements.booked_at.value = currentDateKey();
 document.querySelector("#transfer-form").elements.booked_at.value = currentDateKey();
+document.querySelector("#pay-invoice-form").elements.booked_at.value = currentDateKey();
 document.querySelector("#income-entry-form").elements.booked_at.value = currentDateKey();
 document.querySelector("#expense-entry-form").elements.booked_at.value = currentDateKey();
 updateExpenseCustomCategoryField();
