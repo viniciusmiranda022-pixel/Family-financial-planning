@@ -3223,48 +3223,215 @@ def confirm_capture(
     return {"ok": True, "result": result, "review_items": review_count}
 
 
+_LEDGER_PATRIMONIAL_CATEGORY_NAME = "Transferência patrimonial"
+_LEDGER_INTERNAL_TRANSFER_CATEGORY_NAME = "Transferência interna"
+_LEDGER_MOVEMENT_TYPES = frozenset(
+    {"income", "expense", "transfer", "investment", "redemption", "refund", "reconciliation"}
+)
+_LEDGER_ORIGINS = frozenset({"manual", "capture", "import", "legacy"})
+_LEDGER_ORIGIN_LABELS = {
+    "manual_confirmed": "Lançamento estruturado",
+    "capture_confirmed": "Lançar agora",
+    "local_rule": "Importação · regra local",
+    "builtin_rule": "Importação · regra padrão",
+    "financial_plan_workbook": "Carga inicial da planilha",
+    "legacy": "Origem legada",
+}
+
+
+def _ledger_movement_type(transaction_type: str, category_name: str | None, amount: Decimal) -> str:
+    """Read-only `movement_type` label for the livro-razão (go-live manual
+    slice 4, `docs/WORK_ORDER_MANUAL_LEDGER.md`).
+
+    `Transaction.transaction_type` only stores five values
+    (`income|expense|transfer|refund|reconciliation`); `investment` and
+    `redemption` are both persisted as `type="transfer"` + category
+    "Transferência patrimonial", distinguished only by the sign of the
+    already-computed `amount` (see the "investment"/"redemption" branches of
+    `create_manual_transaction` and `confirm_capture`). This function is the
+    single place that reverses that mapping for display/filtering -- it does
+    not compute a new financial fact, only renders one that the canonical
+    write path already decided, so the ledger never re-derives it a second
+    time in the frontend.
+    """
+    if transaction_type != "transfer":
+        return transaction_type
+    if category_name == _LEDGER_PATRIMONIAL_CATEGORY_NAME:
+        return "investment" if amount < 0 else "redemption"
+    return "transfer"
+
+
 @router.get("/transactions")
 def transactions(
     month: str | None = None,
     review_only: bool = False,
+    movement_type: str | None = Query(default=None),
+    origin: str | None = Query(default=None),
     limit: int = 200,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict]:
+    """Livro-razão unificado de consulta/auditoria (go-live manual slice 4,
+    `docs/WORK_ORDER_MANUAL_LEDGER.md` /
+    `docs/GO_LIVE_MANUAL_UX_PLAN.md#lançamentos`).
+
+    Still the same read-only query over `Transaction` every canonical
+    command from slices 1-3 already writes (Entradas/Saídas, Transferências/
+    Aplicação/Resgate, Contas a pagar/pagamento de fatura, Lançar agora,
+    importação) -- this only adds filters and provenance fields, never a
+    second calculation. `movement_type` filters on the same seven-value
+    vocabulary already established by `ManualTransactionRequest`/
+    `CaptureItemRequest` (see `_ledger_movement_type`); `origin` filters on
+    the already-persisted `classification_source` channel each canonical
+    command already tags its own rows with.
+
+    Every cross-reference this endpoint can expose by name --
+    `account_id`/`category_id`/`document_id`/`linked_transaction_id` -- is
+    re-resolved through a household-scoped lookup before being surfaced. A
+    row whose reference happens to point at another household (a corrupted/
+    inconsistent reference that no canonical command produces, but that must
+    never be trusted blindly either -- see
+    `tests/test_manual_payables_card_payment.py`'s
+    `test_card_invoice_obligation_stays_pending_for_cross_household_link_reference`
+    for the established pattern this mirrors) is treated as unresolved
+    rather than leaking that other household's name/description/id.
+    """
+    if movement_type is not None and movement_type not in _LEDGER_MOVEMENT_TYPES:
+        raise HTTPException(status_code=422, detail="Tipo de movimentação inválido")
+    if origin is not None and origin not in _LEDGER_ORIGINS:
+        raise HTTPException(status_code=422, detail="Origem inválida")
+
     query = select(Transaction).where(Transaction.household_id == user.household_id)
     if month:
         start = _month_start(month)
         query = query.where(Transaction.booked_at >= start, Transaction.booked_at < add_months(start, 1))
     if review_only:
         query = query.where(Transaction.reviewed.is_(False))
+    if movement_type in {"income", "expense", "refund", "reconciliation"}:
+        query = query.where(Transaction.transaction_type == movement_type)
+    elif movement_type == "transfer":
+        query = query.join(Category, Transaction.category_id == Category.id).where(
+            Transaction.transaction_type == "transfer",
+            Category.household_id == user.household_id,
+            Category.name == _LEDGER_INTERNAL_TRANSFER_CATEGORY_NAME,
+        )
+    elif movement_type in {"investment", "redemption"}:
+        query = query.join(Category, Transaction.category_id == Category.id).where(
+            Transaction.transaction_type == "transfer",
+            Category.household_id == user.household_id,
+            Category.name == _LEDGER_PATRIMONIAL_CATEGORY_NAME,
+            Transaction.amount < 0 if movement_type == "investment" else Transaction.amount > 0,
+        )
+    if origin == "manual":
+        query = query.where(Transaction.classification_source == "manual_confirmed")
+    elif origin == "capture":
+        query = query.where(Transaction.classification_source == "capture_confirmed")
+    elif origin == "import":
+        query = query.where(
+            Transaction.classification_source.in_(("local_rule", "builtin_rule", "financial_plan_workbook"))
+        )
+    elif origin == "legacy":
+        query = query.where(Transaction.classification_source == "legacy")
+
     rows = db.scalars(
         query.order_by(Transaction.booked_at.desc(), Transaction.created_at.desc()).limit(min(limit, 1000))
     ).all()
-    return [
+
+    account_ids = {item.account_id for item in rows if item.account_id}
+    accounts_by_id = (
         {
-            "id": item.id,
-            "date": item.booked_at,
-            "description": item.description,
-            "amount": decimal_value(item.amount),
-            "type": item.transaction_type,
-            "category_id": item.category_id,
-            "category": item.category.name if item.category else "Revisar",
-            "owner": item.owner_label,
-            "account": item.account.name if item.account else "",
-            "excluded": item.excluded,
-            "possible_duplicate": item.possible_duplicate,
-            "reviewed": item.reviewed,
-            "confidence": decimal_value(item.confidence),
-            "installment": (
-                f"{item.installment_current}/{item.installment_total}"
-                if item.installment_current and item.installment_total
-                else None
-            ),
-            "manual": item.document_id is None,
-            "transfer_group_id": item.transfer_group_id,
+            account.id: account
+            for account in db.scalars(
+                select(Account).where(Account.id.in_(account_ids), Account.household_id == user.household_id)
+            ).all()
         }
-        for item in rows
-    ]
+        if account_ids
+        else {}
+    )
+    category_ids = {item.category_id for item in rows if item.category_id}
+    categories_by_id = (
+        {
+            category.id: category
+            for category in db.scalars(
+                select(Category).where(Category.id.in_(category_ids), Category.household_id == user.household_id)
+            ).all()
+        }
+        if category_ids
+        else {}
+    )
+    document_ids = {item.document_id for item in rows if item.document_id}
+    documents_by_id = (
+        {
+            document.id: document
+            for document in db.scalars(
+                select(Document).where(Document.id.in_(document_ids), Document.household_id == user.household_id)
+            ).all()
+        }
+        if document_ids
+        else {}
+    )
+    linked_ids = {item.linked_transaction_id for item in rows if item.linked_transaction_id}
+    linked_by_id = (
+        {
+            linked.id: linked
+            for linked in db.scalars(
+                select(Transaction).where(
+                    Transaction.id.in_(linked_ids), Transaction.household_id == user.household_id
+                )
+            ).all()
+        }
+        if linked_ids
+        else {}
+    )
+
+    result = []
+    for item in rows:
+        account = accounts_by_id.get(item.account_id) if item.account_id else None
+        category = categories_by_id.get(item.category_id) if item.category_id else None
+        document = documents_by_id.get(item.document_id) if item.document_id else None
+        linked = linked_by_id.get(item.linked_transaction_id) if item.linked_transaction_id else None
+        category_name = category.name if category else "Revisar"
+        result.append(
+            {
+                "id": item.id,
+                "date": item.booked_at,
+                "description": item.description,
+                "amount": decimal_value(item.amount),
+                "type": item.transaction_type,
+                "movement_type": _ledger_movement_type(item.transaction_type, category_name, item.amount),
+                "category_id": item.category_id,
+                "category": category_name,
+                "owner": item.owner_label,
+                "account": account.name if account else "",
+                "account_id": account.id if account else None,
+                "excluded": item.excluded,
+                "possible_duplicate": item.possible_duplicate,
+                "canonical_status": item.canonical_status,
+                "duplicate_group_id": item.duplicate_group_id,
+                "reviewed": item.reviewed,
+                "confidence": decimal_value(item.confidence),
+                "competence": item.competence,
+                "installment": (
+                    f"{item.installment_current}/{item.installment_total}"
+                    if item.installment_current and item.installment_total
+                    else None
+                ),
+                "manual": item.document_id is None,
+                "classification_source": item.classification_source,
+                "origin_label": _LEDGER_ORIGIN_LABELS.get(
+                    item.classification_source, item.classification_source
+                ),
+                "document_id": document.id if document else None,
+                "document_name": document.original_name if document else None,
+                "document_type": document.document_type if document else None,
+                "transfer_group_id": item.transfer_group_id,
+                "linked_transaction_id": linked.id if linked else None,
+                "linked_description": linked.description if linked else None,
+                "linked_date": linked.booked_at if linked else None,
+                "linked_amount": decimal_value(linked.amount) if linked else None,
+            }
+        )
+    return result
 
 
 @router.post("/transactions", status_code=201)
