@@ -77,10 +77,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+if TYPE_CHECKING:
+    from app.services.duplicates import DuplicateAssessment
 
 from app.services.reconciliation import RECONCILIATION_TOLERANCE
 
@@ -459,6 +462,244 @@ def link_card_payment(
     checking.linked_transaction_id = card.id
     card.linked_transaction_id = checking.id
     return checking, card
+
+
+@dataclass(frozen=True, slots=True)
+class CardInvoiceObligation:
+    """One card-invoice ("fatura") viewed as a payable obligation -- go-live
+    manual slice 3 (`docs/WORK_ORDER_MANUAL_PAYABLES_CARD_PAYMENT.md`,
+    "Contas a pagar").
+
+    `status` is a direct read of `Transaction.linked_transaction_id`, the
+    same canonical proof `list_card_payment_reconciliations` already uses --
+    never fabricated, never inferred from amount, date or any heuristic:
+
+    - `paid`: linked to a checking-side reconciliation leg (whether that
+      leg was imported from a bank statement or created by
+      `pay_card_invoice` below) -- an actual quitação fact exists.
+    - `pending`: no link yet.
+
+    This never buckets a pending invoice into "a vencer"/"vencida" the way
+    `app/api.py::_obligation_timing` does for the generic `Obligation`
+    model: no parser stores the invoice's printed "VENCIMENTO" date on the
+    `Transaction` row (`_reference_date` in `app/services/importer.py` only
+    keeps the invoice's *reference month*, folded into `booked_at`), so a
+    due-date bucket here would fabricate a fact the data does not contain --
+    exactly what the Work Order's acceptance criteria forbid ("sem inventar
+    status ou saldos").
+    """
+
+    card_transaction_id: str
+    status: str
+    amount: Decimal
+    booked_at: str
+    competence: str | None
+    description: str
+    account: str
+    paid_transaction_id: str | None = None
+    paid_booked_at: str | None = None
+
+
+def list_card_invoice_obligations(
+    db: Session,
+    *,
+    household_id: str,
+    period: str | None = None,
+) -> list[CardInvoiceObligation]:
+    """Read-only, deterministic list of card invoices as payable obligations.
+
+    Reads exactly the population `list_card_payment_reconciliations` already
+    treats as the invoice/payment-received side (`transaction_type ==
+    "reconciliation"` on a `credit_card` account) -- no new query shape, no
+    new financial calculation. `period` filters by the invoice's own
+    `competence`; never mutates anything.
+    """
+
+    from app.models import Account, Transaction
+
+    rows = db.scalars(
+        select(Transaction)
+        .join(Account, Account.id == Transaction.account_id)
+        .where(
+            Transaction.household_id == household_id,
+            Transaction.transaction_type == "reconciliation",
+            Account.account_type == "credit_card",
+        )
+        .order_by(Transaction.booked_at.desc(), Transaction.id)
+    ).all()
+    if period:
+        rows = [row for row in rows if row.competence == period]
+
+    results: list[CardInvoiceObligation] = []
+    for row in rows:
+        paid_transaction = db.get(Transaction, row.linked_transaction_id) if row.linked_transaction_id else None
+        results.append(
+            CardInvoiceObligation(
+                card_transaction_id=row.id,
+                status="paid" if row.linked_transaction_id else "pending",
+                amount=row.amount,
+                booked_at=row.booked_at.isoformat(),
+                competence=row.competence,
+                description=row.description,
+                account=row.account.name if row.account else "",
+                paid_transaction_id=row.linked_transaction_id,
+                paid_booked_at=paid_transaction.booked_at.isoformat() if paid_transaction else None,
+            )
+        )
+    return results
+
+
+def serialize_card_invoice_obligation(item: CardInvoiceObligation) -> dict[str, Any]:
+    return {
+        "card_transaction_id": item.card_transaction_id,
+        "status": item.status,
+        "amount": str(item.amount),
+        "date": item.booked_at,
+        "competence": item.competence,
+        "description": item.description,
+        "account": item.account,
+        "paid_transaction_id": item.paid_transaction_id,
+        "paid_date": item.paid_booked_at,
+    }
+
+
+def pay_card_invoice(
+    db: Session,
+    *,
+    household_id: str,
+    card_transaction_id: str,
+    paying_account: Any,
+    category: Any,
+    amount: Decimal,
+    booked_at: Any,
+    description: str,
+) -> tuple[Any, Any, DuplicateAssessment | None]:
+    """Manual payment of a card invoice -- go-live manual slice 3.
+
+    `docs/WORK_ORDER_MANUAL_PAYABLES_CARD_PAYMENT.md`, "Pagamento manual de
+    fatura": creates the checking-side (bank-debit) reconciliation leg for a
+    payment that has not been imported yet, and links it to the invoice's
+    existing payment-received line in the same atomic call -- one command
+    instead of "create a transaction" followed by a separate "link" step
+    that could be left half-done.
+
+    Reuses `link_card_payment`'s exact tolerance/direction contract instead
+    of inventing a second one: the amount paid must match the invoice's own
+    amount within `RECONCILIATION_TOLERANCE` (so partial payment is
+    rejected, not silently accepted -- see the Work Order's "pagamento
+    parcial" acceptance criterion, which requires an unambiguous existing
+    contract or explicit out-of-scope rejection) and the same
+    checking-debit/card-credit sign relationship `_is_card_payment_direction`
+    already enforces. INV-002 holds by construction: the new leg's category
+    is always "Conciliação" and it is always `excluded = True`, exactly like
+    every other reconciliation row in this project -- it can never be
+    counted as a new expense.
+
+    The paying account must be an active `checking` account of this
+    household: the only account type the existing reconciliation contract
+    ever treats as the bank/debit side of a card payment
+    (`list_card_payment_reconciliations`, `_is_card_payment_direction`).
+    Widening that to other account types would be a second, looser
+    direction policy, which this slice's Work Order forbids.
+
+    Raises `LookupError` (-> 404) when `card_transaction_id` does not
+    resolve to a reconciliation row of this household, `CardPaymentLinkError`
+    (-> 409) for any business-rule conflict (not a credit-card invoice line,
+    already paid, wrong direction, amount outside tolerance, inactive/foreign
+    paying account, wrong account type).
+
+    Atomicity: like `create_internal_transfer`, nothing here calls
+    `db.commit()` -- the caller commits once after this call and its
+    duplicate-detection pass succeed, so there is no intermediate state with
+    only the new leg persisted and no link, or vice versa.
+    """
+
+    import uuid
+
+    from app.models import Transaction
+    from app.services.classifier import normalize_description
+    from app.services.duplicates import register_transaction_duplicates, source_priority
+    from app.services.importer import PARSER_CONTRACT_VERSION, ParsedTransaction, transaction_fingerprint
+
+    card = _reconciliation_transaction_or_404(
+        db, household_id=household_id, transaction_id=card_transaction_id, for_update=True
+    )
+    card_account_type = card.account.account_type if card.account else None
+    if card_account_type != "credit_card":
+        raise CardPaymentLinkError(
+            "O identificador informado não corresponde a uma fatura de cartão pendente de pagamento"
+        )
+    if card.linked_transaction_id:
+        raise CardPaymentLinkError(
+            "Esta fatura já está paga; desvincule o pagamento atual antes de registrar outro"
+        )
+    if paying_account.household_id != household_id:
+        raise CardPaymentLinkError("A conta pagadora precisa pertencer a esta família")
+    if not paying_account.active:
+        raise CardPaymentLinkError("A conta pagadora precisa estar ativa")
+    if paying_account.account_type != "checking":
+        raise CardPaymentLinkError(
+            "A conta pagadora precisa ser uma conta corrente; o contrato de conciliação de "
+            "pagamento de fatura só reconhece débito bancário nesse tipo de conta"
+        )
+
+    positive_amount = _money(abs(amount))
+    if positive_amount <= 0:
+        raise CardPaymentLinkError("O valor pago deve ser maior que zero")
+    if abs(positive_amount - abs(card.amount)) > RECONCILIATION_TOLERANCE:
+        raise CardPaymentLinkError(
+            "O valor pago não corresponde ao valor da fatura dentro da tolerância de R$ 0,01; "
+            "pagamento parcial de fatura não é suportado por este contrato"
+        )
+    debit_amount = -positive_amount
+    if not _is_card_payment_direction(checking_amount=debit_amount, card_amount=card.amount):
+        raise CardPaymentLinkError(
+            "A fatura selecionada não está no formato de pagamento recebido esperado para conciliação"
+        )
+
+    parsed = ParsedTransaction(
+        booked_at=booked_at,
+        description=description,
+        amount=_money(debit_amount),
+        source_line=1,
+        card_last_four=paying_account.last_four,
+    )
+    checking_leg = Transaction(
+        household_id=household_id,
+        account_id=paying_account.id,
+        category_id=category.id,
+        booked_at=booked_at,
+        description=description,
+        normalized_description=normalize_description(description),
+        amount=_money(debit_amount),
+        transaction_type="reconciliation",
+        owner_label=paying_account.owner_label,
+        card_last_four=paying_account.last_four,
+        fingerprint=transaction_fingerprint(paying_account.id, parsed, paying_account.owner_label),
+        occurred_at=booked_at,
+        competence=booked_at.strftime("%Y-%m"),
+        classification_source="manual_confirmed",
+        classification_version=PARSER_CONTRACT_VERSION,
+        canonical_status="unassigned",
+        trace_id=str(uuid.uuid4()),
+        source_priority=source_priority("manual"),
+        confidence=Decimal("1"),
+        excluded=True,
+        possible_duplicate=False,
+        reviewed=True,
+    )
+    db.add(checking_leg)
+    db.flush()
+    checking_leg.linked_transaction_id = card.id
+    card.linked_transaction_id = checking_leg.id
+
+    _, duplicate_assessment = register_transaction_duplicates(
+        db, transaction=checking_leg, household_id=household_id
+    )
+    if duplicate_assessment is not None:
+        checking_leg.reviewed = False
+
+    return checking_leg, card, duplicate_assessment
 
 
 def unlink_card_payment(

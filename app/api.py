@@ -44,6 +44,7 @@ from app.schemas import (
     AccountRequest,
     AdvisorRequest,
     CaptureConfirmRequest,
+    CardInvoicePaymentRequest,
     CardPaymentLinkRequest,
     CardPaymentUnlinkRequest,
     ClassificationRuleDeactivateRequest,
@@ -74,7 +75,10 @@ from app.security import (
 from app.services.card_payment_reconciliation import (
     CardPaymentLinkError,
     link_card_payment,
+    list_card_invoice_obligations,
     list_card_payment_reconciliations,
+    pay_card_invoice,
+    serialize_card_invoice_obligation,
     serialize_card_payment_match,
     unlink_card_payment,
 )
@@ -3664,6 +3668,9 @@ def update_transaction(
         "owner_label": transaction.owner_label,
     }
     changes = payload.model_dump(exclude_unset=True)
+    is_linked_reconciliation = (
+        transaction.linked_transaction_id is not None and transaction.transaction_type == "reconciliation"
+    )
     if transaction.transfer_group_id is not None and (
         "excluded" in changes or "category_id" in changes
     ):
@@ -3682,6 +3689,20 @@ def update_transaction(
                 "Uma perna de transferência não pode ter categoria ou inclusão nos totais "
                 "alteradas isoladamente; exclua a transferência e registre novamente se o "
                 "vínculo estiver incorreto"
+            ),
+        )
+    if is_linked_reconciliation and "excluded" in changes:
+        # INV-002: a linked card-payment-reconciliation leg (imported or
+        # created by `pay_card_invoice`) must stay excluded from every
+        # operating total forever -- flipping `excluded` to `False` here
+        # would turn a quitação fact into a fabricated second expense for
+        # the same invoice. `category_id`/`reviewed`/`possible_duplicate`/
+        # `owner_label` carry no INV-002 meaning and stay editable.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Um lançamento de conciliação vinculado não pode ter sua inclusão nos totais "
+                "alterada; desvincule o pagamento da fatura antes, se o vínculo estiver incorreto"
             ),
         )
     if "category_id" in changes and changes["category_id"]:
@@ -3757,6 +3778,27 @@ def delete_manual_transaction(
         raise HTTPException(
             status_code=409,
             detail="Lançamentos importados não são apagados; use Ignorar para preservar a auditoria",
+        )
+    if transaction.linked_transaction_id is not None and transaction.transfer_group_id is None:
+        # A card-payment-reconciliation leg (`POST
+        # /card-payment-reconciliations/pay`, `.../link`) keeps a symmetric
+        # `linked_transaction_id` on both sides, same as a structured
+        # transfer's two legs -- but a transfer also carries
+        # `transfer_group_id`, already handled atomically below, so this
+        # guard only needs to cover the reconciliation case. Its counterpart
+        # usually has its own `document_id` guard above, but a leg created
+        # by `pay_card_invoice` never does (it is manual, not imported) --
+        # so without this check it could be deleted here directly, leaving
+        # its still-imported counterpart pointing at a transaction id that
+        # no longer exists. Unlink first (`POST
+        # /card-payment-reconciliations/unlink`), which clears both sides
+        # symmetrically; only then does this row become deletable.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Este lançamento está vinculado a uma conciliação de pagamento de fatura; "
+                "desvincule antes de excluir"
+            ),
         )
     if transaction.transfer_group_id is not None:
         # A structured transfer (`POST /transfers`) is two atomically-linked
@@ -4036,6 +4078,117 @@ def unlink_card_payment_reconciliation(
         if match.checking_transaction_id == checking.id
     )
     return serialize_card_payment_match(db, match)
+
+
+@router.get("/card-payment-reconciliations/invoices")
+def card_invoice_obligations(
+    period: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """"Contas a pagar" -- card-invoice side.
+
+    `docs/WORK_ORDER_MANUAL_PAYABLES_CARD_PAYMENT.md`: every card invoice
+    the household has already imported, with `paid`/`pending` derived only
+    from `Transaction.linked_transaction_id` -- never a fabricated due-date
+    bucket (see `list_card_invoice_obligations`'s docstring).
+    """
+    items = list_card_invoice_obligations(db, household_id=user.household_id, period=period)
+    return [serialize_card_invoice_obligation(item) for item in items]
+
+
+@router.post("/card-payment-reconciliations/pay", status_code=status.HTTP_201_CREATED)
+def pay_card_invoice_reconciliation(
+    payload: CardInvoicePaymentRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Manual payment of a card invoice -- go-live manual slice 3.
+
+    Creates the checking-side reconciliation leg and links it to the
+    invoice's existing payment-received line in one call
+    (`pay_card_invoice`). INV-002 holds because the new leg is always
+    `transaction_type = "reconciliation"`, category "Conciliação" and
+    `excluded = True` -- exactly like every other reconciliation row, so it
+    can never be counted as a new expense; the invoice's own purchases
+    remain the only economic expense facts.
+    """
+    paying_account = db.scalar(
+        select(Account).where(
+            Account.id == payload.paying_account_id,
+            Account.household_id == user.household_id,
+            Account.active.is_(True),
+        )
+    )
+    if not paying_account:
+        raise HTTPException(status_code=404, detail="Conta pagadora não encontrada")
+
+    profile = profile_for(db, user.household_id)
+    large_threshold = _large_entry_threshold(profile)
+    if payload.amount >= large_threshold and not payload.confirmed_large_amount:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Este valor exige confirmação adicional. Confirme apenas se o pagamento "
+                f"aconteceu de verdade; use o Consultor para simulações. Limite de confirmação: "
+                f"R$ {large_threshold:,.2f}."
+            ),
+        )
+
+    category = category_for(db, user.household_id, "Conciliação")
+    try:
+        checking_leg, card, duplicate_assessment = pay_card_invoice(
+            db,
+            household_id=user.household_id,
+            card_transaction_id=payload.card_transaction_id,
+            paying_account=paying_account,
+            category=category,
+            amount=payload.amount,
+            booked_at=payload.booked_at,
+            description=payload.description,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada") from exc
+    except CardPaymentLinkError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    review_created = False
+    if duplicate_assessment is not None:
+        review_created = True
+        db.add(
+            ReviewItem(
+                household_id=user.household_id,
+                transaction_id=checking_leg.id,
+                reason="possible_duplicate",
+                details=(
+                    "Pagamento manual de fatura agrupado como possível repetição "
+                    f"({duplicate_assessment.band}, confiança {duplicate_assessment.confidence})"
+                ),
+            )
+        )
+
+    audit(
+        db,
+        user,
+        "card_payment_reconciliation.pay",
+        "transaction",
+        checking_leg.id,
+        {
+            "card_transaction_id": card.id,
+            "paying_account_id": paying_account.id,
+            "amount": str(checking_leg.amount),
+        },
+        before_state={"card_transaction_id": card.id, "linked_transaction_id": None},
+        after_state={"checking_transaction_id": checking_leg.id, "card_transaction_id": card.id},
+        trace_id=checking_leg.trace_id,
+        source="card_payment_reconciliation",
+    )
+    db.commit()
+    return {
+        "checking_transaction_id": checking_leg.id,
+        "card_transaction_id": card.id,
+        "review_items": 1 if review_created else 0,
+    }
 
 
 @router.get("/classification-rules")
