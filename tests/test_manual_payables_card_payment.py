@@ -725,6 +725,109 @@ def test_card_invoice_obligation_stays_pending_for_wrong_account_type_link_refer
         assert by_id[invoice_id]["paid_date"] is None
 
 
+def test_card_invoice_obligation_excludes_invoice_whose_own_account_belongs_to_another_household() -> None:
+    """`Transaction.household_id` and `Transaction.account_id` are
+    independent columns: a row claiming `household_id == A` but whose
+    `account_id` actually references an `Account` of household B is
+    corrupted data, not a genuine invoice of household A. BLOQUEIO DE
+    MERGE #5 (2026-09-07): the read model must never serialize that
+    foreign account's name/id under household A's "Contas a pagar" --
+    the row must be excluded from A's listing entirely (and, symmetrically,
+    it can never surface under B's listing either, since its own
+    `Transaction.household_id` is `A`, not `B`) rather than trust
+    `Transaction.household_id` alone."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+
+        _create_household_admin(
+            session_factory,
+            household_name="Outra Família Cartão",
+            username="admin-outra-cartao",
+            password="outra-senha-segura",
+        )
+        with session_factory() as db:
+            other_household_id = db.scalar(
+                select(User.household_id).where(User.username == "admin-outra-cartao")
+            )
+            foreign_card = Account(
+                household_id=other_household_id, name="Cartão da outra família", account_type="credit_card"
+            )
+            db.add(foreign_card)
+            db.commit()
+            foreign_card_id = foreign_card.id
+
+        # Corrupted row: `household_id` says A, `account_id` points at B's
+        # credit-card account.
+        corrupted_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=foreign_card_id, amount="900.00"
+        )
+
+        items = client.get("/api/card-payment-reconciliations/invoices").json()
+        by_id = {item["card_transaction_id"]: item for item in items}
+        assert corrupted_id not in by_id
+        assert not any("outra família" in item["account"].lower() for item in items)
+
+
+def test_card_invoice_obligation_stays_pending_for_counterpart_with_cross_household_account_reference() -> None:
+    """A `linked_transaction_id` reciprocally pointing at a real,
+    same-household (`Transaction.household_id`), right-type, right-
+    direction `reconciliation` row is still not proof of payment if *that
+    counterpart's own account* belongs to a different household.
+    BLOQUEIO DE MERGE #5 (2026-09-07): `counterpart.household_id ==
+    household_id` alone does not prove `counterpart.account.household_id`
+    does too -- this must fail closed to `pending`, exactly like an
+    orphaned or non-reciprocal pointer, and must never leak the foreign
+    account's id/date as `paid_transaction_id`/`paid_date`."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=cartao, amount="1500.00"
+        )
+
+        _create_household_admin(
+            session_factory,
+            household_name="Outra Família Conta",
+            username="admin-outra-conta",
+            password="outra-senha-segura",
+        )
+        with session_factory() as db:
+            other_household_id = db.scalar(
+                select(User.household_id).where(User.username == "admin-outra-conta")
+            )
+            foreign_checking = Account(
+                household_id=other_household_id, name="Conta de outra família", account_type="checking"
+            )
+            db.add(foreign_checking)
+            db.commit()
+            foreign_checking_id = foreign_checking.id
+
+        # Corrupted counterpart: `Transaction.household_id` says A (so the
+        # existing same-household check alone would pass), but its
+        # `account_id` points at B's checking account.
+        debit_id = _bank_debit_line(
+            session_factory,
+            household_id=household,
+            checking_account_id=foreign_checking_id,
+            amount="-1500.00",
+        )
+
+        with session_factory() as db:
+            invoice = db.get(Transaction, invoice_id)
+            debit = db.get(Transaction, debit_id)
+            invoice.linked_transaction_id = debit.id
+            debit.linked_transaction_id = invoice.id
+            db.commit()
+
+        items = client.get("/api/card-payment-reconciliations/invoices").json()
+        by_id = {item["card_transaction_id"]: item for item in items}
+        assert by_id[invoice_id]["status"] == "pending"
+        assert by_id[invoice_id]["paid_transaction_id"] is None
+        assert by_id[invoice_id]["paid_date"] is None
+
+
 def test_combined_redemption_then_payment_flow_creates_two_separate_facts() -> None:
     """`docs/GO_LIVE_MANUAL_UX_PLAN.md`'s worked example: resgatar do
     Privilège DI, depois pagar a fatura -- two independent canonical calls

@@ -247,12 +247,32 @@ def _verified_reconciliation_counterpart(
     - its account is `counterpart_account_type` -- `checking` when
       validating a card-side row's link, `credit_card` when validating a
       checking-side row's link (the same two-sided shape every genuine pair
-      has);
+      has) -- **and** that account itself belongs to `household_id`;
     - the link is reciprocal, `counterpart.linked_transaction_id == row.id`
       -- a one-sided pointer is not lineage, it is corruption;
     - the pair satisfies the same amount tolerance and financial-direction
       contract `link_card_payment` itself enforces
       (`RECONCILIATION_TOLERANCE`, `_is_card_payment_direction`).
+
+    Go-live manual slice 3 review round #5 (2026-09-07, `BLOQUEIO DE MERGE
+    #5` -- "household isolation precisa incluir a conta referenciada, não
+    só `Transaction.household_id`"): `Transaction.household_id` and
+    `Transaction.account_id` are independent columns, so a row's own
+    `household_id` matching does not by itself prove its `Account` does
+    too. Before this round, `counterpart.household_id == household_id`
+    was checked but `counterpart.account.household_id` was not, so a
+    counterpart whose *account* belonged to a different household could
+    still be accepted as a genuine `checking`/`credit_card` counterpart
+    purely on `counterpart.account.account_type`. This function now also
+    requires `counterpart.account.household_id == household_id` -- and,
+    symmetrically, `row.account.household_id == household_id` for the row
+    being proven, since every caller uses this function's `paid`/`linked`
+    result as the single source of truth for whether a quitação fact
+    exists and whether it is safe to serialize `row`'s own account
+    name/metadata. A row (on either side of the pair) whose own account
+    does not verifiably belong to this household fails closed here --
+    `pending`/`ambiguous`/`unmatched` for the caller, never `paid`/`linked`,
+    and never a name/id/date from a foreign account.
 
     `counterpart_hint` lets a caller that already loaded the household's
     card/checking rows (e.g. `card_by_id` in `list_card_payment_
@@ -265,6 +285,9 @@ def _verified_reconciliation_counterpart(
 
     if not row.linked_transaction_id:
         return None
+    row_account = row.account
+    if row_account is None or row_account.household_id != household_id:
+        return None
     counterpart = (
         counterpart_hint
         if counterpart_hint is not None and counterpart_hint.id == row.linked_transaction_id
@@ -274,8 +297,10 @@ def _verified_reconciliation_counterpart(
         return None
     if counterpart.transaction_type != "reconciliation":
         return None
-    counterpart_type = counterpart.account.account_type if counterpart.account else None
-    if counterpart_type != counterpart_account_type:
+    counterpart_account = counterpart.account
+    if counterpart_account is None or counterpart_account.household_id != household_id:
+        return None
+    if counterpart_account.account_type != counterpart_account_type:
         return None
     if counterpart.linked_transaction_id != row.id:
         return None
@@ -318,6 +343,13 @@ def list_card_payment_reconciliations(
             Transaction.household_id == household_id,
             Transaction.transaction_type == "reconciliation",
             Account.account_type == "checking",
+            # BLOQUEIO DE MERGE #5 (2026-09-07): `Transaction.household_id`
+            # and `Transaction.account_id` are independent columns -- also
+            # require the joined `Account` to belong to this household so a
+            # row whose own account reference is corrupted (points at
+            # another household's account) never enters this household's
+            # candidate universe at all, on either side of the pair.
+            Account.household_id == household_id,
         )
         .order_by(Transaction.booked_at.desc(), Transaction.id)
     ).all()
@@ -338,6 +370,7 @@ def list_card_payment_reconciliations(
             Transaction.household_id == household_id,
             Transaction.transaction_type == "reconciliation",
             Account.account_type == "credit_card",
+            Account.household_id == household_id,
         )
     ).all()
     card_by_id = {row.id: row for row in card_rows}
@@ -613,6 +646,15 @@ def list_card_invoice_obligations(
             Transaction.household_id == household_id,
             Transaction.transaction_type == "reconciliation",
             Account.account_type == "credit_card",
+            # BLOQUEIO DE MERGE #5 (2026-09-07): require the invoice's own
+            # `Account` to belong to this household too -- `Transaction.
+            # household_id` matching alone does not prove `Account.
+            # household_id` does, and this row's `account.name` is
+            # serialized below, so a corrupted cross-household account
+            # reference must exclude the row entirely rather than leak a
+            # foreign account's name into this household's "Contas a
+            # pagar" list.
+            Account.household_id == household_id,
         )
         .order_by(Transaction.booked_at.desc(), Transaction.id)
     ).all()
@@ -742,6 +784,13 @@ def _deterministic_bank_evidence_for_card(
             Transaction.household_id == household_id,
             Transaction.transaction_type == "reconciliation",
             Account.account_type == "checking",
+            # BLOQUEIO DE MERGE #5 (2026-09-07): same universe-building
+            # query shape as `list_card_payment_reconciliations`/
+            # `list_card_invoice_obligations` -- require the joined
+            # `Account` to belong to this household too, so a row with a
+            # corrupted cross-household account reference can never be
+            # treated as this household's bank evidence for a payment.
+            Account.household_id == household_id,
         )
     ).all()
     if not all_checking_rows:
@@ -754,6 +803,7 @@ def _deterministic_bank_evidence_for_card(
             Transaction.household_id == household_id,
             Transaction.transaction_type == "reconciliation",
             Account.account_type == "credit_card",
+            Account.household_id == household_id,
         )
     ).all()
 

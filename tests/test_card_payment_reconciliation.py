@@ -219,6 +219,87 @@ def test_linked_status_requires_reciprocal_pointer_not_one_sided() -> None:
     assert match.candidates[0].transaction_id == card_line.id
 
 
+def test_checking_row_excluded_when_own_account_belongs_to_another_household() -> None:
+    """`Transaction.household_id` and `Transaction.account_id` are
+    independent columns: a checking-side row claiming `household_id == A`
+    but whose `account_id` actually references an `Account` of household B
+    is corrupted data, not a genuine bank debit of household A. BLOQUEIO
+    DE MERGE #5 (2026-09-07): it must never enter household A's candidate
+    universe (and so can never be offered as evidence, matched, or leak
+    its foreign account's name) -- `Transaction.household_id` alone is not
+    sufficient proof of which household a row's account belongs to."""
+
+    db = _memory_session()
+    household_a = build_synthetic_household(db, name="Família A Conta Cruzada")
+    household_b = build_synthetic_household(db, name="Família B Conta Cruzada")
+
+    corrupted = Transaction(
+        household_id=household_a.household.id,
+        account_id=household_b.checking.id,
+        booked_at=date(2026, 6, 20),
+        occurred_at=date(2026, 6, 20),
+        competence="2026-06",
+        description="Débito fatura conta cruzada",
+        normalized_description="DEBITO FATURA CONTA CRUZADA",
+        amount=Decimal("-330.00"),
+        transaction_type="reconciliation",
+        fingerprint=f"chkcrosshh{uuid.uuid4().hex}".ljust(64, "0")[:64],
+        source_priority=70,
+        confidence=Decimal("1"),
+        excluded=True,
+    )
+    db.add(corrupted)
+    db.flush()
+
+    matches = list_card_payment_reconciliations(db, household_id=household_a.household.id)
+    assert corrupted.id not in {match.checking_transaction_id for match in matches}
+
+
+def test_checking_row_stays_unlinked_when_card_counterpart_account_belongs_to_another_household() -> None:
+    """A `linked_transaction_id` reciprocally pointing at a real,
+    same-household (`Transaction.household_id`), right-type, right-
+    direction `reconciliation` row is still not proof of a link if *that
+    counterpart's own account* belongs to a different household. BLOQUEIO
+    DE MERGE #5 (2026-09-07): `counterpart.household_id == household_id`
+    alone does not prove `counterpart.account.household_id` does too --
+    `db.get` by primary key bypasses any household-scoped query filter, so
+    `_verified_reconciliation_counterpart` must check the counterpart's
+    account household explicitly. This must fail closed to a non-`linked`
+    status, exactly like an orphaned or non-reciprocal pointer."""
+
+    db = _memory_session()
+    household_a = build_synthetic_household(db, name="Família A Contraparte Cruzada")
+    household_b = build_synthetic_household(db, name="Família B Contraparte Cruzada")
+    checking = household_a.transactions["card_payment"]
+
+    corrupted_card_line = Transaction(
+        household_id=household_a.household.id,
+        account_id=household_b.credit_card.id,
+        category_id=household_a.categories["Conciliação"].id,
+        booked_at=date(2026, 6, 15),
+        occurred_at=date(2026, 6, 15),
+        competence="2026-06",
+        description="Pagamento em 15 JUN",
+        normalized_description="PAGAMENTO EM 15 JUN",
+        amount=Decimal("220.00"),
+        transaction_type="reconciliation",
+        fingerprint=f"cardpaycrosshh{uuid.uuid4().hex}".ljust(64, "0")[:64],
+        source_priority=70,
+        confidence=Decimal("1"),
+        excluded=True,
+    )
+    db.add(corrupted_card_line)
+    db.flush()
+    checking.linked_transaction_id = corrupted_card_line.id
+    corrupted_card_line.linked_transaction_id = checking.id
+    db.flush()
+
+    match = _checking_match(db, household_a)
+    assert match.status != "linked"
+    assert match.linked_transaction_id is None
+    assert all(candidate.transaction_id != corrupted_card_line.id for candidate in match.candidates)
+
+
 def test_two_checking_debits_one_card_candidate_never_both_matched() -> None:
     """P0 regression: a single card-side payment cannot be the deterministic
     `matched` suggestion for two different bank debits at once. Each
