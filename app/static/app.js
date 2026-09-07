@@ -42,6 +42,7 @@ const pageNames = {
   capture: "Lançar agora",
   entradas: "Entradas",
   saidas: "Saídas",
+  transferencias: "Transferências",
   imports: "Importações",
   transactions: "Lançamentos",
   reviews: "Revisar",
@@ -176,6 +177,7 @@ async function navigate(view) {
     capture: loadCapture,
     entradas: loadEntradas,
     saidas: loadSaidas,
+    transferencias: loadTransferencias,
     imports: loadImports,
     transactions: loadTransactions,
     reviews: loadReviews,
@@ -204,6 +206,8 @@ async function loadAccounts() {
   document.querySelector("#transaction-account").innerHTML = accountOptions;
   document.querySelector("#income-entry-account").innerHTML = accountOptions;
   document.querySelector("#expense-entry-account").innerHTML = accountOptions;
+  document.querySelector("#transfer-from-account").innerHTML = accountOptions;
+  document.querySelector("#transfer-to-account").innerHTML = accountOptions;
   updateExpenseCompetenceField();
   const captureSelect = document.querySelector("#capture-account");
   if (captureSelect) {
@@ -735,6 +739,27 @@ async function loadSaidas() {
       <td class="right amount-expense">${money.format(item.amount)}</td>
     `,
   });
+}
+
+async function loadTransferencias() {
+  // Read-only consultation for this view: filters the same rows
+  // `GET /transactions` already returns (no recalculation, no second
+  // classification) down to the ones this screen is about -- transfer legs
+  // (`type === "transfer"`) and the patrimonial-movement category. Editing
+  // and deletion (including atomic paired deletion of a transfer's two
+  // legs) stay in "Lançamentos", the single livro-razão surface.
+  const month = document.querySelector("#transferencias-month").value;
+  const items = await api(`/transactions?limit=500${month ? `&month=${month}` : ""}`);
+  const relevant = items.filter((item) => item.type === "transfer" || item.category === "Transferência patrimonial");
+  document.querySelector("#transferencias-table").innerHTML = relevant.length ? relevant.map((item) => `
+    <tr>
+      <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
+      <td><strong>${escapeHtml(item.description)}</strong></td>
+      <td>${escapeHtml(item.category)}</td>
+      <td>${escapeHtml(item.account)}</td>
+      <td class="right ${item.amount < 0 ? "amount-expense" : "amount-income"}">${money.format(item.amount)}</td>
+    </tr>
+  `).join("") : emptyRow(5, "Nenhuma transferência ou movimentação patrimonial neste mês");
 }
 
 async function loadTransactions() {
@@ -1878,6 +1903,29 @@ document.querySelector("#transaction-form").addEventListener("submit", async (ev
   } catch (error) { toast(error.message, true); }
 });
 
+document.querySelector("#transfer-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const payload = formJson(event.target, ["amount"]);
+    if (payload.from_account_id && payload.from_account_id === payload.to_account_id) {
+      return toast("Conta de origem e destino devem ser diferentes", true);
+    }
+    const largeConfirmation = confirmLargeTransactions([{ ...payload, kind: "transaction" }]);
+    if (!largeConfirmation.allowed) return toast("Transferência cancelada; use o Consultor para simulações", true);
+    payload.confirmed_large_amount = largeConfirmation.confirmed;
+    await api("/transfers", { method: "POST", body: JSON.stringify(payload) });
+    const month = payload.booked_at.slice(0, 7);
+    event.target.reset();
+    event.target.elements.booked_at.value = currentDateKey();
+    document.querySelector("#transferencias-month").value = month;
+    await loadTransferencias();
+    await loadDashboard();
+    toast("Transferência registrada");
+  } catch (error) { toast(error.message, true); }
+});
+
+document.querySelector("#refresh-transferencias").addEventListener("click", loadTransferencias);
+
 document.querySelector("#income-entry-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
@@ -2097,6 +2145,7 @@ window.addEventListener("resize", () => {
 });
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") setMobileMenu(false); });
 document.querySelector("#transaction-form").elements.booked_at.value = currentDateKey();
+document.querySelector("#transfer-form").elements.booked_at.value = currentDateKey();
 document.querySelector("#income-entry-form").elements.booked_at.value = currentDateKey();
 document.querySelector("#expense-entry-form").elements.booked_at.value = currentDateKey();
 updateExpenseCustomCategoryField();

@@ -690,10 +690,29 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard_with_manual["cash_out"] == 176.78
         assert dashboard_with_manual["bank_cash_out"] == 0
         assert dashboard_with_manual["card_spending"] == 176.78
-        assert dashboard_with_manual["investment_balance"] == 20300
-        assert dashboard_with_manual["liquidity_starting_balance"] == 20300
-        assert dashboard_with_manual["liquidity_balance"] == 21123.22
-        assert dashboard_with_manual["liquidity_available"] == 11123.22
+        # `investment_balance` is the household's explicit `PUT /profile`
+        # declaration (see above), not a running counter mutated by manual
+        # investment/redemption transactions -- see
+        # docs/INTEGRITY_IMPLEMENTATION_PLAN.md and
+        # docs/WORK_ORDER_MANUAL_TRANSFERS_INVESTMENT_REDEMPTION.md.
+        # Recording a R$500 investment and a R$200 redemption below records
+        # both as canonical, auditable `Transaction`s but must not silently
+        # change this field.
+        assert dashboard_with_manual["investment_balance"] == 20000
+        # `liquidity_starting_balance` falls back to `profile.investment_balance`
+        # when this household has neither a trusted `AccountBalanceObservation`
+        # nor a prior trusted snapshot (`_opening_balance`'s
+        # "OPENING-LIQUIDITY-LEGACY-FALLBACK" branch in
+        # financial_snapshots.py). Since that field no longer drifts by
+        # +500/-200 with the investment/redemption above, the fallback opening
+        # balance -- and everything `settle_liquidity` derives from it -- shifts
+        # down by the same net R$300 the old (incorrect) mutation used to add.
+        # `liquidity_deposit`/`liquidity_flow` are this period's operating
+        # result and do not depend on the opening balance, so they are
+        # unchanged.
+        assert dashboard_with_manual["liquidity_starting_balance"] == 20000
+        assert dashboard_with_manual["liquidity_balance"] == 20823.22
+        assert dashboard_with_manual["liquidity_available"] == 10823.22
         assert dashboard_with_manual["liquidity_deposit"] == 823.22
         assert dashboard_with_manual["liquidity_flow"] == 823.22
         assert dashboard_with_manual["liquidity_direction"] == "deposit"
@@ -747,6 +766,9 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard_after_delete["cash_out"] == 76.78
         assert dashboard_after_delete["bank_cash_out"] == 0
         assert dashboard_after_delete["card_spending"] == 76.78
+        # Unchanged throughout -- see the comment above: it was never
+        # mutated by the investment/redemption create above, so there is
+        # nothing for delete to "revert".
         assert dashboard_after_delete["investment_balance"] == 20000
         assert dashboard_after_delete["liquidity_balance"] == 19923.22
         assert dashboard_after_delete["liquidity_available"] == 9923.22

@@ -74,6 +74,32 @@ class ManualTransactionRequest(BaseModel):
         return self
 
 
+class TransferRequest(BaseModel):
+    """Structured transfer between two accounts of the same household.
+
+    `docs/GO_LIVE_MANUAL_UX_PLAN.md` -- "Transferências" -- and
+    `docs/WORK_ORDER_MANUAL_TRANSFERS_INVESTMENT_REDEMPTION.md`: origin and
+    destination are both explicit, human-confirmed account ids; nothing
+    here infers either account. `POST /transfers` (`app/api.py`) re-checks
+    household ownership and account status before calling the canonical
+    `create_internal_transfer` (`app/services/transfers.py`), which also
+    re-validates distinct accounts as a structural INV-001 guard.
+    """
+
+    booked_at: date
+    description: str = Field(min_length=2, max_length=500)
+    amount: Decimal = Field(gt=0)
+    from_account_id: str
+    to_account_id: str
+    confirmed_large_amount: bool = False
+
+    @model_validator(mode="after")
+    def validate_distinct_accounts(self) -> "TransferRequest":
+        if self.from_account_id == self.to_account_id:
+            raise ValueError("Conta de origem e destino devem ser diferentes")
+        return self
+
+
 class AdvisorHistoryItem(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
     content: str = Field(min_length=1, max_length=8000)

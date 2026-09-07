@@ -402,6 +402,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_transaction_household_competence",
         "ix_transactions_duplicate_group_id",
         "ix_transactions_trace_id",
+        "ix_transaction_household_transfer_group",
     }.issubset({index["name"] for index in inspector.get_indexes("transactions")})
     assert {index["name"] for index in inspector.get_indexes("duplicate_groups")} == {
         "ix_duplicate_groups_household_id",
@@ -536,7 +537,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0009"
+        ).scalar_one() == "0010"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -562,6 +563,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0009"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0010"
     engine.dispose()
     get_settings.cache_clear()

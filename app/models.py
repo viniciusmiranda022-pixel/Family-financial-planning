@@ -108,6 +108,7 @@ class Transaction(Base, TimestampMixin):
         Index("ix_transaction_household_date", "household_id", "booked_at"),
         Index("ix_transaction_fingerprint", "household_id", "fingerprint"),
         Index("ix_transaction_household_competence", "household_id", "competence"),
+        Index("ix_transaction_household_transfer_group", "household_id", "transfer_group_id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
