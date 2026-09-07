@@ -492,11 +492,46 @@ def serialize_card_payment_match(db: Session, match: CardPaymentMatch) -> dict[s
 def _reconciliation_transaction_or_404(
     db: Session, *, household_id: str, transaction_id: str, for_update: bool = False
 ) -> Any:
-    from app.models import Transaction
+    """Resolve `transaction_id` into a reconciliation-eligible `Transaction`
+    of this household, or fail closed with `LookupError` (-> 404).
 
-    query = select(Transaction).where(
-        Transaction.id == transaction_id,
-        Transaction.household_id == household_id,
+    Go-live manual slice 3 review round #6 (2026-09-07, `BLOQUEIO DE MERGE
+    #6` -- "o próprio fluxo de confirmação `/link` ainda não fecha household
+    isolation na `Account`"): `Transaction.household_id` and
+    `Transaction.account_id` are independent columns (the same fact that
+    drove the `_verified_reconciliation_counterpart` fix in review round #5),
+    so a row's own `household_id` matching does not by itself prove its
+    `Account` does too. Every caller of this function -- `link_card_payment`,
+    `unlink_card_payment`, `pay_card_invoice` -- resolves `transaction.
+    account.account_type` right after calling it, without which the "human
+    confirms a `checking`/`credit_card` pair" contract this slice's Work
+    Order requires cannot be enforced. Before this round, a transaction whose
+    own `household_id` matched but whose `account_id` pointed at another
+    household's `Account` (an inconsistent-evidence state; never produced by
+    this module's own writes, but not proven impossible either) could still
+    be accepted here and have its `account.account_type`/`account.name`
+    read and acted on as if it were this household's. Requiring
+    `transaction.account.household_id == household_id` here -- the same
+    account-isolation check `_verified_reconciliation_counterpart` runs on
+    the *read* side -- closes that gap on the *write* side too, so the two
+    paths agree: a pair the read model would refuse to ever report as
+    `paid`/`linked` is never one the write path can create, confirm-unlink,
+    or otherwise act on. Failing with `LookupError` (identical to "row not
+    found") is deliberate: no code path here ever mutates `linked_
+    transaction_id`, reveals account metadata, or "fixes" the inconsistency
+    -- the caller sees the same 404 it would for a transaction id that does
+    not exist at all.
+    """
+    from app.models import Account, Transaction
+
+    query = (
+        select(Transaction)
+        .join(Account, Account.id == Transaction.account_id)
+        .where(
+            Transaction.id == transaction_id,
+            Transaction.household_id == household_id,
+            Account.household_id == household_id,
+        )
     )
     if for_update:
         # No-op on SQLite (used by the test suite); on PostgreSQL this takes

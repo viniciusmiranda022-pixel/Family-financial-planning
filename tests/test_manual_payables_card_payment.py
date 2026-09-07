@@ -474,6 +474,51 @@ def test_manual_payment_household_isolation() -> None:
             assert db.get(Transaction, own_invoice_id).linked_transaction_id is None
 
 
+def test_manual_payment_rejects_invoice_whose_account_belongs_to_another_household() -> None:
+    """Go-live manual slice 3 review round #6 (`BLOQUEIO DE MERGE #6`):
+    `Transaction.household_id` and `Transaction.account_id` are independent
+    columns. An invoice row whose own `household_id` matches this household
+    but whose `account_id` points at another household's `Account`
+    (inconsistent evidence, not something this module's own writes ever
+    produce) must fail closed here too -- 404, `linked_transaction_id` never
+    written -- the same corrupted shape the read-model regression already
+    covers for `list_card_invoice_obligations`."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        itau = _create_account(client, name="Itaú Corrente")
+
+        _create_household_admin(
+            session_factory,
+            household_name="Outra Família Fatura",
+            username="admin-outra-fatura",
+            password="outra-senha-segura",
+        )
+        with session_factory() as db:
+            other_household_id = db.scalar(
+                select(User.household_id).where(User.username == "admin-outra-fatura")
+            )
+            other_card = Account(
+                household_id=other_household_id, name="Cartão de outra família", account_type="credit_card"
+            )
+            db.add(other_card)
+            db.commit()
+            other_card_id = other_card.id
+
+        corrupted_invoice_id = _card_invoice_line(
+            session_factory, household_id=household, credit_card_account_id=other_card_id
+        )
+
+        response = client.post(
+            "/api/card-payment-reconciliations/pay",
+            json=_pay_payload(card_transaction_id=corrupted_invoice_id, paying_account_id=itau, amount="1500.00"),
+        )
+        assert response.status_code == 404, response.text
+
+        with session_factory() as db:
+            assert db.get(Transaction, corrupted_invoice_id).linked_transaction_id is None
+
+
 def test_manual_payment_large_amount_requires_confirmation() -> None:
     """Reuses the same large-entry confirmation guard every other manual
     command already applies (`_large_entry_threshold`) -- no new policy."""
