@@ -58,6 +58,7 @@
         <button data-view="capture"><span>●</span>Lançar agora</button>
         <button data-view="entradas"><span>↓</span>Entradas</button>
         <button data-view="saidas"><span>↑</span>Saídas</button>
+        <button data-view="transferencias"><span>⇄</span>Transferências</button>
         <button data-view="imports"><span>⇧</span>Importações</button>
         <button data-view="transactions"><span>≡</span>Lançamentos</button>
         <button data-view="reviews"><span>!</span>Revisar <b id="nav-review-count" class="badge">0</b></button>
@@ -340,7 +341,18 @@
         </article>
       </section>
 
-      <section id="view-transactions" class="view">
+      <section id="view-transferencias" class="view">
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">ENTRE CONTAS</span><h2>Transferir entre contas da família</h2><small>Movimenta duas contas do mesmo household sem virar receita ou despesa (INV-001). Origem e destino precisam ser contas distintas já cadastradas; nada é inferido automaticamente.</small></div></div>
+          <form id="transfer-form" class="form-grid three">
+            <label>Data<input type="date" name="booked_at" required></label>
+            <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Reforço da reserva"></label>
+            <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
+            <label>Conta de origem<select name="from_account_id" id="transfer-from-account" required></select></label>
+            <label>Conta de destino<select name="to_account_id" id="transfer-to-account" required></select></label>
+            <button class="primary" type="submit">Transferir</button>
+          </form>
+        </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">MOVIMENTAÇÃO PATRIMONIAL</span><h2>Aplicação, resgate e estorno</h2><small>Receita e despesa têm telas próprias em Entradas e Saídas; aqui ficam apenas aplicação/resgate de investimento e estorno, que não são receita nem despesa.</small></div></div>
           <form id="transaction-form" class="form-grid three">
@@ -352,6 +364,13 @@
             <button class="primary" type="submit">Adicionar lançamento</button>
           </form>
         </article>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">RECENTES</span><h2>Transferências e movimentações recentes</h2></div><div class="filters"><input type="month" id="transferencias-month"><button id="refresh-transferencias" class="secondary">Atualizar</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Conta</th><th class="right">Valor</th></tr></thead><tbody id="transferencias-table"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-transactions" class="view">
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">LIVRO-RAZÃO</span><h2>Lançamentos consolidados</h2></div><div class="filters"><input type="month" id="transaction-month"><button id="refresh-transactions" class="secondary">Atualizar</button></div></div>
           <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Titular</th><th>Conta</th><th>Status</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="transactions-table"></tbody></table></div>
