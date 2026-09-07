@@ -189,6 +189,117 @@ def test_orphaned_link_reference_falls_back_without_crashing() -> None:
     assert match.candidates[0].transaction_id == card_line.id
 
 
+def test_linked_status_requires_reciprocal_pointer_not_one_sided() -> None:
+    """A `linked_transaction_id` that resolves to a real, same-household
+    `reconciliation` row on the right account type is still not proof of a
+    link unless that row points back. Go-live manual slice 3 review round
+    (2026-09-07, `BLOQUEIO DE MERGE`, "`paid` precisa significar quitação
+    comprovada, não apenas ponteiro não nulo") applies symmetrically here:
+    a one-sided pointer is corruption, not lineage, on either side of the
+    pair -- `_verified_reconciliation_counterpart` is the single check
+    both `list_card_payment_reconciliations` and `list_card_invoice_
+    obligations` share, so this must never report `linked` any more than
+    the card-side read model may report `paid` for the same shape."""
+
+    db = _memory_session()
+    household = build_synthetic_household(db)
+    checking = household.transactions["card_payment"]
+    card_line = _card_side_payment_line(household)
+    db.add(card_line)
+    db.flush()
+    checking.linked_transaction_id = card_line.id
+    # `card_line.linked_transaction_id` is intentionally left `None` -- a
+    # one-sided pointer, not the symmetric pair `link_card_payment` always
+    # writes on both rows together.
+    db.flush()
+
+    match = _checking_match(db, household)
+    assert match.status == "ambiguous"
+    assert match.linked_transaction_id is None
+    assert match.candidates[0].transaction_id == card_line.id
+
+
+def test_checking_row_excluded_when_own_account_belongs_to_another_household() -> None:
+    """`Transaction.household_id` and `Transaction.account_id` are
+    independent columns: a checking-side row claiming `household_id == A`
+    but whose `account_id` actually references an `Account` of household B
+    is corrupted data, not a genuine bank debit of household A. BLOQUEIO
+    DE MERGE #5 (2026-09-07): it must never enter household A's candidate
+    universe (and so can never be offered as evidence, matched, or leak
+    its foreign account's name) -- `Transaction.household_id` alone is not
+    sufficient proof of which household a row's account belongs to."""
+
+    db = _memory_session()
+    household_a = build_synthetic_household(db, name="Família A Conta Cruzada")
+    household_b = build_synthetic_household(db, name="Família B Conta Cruzada")
+
+    corrupted = Transaction(
+        household_id=household_a.household.id,
+        account_id=household_b.checking.id,
+        booked_at=date(2026, 6, 20),
+        occurred_at=date(2026, 6, 20),
+        competence="2026-06",
+        description="Débito fatura conta cruzada",
+        normalized_description="DEBITO FATURA CONTA CRUZADA",
+        amount=Decimal("-330.00"),
+        transaction_type="reconciliation",
+        fingerprint=f"chkcrosshh{uuid.uuid4().hex}".ljust(64, "0")[:64],
+        source_priority=70,
+        confidence=Decimal("1"),
+        excluded=True,
+    )
+    db.add(corrupted)
+    db.flush()
+
+    matches = list_card_payment_reconciliations(db, household_id=household_a.household.id)
+    assert corrupted.id not in {match.checking_transaction_id for match in matches}
+
+
+def test_checking_row_stays_unlinked_when_card_counterpart_account_belongs_to_another_household() -> None:
+    """A `linked_transaction_id` reciprocally pointing at a real,
+    same-household (`Transaction.household_id`), right-type, right-
+    direction `reconciliation` row is still not proof of a link if *that
+    counterpart's own account* belongs to a different household. BLOQUEIO
+    DE MERGE #5 (2026-09-07): `counterpart.household_id == household_id`
+    alone does not prove `counterpart.account.household_id` does too --
+    `db.get` by primary key bypasses any household-scoped query filter, so
+    `_verified_reconciliation_counterpart` must check the counterpart's
+    account household explicitly. This must fail closed to a non-`linked`
+    status, exactly like an orphaned or non-reciprocal pointer."""
+
+    db = _memory_session()
+    household_a = build_synthetic_household(db, name="Família A Contraparte Cruzada")
+    household_b = build_synthetic_household(db, name="Família B Contraparte Cruzada")
+    checking = household_a.transactions["card_payment"]
+
+    corrupted_card_line = Transaction(
+        household_id=household_a.household.id,
+        account_id=household_b.credit_card.id,
+        category_id=household_a.categories["Conciliação"].id,
+        booked_at=date(2026, 6, 15),
+        occurred_at=date(2026, 6, 15),
+        competence="2026-06",
+        description="Pagamento em 15 JUN",
+        normalized_description="PAGAMENTO EM 15 JUN",
+        amount=Decimal("220.00"),
+        transaction_type="reconciliation",
+        fingerprint=f"cardpaycrosshh{uuid.uuid4().hex}".ljust(64, "0")[:64],
+        source_priority=70,
+        confidence=Decimal("1"),
+        excluded=True,
+    )
+    db.add(corrupted_card_line)
+    db.flush()
+    checking.linked_transaction_id = corrupted_card_line.id
+    corrupted_card_line.linked_transaction_id = checking.id
+    db.flush()
+
+    match = _checking_match(db, household_a)
+    assert match.status != "linked"
+    assert match.linked_transaction_id is None
+    assert all(candidate.transaction_id != corrupted_card_line.id for candidate in match.candidates)
+
+
 def test_two_checking_debits_one_card_candidate_never_both_matched() -> None:
     """P0 regression: a single card-side payment cannot be the deterministic
     `matched` suggestion for two different bank debits at once. Each
@@ -560,6 +671,129 @@ def test_household_isolation_never_offers_another_households_rows() -> None:
         raise AssertionError("expected LookupError across households")
     except LookupError:
         pass
+
+
+def test_link_rejects_checking_transaction_whose_account_belongs_to_another_household() -> None:
+    """Go-live manual slice 3 review round #6 (`BLOQUEIO DE MERGE #6`):
+    `Transaction.household_id` and `Transaction.account_id` are independent
+    columns. A row whose own `household_id` matches this household but whose
+    `account_id` points at another household's `Account` -- an inconsistent-
+    evidence state `link_card_payment` cannot itself produce, but was not
+    proven impossible before this fix -- must fail closed (404, identical to
+    "row not found") instead of being accepted as the `checking` side of a
+    human-confirmed link and having its `account.account_type` read and
+    acted on.
+    """
+    db = _memory_session()
+    household_a = build_synthetic_household(db, name="Família A")
+    household_b = build_synthetic_household(db, name="Família B")
+    corrupted_checking = Transaction(
+        household_id=household_a.household.id,
+        account_id=household_b.checking.id,
+        booked_at=date(2026, 6, 15),
+        occurred_at=date(2026, 6, 15),
+        competence="2026-06",
+        description="Débito com conta de outra família",
+        normalized_description="DEBITO CONTA OUTRA FAMILIA",
+        amount=Decimal("-220.00"),
+        transaction_type="reconciliation",
+        fingerprint=f"corruptchk{uuid.uuid4().hex}".ljust(64, "0")[:64],
+        source_priority=70,
+        confidence=Decimal("1"),
+        excluded=True,
+    )
+    card_line = _card_side_payment_line(household_a)
+    db.add_all([corrupted_checking, card_line])
+    db.flush()
+
+    try:
+        link_card_payment(
+            db,
+            household_id=household_a.household.id,
+            checking_transaction_id=corrupted_checking.id,
+            card_transaction_id=card_line.id,
+        )
+        raise AssertionError("expected LookupError for cross-household account reference")
+    except LookupError:
+        pass
+    assert corrupted_checking.linked_transaction_id is None
+    assert card_line.linked_transaction_id is None
+
+
+def test_link_rejects_card_transaction_whose_account_belongs_to_another_household() -> None:
+    """Same corrupted-evidence shape as above, mirrored on the card side: a
+    row whose `Transaction.household_id` matches but whose `account_id`
+    points at another household's `Account` must fail closed here too."""
+    db = _memory_session()
+    household_a = build_synthetic_household(db, name="Família A")
+    household_b = build_synthetic_household(db, name="Família B")
+    checking = household_a.transactions["card_payment"]
+    corrupted_card_line = Transaction(
+        household_id=household_a.household.id,
+        account_id=household_b.credit_card.id,
+        booked_at=date(2026, 6, 15),
+        occurred_at=date(2026, 6, 15),
+        competence="2026-06",
+        description="Pagamento em 15 JUN",
+        normalized_description="PAGAMENTO EM 15 JUN",
+        amount=Decimal("220.00"),
+        transaction_type="reconciliation",
+        fingerprint=f"corruptcrd{uuid.uuid4().hex}".ljust(64, "0")[:64],
+        source_priority=70,
+        confidence=Decimal("1"),
+        excluded=True,
+    )
+    db.add(corrupted_card_line)
+    db.flush()
+
+    try:
+        link_card_payment(
+            db,
+            household_id=household_a.household.id,
+            checking_transaction_id=checking.id,
+            card_transaction_id=corrupted_card_line.id,
+        )
+        raise AssertionError("expected LookupError for cross-household account reference")
+    except LookupError:
+        pass
+    assert checking.linked_transaction_id is None
+
+
+def test_unlink_rejects_transaction_whose_account_belongs_to_another_household() -> None:
+    """Same corrupted-evidence shape, but for `unlink_card_payment`: a
+    previously-linked pair whose `Account` reference was later reassigned to
+    another household (schema drift/bug, not something this module's own
+    writes produce) must fail closed (404) instead of silently nulling out
+    the pair's `linked_transaction_id` -- BLOQUEIO DE MERGE #6 point 2, "sem
+    escrever ... sem alterar a contraparte"."""
+    db = _memory_session()
+    household_a = build_synthetic_household(db, name="Família A")
+    household_b = build_synthetic_household(db, name="Família B")
+    checking = household_a.transactions["card_payment"]
+    card_line = _card_side_payment_line(household_a)
+    db.add(card_line)
+    db.flush()
+
+    link_card_payment(
+        db,
+        household_id=household_a.household.id,
+        checking_transaction_id=checking.id,
+        card_transaction_id=card_line.id,
+    )
+    db.flush()
+
+    # Simulate later corruption/drift: the card leg's account is reassigned
+    # to another household without Transaction.household_id following.
+    card_line.account_id = household_b.credit_card.id
+    db.flush()
+
+    try:
+        unlink_card_payment(db, household_id=household_a.household.id, transaction_id=checking.id)
+        raise AssertionError("expected LookupError for cross-household account reference")
+    except LookupError:
+        pass
+    assert checking.linked_transaction_id == card_line.id
+    assert card_line.linked_transaction_id == checking.id
 
 
 def _create_household_admin(session_factory, *, household_name: str, username: str, password: str) -> None:

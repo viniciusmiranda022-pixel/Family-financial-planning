@@ -306,6 +306,35 @@ class CardPaymentUnlinkRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class CardInvoicePaymentRequest(BaseModel):
+    """Manual payment of a card invoice -- go-live manual slice 3.
+
+    `docs/WORK_ORDER_MANUAL_PAYABLES_CARD_PAYMENT.md`, "Fluxo especializado
+    — pagamento de fatura de cartão": the five minimum inputs are the
+    invoice (`card_transaction_id`), amount paid, paying account, date and
+    an explicit human confirmation. `confirmed` is that explicit assent,
+    distinct from `confirmed_large_amount` (`_large_entry_threshold`), which
+    only guards unusually large values the same way every other manual
+    command already does. Reuses `link_card_payment`'s exact amount
+    tolerance/direction contract in `app/services/card_payment_reconciliation
+    .py::pay_card_invoice` -- no second reconciliation policy.
+    """
+
+    card_transaction_id: str = Field(min_length=1, max_length=36)
+    paying_account_id: str
+    amount: Decimal = Field(gt=0)
+    booked_at: date
+    description: str = Field(min_length=2, max_length=500)
+    confirmed: bool
+    confirmed_large_amount: bool = False
+
+    @model_validator(mode="after")
+    def validate_confirmation(self) -> "CardInvoicePaymentRequest":
+        if not self.confirmed:
+            raise ValueError("Confirme explicitamente que este pagamento aconteceu")
+        return self
+
+
 class ClassificationRuleEditRequest(BaseModel):
     """Admin-only edit of an eligible local merchant rule's category.
 
