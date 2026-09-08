@@ -406,6 +406,74 @@ def test_manual_payment_rejects_checking_side_reconciliation_row_as_invoice() ->
         assert "fatura de cartão" in response.json()["detail"]
 
 
+def test_card_invoice_obligations_requires_authentication() -> None:
+    """Every other new endpoint in this slice (`pay`, and the other manual
+    flows in the sibling test modules) has its own
+    `test_..._requires_authentication`; `GET
+    /card-payment-reconciliations/invoices` shared the same
+    `Depends(get_current_user)` wiring but, unlike its siblings, had no
+    independent proof of it (slice 5 gap analysis)."""
+    client, _ = _client()
+    with client:
+        response = client.get("/api/card-payment-reconciliations/invoices")
+        assert response.status_code == 401
+
+
+def test_card_invoice_obligations_household_isolation_with_two_real_households() -> None:
+    """Every other cross-household test for this listing
+    (`test_card_invoice_obligation_stays_pending_for_cross_household_link_reference`
+    and its siblings above) proves a *corrupted* reference is never trusted.
+    None of them proves the plain, uncorrupted case: two genuinely separate
+    households, each with its own legitimate pending invoice, and household
+    A's `GET /invoices` never listing household B's row at all -- the same
+    property `test_ledger_household_isolation`
+    (`tests/test_manual_ledger.py`) and
+    `test_household_isolation_never_offers_another_households_rows`
+    (`tests/test_card_payment_reconciliation.py`) already prove for the
+    ledger and the reconciliation-candidates listing respectively (slice 5
+    gap analysis)."""
+    client, session_factory = _client()
+    with client:
+        household = _setup_household(client, session_factory)
+        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        own_invoice_id = _card_invoice_line(
+            session_factory,
+            household_id=household,
+            credit_card_account_id=cartao,
+            amount="900.00",
+            description="Fatura da própria família",
+        )
+
+        _create_household_admin(
+            session_factory,
+            household_name="Outra Família",
+            username="admin-outra-invoices",
+            password="outra-senha-segura",
+        )
+        with session_factory() as db:
+            other_household_id = db.scalar(
+                select(User.household_id).where(User.username == "admin-outra-invoices")
+            )
+            other_card = Account(
+                household_id=other_household_id, name="Cartão de outra família", account_type="credit_card"
+            )
+            db.add(other_card)
+            db.commit()
+            other_card_id = other_card.id
+        foreign_invoice_id = _card_invoice_line(
+            session_factory,
+            household_id=other_household_id,
+            credit_card_account_id=other_card_id,
+            amount="9999.00",
+            description="Fatura de outra família",
+        )
+
+        items = client.get("/api/card-payment-reconciliations/invoices").json()
+        ids = {item["card_transaction_id"] for item in items}
+        assert own_invoice_id in ids
+        assert foreign_invoice_id not in ids
+
+
 def test_manual_payment_requires_authentication() -> None:
     client, _ = _client()
     with client:

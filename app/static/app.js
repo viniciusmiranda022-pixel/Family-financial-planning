@@ -34,7 +34,17 @@ const ledgerMovementLabels = {
 const documentTypeLabels = { bank_statement: "Extrato", credit_card: "Cartão", payroll: "Holerite" };
 
 function largeEntryThreshold() {
-  return Math.max(5000, Number(state.dashboard?.cash_cap || 0) * 2);
+  // Never recompute this policy in the browser -- `GET /dashboard`
+  // publishes the exact confirmation limit `_large_entry_threshold()`
+  // computes and every mutable money-entry endpoint enforces
+  // server-side (`app/api.py::_large_entry_threshold`). See
+  // `docs/GO_LIVE_MANUAL_UX_PLAN.md` line 114 ("a UI nunca calcula uma
+  // política financeira diferente do backend"). If the dashboard hasn't
+  // loaded yet, return Infinity (never warn) instead of guessing a
+  // formula here -- the backend still enforces the real limit on submit
+  // regardless of whether this client-side heads-up fires.
+  const published = state.dashboard?.noncanonical?.large_entry_threshold?.value;
+  return typeof published === "number" ? published : Infinity;
 }
 
 function selectedLargeTransactions(items) {

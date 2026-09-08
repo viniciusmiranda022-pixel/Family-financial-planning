@@ -5611,6 +5611,31 @@ def dashboard(
                 "certified_by": None,
                 "as_of": datetime.now(UTC).isoformat(),
             },
+            # `large_entry_threshold` is the exact confirmation limit
+            # `_large_entry_threshold(profile)` computes and every mutable
+            # money-entry endpoint (`/captures/{id}/confirm`,
+            # `/transactions`, `/transfers`, `/card-payment-reconciliations`)
+            # actually enforces server-side before it ever accepts a
+            # large-value entry without `confirmed_large_amount`. It is
+            # published here, instead of the frontend recomputing
+            # `max(5000, monthly_cash_cap * 2)` on its own, so the browser
+            # never carries a second, independently-maintained copy of this
+            # financial policy -- see `docs/GO_LIVE_MANUAL_UX_PLAN.md` line
+            # 114 ("a UI nunca calcula uma política financeira diferente do
+            # backend") and the slice 5 PR review that required this fix.
+            # It is `noncanonical` (not folded into the `publication` block
+            # above / INV-019) because it is a live derivation of the
+            # household's *current* `monthly_cash_cap` profile setting, not
+            # a fact `build_snapshot` fixed into this period's snapshot --
+            # exactly the same reasoning `future_commissions_gross` already
+            # documents.
+            "large_entry_threshold": {
+                "value": decimal_value(_large_entry_threshold(profile)),
+                "source": "computed",
+                "freshness": "live",
+                "certified_by": None,
+                "as_of": datetime.now(UTC).isoformat(),
+            },
         },
         "obligation_alerts": obligation_alerts,
     }
