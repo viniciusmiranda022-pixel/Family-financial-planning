@@ -73,6 +73,8 @@ from app.schemas import (
     ObligationRequest,
     PayrollRequest,
     ProfileRequest,
+    PurchaseScenarioAlternativeRequest,
+    PurchaseScenarioComparisonRequest,
     SemanticAuditRequest,
     SetupRequest,
     TransactionUpdate,
@@ -119,6 +121,7 @@ from app.services.finance import (
     ForecastCommission,
     ForecastInput,
     add_months,
+    amortized_installment_payment,
     build_forecast,
     commission_net,
     money,
@@ -132,6 +135,7 @@ from app.services.financial_integrity import (
     IntegrityRunScope,
     IntegrityRunTrigger,
     acknowledge_finding,
+    assess_integrity,
     build_baseline_checks,
     consolidated_integrity_status,
     execute_integrity_run,
@@ -165,6 +169,7 @@ from app.services.importer import (
     parse_payroll_document,
     transaction_fingerprint,
 )
+from app.services.invariant_registry import evaluate_invariant
 from app.services.monthly_close import (
     MonthlyCloseGateError,
     MonthlyCloseStateError,
@@ -744,13 +749,9 @@ def _advisor_payment(
                 "complete": False,
                 "question": "A taxa parece muito alta. Confirme a taxa mensal do parcelamento.",
             }
-    if installments == 1 or monthly_rate == 0:
-        monthly_payment = money(purchase_amount / installments)
-        total_cost = money(monthly_payment * installments)
-    else:
-        factor = Decimal("1") - (Decimal("1") + monthly_rate) ** (-installments)
-        monthly_payment = money(purchase_amount * monthly_rate / factor)
-        total_cost = money(monthly_payment * installments)
+    monthly_payment, total_cost = amortized_installment_payment(
+        purchase_amount, installments, monthly_rate
+    )
     return {
         "complete": True,
         "mode": "cash" if installments == 1 else "installments",
@@ -5373,6 +5374,7 @@ def _build_projection_gate_checks(
     check_period: str,
     entity_type: str,
     entity_id: str,
+    extra_installments: dict[str, Decimal] | None = None,
 ) -> tuple[tuple[IntegrityCheck, ...], list[dict], object]:
     """Run the canonical Projection Engine + independent Validator over
     `[start_month, end_month]` starting from `snapshot`'s closing position and
@@ -5386,6 +5388,14 @@ def _build_projection_gate_checks(
     engineering review on PR 7 that blocked `run -> trust` from ever reaching
     a real `trusted` state because the monthly close never ran this coverage
     at all.
+
+    `extra_installments` (`month -> amount`, added on top of the household's
+    already-persisted `_future_installments`) is the one seam
+    `POST /purchases/scenario-comparison` uses to run a not-yet-existing
+    purchase through this exact same canonical path instead of a second,
+    parallel projection: it never touches persisted data and defaults to
+    `None`, which reproduces the previous behaviour exactly for every
+    existing caller.
     """
 
     obligations_rows = db.scalars(
@@ -5410,6 +5420,10 @@ def _build_projection_gate_checks(
         _, net = commission_net(item.gross_amount, item.tax_rate)
         commissions_input.append(ForecastCommission(item.expected_date, net, item.delay_days))
     rate = monthly_net_rate(profile.investment_gross_annual_rate, profile.investment_income_tax_rate)
+    installments = dict(_future_installments(db, household_id))
+    if extra_installments:
+        for key, value in extra_installments.items():
+            installments[key] = installments.get(key, Decimal("0")) + value
     projection_input = ForecastInput(
         start_month=start_month,
         end_month=end_month,
@@ -5418,7 +5432,7 @@ def _build_projection_gate_checks(
         monthly_cash_cap=profile.monthly_cash_cap,
         monthly_investment_rate=rate,
         obligations=_forecast_obligations(list(obligations_rows)),
-        installments=_future_installments(db, household_id),
+        installments=installments,
         payroll_extras=payroll_extras,
         commissions=tuple(commissions_input),
         starting_uncovered_deficit=Decimal(snapshot.closing_uncovered_deficit),
@@ -5560,6 +5574,249 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
             "validator_tolerance": float(PROJECTION_TOLERANCE),
             "validator_mismatches": len(validation.mismatches),
         },
+    }
+
+
+def _scenario_projection_summary(rows: list[dict], scenario: str) -> dict:
+    """Summarize one canonical projection scenario (`no_commission`,
+    `delayed` or `expected`) as independent, non-prescriptive facts -- never
+    a single derived verdict that elevates one scenario over the other two.
+
+    `docs/FINANCIAL_RULES.md`/the Advisor's own disclosed assumptions
+    describe the safety floor as a reference/alert, never blocked money or a
+    hard limit ("um déficit real pode consumi-lo e até zerar a liquidez");
+    `docs/WORK_ORDER_PURCHASE_SCENARIO_COMPARISON.md` requires it be treated
+    as a reference, never an artificial block, and forbids fabricating a
+    recommendation. An earlier revision of this function fed a single
+    `min(balance_delayed) >= emergency_floor` boolean into a `viable` field
+    that (a) treated crossing the floor as equivalent to economic
+    unviability even when the balance stayed positive with no uncovered
+    deficit at all, and (b) picked `delayed` as the one authoritative
+    scenario for that verdict with no normative contract saying it should
+    be -- see the engineering review on this PR. `crosses_safety_floor` and
+    `has_uncovered_deficit` below are the fix: pure boolean readouts of
+    fields the canonical Projection Engine/Validator already produce and
+    INV-018 already validates (`distance_to_floor_{scenario}` is signed,
+    `balance - safety_floor`, in `projection_validator.py`), reported once
+    per scenario instead of collapsed into a single cross-scenario flag.
+    Never use these two fields to gate, block or recommend anything; they
+    are facts for a human to read, not a computed decision.
+    """
+
+    balances = [row[f"balance_{scenario}"] for row in rows] or [Decimal("0")]
+    deficits = [row[f"uncovered_deficit_{scenario}"] for row in rows] or [Decimal("0")]
+    distances = [row[f"distance_to_floor_{scenario}"] for row in rows] or [Decimal("0")]
+    minimum_distance_to_floor = min(distances)
+    maximum_uncovered_deficit = max(deficits)
+    return {
+        "final_balance": decimal_value(balances[-1]),
+        "minimum_balance": decimal_value(min(balances)),
+        "final_uncovered_deficit": decimal_value(deficits[-1]),
+        "maximum_uncovered_deficit": decimal_value(maximum_uncovered_deficit),
+        "minimum_distance_to_floor": decimal_value(minimum_distance_to_floor),
+        "crosses_safety_floor": minimum_distance_to_floor < 0,
+        "has_uncovered_deficit": maximum_uncovered_deficit > 0,
+    }
+
+
+def _purchase_scenario_candidate_schedule(
+    alternative: PurchaseScenarioAlternativeRequest, *, purchase_month: date
+) -> tuple[dict[str, Decimal], Decimal, Decimal]:
+    """Deterministic `month -> amount` schedule for one hypothetical
+    purchase, plus its `(monthly_payment, total_financed_cost)`.
+
+    Reuses `app.services.finance.amortized_installment_payment` (the exact
+    formula the Advisor chat's free-text parser already uses -- never a
+    second amortization formula) for the amount of each installment. No
+    `Transaction`/`Obligation` row is read or written for this candidate; it
+    exists only in memory for this one request.
+
+    `purchase_month` is, literally and without exception, the first month
+    this purchase affects the projection (matching its own field
+    documentation, `PurchaseScenarioAlternativeRequest.purchase_month`): the
+    down payment, if any, and the financed remainder's first installment
+    (if any) are both due in that same month; each subsequent installment
+    follows one month after the previous one. There is no inferred
+    "first installment due next month" gap -- an earlier revision of this
+    function introduced exactly that as a disclosed-but-unsourced
+    convention justified by "common retail installment plans", which the
+    engineering review on this PR correctly rejected as inventing calendar
+    semantics the Work Order forbids (`docs/WORK_ORDER_PURCHASE_SCENARIO_
+    COMPARISON.md`: reuse existing contracts, never a second one). This
+    version makes no assumption at all about when a real retailer would
+    charge the first installment; it only places `installment_count`
+    equal amounts starting at `purchase_month`, which is the one placement
+    consistent with `purchase_month`'s own documented meaning for every
+    combination of `down_payment`/`installment_count`.
+
+    `_installment_remaining_schedule` -- the single source of truth for
+    "which future months a commitment adds and how much" for
+    already-persisted card installments -- is deliberately *not* reused
+    here: its `installment_current`/`installment_total` contract describes
+    the months remaining *after* an installment that a real `Transaction`
+    already booked, which has no equivalent for a purchase that was only
+    compared, never made. Reusing it anyway (as the earlier revision did,
+    passing `installment_current=0` to fabricate a pre-first-installment
+    "month zero") does not turn its result into a canonical convention; it
+    would still be this function inventing one. Placing `installment_count`
+    equal amounts on consecutive months from `purchase_month` is instead
+    plain, unambiguous date arithmetic with no embedded financial policy.
+    """
+
+    financed_amount = money(alternative.price - alternative.down_payment)
+    if financed_amount <= 0:
+        monthly_payment = Decimal("0")
+        total_financed_cost = Decimal("0")
+    else:
+        monthly_payment, total_financed_cost = amortized_installment_payment(
+            financed_amount, alternative.installment_count, alternative.monthly_interest_rate
+        )
+    schedule: dict[str, Decimal] = {}
+    if alternative.down_payment > 0:
+        schedule[month_key(purchase_month)] = money(alternative.down_payment)
+    if financed_amount > 0:
+        for offset in range(alternative.installment_count):
+            key = month_key(add_months(purchase_month, offset))
+            schedule[key] = schedule.get(key, Decimal("0")) + monthly_payment
+    return schedule, monthly_payment, total_financed_cost
+
+
+@router.post("/purchases/scenario-comparison")
+def compare_purchase_scenarios(
+    payload: PurchaseScenarioComparisonRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Read-only comparison of two or more hypothetical purchase
+    alternatives, each run through the exact canonical Projection
+    Engine/Validator path `GET /forecast` uses
+    (`_build_projection_gate_checks`) -- never a second projection/liquidity/
+    deficit/floor/commission formula here or in the browser
+    (`docs/WORK_ORDER_PURCHASE_SCENARIO_COMPARISON.md`).
+
+    Purely simulative: nothing here is persisted. Every invariant check is
+    evaluated in memory (`evaluate_invariant`/`assess_integrity`, both pure
+    functions with no database access) instead of `execute_integrity_run`,
+    and `db` is never committed in this request -- `build_snapshot`'s own
+    internal `add`/`flush` calls (idempotent: it returns the existing
+    current-period snapshot unchanged when nothing about the household's
+    real facts has changed) are discarded when `get_db` closes the session
+    at the end of the request without a commit. A hypothetical purchase that
+    was only compared, never confirmed, must never leave an
+    `IntegrityRun`/`IntegrityFinding` audit trail as if it had actually been
+    evaluated for real money movement, and must never mutate `Transaction`,
+    `Obligation`, `Commission`, `PayrollRecord`, `Document` or any other
+    historical fact.
+    """
+
+    profile = profile_for(db, user.household_id)
+    current_start = date.today().replace(day=1)
+    current_period = month_key(current_start)
+    current_snapshot = build_snapshot(
+        db,
+        household_id=user.household_id,
+        period=current_period,
+        generated_by=user.id,
+    )
+    end = profile.projection_end or date(date.today().year + 1, 12, 1)
+    start_month = add_months(current_start, 1)
+    balance_evidence_trusted = bool(current_snapshot.payload.get("balance_evidence_trusted", False))
+
+    def _run_scenario(*, extra_installments: dict[str, Decimal] | None, entity_suffix: str) -> dict:
+        checks, rows, validation = _build_projection_gate_checks(
+            db,
+            household_id=user.household_id,
+            profile=profile,
+            snapshot=current_snapshot,
+            start_month=start_month,
+            end_month=end,
+            check_period=current_period,
+            entity_type="projection_scenario_comparison",
+            entity_id=(
+                f"projection_scenario_comparison:{user.household_id}:"
+                f"{current_period}:{entity_suffix}"
+            ),
+            extra_installments=extra_installments,
+        )
+        results = tuple(evaluate_invariant(check.invariant_id, check.context) for check in checks)
+        assessment = assess_integrity(results)
+        inv018_result = next(result for result in results if result.invariant_id == "INV-018")
+        projection_gate_trusted = assessment.trusted_for_projection
+        trusted_for_projection = bool(
+            balance_evidence_trusted and validation.valid and projection_gate_trusted
+        )
+        serialized_rows = [
+            {
+                key: decimal_value(value) if isinstance(value, Decimal) else value
+                for key, value in row.items()
+            }
+            for row in rows
+        ]
+        return {
+            "scenarios": {
+                scenario: _scenario_projection_summary(rows, scenario)
+                for scenario in ("no_commission", "delayed", "expected")
+            },
+            "trusted_for_projection": trusted_for_projection,
+            "projection_formula_trusted": validation.valid,
+            "projection_invariant_gate_trusted": projection_gate_trusted,
+            "integrity_status": inv018_result.status.value,
+            "validator_mismatches": len(validation.mismatches),
+            "commitment_schedule": _advisor_commitment_schedule({"rows": serialized_rows}),
+        }
+
+    baseline = _run_scenario(extra_installments=None, entity_suffix="baseline")
+
+    alternatives_response = []
+    for index, alternative in enumerate(payload.alternatives):
+        if alternative.purchase_month:
+            purchase_month = datetime.strptime(alternative.purchase_month, "%Y-%m").date().replace(
+                day=1
+            )
+        else:
+            purchase_month = start_month
+        if purchase_month < start_month or purchase_month > end:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"O mês da compra de '{alternative.label}' precisa estar entre "
+                    f"{month_key(start_month)} e {month_key(end)} para poder aparecer na "
+                    "projeção; o mês corrente já está fechado pelo snapshot atual."
+                ),
+            )
+        schedule, monthly_payment, total_financed_cost = _purchase_scenario_candidate_schedule(
+            alternative, purchase_month=purchase_month
+        )
+        scenario_result = _run_scenario(extra_installments=schedule, entity_suffix=str(index))
+        alternatives_response.append(
+            {
+                "label": alternative.label,
+                "inputs": {
+                    "price": decimal_value(alternative.price),
+                    "down_payment": decimal_value(alternative.down_payment),
+                    "installment_count": alternative.installment_count,
+                    "monthly_interest_rate": decimal_value(alternative.monthly_interest_rate),
+                    "purchase_month": month_key(purchase_month),
+                },
+                "monthly_payment": decimal_value(monthly_payment),
+                "total_purchase_cost": decimal_value(
+                    money(alternative.down_payment + total_financed_cost)
+                ),
+                "candidate_installment_schedule": [
+                    {"month": key, "amount": decimal_value(value)}
+                    for key, value in sorted(schedule.items())
+                ],
+                **scenario_result,
+            }
+        )
+
+    return {
+        "baseline": baseline,
+        "alternatives": alternatives_response,
+        "emergency_floor": decimal_value(profile.emergency_floor),
+        "projection_start_month": month_key(start_month),
+        "projection_end_month": month_key(end),
+        "projection_calculation_version": PROJECTION_CALCULATION_VERSION,
     }
 
 

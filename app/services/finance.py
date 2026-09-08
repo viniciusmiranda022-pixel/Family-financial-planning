@@ -21,6 +21,29 @@ def monthly_net_rate(gross_annual_rate: Decimal, income_tax_rate: Decimal) -> De
     return gross_monthly * (Decimal("1") - income_tax_rate)
 
 
+def amortized_installment_payment(
+    principal: Decimal, installments: int, monthly_rate: Decimal
+) -> tuple[Decimal, Decimal]:
+    """Canonical price/Gauss amortization: `(monthly_payment, total_cost)` for
+    financing `principal` over `installments` equal monthly payments at
+    `monthly_rate` (0 for interest-free financing).
+
+    Single source of truth for this formula -- the Advisor chat's free-text
+    purchase parser (`_advisor_payment`, `app/api.py`) and the purchase
+    scenario comparison (`POST /purchases/scenario-comparison`) both call
+    this exact function so a financed purchase's monthly payment can never be
+    computed two different ways.
+    """
+    if installments <= 0:
+        return Decimal("0"), Decimal("0")
+    if installments == 1 or monthly_rate == 0:
+        monthly_payment = money(principal / installments)
+        return monthly_payment, money(monthly_payment * installments)
+    factor = Decimal("1") - (Decimal("1") + monthly_rate) ** (-installments)
+    monthly_payment = money(principal * monthly_rate / factor)
+    return monthly_payment, money(monthly_payment * installments)
+
+
 def add_months(value: date, months: int) -> date:
     target = value.month - 1 + months
     year = value.year + target // 12

@@ -259,6 +259,61 @@ snapshot/relatório/projeção. Dashboard, relatórios, projeção e Monthly Clo
 exatamente as mesmas linhas `Transaction`/`DocumentReconciliation` de sempre; esta tela não introduz
 uma segunda fonte de verdade.
 
+## Comparação visual de cenários de compra (Fase 3)
+
+`POST /api/purchases/scenario-comparison` (`app/api.py::compare_purchase_scenarios`) compara duas a
+cinco alternativas hipotéticas de compra (preço, entrada, quantidade de parcelas, juros mensal e
+mês da compra) sem introduzir um segundo motor de cálculo. Cada alternativa é convertida em um
+`month -> valor` de parcelas (`_purchase_scenario_candidate_schedule`, reusando a fórmula de
+amortização price/Gauss, extraída de `_advisor_payment` para
+`app.services.finance.amortized_installment_payment` para nunca existir em duas cópias) e somada,
+sem duplicar, às parcelas futuras já persistidas do household (`_future_installments`). O resultado
+alimenta o mesmo `_build_projection_gate_checks` que `GET /forecast` já usa -- agora com um
+parâmetro opcional `extra_installments` --, então cada alternativa é literalmente rodada pelo
+Projection Engine (`build_forecast`) e pelo Projection Validator (`validate_projection`) canônicos,
+preservando os três cenários normativos (`no_commission`/`delayed`/`expected`) e a autoridade de
+INV-005/006/018/022 sobre `trusted_for_projection`.
+
+`purchase_month` é, sem exceção, o primeiro mês em que a compra afeta a projeção: a entrada (se
+houver) e a primeira parcela do valor financiado (se houver) caem nesse mesmo mês, e cada parcela
+seguinte cai um mês depois da anterior -- aritmética de calendário direta, sem política financeira
+embutida (`for offset in range(installment_count): month_key(add_months(purchase_month, offset))`).
+Uma segunda revisão de engenharia neste PR bloqueou uma versão anterior que inferia "primeira
+parcela financiada só no mês seguinte" como convenção de mercado ("common retail installment
+plans") e reusava `_installment_remaining_schedule` (o contrato de parcelas *remanescentes após*
+uma parcela já observada em um `Transaction` real) com `installment_current=0` para fabricar um
+"mês zero" -- ambas eram semântica financeira nova não reutilizada de nenhum contrato canônico
+existente, e a primeira contradizia a própria documentação do campo `purchase_month`
+(`PurchaseScenarioAlternativeRequest`, `app/schemas.py`). A versão atual não usa
+`_installment_remaining_schedule` nesta função; ela continua sendo a fonte única para as parcelas de
+cartão já persistidas (`_future_installments`/`_project_installments`), que descrevem um cenário
+genuinamente diferente (uma parcela já observada em um `Transaction` real).
+
+Cada cenário publica apenas fatos determinísticos e não prescritivos (`final_balance`,
+`minimum_balance`, `final_uncovered_deficit`, `maximum_uncovered_deficit`,
+`minimum_distance_to_floor`, `crosses_safety_floor`, `has_uncovered_deficit`) -- não existe um
+campo `viable`/veredito que colapse os três cenários em uma única decisão. Uma revisão de
+engenharia neste PR bloqueou uma versão anterior que publicava `"viable": min(balance_delayed) >=
+emergency_floor`: isso tratava o piso como bloqueio (contrariando `FINANCIAL_RULES`/o Work Order,
+que definem o piso como referência/alerta) e elegia `delayed` como cenário decisório sem contrato
+normativo para isso. `crosses_safety_floor`/`has_uncovered_deficit` são apenas leituras booleanas de
+campos que o Projection Engine/Validator já produzem e o INV-018 já valida (`distance_to_floor` é
+`balance - safety_floor`, com sinal, em `projection_validator.py`); nenhum dos dois bloqueia,
+recomenda ou decide -- apenas descrevem o que a projeção calculou, por cenário.
+
+A comparação é inteiramente simulativa e somente leitura: nenhuma `Transaction`, `Obligation`,
+`Commission`, `PayrollRecord` ou `Document` é lida além do necessário para reconstruir a projeção
+real do household, nenhuma é criada, e a sessão do banco nunca é commitada nesta rota -- inclusive
+o `FinancialSnapshot` que `build_snapshot` eventualmente prepara internamente (idempotente; só gera
+uma linha nova quando o checksum do período corrente já mudou) é descartado ao final da requisição
+sem commit. Cada invariant é avaliado em memória (`evaluate_invariant`/`assess_integrity`, funções
+puras, sem acesso a banco) em vez de `execute_integrity_run`, para que uma compra apenas comparada
+--nunca confirmada-- não deixe `IntegrityRun`/`IntegrityFinding` como se tivesse sido avaliada de
+verdade. Um `purchase_month` fora de `[próximo mês da projeção, projection_end]` é rejeitado (422)
+em vez de silenciosamente não aparecer na projeção. O frontend (`view-planning`, painel "Comparar
+cenários de compra") só reformata a resposta desta rota; não existe fórmula financeira paralela em
+`app/static/app.js` para esta funcionalidade (ver `tests/test_purchase_scenario_comparison_frontend.py`).
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila

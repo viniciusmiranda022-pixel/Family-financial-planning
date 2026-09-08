@@ -494,6 +494,17 @@
         </div>
         <article class="panel"><div class="panel-heading"><div><span class="step-label">COMPROMISSOS ATIVOS</span><h2>Obrigações cadastradas</h2><small>Alertas automáticos aparecem 30 dias antes do próximo vencimento.</small></div></div><div class="table-wrap"><table><thead><tr><th>Próximo vencimento</th><th>Nome</th><th>Grupo</th><th>Repetição</th><th>Status</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="obligations-table"></tbody></table></div></article>
         <article class="panel"><div class="panel-heading"><h2>Calendário consolidado</h2><small>O saldo representa a projeção mensal da conta central de liquidez.</small></div><div class="table-wrap wide"><table><thead><tr><th>Mês</th><th class="right">Salário</th><th class="right">Extras</th><th class="right">Comissão + atraso</th><th class="right">Compromissos</th><th class="right">Parcelas</th><th class="right">Rendimento</th><th class="right">Saldo da liquidez</th></tr></thead><tbody id="forecast-table"></tbody></table></div></article>
+
+        <article class="panel" id="scenario-comparison-panel">
+          <div class="panel-heading">
+            <div><span class="step-label">SIMULAÇÃO</span><h2>Comparar cenários de compra</h2><small>Cada alternativa é avaliada pelo mesmo motor de projeção deste Planejamento (Projection Engine/Validator) -- nada é calculado no navegador, e nenhuma compra é registrada até você confirmá-la pelos fluxos normais de Saídas/Contas a pagar.</small></div>
+            <button id="scenario-add-alternative" class="secondary" type="button">+ Alternativa</button>
+          </div>
+          <div id="scenario-alternatives-form" class="scenario-alternatives-form"></div>
+          <div class="form-action"><button id="scenario-compare" class="primary" type="button">Comparar alternativas</button></div>
+          <p id="scenario-comparison-error" class="hidden amount-expense"></p>
+          <div id="scenario-comparison-results"></div>
+        </article>
       </section>
 
       <section id="view-advisor" class="view">

@@ -349,3 +349,48 @@ class ClassificationRuleEditRequest(BaseModel):
 
 class ClassificationRuleDeactivateRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
+
+
+class PurchaseScenarioAlternativeRequest(BaseModel):
+    """One hypothetical purchase alternative to run through the canonical
+    Projection Engine/Validator for `POST /purchases/scenario-comparison`.
+
+    Deliberately mirrors the same structured inputs the rest of the app
+    already supports for a financed purchase (price, down payment,
+    installment count, interest rate) instead of accepting free text -- see
+    `docs/WORK_ORDER_PURCHASE_SCENARIO_COMPARISON.md`. No new financial
+    semantics: `price`/`down_payment`/`installment_count`/
+    `monthly_interest_rate` feed the same amortization formula the Advisor
+    chat already uses (`app.services.finance.amortized_installment_payment`),
+    and the resulting schedule is merged into the exact `ForecastInput`
+    contract the canonical Projection Engine/Validator already consume.
+    """
+
+    label: str = Field(min_length=1, max_length=80)
+    price: Decimal = Field(gt=0, le=Decimal("100000000"))
+    down_payment: Decimal = Field(default=Decimal("0"), ge=0)
+    installment_count: int = Field(default=1, ge=1, le=120)
+    monthly_interest_rate: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("0.30"))
+    # First month this purchase would affect the projection (`YYYY-MM`).
+    # Defaults to the projection's own start month (the next calendar
+    # month) when omitted -- the current month is already closed by the
+    # snapshot the projection starts from, so an earlier month could never
+    # be reflected anyway (see `forecast`/`compare_purchase_scenarios`).
+    purchase_month: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+
+    @model_validator(mode="after")
+    def validate_down_payment(self) -> "PurchaseScenarioAlternativeRequest":
+        if self.down_payment > self.price:
+            raise ValueError("A entrada não pode ser maior que o preço da compra")
+        return self
+
+
+class PurchaseScenarioComparisonRequest(BaseModel):
+    alternatives: list[PurchaseScenarioAlternativeRequest] = Field(min_length=2, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_unique_labels(self) -> "PurchaseScenarioComparisonRequest":
+        labels = [alternative.label for alternative in self.alternatives]
+        if len(labels) != len(set(labels)):
+            raise ValueError("Cada alternativa precisa de um rótulo único")
+        return self

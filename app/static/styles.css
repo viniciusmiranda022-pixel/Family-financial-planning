@@ -229,6 +229,10 @@ tr:last-child td { border-bottom: 0; }
 .capture-item-fields input, .capture-item-fields select { padding: 9px 10px; font-size: 12px; }
 .capture-item-heading { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .capture-warning-list { grid-column: 1 / -1; margin: 0; padding-left: 18px; color: #8a5a10; font-size: 11px; line-height: 1.5; }
+.scenario-alternatives-form { display: grid; gap: 14px; margin-bottom: 14px; }
+.scenario-alternative-card { border: 1px solid var(--line); border-radius: 12px; background: #fbfcfd; padding: 15px; }
+.scenario-alternative-card .panel-heading { margin-bottom: 10px; }
+.scenario-comparison-summary { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
 .capture-notes { margin-bottom: 13px; padding: 11px 13px; border-radius: 10px; color: #7a4e0b; background: var(--soft-amber); font-size: 12px; line-height: 1.5; }
 .capture-confirm-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 17px; padding-top: 15px; border-top: 1px solid var(--line); }
 .capture-preview-panel.needs-input { border-color: #efc56f; }
