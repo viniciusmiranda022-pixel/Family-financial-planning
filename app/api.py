@@ -5614,15 +5614,26 @@ def _purchase_scenario_candidate_schedule(
 
     Convention (disclosed, not derived from `FINANCIAL_RULES`, since no
     purchase-simulation feature existed before this one): the down payment,
-    if any, is due at `purchase_month`; when `installment_count == 1` there
-    is no time-separated financing, so the whole price is due at
-    `purchase_month` in one lump sum; otherwise the financed remainder's
-    first installment is due the month after `purchase_month`, matching
-    common retail installment plans.
+    if any, is due at `purchase_month`. The financed remainder (price minus
+    down payment) is due at `purchase_month` itself, in one lump sum,
+    *only* in the pure-cash case (no down payment at all and a single
+    installment) -- that is the one case with no time-separated financing.
+    Whenever a down payment exists, or more than one installment is
+    requested, the financed remainder's first installment is due the month
+    after `purchase_month` instead, matching common retail installment
+    plans; this keeps the calendar placement orthogonal to
+    `installment_count` (a lone financed installment is still a *future*
+    payment when it coexists with a down payment today, never silently
+    merged into the same month as the down payment -- see the engineering
+    review that caught this discontinuity at `installment_count == 1`).
     """
 
     financed_amount = money(alternative.price - alternative.down_payment)
-    if alternative.installment_count == 1 or financed_amount <= 0:
+    pure_cash = alternative.down_payment == 0 and alternative.installment_count == 1
+    if financed_amount <= 0:
+        monthly_payment = Decimal("0")
+        total_financed_cost = Decimal("0")
+    elif pure_cash:
         monthly_payment = financed_amount
         total_financed_cost = financed_amount
     else:
@@ -5630,14 +5641,13 @@ def _purchase_scenario_candidate_schedule(
             financed_amount, alternative.installment_count, alternative.monthly_interest_rate
         )
     schedule: dict[str, Decimal] = {}
-    if alternative.installment_count == 1:
-        lump_sum = money(alternative.down_payment + monthly_payment)
-        if lump_sum > 0:
-            schedule[month_key(purchase_month)] = lump_sum
-    else:
-        if alternative.down_payment > 0:
-            schedule[month_key(purchase_month)] = money(alternative.down_payment)
-        if financed_amount > 0:
+    if alternative.down_payment > 0:
+        schedule[month_key(purchase_month)] = money(alternative.down_payment)
+    if financed_amount > 0:
+        if pure_cash:
+            key = month_key(purchase_month)
+            schedule[key] = schedule.get(key, Decimal("0")) + monthly_payment
+        else:
             for key, value in _installment_remaining_schedule(
                 amount=monthly_payment,
                 installment_current=0,
