@@ -1,36 +1,41 @@
+<#
+.SYNOPSIS
+    Idempotently publishes the local application behind Tailscale Serve
+    HTTPS, verifies the result, and fails closed on any missing
+    prerequisite. See docs/TAILSCALE.md and docs/SECURITY.md.
+
+.PARAMETER Port
+    Local port the application listens on. Defaults to APP_PORT read from
+    `.env` (falling back to compose.yaml's own default, 8080) when not
+    given explicitly.
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\scripts\setup-tailscale.ps1
+#>
 param(
-    [int]$Port = 8090
+    [int] $Port = 0
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'lib/TailscaleProxy.psm1') -Force
 
-if (-not (Get-Command tailscale.exe -ErrorAction SilentlyContinue)) {
-    throw "Tailscale nao encontrado. Instale-o no Windows e entre na sua tailnet antes de continuar."
+if ($Port -le 0) {
+    $envPath = Join-Path $PSScriptRoot '..\.env'
+    $Port = Resolve-AppPort -EnvFilePath $envPath
 }
 
-try {
-    $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 5
-} catch {
-    throw "O sistema financeiro nao respondeu em http://127.0.0.1:$Port. Inicie o Docker antes de configurar o acesso remoto."
-}
+Assert-TailscaleInstalled
+Assert-AppHealthy -HealthUrl "http://127.0.0.1:$Port/health"
+Assert-TailscaleConnected
 
-if ($health.status -ne "healthy") {
-    throw "O sistema respondeu, mas o health check nao esta saudavel."
-}
+Publish-PrivateHttpsProxy -Port $Port
 
-$status = tailscale.exe status --json | ConvertFrom-Json
-if ($status.BackendState -ne "Running") {
-    throw "O Tailscale nao esta conectado. Abra o aplicativo do Tailscale no Windows e faca login."
-}
+$state = Get-TailscaleServeState
+Assert-ProxyStateSafe -ServeState $state -ExpectedPort $Port
 
-tailscale.exe serve --bg --https=443 "http://127.0.0.1:$Port"
-if ($LASTEXITCODE -ne 0) {
-    throw "Nao foi possivel publicar o servico dentro da tailnet."
-}
-
-Write-Host ""
-Write-Host "Acesso privado configurado. Enderecos ativos:" -ForegroundColor Green
+Write-Host ''
+Write-Host 'Acesso privado configurado e verificado. Enderecos ativos:' -ForegroundColor Green
 tailscale.exe serve status
-Write-Host ""
-Write-Host "Use somente o endereco HTTPS mostrado acima. Nao habilite Tailscale Funnel." -ForegroundColor Yellow
-
+Write-Host ''
+Write-Host 'Tailscale Funnel permanece desabilitado; nenhuma porta publica foi criada.' -ForegroundColor Yellow
+Write-Host 'Use somente o endereco HTTPS mostrado acima.' -ForegroundColor Yellow
