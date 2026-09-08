@@ -28,10 +28,7 @@ Assert-TailscaleInstalled
 Assert-AppHealthy -HealthUrl "http://127.0.0.1:$Port/health"
 Assert-TailscaleConnected
 
-Publish-PrivateHttpsProxy -Port $Port
-
-$state = Get-TailscaleServeState
-Assert-ProxyStateSafe -ServeState $state -ExpectedPort $Port
+Set-VerifiedPrivateHttpsProxy -Port $Port
 
 Write-Host ''
 Write-Host 'Acesso privado configurado e verificado. Enderecos ativos:' -ForegroundColor Green

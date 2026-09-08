@@ -14,10 +14,21 @@ O Tailscale cria a rede privada usada por Vinicius e Kelly para acessar o sistem
 `scripts/setup-tailscale.ps1` automatiza e verifica esse estado: ele falha explicitamente se o
 Tailscale não estiver instalado/conectado ou se a aplicação não responder saudável, reaplica a
 publicação HTTPS de forma idempotente (repetir a execução converge para o mesmo estado, sem
-duplicar regras nem deixar exposição residual de uma configuração manual anterior) e, ao final,
-verifica que o único endereço publicado aponta para a aplicação, que nenhuma porta TCP além de 443
-foi aberta e que o Tailscale Funnel continua desabilitado. Detalhes de implementação e das
-garantias testadas em `scripts/lib/TailscaleProxy.psm1` e `tests/tailscale_proxy/run_tests.ps1`.
+duplicar regras) e, ao final, verifica que o endereço publicado na porta 443 aponta para a
+aplicação, que essa porta está corretamente configurada como HTTPS e que o Tailscale Funnel
+continua desabilitado nela. Se a pós-verificação falhar, a publicação recém-criada é removida antes
+do script terminar, para nunca deixar uma exposição nova sem verificação.
+
+A automação só mexe na porta 443 (a única superfície que esta aplicação usa) e nunca executa
+`tailscale serve reset`, que apagaria configurações de Serve/Funnel de qualquer outro serviço
+eventualmente publicado pelo mesmo nó Tailscale. Ela também nunca assume, só pela forma, que uma
+publicação já existente na porta 443 é sua: mantém um registro local não sensível (apenas a URL de
+destino, nunca versionado — veja `.gitignore`) do que ela mesma publicou da última vez, e só reaplica
+por cima quando o estado atual da porta 443 bate exatamente com esse registro. Qualquer outra coisa
+já publicada na 443 (de outro serviço, de uma configuração manual anterior, ou com drift em relação
+ao registro local) faz o script falhar explicitamente sem alterar nada — resolva manualmente com
+`tailscale serve status` antes de tentar novamente. Detalhes de implementação e das garantias
+testadas em `scripts/lib/TailscaleProxy.psm1` e `tests/tailscale_proxy/run_tests.ps1`.
 
 1. Instale o Tailscale no Windows e entre na conta que será proprietária da tailnet.
 2. Inicie o sistema pelo WSL:
@@ -51,10 +62,12 @@ tailscale serve status
 powershell -ExecutionPolicy Bypass -File .\scripts\disable-tailscale-proxy.ps1
 ```
 
-Equivalente a `tailscale serve reset`, com verificação de que nenhuma publicação restou. Isso
-apenas remove a configuração de proxy do próprio Tailscale; não altera o Docker, o banco de dados,
-os documentos ou qualquer fato financeiro. Para religar o acesso privado depois, execute
-`setup-tailscale.ps1` novamente.
+Remove somente a publicação HTTPS desta aplicação na porta 443 (nunca `tailscale serve reset`,
+que apagaria outros serviços eventualmente publicados pelo mesmo nó Tailscale) e verifica que nada
+restou nela. Assim como o script de configuração, ele também falha explicitamente em vez de remover
+uma configuração na porta 443 que não reconheça como sua. Isso apenas remove a configuração de proxy
+do próprio Tailscale; não altera o Docker, o banco de dados, os documentos ou qualquer fato
+financeiro. Para religar o acesso privado depois, execute `setup-tailscale.ps1` novamente.
 
 ## Acesso da Kelly
 
