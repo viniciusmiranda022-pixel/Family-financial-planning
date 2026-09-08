@@ -540,6 +540,92 @@ Invoke-Test 'Restore-PriorServe443Target lanca erro explicito de intervencao man
 }
 
 # ---------------------------------------------------------------------
+# BLOQUEIO DE MERGE #3: the reapply command's exit code alone is not
+# proof -- a daemon can return 0 while the live state ends up divergent
+# (never applied, wrong target, or Funnel enabled). Restore-PriorServe443Target
+# must re-read Get-TailscaleServeState and hold it to the same
+# Assert-ProxyStateSafe standard as a normal apply before declaring the
+# rollback safe or recreating the marker.
+# ---------------------------------------------------------------------
+Invoke-Test 'Restore-PriorServe443Target nao declara restauracao segura quando o comando retorna sucesso mas o estado vivo nunca reflete o alvo anterior (BLOQUEIO DE MERGE #3)' {
+    $fake = New-FakeTailscaleRunner
+    $marker = New-TestMarkerPath
+    try {
+        Set-ManagedProxyTarget -MarkerPath $marker -Target 'http://127.0.0.1:8080'
+        # O CLI reporta sucesso (exit 0) na reaplicacao, mas o estado vivo
+        # (serve status --json) nunca passa a refletir o alvo anterior --
+        # simula um daemon que retorna 0 sem realmente convergir.
+        $falseSuccessRunner = {
+            param([string[]] $CliArgs)
+            if (($CliArgs -join ' ') -eq 'serve --bg --https=443 http://127.0.0.1:8080') {
+                return [pscustomobject]@{ ExitCode = 0; Output = '' }
+            }
+            & $fake.Runner $CliArgs
+        }.GetNewClosure()
+
+        $thrown = $null
+        try {
+            Restore-PriorServe443Target -Runner $falseSuccessRunner -MarkerPath $marker `
+                -PriorTarget 'http://127.0.0.1:8080' -FailureMessage 'Falha original de teste'
+        } catch { $thrown = $_.Exception.Message }
+
+        Assert-True ($null -ne $thrown -and $thrown -match 'Intervencao manual necessaria') `
+            'quando o estado vivo nao confirma a restauracao, a falha deveria exigir intervencao manual, nao afirmar sucesso'
+        Assert-True ($thrown -notmatch 'comprovada pelo estado vivo') `
+            'a mensagem nao deveria afirmar que a restauracao foi comprovada quando o estado vivo nao confere'
+        Assert-True (-not (Get-ManagedProxyTarget -MarkerPath $marker)) `
+            'o registro local nao deveria reivindicar um alvo que o estado vivo nao comprovou restaurado'
+    } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
+Invoke-Test 'Restore-PriorServe443Target nao declara restauracao segura quando o estado vivo restaura com Funnel habilitado (BLOQUEIO DE MERGE #3)' {
+    $fake = New-FakeTailscaleRunner
+    $marker = New-TestMarkerPath
+    try {
+        Set-ManagedProxyTarget -MarkerPath $marker -Target 'http://127.0.0.1:8080'
+        # O comando aplica o alvo correto, mas o daemon liga o Funnel junto
+        # -- estado vivo divergente mesmo com o target certo e exit 0.
+        $funnelOnRestoreRunner = {
+            param([string[]] $CliArgs)
+            $result = & $fake.Runner $CliArgs
+            if (($CliArgs -join ' ') -eq 'serve --bg --https=443 http://127.0.0.1:8080') {
+                $fake.State.AllowFunnel['fake.ts.net:443'] = $true
+            }
+            $result
+        }.GetNewClosure()
+
+        $thrown = $null
+        try {
+            Restore-PriorServe443Target -Runner $funnelOnRestoreRunner -MarkerPath $marker `
+                -PriorTarget 'http://127.0.0.1:8080' -FailureMessage 'Falha original de teste'
+        } catch { $thrown = $_.Exception.Message }
+
+        Assert-True ($null -ne $thrown -and $thrown -match 'Intervencao manual necessaria') `
+            'Funnel habilitado na restauracao deveria ser tratado como nao comprovada, exigindo intervencao manual'
+        Assert-True (-not (Get-ManagedProxyTarget -MarkerPath $marker)) `
+            'o registro local nao deveria reivindicar restauracao quando o Funnel ficou habilitado'
+    } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
+Invoke-Test 'Restore-PriorServe443Target declara e grava o marcador somente apos comprovar o alvo anterior no estado vivo (BLOQUEIO DE MERGE #3, caminho correto)' {
+    $fake = New-FakeTailscaleRunner
+    $marker = New-TestMarkerPath
+    try {
+        Set-ManagedProxyTarget -MarkerPath $marker -Target 'http://127.0.0.1:8080'
+        $thrown = $null
+        try {
+            Restore-PriorServe443Target -Runner $fake.Runner -MarkerPath $marker `
+                -PriorTarget 'http://127.0.0.1:8080' -FailureMessage 'Falha original de teste'
+        } catch { $thrown = $_.Exception.Message }
+
+        Assert-True ($null -ne $thrown -and $thrown -match 'comprovada pelo estado vivo') `
+            'uma restauracao genuina, comprovada pelo estado vivo, deveria dizer isso explicitamente'
+        Assert-True ((Get-ManagedProxyTarget -MarkerPath $marker) -eq 'http://127.0.0.1:8080') `
+            'apos uma restauracao comprovada, o registro local deveria apontar para o alvo restaurado'
+    } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
+# ---------------------------------------------------------------------
 # Set-VerifiedPrivateHttpsProxy: apply + verify, transactional on failure
 # ---------------------------------------------------------------------
 Invoke-Test 'Set-VerifiedPrivateHttpsProxy aplica e verifica com sucesso no caminho feliz' {

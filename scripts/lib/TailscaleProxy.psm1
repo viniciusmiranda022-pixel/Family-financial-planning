@@ -285,10 +285,10 @@ function Restore-PriorServe443Target {
         Best-effort restoration of a previously-live, self-owned port-443
         target after a failed apply or a failed post-apply safety check.
         Always throws: with a message saying the prior publication was
-        restored, or a manual-intervention message when restoration also
-        failed. Never returns normally, so the original failure this
-        automation was already unwinding from can never be masked as
-        success.
+        restored AND proven live, or a manual-intervention message when
+        restoration failed or could not be proven. Never returns normally,
+        so the original failure this automation was already unwinding from
+        can never be masked as success.
 
     .DESCRIPTION
         Assumes the caller has already ensured port 443 does not currently
@@ -298,6 +298,19 @@ function Restore-PriorServe443Target {
         module) -- this function only reapplies PriorTarget and never
         issues an `off` itself, so it never risks turning off a mapping
         that belongs to an unrelated service.
+
+        A zero exit code from the reapply command is not, by itself,
+        treated as proof: the daemon can report success while the live
+        state ends up divergent (wrong target, or Funnel enabled). So after
+        a zero exit code this re-reads Get-TailscaleServeState and holds it
+        to the exact same Assert-ProxyStateSafe check (via -ExpectedTarget)
+        that a normal apply must pass -- a rollback cannot be verified to a
+        weaker standard than the apply it is reverting. Only when that
+        live-state check also passes is the marker rewritten and success
+        declared; otherwise this falls through to the same
+        manual-intervention failure used when the reapply command itself
+        fails, and the marker is cleared rather than claiming an
+        unobserved target.
     #>
     param(
         [Parameter(Mandatory)] [scriptblock] $Runner,
@@ -307,15 +320,27 @@ function Restore-PriorServe443Target {
     )
     $reapply = & $Runner @('serve', '--bg', '--https=443', $PriorTarget)
     if ($reapply.ExitCode -eq 0) {
-        Set-ManagedProxyTarget -MarkerPath $MarkerPath -Target $PriorTarget
-        throw "$FailureMessage; a publicacao anterior ($PriorTarget) foi restaurada com sucesso."
+        $restoredLive = $false
+        try {
+            $restoredState = Get-TailscaleServeState -Runner $Runner
+            Assert-ProxyStateSafe -ServeState $restoredState -ExpectedTarget $PriorTarget
+            $restoredLive = $true
+        } catch {
+            $restoredLive = $false
+        }
+        if ($restoredLive) {
+            Set-ManagedProxyTarget -MarkerPath $MarkerPath -Target $PriorTarget
+            throw "$FailureMessage; a publicacao anterior ($PriorTarget) foi restaurada e comprovada pelo estado vivo do Tailscale Serve."
+        }
     }
 
-    # The prior state cannot be proven live any more (the reapply itself
-    # failed), so the marker is cleared rather than left pointing at a
-    # target that may not actually be published -- consistent with every
-    # other failure path in this module never claiming ownership of state
-    # it has not verified.
+    # Either the reapply command itself failed, or it reported success
+    # (exit 0) but the live state does not prove PriorTarget is actually
+    # published (HTTPS, no Funnel, no other handler). In both cases the
+    # prior state cannot be proven live, so the marker is cleared rather
+    # than left pointing at a target that may not actually be published --
+    # consistent with every other failure path in this module never
+    # claiming ownership of state it has not verified.
     Clear-ManagedProxyTarget -MarkerPath $MarkerPath
     throw "$FailureMessage e a restauracao da publicacao anterior ($PriorTarget) tambem falhou. Intervencao manual necessaria: verifique agora com 'tailscale serve status' e reaplique manualmente a publicacao anterior se preciso."
 }
@@ -384,12 +409,26 @@ function Assert-ProxyStateSafe {
         application's own port-443 mapping is correct (and only that), no
         Funnel on it, and PostgreSQL/Advisor are unreachable through
         Tailscale Serve regardless of who configured it.
+
+    .DESCRIPTION
+        Accepts exactly one of -ExpectedPort (the normal apply path, which
+        always targets 127.0.0.1) or -ExpectedTarget (a full
+        "http://127.0.0.1:<port>" string). Restore-PriorServe443Target uses
+        -ExpectedTarget so a rollback is held to this exact same live-state
+        proof as a normal apply, instead of a second, weaker policy.
     #>
     param(
         [Parameter(Mandatory)] $ServeState,
-        [Parameter(Mandatory)] [int] $ExpectedPort,
+        [int] $ExpectedPort,
+        [string] $ExpectedTarget,
         [int[]] $ForbiddenPorts = $script:ForbiddenProxyPorts
     )
+
+    $havePort = $PSBoundParameters.ContainsKey('ExpectedPort')
+    if ($havePort -eq [bool]$ExpectedTarget) {
+        throw 'Assert-ProxyStateSafe requer exatamente um entre -ExpectedPort e -ExpectedTarget.'
+    }
+    $expectedTarget = if ($ExpectedTarget) { $ExpectedTarget } else { "http://127.0.0.1:$ExpectedPort" }
 
     $entry = Get-Serve443WebEntry -ServeState $ServeState
     if (-not $entry) {
@@ -397,7 +436,6 @@ function Assert-ProxyStateSafe {
     }
 
     $handlers = @($entry.Value.Handlers.PSObject.Properties)
-    $expectedTarget = "http://127.0.0.1:$ExpectedPort"
     $matchesTarget = $handlers | Where-Object { $_.Value.Proxy -eq $expectedTarget }
     if (-not $matchesTarget -or $handlers.Count -ne 1) {
         throw 'Estado inesperado do Tailscale Serve: o alvo publicado na porta 443 nao corresponde exatamente a aplicacao esperada.'
