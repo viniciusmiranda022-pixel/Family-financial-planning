@@ -344,46 +344,95 @@ def fail_exhausted_stale_jobs(db: Session, *, stale_after_seconds: int) -> int:
     (unless the draft was already confirmed or cancelled by the household
     in the meantime, in which case its own terminal state stands).
 
-    Every draft/document lookup here is scoped by `job.household_id`
+    Reuses `finalize_capture_job`'s `(status='processing', attempts=
+    :claimed_attempt)` compare-and-swap instead of mutating a loaded ORM
+    row (which would UPDATE by primary key alone, with no predicate on the
+    lease it observed). Without that CAS, a real interleaving is provable:
+    this function reads a job as stale/exhausted, but before it commits,
+    the job's *actual* owning worker (still alive, just slow) finishes and
+    calls `finalize_capture_job` with the attempt it legitimately claimed
+    -- winning cleanly because nothing else has touched that row yet. This
+    function's later, unconditional `UPDATE ... WHERE id = :id` would then
+    overwrite that valid `completed` terminal state (and the draft/document
+    it wrote) back to `failed`, exactly the asymmetry the CAS on
+    `claim_capture_job`/`finalize_capture_job` already closes for every
+    other transition. Passing the `attempts` value observed in the same
+    query that found this job stale as `claimed_attempt` makes the two
+    functions share one lease: whichever transaction's UPDATE actually
+    commits first -- this reconciler failing the exhausted attempt, or the
+    slow worker finalizing it -- wins the row lock, and the other one's CAS
+    predicate no longer matches once it runs, so it loses (`False`) instead
+    of clobbering the winner. A job that loses this race is left completely
+    untouched (job, draft and document alike) and is not counted as failed
+    here; the reconciler simply leaves whatever the winner wrote standing.
+
+    Every draft/document lookup here is scoped by the job's `household_id`
     (never a bare `db.get(Model, id)` by primary key alone), exactly like
     `app.api._process_claimed_capture_job` -- a job whose FKs have drifted
     to point at another household's draft/document (corrupted/inconsistent
     persisted state) must never have that foreign row loaded or mutated
     just because its own attempt budget ran out. A job that fails this
     correlation simply leaves the foreign draft/document untouched; only
-    its own `capture_processing_jobs` row is failed above.
+    its own `capture_processing_jobs` row is failed above. These lookups
+    only run for a job whose CAS above actually won, so a lease this
+    function lost can never reach them either.
 
     Caller is responsible for `db.commit()`.
     """
 
     now = datetime.now(UTC)
     cutoff = now - timedelta(seconds=max(1, stale_after_seconds))
-    stuck = db.scalars(
-        select(CaptureProcessingJob).where(
+    stuck = db.execute(
+        select(
+            CaptureProcessingJob.id,
+            CaptureProcessingJob.household_id,
+            CaptureProcessingJob.capture_draft_id,
+            CaptureProcessingJob.document_id,
+            CaptureProcessingJob.attempts,
+        ).where(
             CaptureProcessingJob.status == "processing",
             CaptureProcessingJob.started_at.is_not(None),
             CaptureProcessingJob.started_at < cutoff,
             CaptureProcessingJob.attempts >= CaptureProcessingJob.max_attempts,
         )
     ).all()
-    for job in stuck:
-        mark_job_failed(db, job, error_code="worker_timeout_exhausted")
+    failed_count = 0
+    for job_id, household_id, capture_draft_id, document_id, observed_attempts in stuck:
+        won = finalize_capture_job(
+            db,
+            job_id,
+            status="failed",
+            claimed_attempt=observed_attempts,
+            error_code="worker_timeout_exhausted",
+        )
+        if not won:
+            continue
+        failed_count += 1
+        # `finalize_capture_job` issues a Core `UPDATE`, which -- unlike a
+        # direct ORM attribute assignment -- does not sync any instance of
+        # this row already tracked in `db`'s identity map (e.g. a caller
+        # that loaded it earlier in the same session). `populate_existing`
+        # forces a fresh read of the just-applied-but-not-yet-committed
+        # write (still visible to this same transaction) into that
+        # instance, so nothing downstream in this session can observe a
+        # stale `status`/`error_code` for a job this call just won.
+        db.get(CaptureProcessingJob, job_id, populate_existing=True)
         draft = db.scalar(
             select(CaptureDraft).where(
-                CaptureDraft.id == job.capture_draft_id, CaptureDraft.household_id == job.household_id
+                CaptureDraft.id == capture_draft_id, CaptureDraft.household_id == household_id
             )
         )
         if draft is not None and draft.status not in {"confirmed", "cancelled"}:
             draft.status = "failed"
-        if job.document_id:
+        if document_id:
             document = db.scalar(
                 select(Document).where(
-                    Document.id == job.document_id, Document.household_id == job.household_id
+                    Document.id == document_id, Document.household_id == household_id
                 )
             )
             if document is not None:
                 document.status = "capture_failed"
-    return len(stuck)
+    return failed_count
 
 
 __all__ = [
