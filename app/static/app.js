@@ -1095,7 +1095,9 @@ async function loadForecast() {
 
 const captureSourceLabels = { text: "Texto", audio: "Áudio", image: "Imagem", document: "Documento" };
 const captureTypeLabels = { text: "Mensagem", receipt: "Comprovante", boleto: "Boleto", credit_card: "Fatura", bank_statement: "Extrato", payroll: "Holerite", auto: "Automático" };
-const captureStatusLabels = { preview: "Aguardando confirmação", needs_input: "Precisa de ajuste", confirmed: "Confirmado", cancelled: "Cancelado" };
+const captureStatusLabels = { queued: "Na fila de processamento", processing: "Processando OCR/áudio...", preview: "Aguardando confirmação", needs_input: "Precisa de ajuste", failed: "Falha no processamento", confirmed: "Confirmado", cancelled: "Cancelado" };
+const CAPTURE_POLL_INTERVAL_MS = 2500;
+const CAPTURE_POLL_MAX_ATTEMPTS = 120; // ~5 minutes at the interval above
 
 function captureAccountOptions(selected) {
   return '<option value="">Escolha a conta</option>' + state.accounts.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === selected ? "selected" : ""}>${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("");
@@ -1166,21 +1168,62 @@ function renderCapturePayroll(item, index) {
     </article>`;
 }
 
-function renderCapturePreview(capture) {
+function stopCapturePoll() {
+  if (state.capturePollTimer) {
+    clearTimeout(state.capturePollTimer);
+    state.capturePollTimer = null;
+  }
+}
+
+function scheduleCapturePoll(captureId, attempt = 0) {
+  stopCapturePoll();
+  if (attempt >= CAPTURE_POLL_MAX_ATTEMPTS) return;
+  state.capturePollTimer = setTimeout(async () => {
+    if (!state.captureDraft || state.captureDraft.id !== captureId) return;
+    try {
+      const capture = await api(`/captures/${captureId}`);
+      if (!state.captureDraft || state.captureDraft.id !== captureId) return;
+      renderCapturePreview(capture, attempt + 1);
+      if (capture.status === "queued" || capture.status === "processing") return;
+      await loadCapture();
+    } catch (error) {
+      // Transient network/auth hiccup while polling: keep trying silently
+      // rather than surfacing a toast on every failed poll.
+      scheduleCapturePoll(captureId, attempt + 1);
+    }
+  }, CAPTURE_POLL_INTERVAL_MS);
+}
+
+function renderCapturePreview(capture, pollAttempt = 0) {
   state.captureDraft = capture;
+  const isPending = capture.status === "queued" || capture.status === "processing";
+  const isFailed = capture.status === "failed";
   const panel = document.querySelector("#capture-preview-panel");
   panel.classList.remove("hidden");
   panel.classList.toggle("needs-input", capture.status === "needs_input");
-  document.querySelector("#capture-preview-summary").textContent = `${captureSourceLabels[capture.source_type] || capture.source_type} • ${captureTypeLabels[capture.detected_type] || capture.detected_type} • ${capture.items.length} item(ns)`;
+  panel.classList.toggle("processing", isPending);
+  panel.classList.toggle("failed", isFailed);
+  document.querySelector("#capture-preview-summary").textContent = `${captureSourceLabels[capture.source_type] || capture.source_type} • ${captureTypeLabels[capture.detected_type] || capture.detected_type} • ${isPending ? captureStatusLabels[capture.status] : `${capture.items.length} item(ns)`}`;
   document.querySelector("#capture-confidence").textContent = `${Math.round((capture.confidence || 0) * 100)}%`;
   const notes = document.querySelector("#capture-preview-notes");
-  notes.classList.toggle("hidden", !capture.notes);
-  notes.textContent = capture.notes || "";
-  document.querySelector("#capture-preview-items").innerHTML = capture.items.length
-    ? capture.items.map((item, index) => item.kind === "transaction" ? renderCaptureTransaction(item, index) : item.kind === "obligation" ? renderCaptureObligation(item, index) : renderCapturePayroll(item, index)).join("")
-    : '<div class="capture-empty-preview">Não foi possível montar uma prévia automática. Escreva os dados principais no campo de mensagem e tente novamente.</div>';
-  document.querySelector("#capture-confirm").disabled = !capture.items.length;
-  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+  const noteText = isFailed
+    ? 'Não foi possível concluir o processamento deste arquivo. Toque em "Tentar novamente" para reprocessar.'
+    : (capture.notes || "");
+  notes.classList.toggle("hidden", !noteText);
+  notes.textContent = noteText;
+  document.querySelector("#capture-preview-items").innerHTML = isPending
+    ? '<div class="capture-empty-preview">Processando OCR/áudio em segundo plano; esta prévia é atualizada automaticamente...</div>'
+    : capture.items.length
+      ? capture.items.map((item, index) => item.kind === "transaction" ? renderCaptureTransaction(item, index) : item.kind === "obligation" ? renderCaptureObligation(item, index) : renderCapturePayroll(item, index)).join("")
+      : '<div class="capture-empty-preview">Não foi possível montar uma prévia automática. Escreva os dados principais no campo de mensagem e tente novamente.</div>';
+  document.querySelector("#capture-confirm").disabled = !capture.items.length || isPending || isFailed;
+  document.querySelector("#capture-retry").classList.toggle("hidden", !isFailed);
+  if (pollAttempt === 0) panel.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (isPending) {
+    scheduleCapturePoll(capture.id, pollAttempt);
+  } else {
+    stopCapturePoll();
+  }
 }
 
 function clearCaptureAudio() {
@@ -1193,6 +1236,7 @@ function clearCaptureAudio() {
 }
 
 function closeCapturePreview() {
+  stopCapturePoll();
   state.captureDraft = null;
   document.querySelector("#capture-preview-panel").classList.add("hidden");
   document.querySelector("#capture-preview-items").innerHTML = "";
@@ -1202,7 +1246,7 @@ async function loadCapture() {
   await Promise.all([loadAccounts(), loadCategories()]);
   const captures = await api("/captures");
   document.querySelector("#captures-table").innerHTML = captures.length ? captures.map((item) => `
-    <tr><td>${escapeHtml(captureSourceLabels[item.source_type] || item.source_type)}${item.file_name ? `<br><small>${escapeHtml(item.file_name)}</small>` : ""}</td><td>${escapeHtml(captureTypeLabels[item.detected_type] || item.detected_type)}</td><td><span class="status-chip ${item.status === "confirmed" ? "ok" : item.status === "needs_input" ? "warn" : "muted"}">${escapeHtml(captureStatusLabels[item.status] || item.status)}</span></td><td>${item.items.length}</td><td>${escapeHtml(item.processor)}</td><td>${new Date(item.created_at).toLocaleString("pt-BR")}</td></tr>
+    <tr><td>${escapeHtml(captureSourceLabels[item.source_type] || item.source_type)}${item.file_name ? `<br><small>${escapeHtml(item.file_name)}</small>` : ""}</td><td>${escapeHtml(captureTypeLabels[item.detected_type] || item.detected_type)}</td><td><span class="status-chip ${item.status === "confirmed" ? "ok" : item.status === "needs_input" || item.status === "queued" || item.status === "processing" ? "warn" : item.status === "failed" ? "danger" : "muted"}">${escapeHtml(captureStatusLabels[item.status] || item.status)}</span></td><td>${item.items.length}</td><td>${escapeHtml(item.processor)}</td><td>${new Date(item.created_at).toLocaleString("pt-BR")}</td></tr>
   `).join("") : emptyRow(6, "Nenhuma captura realizada");
 }
 
@@ -1971,7 +2015,11 @@ document.querySelector("#capture-form").addEventListener("submit", async (event)
     const capture = await api("/captures/preview", { method: "POST", body: data });
     renderCapturePreview(capture);
     await loadCapture();
-    toast(capture.items.length ? "Prévia pronta para conferência" : "A captura precisa de mais informações", !capture.items.length);
+    if (capture.status === "queued" || capture.status === "processing") {
+      toast("Recebido; processando OCR/áudio em segundo plano...");
+    } else {
+      toast(capture.items.length ? "Prévia pronta para conferência" : "A captura precisa de mais informações", !capture.items.length);
+    }
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -2012,6 +2060,23 @@ document.querySelector("#capture-confirm").addEventListener("click", async () =>
   } finally {
     button.disabled = false;
     button.textContent = "Confirmar itens selecionados";
+  }
+});
+
+document.querySelector("#capture-retry").addEventListener("click", async () => {
+  if (!state.captureDraft) return;
+  const button = document.querySelector("#capture-retry");
+  button.disabled = true;
+  button.textContent = "Reenviando...";
+  try {
+    const capture = await api(`/captures/${state.captureDraft.id}/retry`, { method: "POST" });
+    renderCapturePreview(capture);
+    await loadCapture();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Tentar novamente";
   }
 });
 
