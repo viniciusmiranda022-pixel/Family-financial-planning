@@ -34,6 +34,7 @@ import asyncio
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
@@ -51,6 +52,7 @@ from app.cli.capture_worker import reconcile_once  # noqa: E402
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import (  # noqa: E402
+    Account,
     CaptureDraft,
     CaptureProcessingJob,
     Document,
@@ -667,5 +669,498 @@ def test_duplicate_file_upload_is_rejected_before_any_second_job_is_queued(monke
         with _TestSessionLocal() as db:
             assert len(db.scalars(select(CaptureProcessingJob).where(CaptureProcessingJob.household_id == household_id)).all()) == 1
             assert len(db.scalars(select(Document).where(Document.household_id == household_id)).all()) == 1
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_concurrent_reclaim_of_a_stale_job_is_race_safe(monkeypatch) -> None:
+    """Review item 1: two reclaimers racing on the same *stale processing*
+    job (not a fresh `queued` one) must not both win. `status` alone does
+    not change across a reclaim (`processing` -> `processing`), so a CAS
+    predicate on `status` only would let a second reclaimer's `UPDATE ...
+    WHERE status = 'processing'` still match after the first reclaimer's
+    commit -- the persisted value never actually changed. `claim_capture_job`
+    must also pin `attempts` (which *does* change on every successful
+    claim) to the pre-image each caller observed.
+
+    A true concurrent race is simulated deterministically -- without real
+    threads, and without relying on `Session`/connection-pool caching
+    behavior that is an implementation detail, not a guarantee -- by
+    forcing worker B's own read to return a pinned, pre-claim snapshot
+    (`attempts=1`, the exact pre-image a truly concurrent reader would have
+    observed if its own SELECT executed before worker A's commit landed),
+    while worker B's actual CAS `UPDATE` still runs for real against the
+    already-committed row. This isolates exactly the property under test:
+    given that pre-image, does `claim_capture_job` build a `WHERE` clause
+    that only matches if nothing else has changed since?
+    """
+
+    _fake_ocr(monkeypatch)
+    client = _client()
+    try:
+        with client:
+            household_id = _setup_household(
+                client, household_name="Família Reclaim", username="admin-reclaim-1", password="senha-reclaim-segura-1"
+            )["household_id"]
+            _create_account(client)
+            with _TestSessionLocal() as db:
+                draft = CaptureDraft(
+                    household_id=household_id,
+                    source_type="image",
+                    detected_type="auto",
+                    status="processing",
+                    processor="pending",
+                    proposal_json="[]",
+                )
+                db.add(draft)
+                db.flush()
+                job = CaptureProcessingJob(
+                    household_id=household_id,
+                    capture_draft_id=draft.id,
+                    document_id=None,
+                    job_type="ocr",
+                    content_type="image/png",
+                    status="processing",
+                    attempts=1,
+                    max_attempts=5,
+                    started_at=datetime.now(UTC) - timedelta(seconds=900),
+                )
+                db.add(job)
+                db.commit()
+                job_id = job.id
+                pre_claim_started_at = job.started_at
+
+            with _TestSessionLocal() as db_a, _TestSessionLocal() as db_b:
+                claimed_a = capture_worker.claim_capture_job(
+                    db_a, job_id, worker_id="worker-a", stale_after_seconds=600
+                )
+                assert claimed_a is not None
+
+                # Pin worker B's read to the pre-claim snapshot it would
+                # have observed had its own SELECT run before A's commit.
+                stale_pre_image = SimpleNamespace(
+                    status="processing", attempts=1, started_at=pre_claim_started_at
+                )
+                monkeypatch.setattr(db_b, "get", lambda *a, **k: stale_pre_image)
+
+                claimed_b = capture_worker.claim_capture_job(
+                    db_b, job_id, worker_id="worker-b", stale_after_seconds=600
+                )
+                assert claimed_b is None  # must lose the reclaim race
+
+            with _TestSessionLocal() as db:
+                refreshed = db.get(CaptureProcessingJob, job_id)
+                assert refreshed.status == "processing"
+                assert refreshed.attempts == 2  # incremented exactly once
+                assert refreshed.claimed_by == "worker-a"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_late_cancellation_during_processing_is_not_resurrected_by_a_slow_worker(monkeypatch) -> None:
+    """Review item 3: a cancellation that lands *while* the worker is still
+    doing the heavy OCR/transcription work -- after the worker's own
+    early "already cancelled" check has already passed -- must still win.
+    The existing `test_cancelling_a_queued_capture_prevents_the_worker_from_resurrecting_it`
+    only covers a cancel that lands *before* the job is ever claimed; this
+    covers the real in-flight interleaving the PR itself flagged as an
+    open risk: the worker's eventual `completed` write must not resurrect
+    the draft, and must not silently replace `error_code="cancelled_by_user"`
+    with a processing outcome."""
+
+    client = _client()
+    try:
+        with client:
+            household_id = _setup_household(
+                client,
+                household_name="Família Corrida Cancelar",
+                username="admin-race-cancel-1",
+                password="senha-race-cancel-segura-1",
+            )["household_id"]
+            _create_account(client)
+
+            with _TestSessionLocal() as db:
+                draft = CaptureDraft(
+                    household_id=household_id,
+                    source_type="image",
+                    detected_type="auto",
+                    status="queued",
+                    processor="pending",
+                    proposal_json="[]",
+                )
+                db.add(draft)
+                db.flush()
+                job = capture_worker.create_capture_job(
+                    db,
+                    household_id=household_id,
+                    capture_draft_id=draft.id,
+                    document_id=None,
+                    job_type="ocr",
+                    content_type="image/png",
+                    max_attempts=3,
+                )
+                db.commit()
+                draft_id, job_id = draft.id, job.id
+
+            def _ocr_that_races_a_cancellation(filename, payload, content_type):
+                # Stands in for the household cancelling the draft while
+                # this (slow, already-in-flight) OCR call is still running
+                # -- the exact window review item 3 flagged. Calls the real
+                # `cancel_capture` route function directly (its own,
+                # independent DB session, exactly like a genuinely
+                # concurrent request would use) rather than re-implementing
+                # its mutations, but bypasses the TestClient/ASGI layer to
+                # avoid nesting a second live request inside the threadpool
+                # thread `run_in_threadpool` already runs this OCR call on.
+                with _TestSessionLocal() as cancel_db:
+                    household_user = cancel_db.scalar(
+                        select(User).where(User.household_id == household_id)
+                    )
+                    api_module.cancel_capture(draft_id, user=household_user, db=cancel_db)
+                return "Gastei R$ 45,00 no mercado hoje", "ocr_local"
+
+            monkeypatch.setattr(
+                smart_capture_module, "extract_document_text", _ocr_that_races_a_cancellation
+            )
+
+            with _TestSessionLocal() as db_worker:
+                claimed = capture_worker.claim_capture_job(
+                    db_worker, job_id, worker_id="worker-race-cancel", stale_after_seconds=600
+                )
+                assert claimed is not None
+                asyncio.run(
+                    api_module._process_claimed_capture_job(db_worker, claimed, payload=_png_bytes())
+                )
+
+            with _TestSessionLocal() as db:
+                draft = db.get(CaptureDraft, draft_id)
+                job = db.get(CaptureProcessingJob, job_id)
+                assert draft.status == "cancelled"  # not resurrected into "preview"
+                assert draft.proposal_json == "[]"  # no proposal written after all
+                assert job.status == "failed"
+                assert job.error_code == "cancelled_by_user"  # not overwritten to "completed"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_worker_fails_closed_when_job_household_disagrees_with_its_draft(monkeypatch) -> None:
+    """Review item 2: `capture_processing_jobs.household_id` and its
+    `capture_draft_id`'s own `household_id` are two independent FKs with no
+    constraint tying them together. If that ever drifted apart (corrupted/
+    inconsistent state), the worker must fail closed instead of silently
+    processing -- and must never write to the foreign draft it does not
+    actually own."""
+
+    _fake_ocr(monkeypatch)
+    client = _client()
+    try:
+        with client:
+            household_a = _setup_household(
+                client, household_name="Família Iso A", username="admin-iso-job-a", password="senha-iso-job-segura-a"
+            )["household_id"]
+            household_b = _setup_household(
+                client, household_name="Família Iso B", username="admin-iso-job-b", password="senha-iso-job-segura-b"
+            )["household_id"]
+
+            with _TestSessionLocal() as db:
+                draft = CaptureDraft(
+                    household_id=household_a,
+                    source_type="text",
+                    detected_type="auto",
+                    status="queued",
+                    processor="pending",
+                    proposal_json="[]",
+                )
+                db.add(draft)
+                db.flush()
+                # Deliberately corrupted: job claims household B while the
+                # draft it correlates to actually belongs to household A.
+                job = CaptureProcessingJob(
+                    household_id=household_b,
+                    capture_draft_id=draft.id,
+                    document_id=None,
+                    job_type="ocr",
+                    content_type="image/png",
+                    status="queued",
+                )
+                db.add(job)
+                db.commit()
+                draft_id, job_id = draft.id, job.id
+
+            with _TestSessionLocal() as db:
+                claimed = capture_worker.claim_capture_job(
+                    db, job_id, worker_id="worker-cross-household", stale_after_seconds=600
+                )
+                assert claimed is not None
+                asyncio.run(
+                    api_module._process_claimed_capture_job(db, claimed, payload=None)
+                )
+
+            with _TestSessionLocal() as db:
+                job = db.get(CaptureProcessingJob, job_id)
+                draft = db.get(CaptureDraft, draft_id)
+                assert job.status == "failed"
+                assert job.error_code == "cross_household_state"
+                # The foreign draft (household A's) must be untouched.
+                assert draft.status == "queued"
+                assert draft.proposal_json == "[]"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_worker_fails_closed_when_document_belongs_to_another_household(monkeypatch) -> None:
+    """Review item 2: same invariant as above, one hop further down --
+    `capture_processing_jobs.document_id` may point at a `documents` row
+    that does not belong to this job's own household. The worker must fail
+    closed without reading/decrypting that document, while still being
+    free to mark its *own* household's draft as failed."""
+
+    _fake_ocr(monkeypatch)
+    client = _client()
+    try:
+        with client:
+            household_b = _setup_household(
+                client, household_name="Família Iso Doc B", username="admin-iso-doc-b", password="senha-iso-doc-segura-b"
+            )["household_id"]
+            with _TestSessionLocal() as db:
+                foreign_document = Document(
+                    household_id=household_b,
+                    original_name="recibo-b.png",
+                    document_type="smart_capture",
+                    sha256="b" * 64,
+                    encrypted_path="ignored-for-this-test",
+                    status="capture_processing",
+                )
+                db.add(foreign_document)
+                db.commit()
+                foreign_document_id = foreign_document.id
+
+            household_a = _setup_household(
+                client, household_name="Família Iso Doc A", username="admin-iso-doc-a", password="senha-iso-doc-segura-a"
+            )["household_id"]
+            with _TestSessionLocal() as db:
+                draft = CaptureDraft(
+                    household_id=household_a,
+                    source_type="image",
+                    detected_type="auto",
+                    status="queued",
+                    processor="pending",
+                    proposal_json="[]",
+                )
+                db.add(draft)
+                db.flush()
+                job = CaptureProcessingJob(
+                    household_id=household_a,
+                    capture_draft_id=draft.id,
+                    document_id=foreign_document_id,  # belongs to household B
+                    job_type="ocr",
+                    content_type="image/png",
+                    status="queued",
+                )
+                db.add(job)
+                db.commit()
+                draft_id, job_id = draft.id, job.id
+
+            with _TestSessionLocal() as db:
+                claimed = capture_worker.claim_capture_job(
+                    db, job_id, worker_id="worker-cross-household-doc", stale_after_seconds=600
+                )
+                assert claimed is not None
+                asyncio.run(
+                    api_module._process_claimed_capture_job(db, claimed, payload=None)
+                )
+
+            with _TestSessionLocal() as db:
+                job = db.get(CaptureProcessingJob, job_id)
+                draft = db.get(CaptureDraft, draft_id)
+                document = db.get(Document, foreign_document_id)
+                assert job.status == "failed"
+                assert job.error_code == "cross_household_state"
+                assert draft.status == "failed"  # our own draft: allowed to mark failed
+                assert document.status == "capture_processing"  # foreign document: untouched
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_worker_fails_closed_when_account_or_user_belongs_to_another_household(monkeypatch) -> None:
+    """Review item 2, the remaining two correlations: `documents.account_id`
+    and `capture_drafts.user_id` may also point outside this job's own
+    household. Covers both in one pass (account first, then user, on two
+    independent jobs) since both take the same fail-closed path."""
+
+    _fake_ocr(monkeypatch)
+    client = _client()
+    try:
+        with client:
+            household_b = _setup_household(
+                client, household_name="Família Iso Acc B", username="admin-iso-acc-b", password="senha-iso-acc-segura-b"
+            )["household_id"]
+            foreign_account = _create_account(client)
+            with _TestSessionLocal() as db:
+                foreign_user = db.scalar(select(User).where(User.household_id == household_b))
+                foreign_user_id = foreign_user.id
+
+            household_a = _setup_household(
+                client, household_name="Família Iso Acc A", username="admin-iso-acc-a", password="senha-iso-acc-segura-a"
+            )["household_id"]
+            _create_account(client)
+
+            # -- Case 1: document.account_id points at household B's account. --
+            with _TestSessionLocal() as db:
+                document = Document(
+                    household_id=household_a,
+                    account_id=foreign_account["id"],
+                    original_name="recibo-acc.png",
+                    document_type="smart_capture",
+                    sha256="c" * 64,
+                    encrypted_path="ignored-for-this-test",
+                    status="capture_processing",
+                )
+                db.add(document)
+                db.flush()
+                draft = CaptureDraft(
+                    household_id=household_a,
+                    document_id=document.id,
+                    source_type="image",
+                    detected_type="auto",
+                    status="queued",
+                    processor="pending",
+                    proposal_json="[]",
+                )
+                db.add(draft)
+                db.flush()
+                job = CaptureProcessingJob(
+                    household_id=household_a,
+                    capture_draft_id=draft.id,
+                    document_id=document.id,
+                    job_type="ocr",
+                    content_type="image/png",
+                    status="queued",
+                )
+                db.add(job)
+                db.commit()
+                document_id, job_id = document.id, job.id
+
+            with _TestSessionLocal() as db:
+                claimed = capture_worker.claim_capture_job(
+                    db, job_id, worker_id="worker-cross-household-acc", stale_after_seconds=600
+                )
+                assert claimed is not None
+                asyncio.run(api_module._process_claimed_capture_job(db, claimed, payload=None))
+
+            with _TestSessionLocal() as db:
+                job = db.get(CaptureProcessingJob, job_id)
+                document = db.get(Document, document_id)
+                account = db.get(Account, foreign_account["id"])
+                assert job.status == "failed"
+                assert job.error_code == "cross_household_state"
+                assert document.status == "capture_failed"  # our own document: allowed
+                assert account.household_id == household_b  # foreign account untouched/unread
+
+            # -- Case 2: capture_draft.user_id points at household B's user. --
+            with _TestSessionLocal() as db:
+                draft2 = CaptureDraft(
+                    household_id=household_a,
+                    user_id=foreign_user_id,
+                    source_type="text",
+                    detected_type="auto",
+                    status="queued",
+                    processor="pending",
+                    proposal_json="[]",
+                )
+                db.add(draft2)
+                db.flush()
+                job2 = CaptureProcessingJob(
+                    household_id=household_a,
+                    capture_draft_id=draft2.id,
+                    document_id=None,
+                    job_type="ocr",
+                    content_type="image/png",
+                    status="queued",
+                )
+                db.add(job2)
+                db.commit()
+                draft2_id, job2_id = draft2.id, job2.id
+
+            with _TestSessionLocal() as db:
+                claimed2 = capture_worker.claim_capture_job(
+                    db, job2_id, worker_id="worker-cross-household-user", stale_after_seconds=600
+                )
+                assert claimed2 is not None
+                asyncio.run(api_module._process_claimed_capture_job(db, claimed2, payload=None))
+
+            with _TestSessionLocal() as db:
+                job2 = db.get(CaptureProcessingJob, job2_id)
+                draft2 = db.get(CaptureDraft, draft2_id)
+                assert job2.status == "failed"
+                assert job2.error_code == "cross_household_state"
+                assert draft2.status == "failed"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_retry_is_refused_for_a_cancelled_capture(monkeypatch) -> None:
+    """`cancel_capture` marks an in-flight job `"failed"` with
+    `error_code="cancelled_by_user"` -- its own honest terminal state --
+    which means `job.status == "failed"` alone cannot tell `/retry` apart
+    from a genuinely failed job. Without checking the draft's own status,
+    `/retry` would be a second, user-triggered path to resurrect a
+    cancelled capture (besides the worker race the atomic finalize above
+    already closes)."""
+
+    _fake_ocr(monkeypatch)
+    client = _client()
+    try:
+        with client:
+            household_id = _setup_household(
+                client, household_name="Família Retry Cancelado", username="admin-retry-cancel-1", password="senha-retry-cancel-segura-1"
+            )["household_id"]
+            _create_account(client)
+            # Manually enqueue a job still `queued` (never claimed) --
+            # mirrors `test_cancelling_a_queued_capture_prevents_the_worker_from_resurrecting_it` --
+            # so cancelling it lands `job.status == "failed"` for the same
+            # reason a genuinely failed job would: without checking the
+            # draft's own status, `/retry`'s `job.status != "failed"` guard
+            # alone cannot tell the two apart.
+            with _TestSessionLocal() as db:
+                draft = CaptureDraft(
+                    household_id=household_id,
+                    source_type="image",
+                    detected_type="auto",
+                    status="queued",
+                    processor="pending",
+                    proposal_json="[]",
+                )
+                db.add(draft)
+                db.flush()
+                capture_worker.create_capture_job(
+                    db,
+                    household_id=household_id,
+                    capture_draft_id=draft.id,
+                    document_id=None,
+                    job_type="ocr",
+                    content_type="image/png",
+                    max_attempts=3,
+                )
+                db.commit()
+                capture_id = draft.id
+
+            cancel_response = client.delete(f"/api/captures/{capture_id}")
+            assert cancel_response.status_code == 200
+
+            with _TestSessionLocal() as db:
+                job = db.get(CaptureDraft, capture_id).processing_job
+                assert job.status == "failed"
+                assert job.error_code == "cancelled_by_user"
+
+            retry_response = client.post(f"/api/captures/{capture_id}/retry")
+            assert retry_response.status_code == 409
+            assert "cancelad" in retry_response.json()["detail"].casefold()
+
+            with _TestSessionLocal() as db:
+                draft = db.get(CaptureDraft, capture_id)
+                job = db.get(CaptureProcessingJob, job.id)
+                assert draft.status == "cancelled"  # unchanged -- retry never revived it
+                assert job.status == "failed"  # unchanged -- never moved back to "queued"
     finally:
         app.dependency_overrides.clear()
