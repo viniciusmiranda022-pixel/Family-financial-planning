@@ -598,6 +598,103 @@ def test_exhausted_stale_job_never_mutates_a_cross_household_draft_or_document()
         assert foreign_document.status == "capture_processing"
 
 
+def test_exhausted_reconciler_never_overwrites_a_worker_that_finalized_first(monkeypatch) -> None:
+    """Third BLOQUEIO DE MERGE pass: `fail_exhausted_stale_jobs` used to
+    resolve its own stuck/exhausted job with `mark_job_failed` mutating a
+    loaded ORM row, which SQLAlchemy flushes as an unconditional
+    `UPDATE ... WHERE id = :id` -- no predicate on the `status`/`attempts`
+    lease it observed. Interleaving this proves is real: the reconciler
+    reads a job as `processing`, stale, and exhausted (`attempts ==
+    max_attempts`); before its own write commits, that job's *actual*
+    owner -- alive, just slow, not actually crashed -- finishes and calls
+    `finalize_capture_job` for the exact attempt it legitimately claimed,
+    winning cleanly because nothing else has touched the row yet. The
+    reconciler's later write must then lose (same CAS discipline
+    `claim_capture_job`/`finalize_capture_job` already use elsewhere) and
+    leave the worker's `completed` job, and the draft/document it wrote,
+    completely untouched -- not overwritten back to `failed`."""
+
+    with _TestSessionLocal() as db:
+        household = Household(name="Família Corrida Esgotada")
+        db.add(household)
+        db.flush()
+        draft = CaptureDraft(
+            household_id=household.id,
+            source_type="image",
+            detected_type="auto",
+            status="processing",
+            processor="pending",
+            proposal_json="[]",
+        )
+        db.add(draft)
+        db.flush()
+        document = Document(
+            household_id=household.id,
+            original_name="recibo-corrida.png",
+            document_type="smart_capture",
+            sha256="e" * 64,
+            encrypted_path="ignored-for-this-test",
+            status="capture_processing",
+        )
+        db.add(document)
+        db.flush()
+        job = CaptureProcessingJob(
+            household_id=household.id,
+            capture_draft_id=draft.id,
+            document_id=document.id,
+            job_type="ocr",
+            content_type="image/png",
+            status="processing",
+            attempts=3,
+            max_attempts=3,
+            started_at=datetime.now(UTC) - timedelta(seconds=900),
+        )
+        db.add(job)
+        db.commit()
+        job_id, draft_id, document_id = job.id, draft.id, document.id
+
+    real_finalize = capture_worker.finalize_capture_job
+    calls = 0
+
+    def _finalize_that_lets_the_real_owner_win_first(db_arg, job_id_arg, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # The job's real, still-alive owner finishes its (legitimate,
+            # attempt-3) work and finalizes for real, in its own
+            # independently committed transaction, before the
+            # reconciler's own CAS write below ever runs.
+            with _TestSessionLocal() as worker_db:
+                won = real_finalize(
+                    worker_db, job_id_arg, status="completed", claimed_attempt=3, duration_ms=1234
+                )
+                assert won is True
+                worker_db.commit()
+        return real_finalize(db_arg, job_id_arg, **kwargs)
+
+    monkeypatch.setattr(capture_worker, "finalize_capture_job", _finalize_that_lets_the_real_owner_win_first)
+
+    with _TestSessionLocal() as db:
+        failed_count = capture_worker.fail_exhausted_stale_jobs(db, stale_after_seconds=600)
+        db.commit()
+    # The reconciler's CAS lost the race -- it must not count this job as
+    # one it failed.
+    assert failed_count == 0
+
+    with _TestSessionLocal() as db:
+        job = db.get(CaptureProcessingJob, job_id)
+        draft = db.get(CaptureDraft, draft_id)
+        document = db.get(Document, document_id)
+        # The worker's legitimate terminal state stands, completely
+        # undisturbed by the reconciler's lost attempt to fail it for
+        # exhaustion.
+        assert job.status == "completed"
+        assert job.error_code is None
+        assert job.duration_ms == 1234
+        assert draft.status == "processing"  # never overwritten to "failed"
+        assert document.status == "capture_processing"  # never overwritten to "capture_failed"
+
+
 def test_household_isolation_on_capture_and_job_endpoints(monkeypatch) -> None:
     _fake_ocr(monkeypatch)
     client = _client()

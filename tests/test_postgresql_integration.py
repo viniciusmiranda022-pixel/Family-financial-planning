@@ -753,3 +753,129 @@ def test_capture_job_finalize_cas_is_race_safe_on_real_postgresql() -> None:
             assert refreshed.status == "completed"
     finally:
         engine.dispose()
+
+
+def test_exhausted_reconciler_cas_is_race_safe_on_real_postgresql() -> None:
+    """`docs/WORK_ORDER_ASYNC_OCR_AUDIO_WORKER.md` review (third BLOQUEIO
+    DE MERGE pass): `app.services.capture_worker.fail_exhausted_stale_jobs`
+    now finalizes an exhausted/stale job through the same `finalize_capture_job`
+    `(status='processing', attempts=:claimed_attempt)` compare-and-swap the
+    normal completion/cancellation paths already use, instead of an
+    unconditional `UPDATE ... WHERE id = :id`. This proves that CAS holds
+    under real PostgreSQL row-level locking, not just the SQLite unit
+    coverage (`test_exhausted_reconciler_never_overwrites_a_worker_that_finalized_first`
+    in `tests/test_async_capture_worker.py`, which simulates the
+    interleaving via a monkeypatch injection point rather than genuinely
+    overlapping transactions/connections).
+
+    Two real, concurrent connections: the job's actual (slow, not crashed)
+    worker finalizes its exhausted attempt on one connection but
+    deliberately holds the transaction open before commit; a second,
+    fully concurrent connection runs the crash-recovery reconciler
+    (`fail_exhausted_stale_jobs`), which must block on PostgreSQL's row
+    lock for that same job, then -- once the worker commits -- observe the
+    now-`completed` row and lose its own CAS instead of overwriting it
+    back to `failed`.
+    """
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as setup_db:
+            household = Household(name="Família Corrida Esgotada PostgreSQL")
+            setup_db.add(household)
+            setup_db.flush()
+            draft = CaptureDraft(
+                household_id=household.id,
+                source_type="image",
+                detected_type="auto",
+                status="processing",
+                processor="pending",
+                proposal_json="[]",
+            )
+            setup_db.add(draft)
+            setup_db.flush()
+            document = Document(
+                household_id=household.id,
+                original_name="recibo-corrida-pg.png",
+                document_type="smart_capture",
+                sha256="f" * 64,
+                encrypted_path="ignored-for-this-test",
+                status="capture_processing",
+            )
+            setup_db.add(document)
+            setup_db.flush()
+            job = CaptureProcessingJob(
+                household_id=household.id,
+                capture_draft_id=draft.id,
+                document_id=document.id,
+                job_type="ocr",
+                content_type="image/png",
+                status="processing",
+                attempts=3,
+                max_attempts=3,
+                started_at=datetime.now(UTC) - timedelta(seconds=900),
+            )
+            setup_db.add(job)
+            setup_db.commit()
+            job_id, draft_id, document_id = job.id, draft.id, document.id
+
+        reconciler_done = threading.Event()
+        reconciler_error: list[BaseException] = []
+        reconciler_result: list[int] = []
+
+        def _reconciler_attempt() -> None:
+            try:
+                reconciler_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(reconciler_engine) as reconciler_db:
+                    failed_count = capture_worker.fail_exhausted_stale_jobs(
+                        reconciler_db, stale_after_seconds=600
+                    )
+                    reconciler_db.commit()
+                    reconciler_result.append(failed_count)
+                reconciler_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001 - surfaced via assertion below
+                reconciler_error.append(exc)
+            finally:
+                reconciler_done.set()
+
+        with Session(engine) as worker_db:
+            won = capture_worker.finalize_capture_job(
+                worker_db, job_id, status="completed", claimed_attempt=3, duration_ms=1234
+            )
+            assert won is True
+            # Deliberately do not commit yet: the reconciler's own
+            # `finalize_capture_job` UPDATE for this same job must block on
+            # PostgreSQL's row-level write lock for as long as this
+            # transaction stays open.
+            worker = threading.Thread(target=_reconciler_attempt, daemon=True)
+            worker.start()
+            still_blocked = not reconciler_done.wait(timeout=1.0)
+            assert still_blocked, (
+                "reconciler completed before the worker's transaction "
+                "committed -- the row lock is not actually serializing"
+            )
+            worker_db.commit()
+
+        assert reconciler_done.wait(timeout=10.0), "reconciler never finished"
+        if reconciler_error:
+            raise reconciler_error[0]
+        # The reconciler's CAS must have lost the race -- it must not count
+        # this job as one it failed.
+        assert reconciler_result == [0]
+
+        with Session(engine) as verify_db:
+            job_row = verify_db.get(CaptureProcessingJob, job_id)
+            draft_row = verify_db.get(CaptureDraft, draft_id)
+            document_row = verify_db.get(Document, document_id)
+            # The worker's legitimate terminal state stands, completely
+            # undisturbed by the reconciler's lost attempt to fail it for
+            # exhaustion.
+            assert job_row.status == "completed"
+            assert job_row.error_code is None
+            assert job_row.duration_ms == 1234
+            assert draft_row.status == "processing"  # never overwritten to "failed"
+            assert document_row.status == "capture_processing"  # never overwritten
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
