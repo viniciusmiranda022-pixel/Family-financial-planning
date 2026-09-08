@@ -10,6 +10,15 @@ const state = {
   captureAudio: null,
   captureRecorder: null,
   advisorHistory: [],
+  // Draft-only, client-side: the actual price/entrada/parcelas/juros inputs
+  // for `POST /purchases/scenario-comparison`. Never a computed financial
+  // value -- every number this feature shows comes back from that endpoint
+  // (`docs/WORK_ORDER_PURCHASE_SCENARIO_COMPARISON.md`: "sem cálculo
+  // financeiro paralelo no navegador").
+  scenarioAlternatives: [
+    { label: "À vista", price: "", down_payment: "0", installment_count: "1", monthly_interest_rate_percent: "0", purchase_month: "" },
+    { label: "Parcelado", price: "", down_payment: "0", installment_count: "10", monthly_interest_rate_percent: "0", purchase_month: "" },
+  ],
 };
 const money = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
 const compactMoney = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", notation: "compact", maximumFractionDigits: 1 });
@@ -1091,6 +1100,103 @@ async function loadForecast() {
     catch (error) { toast(error.message, true); }
   }));
   drawForecast(data.rows, data.summary.emergency_floor);
+  renderScenarioAlternativesForm();
+}
+
+// Comparação visual de cenários de compra (Fase 3,
+// `docs/WORK_ORDER_PURCHASE_SCENARIO_COMPARISON.md`). Every number rendered
+// here comes straight from `POST /purchases/scenario-comparison`'s response
+// -- this file only formats/echoes values already computed by the canonical
+// Projection Engine/Validator on the backend. No balance, deficit, floor,
+// installment or interest math is ever performed in this module for this
+// feature; `monthly_interest_rate_percent` below is a pure display/unit
+// convenience (percent in the form, decimal fraction in the request body).
+function renderScenarioAlternativesForm() {
+  const container = document.querySelector("#scenario-alternatives-form");
+  if (!container) return;
+  container.innerHTML = state.scenarioAlternatives.map((item, index) => `
+    <article class="scenario-alternative-card" data-index="${index}">
+      <div class="panel-heading">
+        <strong>Alternativa ${index + 1}</strong>
+        ${state.scenarioAlternatives.length > 2 ? `<button class="text-action scenario-remove-alternative" type="button" data-index="${index}">Remover</button>` : ""}
+      </div>
+      <div class="form-grid three">
+        <label>Rótulo<input data-field="label" maxlength="80" value="${escapeHtml(item.label)}" placeholder="Ex.: À vista"></label>
+        <label>Preço<input data-field="price" type="number" min="0.01" step="0.01" value="${escapeHtml(item.price)}"></label>
+        <label>Entrada<input data-field="down_payment" type="number" min="0" step="0.01" value="${escapeHtml(item.down_payment)}"></label>
+        <label>Parcelas<input data-field="installment_count" type="number" min="1" max="120" value="${escapeHtml(item.installment_count)}"></label>
+        <label>Juros mensal (%)<input data-field="monthly_interest_rate_percent" type="number" min="0" max="30" step="0.01" value="${escapeHtml(item.monthly_interest_rate_percent)}"></label>
+        <label>Mês da compra<input data-field="purchase_month" type="month" value="${escapeHtml(item.purchase_month)}"><small>Padrão: próximo mês da projeção</small></label>
+      </div>
+    </article>
+  `).join("");
+  container.querySelectorAll("input[data-field]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const index = Number(input.closest(".scenario-alternative-card").dataset.index);
+      state.scenarioAlternatives[index][input.dataset.field] = input.value;
+    });
+  });
+  container.querySelectorAll(".scenario-remove-alternative").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.scenarioAlternatives.splice(Number(button.dataset.index), 1);
+      renderScenarioAlternativesForm();
+    });
+  });
+}
+
+function scenarioTrustBadge(result) {
+  if (!result.trusted_for_projection) {
+    return `<span class="status-chip warn">Projeção ${escapeHtml(result.integrity_status)}</span>`;
+  }
+  return `<span class="status-chip ok">Projeção confiável</span>`;
+}
+
+function renderScenarioComparisonResults(data) {
+  const container = document.querySelector("#scenario-comparison-results");
+  const baselineTrust = data.baseline.trusted_for_projection ? "confiável" : `${data.baseline.integrity_status} (não confiável)`;
+  const rows = data.alternatives.map((alternative) => `
+    <tr>
+      <td><strong>${escapeHtml(alternative.label)}</strong></td>
+      <td class="right">${money.format(alternative.monthly_payment)}</td>
+      <td class="right">${money.format(alternative.total_purchase_cost)}</td>
+      <td class="right ${alternative.scenarios.delayed.minimum_balance < data.emergency_floor ? "amount-expense" : "amount-income"}">${money.format(alternative.scenarios.delayed.minimum_balance)}</td>
+      <td class="right ${alternative.scenarios.delayed.maximum_uncovered_deficit > 0 ? "amount-expense" : ""}">${money.format(alternative.scenarios.delayed.maximum_uncovered_deficit)}</td>
+      <td class="right">${money.format(alternative.scenarios.delayed.minimum_distance_to_floor)}</td>
+      <td>${alternative.viable ? '<span class="status-chip ok">Viável</span>' : '<span class="status-chip danger">Revisar</span>'}</td>
+      <td>${scenarioTrustBadge(alternative)}</td>
+    </tr>
+  `).join("");
+  container.innerHTML = `
+    <p class="scenario-comparison-summary">Referência sem esta compra (cenário conservador atual): menor saldo projetado ${money.format(data.baseline.scenarios.delayed.minimum_balance)}; projeção ${escapeHtml(baselineTrust)}.</p>
+    <div class="table-wrap wide"><table>
+      <thead><tr><th>Alternativa</th><th class="right">Parcela</th><th class="right">Custo total</th><th class="right">Menor saldo (conservador)</th><th class="right">Maior déficit descoberto</th><th class="right">Distância do piso</th><th>Viabilidade</th><th>Confiabilidade</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+  `;
+}
+
+async function compareScenarios() {
+  const errorBox = document.querySelector("#scenario-comparison-error");
+  errorBox.classList.add("hidden");
+  document.querySelector("#scenario-comparison-results").innerHTML = "";
+  const alternatives = state.scenarioAlternatives.map((item) => {
+    const payload = {
+      label: item.label || "",
+      price: Number(item.price || 0),
+      down_payment: Number(item.down_payment || 0),
+      installment_count: Number(item.installment_count || 1),
+      monthly_interest_rate: Number(item.monthly_interest_rate_percent || 0) / 100,
+    };
+    if (item.purchase_month) payload.purchase_month = item.purchase_month;
+    return payload;
+  });
+  try {
+    const data = await api("/purchases/scenario-comparison", { method: "POST", body: JSON.stringify({ alternatives }) });
+    renderScenarioComparisonResults(data);
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.classList.remove("hidden");
+  }
 }
 
 const captureSourceLabels = { text: "Texto", audio: "Áudio", image: "Imagem", document: "Documento" };
@@ -2335,6 +2441,19 @@ document.querySelector("#obligation-form").addEventListener("submit", async (eve
   try { await api("/obligations", { method: "POST", body: JSON.stringify(formJson(event.target, ["amount", "recurrence_months", "occurrence_count"])) }); event.target.reset(); event.target.elements.recurrence_months.value = "0"; event.target.elements.occurrence_count.value = "1"; await loadForecast(); toast("Compromisso incluído na projeção"); }
   catch (error) { toast(error.message, true); }
 });
+document.querySelector("#scenario-add-alternative").addEventListener("click", () => {
+  if (state.scenarioAlternatives.length >= 5) { toast("Máximo de 5 alternativas por comparação"); return; }
+  state.scenarioAlternatives.push({
+    label: `Alternativa ${state.scenarioAlternatives.length + 1}`,
+    price: "",
+    down_payment: "0",
+    installment_count: "1",
+    monthly_interest_rate_percent: "0",
+    purchase_month: "",
+  });
+  renderScenarioAlternativesForm();
+});
+document.querySelector("#scenario-compare").addEventListener("click", () => compareScenarios());
 document.querySelector("#user-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const payload = formJson(event.target);
