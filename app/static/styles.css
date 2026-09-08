@@ -80,6 +80,13 @@ input:focus, select:focus, textarea:focus { border-color: var(--teal); box-shado
 .topbar h1 { margin: 2px 0 0; font-size: 29px; letter-spacing: -.03em; }
 .privacy-chip { display: flex; align-items: center; gap: 9px; padding: 9px 13px; border-radius: 999px; background: white; color: var(--muted); box-shadow: 0 3px 10px rgba(16,42,67,.06); font-size: 12px; font-weight: 700; }
 .privacy-chip span { width: 8px; height: 8px; border-radius: 50%; background: #23a36d; box-shadow: 0 0 0 4px rgba(35,163,109,.12); }
+.topbar-actions { display: flex; align-items: center; gap: 12px; }
+.due-notifications { position: relative; }
+.due-notifications-toggle { position: relative; display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--line); border-radius: 999px; background: white; font-size: 18px; box-shadow: 0 3px 10px rgba(16,42,67,.06); }
+.due-notifications-toggle .badge { position: absolute; top: -4px; right: -4px; min-width: 18px; height: 18px; margin-left: 0; padding: 0 4px; font-size: 10px; line-height: 18px; }
+.due-notifications-panel { position: absolute; top: calc(100% + 10px); right: 0; width: min(320px, calc(100vw - 24px)); max-height: 380px; overflow-y: auto; display: grid; gap: 10px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: white; box-shadow: var(--shadow); z-index: 40; }
+.due-notifications-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.due-notifications-panel .obligation-alert { padding: 10px 12px; }
 .view { display: none; animation: reveal .18s ease; }
 .view.active { display: block; }
 @keyframes reveal { from { opacity: .3; transform: translateY(4px); } to { opacity: 1; transform: none; } }
@@ -438,6 +445,7 @@ tr:last-child td { border-bottom: 0; }
   .content { width: 100%; min-width: 0; padding: 0 12px calc(32px + env(safe-area-inset-bottom)); }
   .topbar { min-height: 86px; align-items: flex-start; flex-direction: column; justify-content: center; gap: 6px; }
   .topbar h1 { font-size: 25px; }
+  .topbar-actions { align-self: flex-end; }
   .view, .panel, .two-column, .capture-layout, .advisor-layout { width: 100%; min-width: 0; max-width: 100%; }
   .panel { margin-bottom: 12px; padding: 16px; border-radius: 13px; }
   .panel-heading { align-items: stretch; flex-direction: column; gap: 11px; margin-bottom: 14px; }

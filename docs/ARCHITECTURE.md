@@ -314,6 +314,45 @@ em vez de silenciosamente não aparecer na projeção. O frontend (`view-plannin
 cenários de compra") só reformata a resposta desta rota; não existe fórmula financeira paralela em
 `app/static/app.js` para esta funcionalidade (ver `tests/test_purchase_scenario_comparison_frontend.py`).
 
+## Notificações de vencimento no navegador (Fase 3)
+
+`docs/WORK_ORDER_BROWSER_DUE_NOTIFICATIONS.md`. Este slice não introduz nenhuma rota, tabela,
+migração ou coluna nova: o módulo em `app/static/app.js` (funções `checkDueNotifications`,
+`renderDueNotificationsPanel`, `fireDueNotification`, etc.) apenas reutiliza `GET /obligations`
+(`app/api.py::obligations` → `_obligation_rows`), a mesma função canônica, autenticada e isolada por
+família que já alimenta a tabela de "Planejamento" e o painel "Obrigações próximas do vencimento" do
+dashboard. Nenhuma data, recorrência, parcela, projeção, juros, saldo, piso ou classificação é
+recalculada no navegador: o único critério usado no cliente é a pertença categórica ao
+`alert_level` que o backend já calculou (`overdue`/`urgent`/`soon`/`scheduled`), nunca uma diferença
+de datas refeita em JavaScript. O sino no topo da aplicação (`#due-notifications-toggle`/`#due-
+notifications-panel`) sempre mostra essa lista (janela de 30 dias, mesmo recorte do painel do
+dashboard) como superfície interna sempre disponível; a API `Notification` do navegador é uma camada
+opcional por cima dela, reservada aos itens `urgent`/`overdue` (últimos 7 dias e atrasados). Como o
+canal nativo do sistema operacional (central de notificações/lock screen do dispositivo) fica fora
+da superfície autenticada da aplicação, seu título e corpo são deliberadamente genéricos -- nunca o
+nome do compromisso, o valor ou o rótulo com contagem de dias (`dueNotificationBody`, `fireDueNotification`);
+somente o painel interno autenticado mostra esses detalhes.
+
+A permissão do navegador só é solicitada por clique explícito (`enableDueNotifications`, nunca
+chamada a partir de `bootstrap()`/`showApp()`); `Notification` indisponível, permissão `denied` ou
+uma chamada que lance exceção degradam para o painel interno sem quebrar a aplicação --
+`checkDueNotifications` nunca deixa uma falha de rede ou de permissão se propagar como erro da UI. O
+estado "ativado/desativado" e a lista de alertas já disparados (`localStorage`, chaves
+`ffp:due-notifications:*:<user.id>`, nunca `household_id` -- que a API nunca expõe ao navegador) só
+existem no navegador do usuário: nunca é enviado ao backend, nunca é um fato financeiro e nunca
+persiste em `Obligation` ou qualquer outra entidade. A chave de deduplicação
+(`id:next_due_date:alert_level`) evita notificar duas vezes o mesmo fato na mesma janela no mesmo
+cliente, mas ainda assim renotifica quando uma ocorrência recorrente cruza para um `alert_level` mais
+urgente -- nunca uma segunda política de agenda, apenas leitura categórica do que o backend já
+publica.
+
+Faturas de cartão (`GET /card-payment-reconciliations/invoices`) são deliberadamente excluídas desta
+superfície: `CardInvoiceObligation` (`app/services/card_payment_reconciliation.py`) documenta que
+nenhum parser grava a data impressa de "VENCIMENTO" da fatura, então um vencimento de fatura aqui
+seria um fato fabricado -- o Work Order proíbe exatamente isso ("não inferir vencimentos
+inexistentes"). Somente `Obligation` (campo `due_date` obrigatório, sem valor nulo) alimenta esta
+funcionalidade.
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila

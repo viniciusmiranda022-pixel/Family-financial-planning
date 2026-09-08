@@ -83,7 +83,22 @@
       </div>
       <header class="topbar">
         <div><p class="eyebrow">PLANEJAMENTO FINANCEIRO FAMILIAR</p><h1 id="page-title">Visão geral</h1></div>
-        <div class="privacy-chip"><span></span> Dados no servidor local</div>
+        <div class="topbar-actions">
+          <div class="due-notifications">
+            <button id="due-notifications-toggle" class="due-notifications-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Vencimentos próximos">
+              <span aria-hidden="true">🔔</span>
+              <b id="due-notifications-count" class="badge hidden">0</b>
+            </button>
+            <div id="due-notifications-panel" class="due-notifications-panel hidden" role="menu">
+              <div class="due-notifications-panel-heading">
+                <strong>Vencimentos próximos</strong>
+                <button data-go="settings" class="text-button">Notificações</button>
+              </div>
+              <div id="due-notifications-list"></div>
+            </div>
+          </div>
+          <div class="privacy-chip"><span></span> Dados no servidor local</div>
+        </div>
       </header>
 
       <section id="view-dashboard" class="view active">
@@ -634,6 +649,15 @@
             <div class="form-action"><button class="primary" type="submit">Salvar premissas</button></div>
           </form>
           <div class="security-note"><strong>Como o Privilège DI funciona no sistema</strong><p>Ele é a conta central de liquidez da família: recebe a sobra do mês e cobre o déficit quando salário e outras receitas não bastam. Se o déficit superar o saldo, o Privilège zera e o restante aparece como dívida sem cobertura. O piso é uma meta de alerta, não dinheiro bloqueado.</p></div>
+        </article>
+        <article class="panel settings-panel" id="due-notifications-settings">
+          <div class="panel-heading"><div><span class="step-label">ALERTAS LOCAIS</span><h2>Notificações de vencimento no navegador</h2></div></div>
+          <p class="muted-copy">Avisos informativos sobre compromissos já cadastrados (o mesmo cálculo de vencimento usado em "Planejamento"). Nada é pago, criado, reclassificado ou conciliado automaticamente — é só um lembrete deste navegador.</p>
+          <div id="due-notifications-status" class="security-note"></div>
+          <div class="form-action">
+            <button id="due-notifications-enable" class="primary" type="button">Ativar notificações no navegador</button>
+            <button id="due-notifications-disable" class="secondary hidden" type="button">Desativar neste navegador</button>
+          </div>
         </article>
       </section>
     </main>

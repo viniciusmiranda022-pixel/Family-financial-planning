@@ -4,6 +4,7 @@ const state = {
   categories: [],
   forecast: [],
   forecastFloor: 0,
+  dueNotificationsTimer: null,
   report: null,
   dashboard: null,
   captureDraft: null,
@@ -188,6 +189,7 @@ async function showApp() {
   await Promise.all([loadAccounts(), loadCategories()]);
   await navigate("dashboard");
   if (integrityUiEnabled()) await refreshIntegrityBanner();
+  initDueNotifications();
 }
 
 async function bootstrap() {
@@ -1077,6 +1079,7 @@ async function loadProfile() {
   const profile = await api("/profile");
   const form = document.querySelector("#profile-form");
   Object.entries(profile).forEach(([key, value]) => { if (form.elements[key] && value !== null) form.elements[key].value = value; });
+  renderDueNotificationsSettings();
 }
 
 async function loadForecast() {
@@ -1101,6 +1104,215 @@ async function loadForecast() {
   }));
   drawForecast(data.rows, data.summary.emergency_floor);
   renderScenarioAlternativesForm();
+  renderDueNotificationsPanel(obligations);
+}
+
+// Notificações de vencimento no navegador (Fase 3,
+// `docs/WORK_ORDER_BROWSER_DUE_NOTIFICATIONS.md`). This module never derives
+// a due date, recurrence, installment, amount or alert level itself -- every
+// item it shows or notifies about is `GET /obligations`'s response verbatim,
+// the exact same canonical, already-tested `_obligation_rows()` the
+// "Planejamento" table and the dashboard's "Obrigações próximas do
+// vencimento" panel already consume (`app/api.py`). The only comparisons
+// here are against the categorical `alert_level` the backend already
+// computed (`overdue`/`urgent`/`soon`/`scheduled`) -- never a recomputed day
+// count or date arithmetic. Enabling native browser notifications requires
+// an explicit click (`enableDueNotifications`, wired to a button, never
+// called from `bootstrap()`/`showApp()` automatically); a denied/revoked
+// permission, an unsupported browser or a thrown `Notification` call all
+// degrade to the always-rendered internal panel (`due-notifications-panel`)
+// instead of breaking the app. Nothing here mutates `Obligation` or any
+// other financial entity -- it only reads `/obligations` and writes a
+// per-browser "already shown" list to `localStorage`, never a financial
+// fact, never sent to the backend. The native `Notification`'s title/body
+// (`fireDueNotification`/`dueNotificationBody`) are deliberately generic --
+// never the obligation's name, amount or day-count label -- because that
+// surface (lock screen / OS notification center) sits outside this app's
+// authenticated boundary; the internal panel remains the only place with
+// those details.
+const DUE_NOTIFICATIONS_POLL_MS = 20 * 60 * 1000;
+// `soon`/`urgent`/`overdue` mirror the exact same 30-day window the
+// dashboard's "Obrigações próximas do vencimento" panel already uses
+// (`_obligation_rows`); `scheduled` (>30 days out) never appears here.
+const DUE_NOTIFICATIONS_PANEL_LEVELS = new Set(["overdue", "urgent", "soon"]);
+// Native OS notifications are reserved for the same "last 7 days" window the
+// dashboard panel already highlights (`urgent`) plus `overdue` -- never the
+// wider 30-day `soon` set, so enabling this feature does not turn every
+// upcoming bill into an interruption.
+const DUE_NOTIFICATIONS_ALERT_LEVELS = new Set(["overdue", "urgent"]);
+
+function dueNotificationsStorageKey(suffix) {
+  // Scoped by `user.id` (the only identifier `/auth/me` exposes -- this app
+  // never sends `household_id` to the browser) so two people sharing one
+  // browser/profile do not inherit each other's dismissed-alert history or
+  // enabled/disabled preference. Each install already serves exactly one
+  // household (`docs/ARCHITECTURE.md`), so no coarser scoping is needed.
+  return `ffp:due-notifications:${suffix}:${state.user?.id || "anonymous"}`;
+}
+
+function dueNotificationsEnabled() {
+  try { return localStorage.getItem(dueNotificationsStorageKey("enabled")) === "1"; }
+  catch (_) { return false; }
+}
+
+function setDueNotificationsEnabled(value) {
+  try { localStorage.setItem(dueNotificationsStorageKey("enabled"), value ? "1" : "0"); }
+  catch (_) { /* private browsing / blocked storage: the preference just will not persist */ }
+}
+
+function readShownDueAlerts() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(dueNotificationsStorageKey("shown")) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) { return []; }
+}
+
+function rememberShownDueAlerts(keys, currentKeys) {
+  try {
+    // Drop any key no longer present in the obligations the backend just
+    // returned (paid off/deleted/recurred into a new occurrence) so this
+    // list never grows without bound.
+    const pruned = keys.filter((key) => currentKeys.has(key));
+    localStorage.setItem(dueNotificationsStorageKey("shown"), JSON.stringify(pruned.slice(-200)));
+  } catch (_) { /* best-effort; a missed prune only risks one repeated alert */ }
+}
+
+function dueNotificationsSupported() {
+  return typeof Notification !== "undefined";
+}
+
+function dueAlertKey(item) {
+  // A recurring obligation's next occurrence carries a different
+  // `next_due_date`, so this key is deliberately per-occurrence: crossing
+  // into a more urgent `alert_level` for the *same* occurrence (soon ->
+  // urgent) is also treated as a new, once-only alert.
+  return `${item.id}:${item.next_due_date}:${item.alert_level}`;
+}
+
+function renderDueNotificationsSettings() {
+  const statusBox = document.querySelector("#due-notifications-status");
+  const enableButton = document.querySelector("#due-notifications-enable");
+  const disableButton = document.querySelector("#due-notifications-disable");
+  if (!statusBox || !enableButton || !disableButton) return;
+  if (!dueNotificationsSupported()) {
+    statusBox.textContent = "Este navegador não oferece notificações. A lista de vencimentos continua disponível no sino no topo da tela.";
+    enableButton.classList.add("hidden");
+    disableButton.classList.add("hidden");
+    return;
+  }
+  const permission = Notification.permission;
+  const enabled = permission === "granted" && dueNotificationsEnabled();
+  enableButton.classList.toggle("hidden", enabled || permission === "denied");
+  disableButton.classList.toggle("hidden", !enabled);
+  if (permission === "denied") {
+    statusBox.textContent = "Permissão negada neste navegador. Para reativar, ajuste as permissões de notificação deste site nas configurações do navegador. A lista de vencimentos continua disponível no sino no topo da tela.";
+  } else if (enabled) {
+    statusBox.textContent = "Notificações ativas neste navegador para os vencimentos dos próximos 7 dias (e atrasados). Você pode desativar quando quiser.";
+  } else {
+    statusBox.textContent = "Desativado. Ative para receber um aviso neste navegador quando um compromisso estiver perto do vencimento; a lista de vencimentos continua disponível no sino no topo da tela.";
+  }
+}
+
+async function enableDueNotifications() {
+  if (!dueNotificationsSupported()) return;
+  try {
+    const permission = await Notification.requestPermission();
+    setDueNotificationsEnabled(permission === "granted");
+    if (permission === "denied") toast("Permissão de notificação negada pelo navegador", true);
+  } catch (_) {
+    setDueNotificationsEnabled(false);
+    toast("Não foi possível ativar notificações neste navegador", true);
+  }
+  renderDueNotificationsSettings();
+  await checkDueNotifications();
+}
+
+function disableDueNotifications() {
+  setDueNotificationsEnabled(false);
+  renderDueNotificationsSettings();
+  toast("Notificações desativadas neste navegador");
+}
+
+function renderDueNotificationsPanel(items) {
+  const list = document.querySelector("#due-notifications-list");
+  const count = document.querySelector("#due-notifications-count");
+  if (!list || !count) return;
+  const visible = items.filter((item) => DUE_NOTIFICATIONS_PANEL_LEVELS.has(item.alert_level));
+  count.textContent = String(visible.length);
+  count.classList.toggle("hidden", visible.length === 0);
+  list.innerHTML = visible.length
+    ? visible.map((item) => `
+      <div class="obligation-alert ${escapeHtml(item.alert_level)}"><div><strong>${escapeHtml(item.name)}</strong><small>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))} • ${escapeHtml(item.alert_label)}</small></div><span>${money.format(item.amount)}</span></div>
+    `).join("")
+    : '<div class="empty compact-empty">Nenhum vencimento nos próximos 30 dias.</div>';
+}
+
+// Engineer review (2026-09-08, PR #54): the OS-level notification surface
+// (lock screen / notification center) sits outside this app's authenticated
+// boundary, so its content must stay generic -- never the obligation name or
+// amount that the always-available, authenticated internal panel above
+// already shows in full. `dueNotificationBody` therefore branches only on
+// the categorical `alert_level` the backend already computed, never on
+// `item.name`, `item.amount` or `item.alert_label` (which itself embeds a
+// day count derived from the due date).
+function dueNotificationBody(item) {
+  return item.alert_level === "overdue"
+    ? "Há um compromisso vencido. Abra o app para ver os detalhes."
+    : "Há um vencimento próximo. Abra o app para ver os detalhes.";
+}
+
+function fireDueNotification(item) {
+  try {
+    const notification = new Notification("Family Financial Planning", {
+      body: dueNotificationBody(item),
+      tag: dueAlertKey(item),
+    });
+    notification.onclick = () => { window.focus(); navigate("planning"); notification.close(); };
+  } catch (_) {
+    // Some browsers/environments throw on `new Notification(...)` (e.g. a
+    // Service Worker is required); the always-rendered internal panel above
+    // already covers this case, so this failure is silent by design -- never
+    // a functional break for the rest of the app.
+  }
+}
+
+async function checkDueNotifications() {
+  if (!state.user) return;
+  let items;
+  try { items = await api("/obligations"); }
+  catch (_) { return; } // best-effort background check; a transient failure here must never surface as an app error
+  renderDueNotificationsPanel(items);
+  if (!dueNotificationsSupported() || Notification.permission !== "granted" || !dueNotificationsEnabled()) return;
+  const currentKeys = new Set(items.map(dueAlertKey));
+  const shownSet = new Set(readShownDueAlerts());
+  const toNotify = items.filter((item) => DUE_NOTIFICATIONS_ALERT_LEVELS.has(item.alert_level) && !shownSet.has(dueAlertKey(item)));
+  if (!toNotify.length) return;
+  toNotify.forEach((item) => { fireDueNotification(item); shownSet.add(dueAlertKey(item)); });
+  rememberShownDueAlerts([...shownSet], currentKeys);
+}
+
+function toggleDueNotificationsPanel(forceOpen) {
+  const panel = document.querySelector("#due-notifications-panel");
+  const toggle = document.querySelector("#due-notifications-toggle");
+  if (!panel || !toggle) return;
+  const open = forceOpen === undefined ? panel.classList.contains("hidden") : forceOpen;
+  panel.classList.toggle("hidden", !open);
+  toggle.setAttribute("aria-expanded", String(open));
+}
+
+function initDueNotifications() {
+  clearInterval(state.dueNotificationsTimer);
+  renderDueNotificationsSettings();
+  checkDueNotifications();
+  state.dueNotificationsTimer = setInterval(checkDueNotifications, DUE_NOTIFICATIONS_POLL_MS);
+}
+
+function stopDueNotifications() {
+  clearInterval(state.dueNotificationsTimer);
+  state.dueNotificationsTimer = null;
+  toggleDueNotificationsPanel(false);
+  document.querySelector("#due-notifications-list").innerHTML = "";
+  document.querySelector("#due-notifications-count")?.classList.add("hidden");
 }
 
 // Comparação visual de cenários de compra (Fase 3,
@@ -2039,7 +2251,7 @@ document.querySelector("#login-form").addEventListener("submit", async (event) =
   try { state.user = await api("/auth/login", { method: "POST", body: JSON.stringify(formJson(event.target)) }); await showApp(); }
   catch (error) { toast(error.message, true); }
 });
-document.querySelector("#logout-button").addEventListener("click", async () => { await api("/auth/logout", { method: "POST" }); state.user = null; showAuth(true); });
+document.querySelector("#logout-button").addEventListener("click", async () => { await api("/auth/logout", { method: "POST" }); state.user = null; stopDueNotifications(); showAuth(true); });
 document.querySelectorAll("#main-nav button").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
 document.querySelector("#mobile-menu-toggle").addEventListener("click", () => {
   setMobileMenu(!document.querySelector(".sidebar").classList.contains("menu-open"));
@@ -2047,7 +2259,15 @@ document.querySelector("#mobile-menu-toggle").addEventListener("click", () => {
 document.querySelectorAll("[data-go]").forEach((button) => button.addEventListener("click", () => {
   if (button.dataset.go === "transactions") document.querySelector("#transaction-month").value = document.querySelector("#dashboard-month").value;
   navigate(button.dataset.go);
+  toggleDueNotificationsPanel(false);
 }));
+document.querySelector("#due-notifications-toggle").addEventListener("click", () => toggleDueNotificationsPanel());
+document.addEventListener("click", (event) => {
+  const container = document.querySelector(".due-notifications");
+  if (container && !container.contains(event.target)) toggleDueNotificationsPanel(false);
+});
+document.querySelector("#due-notifications-enable").addEventListener("click", enableDueNotifications);
+document.querySelector("#due-notifications-disable").addEventListener("click", disableDueNotifications);
 document.querySelector("#dashboard-month").addEventListener("change", loadDashboard);
 document.querySelector("#dashboard-prev-month").addEventListener("click", () => {
   const control = document.querySelector("#dashboard-month");
