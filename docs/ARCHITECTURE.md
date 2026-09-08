@@ -12,7 +12,7 @@
 
 ### Aplicação
 
-FastAPI serve a interface web e a API. Para o MVP, o processamento ocorre no próprio serviço porque o volume é familiar. Um worker separado poderá ser adicionado quando OCR ou modelos locais exigirem filas demoradas.
+FastAPI serve a interface web e a API. O processamento continua no próprio serviço/contêiner (nenhum broker ou processo separado foi introduzido, adequado ao volume familiar de uma instalação), mas o OCR/transcrição de captura roda fora do caminho da requisição HTTP -- ver "Fila assíncrona de OCR/áudio" abaixo. Um worker realmente separado (processo/contêiner próprio) poderá ser adicionado depois, quando o volume exigir, sem mudar o modelo de dados.
 
 ### PostgreSQL
 
@@ -25,6 +25,28 @@ O arquivo original é criptografado com Fernet antes de ser persistido no volume
 ### Central inteligente
 
 Texto e documentos entram em `capture_drafts`. Regras locais, Tesseract e Whisper montam propostas editáveis. Somente a confirmação cria lançamentos, obrigações ou registros de folha. O arquivo original permanece criptografado e a captura registra processador, confiança, proposta e resultado.
+
+#### Fila assíncrona de OCR/áudio
+
+`POST /captures/preview` para imagem, PDF ou áudio cria o `Document`/`CaptureDraft` (status
+`queued`) e uma linha em `capture_processing_jobs` (household, draft e documento correlacionados,
+`job_type` `ocr`/`audio`, `status` `queued`/`processing`/`completed`/`failed`, tentativas, erro
+sanitizado, `trace_id`) e responde sem esperar o OCR/Whisper terminar; o processamento roda em
+segundo plano (`BackgroundTasks` do FastAPI) chamando exatamente os mesmos
+`extract_document_text`/`transcribe_audio`/`preview_capture` do caminho síncrono -- nenhum segundo
+motor de OCR, transcrição, classificação ou importação. Texto simples e CSV/OFX continuam
+síncronos, por serem rápidos.
+
+O claim de um job é uma única `UPDATE ... WHERE status = ...` (sem depender de `SELECT ... FOR
+UPDATE SKIP LOCKED`), por isso é seguro contra corrida em PostgreSQL e SQLite igualmente: entrega
+duplicada, uma nova tentativa manual (`POST /captures/{id}/retry`) e o reconciliador de recuperação
+de falhas nunca processam o mesmo job duas vezes nem duplicam `Document`/`CaptureDraft`. Um job
+travado em `processing` além do tempo configurado (worker morto/reiniciado) é reclamado pelo
+reconciliador (`python -m app.cli.capture_worker`, executado manualmente ou por cron/systemd-timer
+fora do processo web) até esgotar as tentativas, quando é marcado `failed` explicitamente --
+nunca promovido a sucesso silenciosamente. Falha ou timeout nunca apaga ou reescreve o documento
+original; a confirmação humana continua sendo a única ação que cria lançamento, obrigação ou
+registro de folha.
 
 ### Consultor Codex
 
@@ -239,4 +261,8 @@ uma segunda fonte de verdade.
 
 ## Evolução
 
-Se o volume familiar crescer, OCR e transcrição podem migrar para um worker assíncrono. O modelo `capture_drafts` preserva a compatibilidade dessa evolução sem alterar o livro financeiro.
+OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila
+assíncrona de OCR/áudio"), mas ainda dentro do mesmo processo/contêiner da aplicação. Se o volume
+familiar justificar, essa fila pode migrar para um worker/contêiner realmente separado sem mudar o
+modelo de dados nem o contrato de `capture_drafts` -- o desenho do claim atômico e do reconciliador
+de recuperação já foi feito pensando nessa migração futura, sem exigir Redis ou outro broker.

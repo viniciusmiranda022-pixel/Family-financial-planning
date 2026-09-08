@@ -311,6 +311,28 @@ EXPECTED_BACKFILL_RUN_COLUMNS = {
     "triggered_by",
 }
 
+EXPECTED_0011_TABLES = {"capture_processing_jobs"}
+
+EXPECTED_CAPTURE_PROCESSING_JOB_COLUMNS = {
+    "id",
+    "household_id",
+    "capture_draft_id",
+    "document_id",
+    "job_type",
+    "content_type",
+    "status",
+    "attempts",
+    "max_attempts",
+    "claimed_by",
+    "started_at",
+    "completed_at",
+    "duration_ms",
+    "error_code",
+    "trace_id",
+    "created_at",
+    "updated_at",
+}
+
 
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
@@ -358,6 +380,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0006_TABLES,
             *EXPECTED_0007_TABLES,
             *EXPECTED_0009_TABLES,
+            *EXPECTED_0011_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -450,6 +473,16 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_backfill_runs_status",
         "ix_backfill_runs_trace_id",
     }
+    assert {
+        column["name"] for column in inspector.get_columns("capture_processing_jobs")
+    } == EXPECTED_CAPTURE_PROCESSING_JOB_COLUMNS
+    assert {index["name"] for index in inspector.get_indexes("capture_processing_jobs")} == {
+        "ix_capture_jobs_household_id",
+        "ix_capture_jobs_capture_draft_id",
+        "ix_capture_jobs_trace_id",
+        "ix_capture_jobs_household_status",
+        "ix_capture_jobs_status_created",
+    }
     engine.dispose()
 
     command.downgrade(config, "0001")
@@ -537,7 +570,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0010"
+        ).scalar_one() == "0011"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -563,6 +596,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0010"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0011"
     engine.dispose()
     get_settings.cache_clear()
