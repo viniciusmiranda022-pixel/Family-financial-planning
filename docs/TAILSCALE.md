@@ -4,12 +4,20 @@ O Tailscale cria a rede privada usada por Vinicius e Kelly para acessar o sistem
 
 ## Arquitetura
 
-1. O Docker continua executando o sistema localmente na porta `8090`.
+1. O Docker continua executando o sistema localmente na porta configurada em `APP_PORT` (`.env`; `8080` por padrão em `.env.example`/`compose.yaml`).
 2. O Tailscale instalado no Windows publica essa porta somente dentro da tailnet.
 3. Cada pessoa usa uma conta individual do Tailscale e um usuário individual no sistema financeiro.
 4. Nenhuma porta do roteador é aberta e o recurso público **Funnel** não deve ser habilitado.
 
-## Configuração do computador
+## Configuração automatizada (Fase 4)
+
+`scripts/setup-tailscale.ps1` automatiza e verifica esse estado: ele falha explicitamente se o
+Tailscale não estiver instalado/conectado ou se a aplicação não responder saudável, reaplica a
+publicação HTTPS de forma idempotente (repetir a execução converge para o mesmo estado, sem
+duplicar regras nem deixar exposição residual de uma configuração manual anterior) e, ao final,
+verifica que o único endereço publicado aponta para a aplicação, que nenhuma porta TCP além de 443
+foi aberta e que o Tailscale Funnel continua desabilitado. Detalhes de implementação e das
+garantias testadas em `scripts/lib/TailscaleProxy.psm1` e `tests/tailscale_proxy/run_tests.ps1`.
 
 1. Instale o Tailscale no Windows e entre na conta que será proprietária da tailnet.
 2. Inicie o sistema pelo WSL:
@@ -25,6 +33,10 @@ O Tailscale cria a rede privada usada por Vinicius e Kelly para acessar o sistem
    powershell -ExecutionPolicy Bypass -File .\scripts\setup-tailscale.ps1
    ```
 
+   O script lê `APP_PORT` do `.env` automaticamente; para apontar para outra porta manualmente, use
+   `-Port <numero>`. Executar novamente (após reiniciar o Docker, trocar de rede etc.) é seguro e
+   esperado: o script reconverge para o mesmo estado.
+
 4. O comando exibirá um endereço HTTPS terminado em `.ts.net`. Esse é o endereço privado do sistema.
 
 Para conferir posteriormente:
@@ -33,11 +45,16 @@ Para conferir posteriormente:
 tailscale serve status
 ```
 
-Para remover a publicação privada:
+## Desativação (rollback)
 
 ```powershell
-tailscale serve reset
+powershell -ExecutionPolicy Bypass -File .\scripts\disable-tailscale-proxy.ps1
 ```
+
+Equivalente a `tailscale serve reset`, com verificação de que nenhuma publicação restou. Isso
+apenas remove a configuração de proxy do próprio Tailscale; não altera o Docker, o banco de dados,
+os documentos ou qualquer fato financeiro. Para religar o acesso privado depois, execute
+`setup-tailscale.ps1` novamente.
 
 ## Acesso da Kelly
 
