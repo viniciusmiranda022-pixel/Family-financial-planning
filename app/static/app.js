@@ -1124,7 +1124,12 @@ async function loadForecast() {
 // instead of breaking the app. Nothing here mutates `Obligation` or any
 // other financial entity -- it only reads `/obligations` and writes a
 // per-browser "already shown" list to `localStorage`, never a financial
-// fact, never sent to the backend.
+// fact, never sent to the backend. The native `Notification`'s title/body
+// (`fireDueNotification`/`dueNotificationBody`) are deliberately generic --
+// never the obligation's name, amount or day-count label -- because that
+// surface (lock screen / OS notification center) sits outside this app's
+// authenticated boundary; the internal panel remains the only place with
+// those details.
 const DUE_NOTIFICATIONS_POLL_MS = 20 * 60 * 1000;
 // `soon`/`urgent`/`overdue` mirror the exact same 30-day window the
 // dashboard's "Obrigações próximas do vencimento" panel already uses
@@ -1242,10 +1247,24 @@ function renderDueNotificationsPanel(items) {
     : '<div class="empty compact-empty">Nenhum vencimento nos próximos 30 dias.</div>';
 }
 
+// Engineer review (2026-09-08, PR #54): the OS-level notification surface
+// (lock screen / notification center) sits outside this app's authenticated
+// boundary, so its content must stay generic -- never the obligation name or
+// amount that the always-available, authenticated internal panel above
+// already shows in full. `dueNotificationBody` therefore branches only on
+// the categorical `alert_level` the backend already computed, never on
+// `item.name`, `item.amount` or `item.alert_label` (which itself embeds a
+// day count derived from the due date).
+function dueNotificationBody(item) {
+  return item.alert_level === "overdue"
+    ? "Há um compromisso vencido. Abra o app para ver os detalhes."
+    : "Há um vencimento próximo. Abra o app para ver os detalhes.";
+}
+
 function fireDueNotification(item) {
   try {
-    const notification = new Notification(item.name, {
-      body: `${item.alert_label} • ${money.format(item.amount)}`,
+    const notification = new Notification("Family Financial Planning", {
+      body: dueNotificationBody(item),
       tag: dueAlertKey(item),
     });
     notification.onclick = () => { window.focus(); navigate("planning"); notification.close(); };

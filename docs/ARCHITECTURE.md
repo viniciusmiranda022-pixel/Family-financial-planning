@@ -327,7 +327,11 @@ recalculada no navegador: o único critério usado no cliente é a pertença cat
 de datas refeita em JavaScript. O sino no topo da aplicação (`#due-notifications-toggle`/`#due-
 notifications-panel`) sempre mostra essa lista (janela de 30 dias, mesmo recorte do painel do
 dashboard) como superfície interna sempre disponível; a API `Notification` do navegador é uma camada
-opcional por cima dela, reservada aos itens `urgent`/`overdue` (últimos 7 dias e atrasados).
+opcional por cima dela, reservada aos itens `urgent`/`overdue` (últimos 7 dias e atrasados). Como o
+canal nativo do sistema operacional (central de notificações/lock screen do dispositivo) fica fora
+da superfície autenticada da aplicação, seu título e corpo são deliberadamente genéricos -- nunca o
+nome do compromisso, o valor ou o rótulo com contagem de dias (`dueNotificationBody`, `fireDueNotification`);
+somente o painel interno autenticado mostra esses detalhes.
 
 A permissão do navegador só é solicitada por clique explícito (`enableDueNotifications`, nunca
 chamada a partir de `bootstrap()`/`showApp()`); `Notification` indisponível, permissão `denied` ou

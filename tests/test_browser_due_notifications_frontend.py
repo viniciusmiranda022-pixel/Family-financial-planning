@@ -111,6 +111,26 @@ def test_fire_due_notification_degrades_safely_instead_of_throwing() -> None:
     assert "new Notification(" in body
 
 
+def test_native_notification_content_never_leaks_obligation_details() -> None:
+    # Engineer review (PR #54): the OS-level notification (lock screen /
+    # notification center) sits outside the authenticated app surface, so it
+    # must never carry the obligation's name, amount or day-count label --
+    # only the always-available internal panel (`renderDueNotificationsPanel`,
+    # already covered above) may show those. This applies to the title/body
+    # actually passed to `new Notification(...)` (`fireDueNotification`) and
+    # to the helper that builds the body (`dueNotificationBody`).
+    source = _app_js()
+    for name in ("fireDueNotification", "dueNotificationBody"):
+        body = _function_body(source, name)
+        assert "item.name" not in body
+        assert "item.amount" not in body
+        assert "item.alert_label" not in body
+        assert "money.format(" not in body
+    fire_body = _function_body(source, "fireDueNotification")
+    assert "dueNotificationBody(item)" in fire_body
+    assert '"Family Financial Planning"' in fire_body
+
+
 def test_check_due_notifications_guards_every_denied_or_unsupported_state() -> None:
     source = _app_js()
     body = _function_body(source, "checkDueNotifications")
