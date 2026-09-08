@@ -1,0 +1,294 @@
+"""Durable DB-backed queue for asynchronous OCR/audio capture processing.
+
+Fase 3 item 1 (`docs/WORK_ORDER_ASYNC_OCR_AUDIO_WORKER.md`): moves the
+potentially slow OCR (scanned image/PDF) and Whisper transcription work off
+the `POST /captures/preview` request path without a second processing
+engine, a message broker, or any authority over financial facts. This
+module only manages `CaptureProcessingJob` rows (claim/complete/fail/retry
+bookkeeping); the actual OCR/Whisper/classification work is still done by
+the existing canonical `app.services.smart_capture` functions, invoked from
+the single shared pipeline in `app.api._analyze_and_persist_capture`.
+
+Deliberately does not use `SELECT ... FOR UPDATE SKIP LOCKED`. This project
+runs a single PostgreSQL instance for one family/household deployment (see
+`docs/ARCHITECTURE.md`'s MVP note and `docs/INTEGRITY_IMPLEMENTATION_PLAN.md`
+section 15: "a modelagem deve permitir worker futuro sem obrigar Redis
+nesta etapa"), and an atomic `UPDATE ... WHERE status = ...` compare-and-swap
+claim is dialect-agnostic -- it behaves identically on PostgreSQL
+(production) and SQLite (tests), which matters more here than the extra
+concurrency headroom `SKIP LOCKED` buys for a household-scale workload.
+"""
+
+from __future__ import annotations
+
+import os
+import socket
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
+
+from app.models import CaptureDraft, CaptureProcessingJob, Document
+
+AUDIO_SUFFIXES = {".webm", ".m4a", ".mp3", ".wav", ".ogg"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".heic"}
+
+TERMINAL_STATUSES = {"completed", "failed"}
+
+
+def _aware_utc(value: datetime | None) -> datetime | None:
+    """Normalize a `DateTime(timezone=True)` column value read back from the
+    database for a Python-level comparison against `datetime.now(UTC)`.
+
+    PostgreSQL always returns a timezone-aware value for this column type;
+    SQLite (used in tests) always returns a naive one regardless -- every
+    value this app ever writes to such a column is already UTC
+    (`datetime.now(UTC)`), so a naive value is safely assumed to already be
+    UTC rather than the local clock. Only Python-level comparisons need
+    this: SQL-level `WHERE ... < :cutoff` comparisons compare correctly on
+    both dialects without it, since SQLAlchemy's bind/result processors
+    already serialize consistently within one dialect.
+    """
+
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
+def classify_async_job_type(
+    filename: str | None, content_type: str | None, *, has_payload: bool
+) -> str | None:
+    """Return `"audio"`, `"ocr"`, or `None` (fast/synchronous path).
+
+    Mirrors -- deliberately, not by re-implementing -- the exact
+    audio/image/pdf dispatch `app.services.smart_capture.preview_capture`
+    and `extract_document_text` already use, so the decision "does this
+    upload need the async queue" can never drift from the decision those
+    functions make about *how* to process it. Plain text and fast
+    structured formats (CSV/OFX/TXT) return `None`: Fase 3 item 1 is scoped
+    to OCR and audio only (item 9, "não antecipar" other roadmap items).
+    """
+
+    if not has_payload:
+        return None
+    content_type = content_type or ""
+    suffix = Path(filename or "").suffix.lower()
+    if content_type.startswith("audio/") or suffix in AUDIO_SUFFIXES:
+        return "audio"
+    if content_type.startswith("image/") or suffix in IMAGE_SUFFIXES:
+        return "ocr"
+    if suffix == ".pdf" or content_type == "application/pdf":
+        return "ocr"
+    return None
+
+
+def worker_identity() -> str:
+    """Best-effort, non-sensitive label for `claimed_by` -- observability
+    only, never used for authorization or as a lock token."""
+
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def create_capture_job(
+    db: Session,
+    *,
+    household_id: str,
+    capture_draft_id: str,
+    document_id: str | None,
+    job_type: str,
+    content_type: str | None,
+    max_attempts: int,
+) -> CaptureProcessingJob:
+    job = CaptureProcessingJob(
+        household_id=household_id,
+        capture_draft_id=capture_draft_id,
+        document_id=document_id,
+        job_type=job_type,
+        content_type=(content_type or "")[:100] or None,
+        status="queued",
+        max_attempts=max_attempts,
+    )
+    db.add(job)
+    db.flush()
+    return job
+
+
+def claim_capture_job(
+    db: Session,
+    job_id: str,
+    *,
+    worker_id: str,
+    stale_after_seconds: int,
+) -> CaptureProcessingJob | None:
+    """Atomically claim `job_id` if it is `queued`, or if it is `processing`
+    but has been so for longer than `stale_after_seconds` (its previous
+    worker crashed or was killed mid-job -- item 5, "recuperação de
+    worker").
+
+    Uses one `UPDATE ... WHERE id = :id AND status = :observed_status` so
+    two callers racing on the same job (the request's own background task
+    and a concurrently-run reconciler sweep, or two reconciler sweeps)
+    cannot both believe they claimed it: only the statement whose `WHERE`
+    still matched at execution time affects a row; `rowcount == 0` tells
+    every loser it lost the race, and it returns `None` rather than
+    processing anything -- this is what makes duplicate delivery /
+    concurrent retry safe (item 4).
+    """
+
+    now = datetime.now(UTC)
+    stale_cutoff = now - timedelta(seconds=max(1, stale_after_seconds))
+    job = db.get(CaptureProcessingJob, job_id)
+    if job is None or job.status in TERMINAL_STATUSES:
+        return None
+    started_at = _aware_utc(job.started_at)
+    claimable = job.status == "queued" or (
+        job.status == "processing" and (started_at is None or started_at < stale_cutoff)
+    )
+    if not claimable:
+        return None
+    observed_status = job.status
+    result = db.execute(
+        update(CaptureProcessingJob)
+        .where(CaptureProcessingJob.id == job_id, CaptureProcessingJob.status == observed_status)
+        .values(
+            status="processing",
+            attempts=CaptureProcessingJob.attempts + 1,
+            started_at=now,
+            claimed_by=worker_id,
+            error_code=None,
+        )
+    )
+    db.commit()
+    if result.rowcount == 0:
+        return None
+    db.refresh(job)
+    return job
+
+
+def mark_job_completed(db: Session, job: CaptureProcessingJob, *, duration_ms: int | None = None) -> None:
+    """`duration_ms` is measured by the caller with `time.perf_counter()`
+    around the actual processing call (like every other duration this
+    codebase records -- see `app.cli.backfill`/`app.services.financial_integrity`),
+    not by subtracting `job.started_at` from now: SQLite (tests) returns
+    `DateTime(timezone=True)` columns as timezone-*naive*, which cannot be
+    subtracted from an aware `datetime.now(UTC)`, and even on PostgreSQL a
+    reclaimed job's `started_at` reflects the *current* claim, not
+    necessarily when this specific attempt's measured work began. `None`
+    (left unset) is honest when no such measurement is available -- e.g. a
+    crash-recovery job whose original attempt never finished timing itself
+    (see `fail_exhausted_stale_jobs`)."""
+
+    job.status = "completed"
+    job.completed_at = datetime.now(UTC)
+    if duration_ms is not None:
+        job.duration_ms = max(0, duration_ms)
+    job.error_code = None
+
+
+def mark_job_failed(
+    db: Session, job: CaptureProcessingJob, *, error_code: str, duration_ms: int | None = None
+) -> None:
+    """Terminal failure: fail-closed, never promotes an incomplete result to
+    `completed`. Never deletes or rewrites the original document/draft --
+    a household member can retry via `POST /captures/{id}/retry`
+    (`app.api.retry_capture`), which is the only thing that moves a
+    `failed` job back to `queued`. See `mark_job_completed` for why
+    `duration_ms` is caller-measured rather than derived from
+    `started_at`."""
+
+    job.status = "failed"
+    job.completed_at = datetime.now(UTC)
+    if duration_ms is not None:
+        job.duration_ms = max(0, duration_ms)
+    job.error_code = error_code[:80]
+
+
+def reset_job_for_retry(db: Session, job: CaptureProcessingJob) -> None:
+    """Manual retry (`POST /captures/{id}/retry`) is a deliberate household
+    action, so -- unlike the automatic reconciler reclaim below -- it is
+    not bounded by `max_attempts`; `attempts` itself is left untouched
+    (cumulative audit history of how many times this job has ever run),
+    only the terminal/clock fields reset so it looks freshly queued."""
+
+    job.status = "queued"
+    job.error_code = None
+    job.started_at = None
+    job.completed_at = None
+    job.duration_ms = None
+    job.claimed_by = None
+
+
+def find_claimable_job_ids(db: Session, *, limit: int, stale_after_seconds: int) -> list[str]:
+    """Used by the crash-recovery reconciler (`app/cli/capture_worker.py`)
+    to discover work: any `queued` job, plus any `processing` job stuck
+    past `stale_after_seconds` (its worker died) that still has attempts
+    left. A stale job that has exhausted `max_attempts` is deliberately
+    excluded here -- see `fail_exhausted_stale_jobs`, which fails it
+    outright instead of offering it for endless reclaim."""
+
+    now = datetime.now(UTC)
+    stale_cutoff = now - timedelta(seconds=max(1, stale_after_seconds))
+    rows = db.scalars(
+        select(CaptureProcessingJob.id)
+        .where(
+            (CaptureProcessingJob.status == "queued")
+            | (
+                (CaptureProcessingJob.status == "processing")
+                & (CaptureProcessingJob.started_at.is_not(None))
+                & (CaptureProcessingJob.started_at < stale_cutoff)
+                & (CaptureProcessingJob.attempts < CaptureProcessingJob.max_attempts)
+            )
+        )
+        .order_by(CaptureProcessingJob.created_at)
+        .limit(limit)
+    ).all()
+    return list(rows)
+
+
+def fail_exhausted_stale_jobs(db: Session, *, stale_after_seconds: int) -> int:
+    """Explicitly fail any `processing` job stuck past `stale_after_seconds`
+    that has already used all of its attempts, so it never sits in
+    `processing` forever misrepresenting an in-flight worker (fail-closed,
+    item 5). This is the terminal counterpart to `find_claimable_job_ids`,
+    which stops offering such a job for reclaim once attempts are
+    exhausted. Also marks the correlated `CaptureDraft`/`Document` honestly
+    (unless the draft was already confirmed or cancelled by the household
+    in the meantime, in which case its own terminal state stands).
+
+    Caller is responsible for `db.commit()`.
+    """
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=max(1, stale_after_seconds))
+    stuck = db.scalars(
+        select(CaptureProcessingJob).where(
+            CaptureProcessingJob.status == "processing",
+            CaptureProcessingJob.started_at.is_not(None),
+            CaptureProcessingJob.started_at < cutoff,
+            CaptureProcessingJob.attempts >= CaptureProcessingJob.max_attempts,
+        )
+    ).all()
+    for job in stuck:
+        mark_job_failed(db, job, error_code="worker_timeout_exhausted")
+        draft = db.get(CaptureDraft, job.capture_draft_id)
+        if draft is not None and draft.status not in {"confirmed", "cancelled"}:
+            draft.status = "failed"
+        if job.document_id:
+            document = db.get(Document, job.document_id)
+            if document is not None:
+                document.status = "capture_failed"
+    return len(stuck)
+
+
+__all__ = [
+    "classify_async_job_type",
+    "worker_identity",
+    "create_capture_job",
+    "claim_capture_job",
+    "mark_job_completed",
+    "mark_job_failed",
+    "reset_job_for_retry",
+    "find_claimable_job_ids",
+    "fail_exhausted_stale_jobs",
+]

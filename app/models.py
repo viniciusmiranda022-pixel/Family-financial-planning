@@ -202,6 +202,75 @@ class CaptureDraft(Base, TimestampMixin):
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     document: Mapped[Document | None] = relationship()
+    processing_job: Mapped["CaptureProcessingJob | None"] = relationship(
+        back_populates="capture_draft", uselist=False
+    )
+
+
+class CaptureProcessingJob(Base, TimestampMixin):
+    """Durable, auditable state for asynchronous OCR/audio processing of a
+    `CaptureDraft` upload (Fase 3 item 1,
+    `docs/WORK_ORDER_ASYNC_OCR_AUDIO_WORKER.md`).
+
+    Moves the potentially slow OCR (scanned image/PDF) and Whisper
+    transcription work off the `POST /captures/preview` request path
+    without a second OCR/transcription/classification engine, a message
+    broker, or any authority over financial facts: this table only ever
+    correlates to one `capture_drafts` row and records *when infrastructure
+    ran*, never a financial fact -- `app.api._analyze_and_persist_capture`
+    remains the single place (shared by the synchronous fast path and this
+    worker) that turns processed text into a capture proposal, and human
+    confirmation (`POST /captures/{id}/confirm`) remains the only path that
+    ever creates a `Transaction`/`Obligation`/`PayrollRecord`.
+
+    One row per `capture_draft_id` (unique): a retry or duplicate delivery
+    updates this same row in place (bumping `attempts`) instead of
+    inserting a second one, so reprocessing can never fan out into a
+    duplicate draft, document or downstream financial record -- see item 4
+    ("idempotência em retry"). Claiming
+    (`app.services.capture_worker.claim_capture_job`) uses a single atomic
+    `UPDATE ... WHERE status = ...` rather than
+    `SELECT ... FOR UPDATE SKIP LOCKED` so the exact same claim code is
+    race-safe on both PostgreSQL (production) and SQLite (tests) --
+    consistent with `docs/INTEGRITY_IMPLEMENTATION_PLAN.md` section 15's
+    guidance that heavy async work here should not require Redis.
+
+    `status` lifecycle: `queued` -> `processing` -> `completed` | `failed`.
+    A worker crash/timeout leaves a job in `processing`; the crash-recovery
+    reconciler (`app/cli/capture_worker.py`) either reclaims it (attempts
+    remaining) or explicitly fails it once attempts are exhausted --
+    `processing` never silently expires into `completed` (fail-closed, item
+    5). `failed` is terminal for automatic reclaim but a household member
+    may always retry it explicitly via `POST /captures/{id}/retry`.
+    """
+
+    __tablename__ = "capture_processing_jobs"
+    __table_args__ = (
+        Index("ix_capture_jobs_household_status", "household_id", "status"),
+        Index("ix_capture_jobs_status_created", "status", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(ForeignKey("households.id", ondelete="CASCADE"), index=True)
+    capture_draft_id: Mapped[str] = mapped_column(
+        ForeignKey("capture_drafts.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    job_type: Mapped[str] = mapped_column(String(20))
+    content_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    claimed_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(36), unique=True, index=True, default=new_id)
+
+    capture_draft: Mapped[CaptureDraft] = relationship(back_populates="processing_job")
 
 
 class Commission(Base, TimestampMixin):
