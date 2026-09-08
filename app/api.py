@@ -5579,21 +5579,43 @@ def forecast(user: User = Depends(get_current_user), db: Session = Depends(get_d
 
 def _scenario_projection_summary(rows: list[dict], scenario: str) -> dict:
     """Summarize one canonical projection scenario (`no_commission`,
-    `delayed` or `expected`) the same way `GET /forecast`'s summary does for
-    `delayed`, generalized to all three so
-    `POST /purchases/scenario-comparison` never drops any of the three
-    normative scenarios (`docs/FINANCIAL_RULES.md`, WO acceptance criterion
-    "preservar os três cenários normativos")."""
+    `delayed` or `expected`) as independent, non-prescriptive facts -- never
+    a single derived verdict that elevates one scenario over the other two.
+
+    `docs/FINANCIAL_RULES.md`/the Advisor's own disclosed assumptions
+    describe the safety floor as a reference/alert, never blocked money or a
+    hard limit ("um déficit real pode consumi-lo e até zerar a liquidez");
+    `docs/WORK_ORDER_PURCHASE_SCENARIO_COMPARISON.md` requires it be treated
+    as a reference, never an artificial block, and forbids fabricating a
+    recommendation. An earlier revision of this function fed a single
+    `min(balance_delayed) >= emergency_floor` boolean into a `viable` field
+    that (a) treated crossing the floor as equivalent to economic
+    unviability even when the balance stayed positive with no uncovered
+    deficit at all, and (b) picked `delayed` as the one authoritative
+    scenario for that verdict with no normative contract saying it should
+    be -- see the engineering review on this PR. `crosses_safety_floor` and
+    `has_uncovered_deficit` below are the fix: pure boolean readouts of
+    fields the canonical Projection Engine/Validator already produce and
+    INV-018 already validates (`distance_to_floor_{scenario}` is signed,
+    `balance - safety_floor`, in `projection_validator.py`), reported once
+    per scenario instead of collapsed into a single cross-scenario flag.
+    Never use these two fields to gate, block or recommend anything; they
+    are facts for a human to read, not a computed decision.
+    """
 
     balances = [row[f"balance_{scenario}"] for row in rows] or [Decimal("0")]
     deficits = [row[f"uncovered_deficit_{scenario}"] for row in rows] or [Decimal("0")]
     distances = [row[f"distance_to_floor_{scenario}"] for row in rows] or [Decimal("0")]
+    minimum_distance_to_floor = min(distances)
+    maximum_uncovered_deficit = max(deficits)
     return {
         "final_balance": decimal_value(balances[-1]),
         "minimum_balance": decimal_value(min(balances)),
         "final_uncovered_deficit": decimal_value(deficits[-1]),
-        "maximum_uncovered_deficit": decimal_value(max(deficits)),
-        "minimum_distance_to_floor": decimal_value(min(distances)),
+        "maximum_uncovered_deficit": decimal_value(maximum_uncovered_deficit),
+        "minimum_distance_to_floor": decimal_value(minimum_distance_to_floor),
+        "crosses_safety_floor": minimum_distance_to_floor < 0,
+        "has_uncovered_deficit": maximum_uncovered_deficit > 0,
     }
 
 
@@ -5729,13 +5751,11 @@ def compare_purchase_scenarios(
             }
             for row in rows
         ]
-        delayed_balances = [row["balance_delayed"] for row in rows] or [Decimal("0")]
         return {
             "scenarios": {
                 scenario: _scenario_projection_summary(rows, scenario)
                 for scenario in ("no_commission", "delayed", "expected")
             },
-            "viable": min(delayed_balances) >= profile.emergency_floor,
             "trusted_for_projection": trusted_for_projection,
             "projection_formula_trusted": validation.valid,
             "projection_invariant_gate_trusted": projection_gate_trusted,

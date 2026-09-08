@@ -1151,6 +1151,18 @@ function scenarioTrustBadge(result) {
   return `<span class="status-chip ok">Projeção confiável</span>`;
 }
 
+// The safety floor is a reference/alert, never a block: `crosses_safety_floor`
+// is a plain fact the backend already computed (`distance_to_floor < 0`),
+// shown here as a neutral flag -- never as a "viável"/"revisar" verdict, and
+// never derived from a single scenario as if it had authority over the
+// other two (engineering review on this PR). All three normative scenarios
+// are rendered as independent columns; none is picked as decisive.
+function scenarioFloorChip(scenarioSummary) {
+  return scenarioSummary.crosses_safety_floor
+    ? '<span class="status-chip warn">Abaixo do piso</span>'
+    : '<span class="status-chip ok">Acima do piso</span>';
+}
+
 function renderScenarioComparisonResults(data) {
   const container = document.querySelector("#scenario-comparison-results");
   const baselineTrust = data.baseline.trusted_for_projection ? "confiável" : `${data.baseline.integrity_status} (não confiável)`;
@@ -1159,17 +1171,18 @@ function renderScenarioComparisonResults(data) {
       <td><strong>${escapeHtml(alternative.label)}</strong></td>
       <td class="right">${money.format(alternative.monthly_payment)}</td>
       <td class="right">${money.format(alternative.total_purchase_cost)}</td>
-      <td class="right ${alternative.scenarios.delayed.minimum_balance < data.emergency_floor ? "amount-expense" : "amount-income"}">${money.format(alternative.scenarios.delayed.minimum_balance)}</td>
-      <td class="right ${alternative.scenarios.delayed.maximum_uncovered_deficit > 0 ? "amount-expense" : ""}">${money.format(alternative.scenarios.delayed.maximum_uncovered_deficit)}</td>
-      <td class="right">${money.format(alternative.scenarios.delayed.minimum_distance_to_floor)}</td>
-      <td>${alternative.viable ? '<span class="status-chip ok">Viável</span>' : '<span class="status-chip danger">Revisar</span>'}</td>
+      <td class="right">${money.format(alternative.scenarios.no_commission.minimum_balance)}</td>
+      <td class="right">${money.format(alternative.scenarios.delayed.minimum_balance)}</td>
+      <td class="right">${money.format(alternative.scenarios.expected.minimum_balance)}</td>
+      <td class="right">${money.format(alternative.scenarios.delayed.maximum_uncovered_deficit)}</td>
+      <td>${scenarioFloorChip(alternative.scenarios.delayed)}</td>
       <td>${scenarioTrustBadge(alternative)}</td>
     </tr>
   `).join("");
   container.innerHTML = `
-    <p class="scenario-comparison-summary">Referência sem esta compra (cenário conservador atual): menor saldo projetado ${money.format(data.baseline.scenarios.delayed.minimum_balance)}; projeção ${escapeHtml(baselineTrust)}.</p>
+    <p class="scenario-comparison-summary">Referência sem esta compra (cenário conservador atual): menor saldo projetado ${money.format(data.baseline.scenarios.delayed.minimum_balance)}; projeção ${escapeHtml(baselineTrust)}. O piso de segurança é uma referência, não um bloqueio: um saldo abaixo do piso não é convertido em recomendação, apenas sinalizado.</p>
     <div class="table-wrap wide"><table>
-      <thead><tr><th>Alternativa</th><th class="right">Parcela</th><th class="right">Custo total</th><th class="right">Menor saldo (conservador)</th><th class="right">Maior déficit descoberto</th><th class="right">Distância do piso</th><th>Viabilidade</th><th>Confiabilidade</th></tr></thead>
+      <thead><tr><th>Alternativa</th><th class="right">Parcela</th><th class="right">Custo total</th><th class="right">Menor saldo (sem comissão)</th><th class="right">Menor saldo (conservador)</th><th class="right">Menor saldo (esperado)</th><th class="right">Maior déficit descoberto</th><th>Piso (conservador)</th><th>Confiabilidade</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
   `;

@@ -275,6 +275,18 @@ Projection Engine (`build_forecast`) e pelo Projection Validator (`validate_proj
 preservando os três cenários normativos (`no_commission`/`delayed`/`expected`) e a autoridade de
 INV-005/006/018/022 sobre `trusted_for_projection`.
 
+Cada cenário publica apenas fatos determinísticos e não prescritivos (`final_balance`,
+`minimum_balance`, `final_uncovered_deficit`, `maximum_uncovered_deficit`,
+`minimum_distance_to_floor`, `crosses_safety_floor`, `has_uncovered_deficit`) -- não existe um
+campo `viable`/veredito que colapse os três cenários em uma única decisão. Uma revisão de
+engenharia neste PR bloqueou uma versão anterior que publicava `"viable": min(balance_delayed) >=
+emergency_floor`: isso tratava o piso como bloqueio (contrariando `FINANCIAL_RULES`/o Work Order,
+que definem o piso como referência/alerta) e elegia `delayed` como cenário decisório sem contrato
+normativo para isso. `crosses_safety_floor`/`has_uncovered_deficit` são apenas leituras booleanas de
+campos que o Projection Engine/Validator já produzem e o INV-018 já valida (`distance_to_floor` é
+`balance - safety_floor`, com sinal, em `projection_validator.py`); nenhum dos dois bloqueia,
+recomenda ou decide -- apenas descrevem o que a projeção calculou, por cenário.
+
 A comparação é inteiramente simulativa e somente leitura: nenhuma `Transaction`, `Obligation`,
 `Commission`, `PayrollRecord` ou `Document` é lida além do necessário para reconstruir a projeção
 real do household, nenhuma é criada, e a sessão do banco nunca é commitada nesta rota -- inclusive

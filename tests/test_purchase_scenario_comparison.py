@@ -291,6 +291,8 @@ def test_two_alternatives_differ_and_match_manual_projection_engine():
                 "final_uncovered_deficit": float(money(deficits[-1])),
                 "maximum_uncovered_deficit": float(money(max(deficits))),
                 "minimum_distance_to_floor": float(money(min(distances))),
+                "crosses_safety_floor": min(distances) < 0,
+                "has_uncovered_deficit": max(deficits) > 0,
             }
             assert financed["scenarios"][scenario] == manual_summary
 
@@ -333,10 +335,15 @@ def test_deficit_larger_than_liquidity_never_yields_negative_balance():
             assert summary["final_balance"] >= 0
             assert summary["final_balance"] == 0
             # 10000 purchase against 1000 of liquidity and no income at all
-            # to ever pay it back: the shortfall is fully uncovered debt.
+            # to ever pay it back: the shortfall is fully uncovered debt --
+            # a genuine fact, not the removed `viable` verdict (engineering
+            # review on this PR: a single cross-scenario boolean is never
+            # published again; each scenario reports its own facts).
             assert summary["final_uncovered_deficit"] == 9000.0
             assert summary["maximum_uncovered_deficit"] == 9000.0
-        assert blown["viable"] is False
+            assert summary["has_uncovered_deficit"] is True
+            assert summary["crosses_safety_floor"] is True
+        assert "viable" not in blown
 
 
 # ---------------------------------------------------------------------------
@@ -370,12 +377,19 @@ def test_alternative_below_safety_floor_returns_200_not_blocked():
         assert response.status_code == 200, response.text
         data = response.json()
         for item in data["alternatives"]:
-            assert item["viable"] is False
+            # This is exactly the case the engineering review on this PR
+            # flagged: crossing the floor with a genuinely positive balance
+            # and zero real deficit must be reported as a plain fact, never
+            # coerced into an invented "not viable"/veto verdict -- there is
+            # no `viable` field at all any more, only independent facts.
+            assert "viable" not in item
+            assert item["scenarios"]["delayed"]["crosses_safety_floor"] is True
             assert item["scenarios"]["delayed"]["minimum_distance_to_floor"] < 0
             # The purchase itself never drained liquidity to zero here --
             # only the floor (a reference target) is missed, not an actual
             # deficit -- proving the floor is advisory, not a hard block.
             assert item["scenarios"]["delayed"]["final_uncovered_deficit"] == 0.0
+            assert item["scenarios"]["delayed"]["has_uncovered_deficit"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -518,10 +532,15 @@ def test_untrusted_projection_is_reported_fail_closed_not_hidden():
         for alt in data["alternatives"]:
             assert alt["trusted_for_projection"] is False
             assert alt["projection_formula_trusted"] is True
-            # `viable` is a distinct, independently computed signal (balance
-            # vs. floor) and must never be coerced by the trust flag in
-            # either direction.
-            assert isinstance(alt["viable"], bool)
+            # No `viable` field exists at all (engineering review on this
+            # PR): each scenario's `crosses_safety_floor`/
+            # `has_uncovered_deficit` are distinct, independently computed
+            # facts and must never be coerced by the trust flag in either
+            # direction.
+            assert "viable" not in alt
+            for scenario in ("no_commission", "delayed", "expected"):
+                assert isinstance(alt["scenarios"][scenario]["crosses_safety_floor"], bool)
+                assert isinstance(alt["scenarios"][scenario]["has_uncovered_deficit"], bool)
             # The untrusted state must never vanish behind a 4xx/5xx or an
             # incomplete payload -- every field is still present and honest.
             assert set(alt["scenarios"]) == {"no_commission", "delayed", "expected"}
