@@ -279,6 +279,47 @@ function Assert-Serve443OwnedOrEmpty {
     return $liveTarget
 }
 
+function Restore-PriorServe443Target {
+    <#
+    .SYNOPSIS
+        Best-effort restoration of a previously-live, self-owned port-443
+        target after a failed apply or a failed post-apply safety check.
+        Always throws: with a message saying the prior publication was
+        restored, or a manual-intervention message when restoration also
+        failed. Never returns normally, so the original failure this
+        automation was already unwinding from can never be masked as
+        success.
+
+    .DESCRIPTION
+        Assumes the caller has already ensured port 443 does not currently
+        hold the target that just failed (either it was never applied, or
+        it was already removed with the same granular
+        `tailscale serve --https=443 off` used everywhere else in this
+        module) -- this function only reapplies PriorTarget and never
+        issues an `off` itself, so it never risks turning off a mapping
+        that belongs to an unrelated service.
+    #>
+    param(
+        [Parameter(Mandatory)] [scriptblock] $Runner,
+        [Parameter(Mandatory)] [string] $MarkerPath,
+        [Parameter(Mandatory)] [string] $PriorTarget,
+        [Parameter(Mandatory)] [string] $FailureMessage
+    )
+    $reapply = & $Runner @('serve', '--bg', '--https=443', $PriorTarget)
+    if ($reapply.ExitCode -eq 0) {
+        Set-ManagedProxyTarget -MarkerPath $MarkerPath -Target $PriorTarget
+        throw "$FailureMessage; a publicacao anterior ($PriorTarget) foi restaurada com sucesso."
+    }
+
+    # The prior state cannot be proven live any more (the reapply itself
+    # failed), so the marker is cleared rather than left pointing at a
+    # target that may not actually be published -- consistent with every
+    # other failure path in this module never claiming ownership of state
+    # it has not verified.
+    Clear-ManagedProxyTarget -MarkerPath $MarkerPath
+    throw "$FailureMessage e a restauracao da publicacao anterior ($PriorTarget) tambem falhou. Intervencao manual necessaria: verifique agora com 'tailscale serve status' e reaplique manualmente a publicacao anterior se preciso."
+}
+
 function Publish-PrivateHttpsProxy {
     <#
     .SYNOPSIS
@@ -296,6 +337,14 @@ function Publish-PrivateHttpsProxy {
         untouched) before the desired mapping is (re)applied. Any other
         Web/TCP/Funnel entry already on the node -- belonging to an
         unrelated service -- is never inspected or mutated.
+
+        If a self-owned mapping existed before this call and the new
+        apply fails, this is a transactional reapplication, not a bare
+        removal: Restore-PriorServe443Target puts the previous, working
+        target back on port 443 (and its marker) before propagating the
+        original failure, so a failed reapply never leaves a previously
+        healthy proxy dark. When there was no prior mapping, a failed
+        apply simply leaves port 443 empty, as before.
     #>
     param(
         [Parameter(Mandatory)] [int] $Port,
@@ -315,6 +364,13 @@ function Publish-PrivateHttpsProxy {
     $target = "http://127.0.0.1:$Port"
     $apply = & $Runner @('serve', '--bg', '--https=443', $target)
     if ($apply.ExitCode -ne 0) {
+        if ($priorTarget) {
+            # Port 443 was already turned off above; put back exactly what
+            # was live before this call instead of leaving a previously
+            # working proxy dark because the reapply failed.
+            Restore-PriorServe443Target -Runner $Runner -MarkerPath $MarkerPath -PriorTarget $priorTarget `
+                -FailureMessage 'Nao foi possivel publicar o servico dentro da tailnet'
+        }
         throw 'Nao foi possivel publicar o servico dentro da tailnet.'
     }
     Set-ManagedProxyTarget -MarkerPath $MarkerPath -Target $target
@@ -386,16 +442,21 @@ function Set-VerifiedPrivateHttpsProxy {
     .SYNOPSIS
         Applies Publish-PrivateHttpsProxy and verifies the result with
         Assert-ProxyStateSafe. If the post-apply verification fails, this
-        removes only the port-443 mapping this call just created (the same
-        granular `--https=443 off`, never a node-wide reset) so no new
-        exposure from this application is left behind, then re-throws --
-        it never masks the original failure as success.
+        first removes the port-443 mapping this call just created (the
+        same granular `--https=443 off`, never a node-wide reset) so no
+        new exposure from this application is left behind; then, if a
+        self-owned mapping was already live and working before this call,
+        it is restored via Restore-PriorServe443Target instead of leaving
+        443 empty. It never masks the original failure as success.
     #>
     param(
         [Parameter(Mandatory)] [int] $Port,
         [scriptblock] $Runner = ${function:Invoke-TailscaleCli},
         [string] $MarkerPath = (Get-DefaultProxyMarkerPath)
     )
+
+    $priorState = Get-TailscaleServeState -Runner $Runner
+    $priorTarget = Assert-Serve443OwnedOrEmpty -ServeState $priorState -MarkerPath $MarkerPath
 
     Publish-PrivateHttpsProxy -Port $Port -Runner $Runner -MarkerPath $MarkerPath
     try {
@@ -406,6 +467,13 @@ function Set-VerifiedPrivateHttpsProxy {
         $off = & $Runner @('serve', '--https=443', 'off')
         if ($off.ExitCode -ne 0) {
             throw "Pos-condicao de seguranca falhou apos publicar o proxy, e a remocao de emergencia da porta 443 tambem falhou. Verifique manualmente agora com 'tailscale serve status'. Causa original: $originalMessage"
+        }
+        if ($priorTarget) {
+            # A previously working, self-owned publication existed before
+            # this call. Put it back instead of leaving 443 empty, so a
+            # failed reapplication never regresses a healthy proxy.
+            Restore-PriorServe443Target -Runner $Runner -MarkerPath $MarkerPath -PriorTarget $priorTarget `
+                -FailureMessage "Pos-condicao de seguranca falhou apos publicar o proxy. Causa original: $originalMessage"
         }
         Clear-ManagedProxyTarget -MarkerPath $MarkerPath
         throw "Pos-condicao de seguranca falhou apos publicar o proxy; a publicacao na porta 443 foi removida e nenhuma exposicao nova desta aplicacao foi deixada. Causa original: $originalMessage"
@@ -469,6 +537,7 @@ Export-ModuleMember -Function `
     Set-ManagedProxyTarget, `
     Clear-ManagedProxyTarget, `
     Assert-Serve443OwnedOrEmpty, `
+    Restore-PriorServe443Target, `
     Publish-PrivateHttpsProxy, `
     Assert-ProxyStateSafe, `
     Set-VerifiedPrivateHttpsProxy, `

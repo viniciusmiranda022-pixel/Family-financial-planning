@@ -16,8 +16,13 @@ Tailscale não estiver instalado/conectado ou se a aplicação não responder sa
 publicação HTTPS de forma idempotente (repetir a execução converge para o mesmo estado, sem
 duplicar regras) e, ao final, verifica que o endereço publicado na porta 443 aponta para a
 aplicação, que essa porta está corretamente configurada como HTTPS e que o Tailscale Funnel
-continua desabilitado nela. Se a pós-verificação falhar, a publicação recém-criada é removida antes
-do script terminar, para nunca deixar uma exposição nova sem verificação.
+continua desabilitado nela. Se o novo apply falhar ou a pós-verificação falhar depois dele, a
+reaplicação é tratada como transacional: quando já existia uma publicação própria funcionando antes
+da execução, o script restaura exatamente esse alvo anterior (e o registro local correspondente) em
+vez de deixar a porta 443 vazia; quando não havia publicação anterior, a porta 443 termina vazia e
+sem registro local, como antes. Se mesmo a restauração falhar, o script para com uma mensagem
+explícita de intervenção manual em vez de presumir sucesso — nunca deixa uma exposição nova sem
+verificação, nem finge que um estado anterior foi recuperado sem confirmar.
 
 A automação só mexe na porta 443 (a única superfície que esta aplicação usa) e nunca executa
 `tailscale serve reset`, que apagaria configurações de Serve/Funnel de qualquer outro serviço

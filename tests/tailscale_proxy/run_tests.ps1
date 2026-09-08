@@ -426,6 +426,120 @@ Invoke-Test 'Publish-PrivateHttpsProxy propaga falha do CLI ao remover a publica
 }
 
 # ---------------------------------------------------------------------
+# Transactional reapplication (BLOQUEIO DE MERGE #2): a reapply that
+# fails after a self-owned publication was already live must restore
+# exactly that prior publication, never leave 443 empty or in a
+# half-migrated state.
+# ---------------------------------------------------------------------
+function New-RunnerFailingOnApplyTarget {
+    <#
+    .SYNOPSIS
+        Wraps a fake runner so `serve --bg --https=443 <TargetToFail>`
+        fails while every other call (off, status, apply to any other
+        target) behaves normally -- lets a test fail exactly one specific
+        reapply without touching prerequisite/setup calls.
+    #>
+    param([Parameter(Mandatory)] $BaseRunner, [Parameter(Mandatory)] [string] $TargetToFail)
+    $runner = {
+        param([string[]] $CliArgs)
+        if (($CliArgs -join ' ') -eq "serve --bg --https=443 $TargetToFail") {
+            return [pscustomobject]@{ ExitCode = 1; Output = 'falhou' }
+        }
+        & $BaseRunner $CliArgs
+    }.GetNewClosure()
+    return $runner
+}
+
+Invoke-Test 'Publish-PrivateHttpsProxy restaura o alvo anterior quando o novo apply falha (BLOQUEIO DE MERGE #2, regressao 1)' {
+    $fake = New-FakeTailscaleRunner
+    $marker = New-TestMarkerPath
+    try {
+        Publish-PrivateHttpsProxy -Port 8080 -Runner $fake.Runner -MarkerPath $marker
+        $failingRunner = New-RunnerFailingOnApplyTarget -BaseRunner $fake.Runner -TargetToFail 'http://127.0.0.1:9090'
+
+        Assert-Throws { Publish-PrivateHttpsProxy -Port 9090 -Runner $failingRunner -MarkerPath $marker } `
+            'a falha ao aplicar o novo alvo deveria propagar como excecao'
+
+        $finalState = Get-TailscaleServeState -Runner $fake.Runner
+        Assert-NotThrows { Assert-ProxyStateSafe -ServeState $finalState -ExpectedPort 8080 } `
+            'o estado final deveria ter voltado exatamente para a publicacao anterior (porta 8080)'
+        Assert-True ((Get-ManagedProxyTarget -MarkerPath $marker) -eq 'http://127.0.0.1:8080') `
+            'o registro local deveria voltar a apontar para o alvo anterior'
+    } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
+Invoke-Test 'Set-VerifiedPrivateHttpsProxy restaura o alvo anterior quando a pos-verificacao falha (BLOQUEIO DE MERGE #2, regressao 2)' {
+    $fake = New-FakeTailscaleRunner
+    $marker = New-TestMarkerPath
+    try {
+        Set-VerifiedPrivateHttpsProxy -Port 8080 -Runner $fake.Runner -MarkerPath $marker
+
+        # Um servico nao relacionado, em outra porta, deve sobreviver a toda a operacao.
+        $fake.State.Web['fake.ts.net:8443'] = @{ Handlers = @{ '/' = @{ Proxy = 'http://127.0.0.1:9999' } } }
+        $fake.State.TCP['8443'] = @{ HTTPS = $true }
+
+        $funnelRunner = {
+            param([string[]] $CliArgs)
+            $result = & $fake.Runner $CliArgs
+            if (($CliArgs -join ' ') -match '^serve --bg --https=443 http://127\.0\.0\.1:9090$') {
+                $fake.State.AllowFunnel['fake.ts.net:443'] = $true
+            }
+            $result
+        }.GetNewClosure()
+
+        Assert-Throws { Set-VerifiedPrivateHttpsProxy -Port 9090 -Runner $funnelRunner -MarkerPath $marker } `
+            'a pos-condicao (Funnel habilitado) para o novo alvo deveria falhar e propagar'
+
+        $finalState = Get-TailscaleServeState -Runner $fake.Runner
+        Assert-NotThrows { Assert-ProxyStateSafe -ServeState $finalState -ExpectedPort 8080 } `
+            'o estado final deveria ter voltado exatamente para a publicacao anterior (porta 8080), sem Funnel'
+        Assert-True ((Get-ManagedProxyTarget -MarkerPath $marker) -eq 'http://127.0.0.1:8080') `
+            'o registro local deveria voltar a apontar para o alvo anterior'
+        Assert-True ($fake.State.Web['fake.ts.net:8443'].Handlers.'/'.Proxy -eq 'http://127.0.0.1:9999') `
+            'o servico nao relacionado em outra porta nao deveria ter sido tocado'
+    } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
+Invoke-Test 'Publish-PrivateHttpsProxy sem publicacao anterior deixa a 443 vazia e sem marcador quando o apply falha (BLOQUEIO DE MERGE #2, regressao 3)' {
+    $failingRunner = { param([string[]] $CliArgs) [pscustomobject]@{ ExitCode = 1; Output = 'falhou' } }
+    $marker = New-TestMarkerPath
+    try {
+        Assert-Throws { Publish-PrivateHttpsProxy -Port 8080 -Runner $failingRunner -MarkerPath $marker } `
+            'a primeira publicacao deveria propagar a falha do apply'
+        Assert-True (-not (Get-ManagedProxyTarget -MarkerPath $marker)) 'sem publicacao anterior, nao deveria sobrar marcador'
+    } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
+Invoke-Test 'Set-VerifiedPrivateHttpsProxy sem publicacao anterior deixa a 443 vazia e sem marcador quando a pos-verificacao falha (BLOQUEIO DE MERGE #2, regressao 4)' {
+    $fake = New-FakeTailscaleRunner -EnableFunnelOnApply
+    $marker = New-TestMarkerPath
+    try {
+        Assert-Throws { Set-VerifiedPrivateHttpsProxy -Port 8080 -Runner $fake.Runner -MarkerPath $marker } `
+            'a pos-condicao (Funnel habilitado) deveria falhar e propagar na primeira publicacao'
+        Assert-True (-not (Get-Serve443WebEntry -ServeState (Get-TailscaleServeState -Runner $fake.Runner))) `
+            'sem publicacao anterior, a porta 443 deveria terminar vazia'
+        Assert-True (-not (Get-ManagedProxyTarget -MarkerPath $marker)) 'sem publicacao anterior, nao deveria sobrar marcador'
+    } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
+Invoke-Test 'Restore-PriorServe443Target lanca erro explicito de intervencao manual quando a propria restauracao falha (BLOQUEIO DE MERGE #2, regressao 5)' {
+    $alwaysFailingRunner = { param([string[]] $CliArgs) [pscustomobject]@{ ExitCode = 1; Output = 'falhou' } }
+    $marker = New-TestMarkerPath
+    try {
+        Set-ManagedProxyTarget -MarkerPath $marker -Target 'http://127.0.0.1:8080'
+        $thrown = $null
+        try {
+            Restore-PriorServe443Target -Runner $alwaysFailingRunner -MarkerPath $marker `
+                -PriorTarget 'http://127.0.0.1:8080' -FailureMessage 'Falha original de teste'
+        } catch { $thrown = $_.Exception.Message }
+        Assert-True ($null -ne $thrown -and $thrown -match 'Intervencao manual necessaria') `
+            'a falha da propria restauracao deveria lancar uma mensagem explicita de intervencao manual'
+        Assert-True (-not (Get-ManagedProxyTarget -MarkerPath $marker)) `
+            'o registro local nao deveria reivindicar um alvo que nao foi comprovadamente restaurado'
+    } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
+# ---------------------------------------------------------------------
 # Set-VerifiedPrivateHttpsProxy: apply + verify, transactional on failure
 # ---------------------------------------------------------------------
 Invoke-Test 'Set-VerifiedPrivateHttpsProxy aplica e verifica com sucesso no caminho feliz' {
