@@ -1,25 +1,39 @@
 import json
 import logging
 import re
+import time
 import uuid
 from calendar import monthrange
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.models import (
     Account,
     AccountBalanceObservation,
     AuditEvent,
     CaptureDraft,
+    CaptureProcessingJob,
     Category,
     ClassificationRule,
     Commission,
@@ -72,6 +86,7 @@ from app.security import (
     set_session_cookie,
     verify_password,
 )
+from app.services import capture_worker
 from app.services.card_payment_reconciliation import (
     CardPaymentLinkError,
     link_card_payment,
@@ -889,6 +904,20 @@ def _capture_response(item: CaptureDraft) -> dict:
         result = json.loads(item.result_json) if item.result_json else None
     except json.JSONDecodeError:
         result = None
+    job = item.processing_job
+    job_info = (
+        {
+            "job_type": job.job_type,
+            "status": job.status,
+            "attempts": job.attempts,
+            "max_attempts": job.max_attempts,
+            "error_code": job.error_code,
+            "started_at": job.started_at,
+            "completed_at": job.completed_at,
+        }
+        if job
+        else None
+    )
     return {
         "id": item.id,
         "source_type": item.source_type,
@@ -902,6 +931,7 @@ def _capture_response(item: CaptureDraft) -> dict:
         "file_name": item.document.original_name if item.document else None,
         "created_at": item.created_at,
         "confirmed_at": item.confirmed_at,
+        "job": job_info,
     }
 
 
@@ -2727,8 +2757,306 @@ def rerun_document_reconciliation(
     return serialize_reconciliation(reconciliation)
 
 
+async def _analyze_and_persist_capture(
+    db: Session,
+    user: User,
+    document: Document | None,
+    *,
+    text: str | None,
+    filename: str | None,
+    content_type: str | None,
+    payload: bytes | None,
+    document_type: str,
+    account: Account | None,
+    capture: CaptureDraft | None = None,
+) -> CaptureDraft:
+    """Run `preview_capture` (+ conditional Codex low-confidence enrichment)
+    and persist the resulting proposal onto a `CaptureDraft`.
+
+    This is the single place -- shared by the synchronous fast path
+    (plain text / CSV / OFX, below) and the asynchronous OCR/audio worker
+    (`_process_claimed_capture_job`) -- that turns processed text into a
+    capture proposal; see `docs/WORK_ORDER_ASYNC_OCR_AUDIO_WORKER.md` item
+    2 ("reutilizar os mesmos parsers/processadores/serviços canônicos
+    existentes; não criar segunda implementação").
+
+    When `capture` is `None`, a new draft is created (the synchronous path,
+    and the `CaptureParseError` "needs_input" branch it can also take).
+    When `capture` is given, that existing row is updated in place instead
+    -- what the worker and manual retry use, so reprocessing a draft can
+    never create a second `CaptureDraft`/`Document` (item 4: retry must not
+    duplicate a draft or document).
+
+    Caller is responsible for `db.commit()`.
+    """
+
+    try:
+        analysis = await run_in_threadpool(
+            preview_capture,
+            text=text,
+            filename=filename,
+            content_type=content_type,
+            payload=payload,
+            requested_type=document_type,
+            account_type=account.account_type if account else None,
+            db=db,
+            household_id=user.household_id,
+        )
+    except CaptureParseError as exc:
+        source_type = "text"
+        if payload:
+            if (content_type or "").startswith("audio/"):
+                source_type = "audio"
+            elif (content_type or "").startswith("image/"):
+                source_type = "image"
+            else:
+                source_type = "document"
+        if capture is None:
+            capture = CaptureDraft(
+                household_id=user.household_id,
+                user_id=user.id,
+                document_id=document.id if document else None,
+                proposal_json="[]",
+                confidence=Decimal("0"),
+            )
+            db.add(capture)
+        capture.source_type = source_type
+        capture.detected_type = document_type
+        capture.status = "needs_input"
+        capture.processor = "local_rules"
+        capture.original_text = (text or "")[:10000] or None
+        capture.notes = str(exc)
+        db.flush()
+        if document:
+            document.status = "capture_needs_input"
+            document.notes = str(exc)
+        audit(
+            db,
+            user,
+            "capture.needs_input",
+            "capture_draft",
+            capture.id,
+            {"source_type": source_type, "reason": str(exc)},
+        )
+        return capture
+
+    category_rows = db.scalars(select(Category).where(Category.household_id == user.household_id)).all()
+    categories_by_name = {item.name.casefold(): item.name for item in category_rows}
+    if (
+        len(analysis["items"]) == 1
+        and analysis["items"][0].get("kind") == "transaction"
+        and float(analysis["items"][0].get("confidence", 0)) < 0.70
+    ):
+        codex = CodexAdvisorClient()
+        classification = await run_in_threadpool(
+            codex.classify,
+            {
+                "message": (analysis.get("extracted_text") or text or "")[:2000],
+                "local_proposal": analysis["items"][0],
+                "allowed_categories": [item.name for item in category_rows],
+            },
+        )
+        if classification.payload:
+            suggestion = classification.payload
+            allowed_category = categories_by_name.get(str(suggestion.get("category_name") or "").casefold())
+            if allowed_category:
+                proposal = analysis["items"][0]
+                proposal["category_name"] = allowed_category
+                proposal["movement_type"] = suggestion.get("movement_type", proposal.get("movement_type"))
+                proposed_description = " ".join(
+                    str(suggestion.get("description") or proposal.get("description") or "").split()
+                )
+                if 2 <= len(proposed_description) <= 500:
+                    proposal["description"] = proposed_description
+                try:
+                    suggested_confidence = float(suggestion.get("confidence", 0))
+                except (TypeError, ValueError):
+                    suggested_confidence = 0
+                proposal["confidence"] = round(max(0, min(1, suggested_confidence)), 4)
+                if suggestion.get("reason"):
+                    proposal.setdefault("warnings", []).append(str(suggestion["reason"]))
+                analysis["processor"] += "+codex"
+                analysis["confidence"] = proposal["confidence"]
+
+    proposals = _enrich_capture_items(
+        db,
+        user.household_id,
+        analysis["items"],
+        account.id if account else None,
+    )
+    warnings = list(analysis.get("warnings") or [])
+    if any(item.get("requires_account") for item in proposals):
+        warnings.append("Escolha a conta ou o cartão antes de confirmar")
+    if capture is None:
+        capture = CaptureDraft(household_id=user.household_id, user_id=user.id, document_id=document.id if document else None)
+        db.add(capture)
+    capture.source_type = analysis["source_type"]
+    capture.detected_type = analysis["detected_type"]
+    capture.status = "preview"
+    capture.processor = analysis["processor"]
+    capture.original_text = (text or "")[:10000] or None
+    capture.extracted_text = analysis.get("extracted_text") or None
+    capture.proposal_json = json.dumps(proposals, ensure_ascii=False)
+    capture.confidence = Decimal(str(analysis["confidence"]))
+    capture.notes = "; ".join(dict.fromkeys(warnings))[:4000] or None
+    db.flush()
+    if document:
+        document.document_type = (
+            analysis["detected_type"]
+            if analysis["detected_type"] in {"bank_statement", "credit_card", "payroll"}
+            else "smart_capture"
+        )
+        document.status = "capture_preview"
+    audit(
+        db,
+        user,
+        "capture.preview",
+        "capture_draft",
+        capture.id,
+        {
+            "source_type": capture.source_type,
+            "detected_type": capture.detected_type,
+            "processor": capture.processor,
+            "items": len(proposals),
+        },
+    )
+    return capture
+
+
+async def _process_claimed_capture_job(
+    db: Session, job: CaptureProcessingJob, *, payload: bytes | None
+) -> None:
+    """Process a job this call has already claimed (see
+    `capture_worker.claim_capture_job`). Shared by the background task that
+    runs right after `POST /captures/preview`/`/retry` responds and by the
+    crash-recovery reconciler (`app/cli/capture_worker.py`) -- neither path
+    duplicates the OCR/Whisper/classification work itself, only how a job
+    gets claimed.
+
+    `payload` is the plaintext bytes already read for the request that
+    enqueued the job, when available (avoids a redundant decrypt); the
+    reconciler has no such in-memory payload and this function reads the
+    encrypted original from disk instead. Either way the original file
+    itself is never rewritten, never leaves this process, and is never
+    logged.
+    """
+
+    capture = db.get(CaptureDraft, job.capture_draft_id)
+    if capture is None:
+        # Draft no longer exists (out-of-band cleanup) -- nothing left to
+        # do; finish the job honestly rather than leaving it "processing".
+        capture_worker.mark_job_completed(db, job)
+        db.commit()
+        return
+    if capture.status == "cancelled":
+        # The household cancelled this draft while the job was in flight;
+        # never resurrect a cancelled draft by writing a proposal onto it.
+        capture_worker.mark_job_completed(db, job)
+        db.commit()
+        return
+
+    document = db.get(Document, job.document_id) if job.document_id else None
+    capture.status = "processing"
+    db.commit()
+
+    account = db.get(Account, document.account_id) if document and document.account_id else None
+    actor_user = db.get(User, capture.user_id) if capture.user_id else None
+    actor = actor_user or SimpleNamespace(household_id=job.household_id, id=capture.user_id)
+
+    timer_started = time.perf_counter()
+    try:
+        if payload is None and document:
+            payload = EncryptedDocumentStore().read(document.encrypted_path)
+        await _analyze_and_persist_capture(
+            db,
+            actor,
+            document,
+            text=capture.original_text,
+            filename=document.original_name if document else None,
+            content_type=job.content_type,
+            payload=payload,
+            document_type=capture.detected_type,
+            account=account,
+            capture=capture,
+        )
+        capture_worker.mark_job_completed(
+            db, job, duration_ms=round((time.perf_counter() - timer_started) * 1000)
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "capture_processing_job_failed",
+            extra={"job_id": job.id, "job_type": job.job_type, "household_id": job.household_id},
+        )
+        capture_worker.mark_job_failed(
+            db,
+            job,
+            error_code="processing_error",
+            duration_ms=round((time.perf_counter() - timer_started) * 1000),
+        )
+        capture = db.get(CaptureDraft, job.capture_draft_id)
+        if capture is not None:
+            capture.status = "failed"
+        if document is not None:
+            document.status = "capture_failed"
+        db.commit()
+
+
+def get_capture_job_session_factory() -> Callable[[], Session]:
+    """FastAPI dependency wrapping `app.db.SessionLocal` for the async
+    capture worker's background task.
+
+    A `BackgroundTasks` target runs after the request's own `Depends(get_db)`
+    session has already closed, so it must always open a session of its
+    own -- but resolving *which* session factory to use through a
+    dependency (rather than importing `SessionLocal` directly at the call
+    site) lets tests override this exactly like they override `get_db`
+    (`app.dependency_overrides[get_capture_job_session_factory] = ...`)
+    instead of depending on which test module happens to import `app.db`
+    first and fix its module-level engine for the rest of the test run.
+    """
+
+    return SessionLocal
+
+
+async def _run_capture_job_background(
+    job_id: str,
+    payload: bytes | None,
+    *,
+    session_factory: Callable[[], Session] = SessionLocal,
+) -> None:
+    """`BackgroundTasks` target for a freshly (re)queued OCR/audio job: runs
+    after the HTTP response has already been sent, on its own DB session
+    (`app.db.SessionLocal` by default) since the request's own session is
+    closed by the time background tasks execute.
+
+    `session_factory` defaults to the real `app.db.SessionLocal` -- tests
+    inject their own isolated session factory instead of a global
+    `get_db` dependency override, since this always opens a session itself
+    rather than receiving one through FastAPI's dependency injection (see
+    `app.cli.capture_worker.reconcile_once`, the crash-recovery reconciler,
+    for the same pattern).
+    """
+
+    db = session_factory()
+    try:
+        job = capture_worker.claim_capture_job(
+            db,
+            job_id,
+            worker_id=capture_worker.worker_identity(),
+            stale_after_seconds=settings.capture_job_stale_after_seconds,
+        )
+        if job is None:
+            return
+        await _process_claimed_capture_job(db, job, payload=payload)
+    finally:
+        db.close()
+
+
 @router.post("/captures/preview", status_code=201)
 async def create_capture_preview(
+    background_tasks: BackgroundTasks,
     text: str | None = Form(default=None),
     account_id: str | None = Form(default=None),
     document_type: str = Form(
@@ -2738,6 +3066,7 @@ async def create_capture_preview(
     file: UploadFile | None = File(default=None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    job_session_factory: Callable[[], Session] = Depends(get_capture_job_session_factory),
 ) -> dict:
     if not (text and text.strip()) and file is None:
         raise HTTPException(status_code=422, detail="Escreva uma mensagem ou envie um arquivo")
@@ -2789,138 +3118,51 @@ async def create_capture_preview(
         db.flush()
         document.encrypted_path = EncryptedDocumentStore().save(document.id, payload)
 
-    try:
-        analysis = await run_in_threadpool(
-            preview_capture,
-            text=text,
-            filename=filename,
-            content_type=content_type,
-            payload=payload,
-            requested_type=document_type,
-            account_type=account.account_type if account else None,
-            db=db,
-            household_id=user.household_id,
+    job_type = capture_worker.classify_async_job_type(filename, content_type, has_payload=payload is not None)
+    if job_type and settings.capture_async_processing_enabled:
+        source_type = "audio" if job_type == "audio" else (
+            "image" if (content_type or "").startswith("image/") else "document"
         )
-    except CaptureParseError as exc:
-        source_type = "text"
-        if file:
-            if (content_type or "").startswith("audio/"):
-                source_type = "audio"
-            elif (content_type or "").startswith("image/"):
-                source_type = "image"
-            else:
-                source_type = "document"
         capture = CaptureDraft(
             household_id=user.household_id,
             user_id=user.id,
             document_id=document.id if document else None,
             source_type=source_type,
             detected_type=document_type,
-            status="needs_input",
-            processor="local_rules",
+            status="queued",
+            processor="pending",
             original_text=(text or "")[:10000] or None,
             proposal_json="[]",
             confidence=Decimal("0"),
-            notes=str(exc),
         )
         db.add(capture)
-        if document:
-            document.status = "capture_needs_input"
-            document.notes = str(exc)
         db.flush()
-        audit(
+        job = capture_worker.create_capture_job(
             db,
-            user,
-            "capture.needs_input",
-            "capture_draft",
-            capture.id,
-            {"source_type": source_type, "reason": str(exc)},
+            household_id=user.household_id,
+            capture_draft_id=capture.id,
+            document_id=document.id if document else None,
+            job_type=job_type,
+            content_type=content_type,
+            max_attempts=settings.capture_job_max_attempts,
         )
+        audit(db, user, "capture.queued", "capture_draft", capture.id, {"job_type": job_type})
         db.commit()
+        background_tasks.add_task(
+            _run_capture_job_background, job.id, payload, session_factory=job_session_factory
+        )
         return _capture_response(capture)
 
-    category_rows = db.scalars(select(Category).where(Category.household_id == user.household_id)).all()
-    categories_by_name = {item.name.casefold(): item.name for item in category_rows}
-    if (
-        len(analysis["items"]) == 1
-        and analysis["items"][0].get("kind") == "transaction"
-        and float(analysis["items"][0].get("confidence", 0)) < 0.70
-    ):
-        codex = CodexAdvisorClient()
-        classification = await run_in_threadpool(
-            codex.classify,
-            {
-                "message": (analysis.get("extracted_text") or text or "")[:2000],
-                "local_proposal": analysis["items"][0],
-                "allowed_categories": [item.name for item in category_rows],
-            },
-        )
-        if classification.payload:
-            suggestion = classification.payload
-            allowed_category = categories_by_name.get(str(suggestion.get("category_name") or "").casefold())
-            if allowed_category:
-                proposal = analysis["items"][0]
-                proposal["category_name"] = allowed_category
-                proposal["movement_type"] = suggestion.get("movement_type", proposal.get("movement_type"))
-                proposed_description = " ".join(
-                    str(suggestion.get("description") or proposal.get("description") or "").split()
-                )
-                if 2 <= len(proposed_description) <= 500:
-                    proposal["description"] = proposed_description
-                try:
-                    suggested_confidence = float(suggestion.get("confidence", 0))
-                except (TypeError, ValueError):
-                    suggested_confidence = 0
-                proposal["confidence"] = round(max(0, min(1, suggested_confidence)), 4)
-                if suggestion.get("reason"):
-                    proposal.setdefault("warnings", []).append(str(suggestion["reason"]))
-                analysis["processor"] += "+codex"
-                analysis["confidence"] = proposal["confidence"]
-
-    proposals = _enrich_capture_items(
-        db,
-        user.household_id,
-        analysis["items"],
-        account.id if account else None,
-    )
-    warnings = list(analysis.get("warnings") or [])
-    if any(item.get("requires_account") for item in proposals):
-        warnings.append("Escolha a conta ou o cartão antes de confirmar")
-    capture = CaptureDraft(
-        household_id=user.household_id,
-        user_id=user.id,
-        document_id=document.id if document else None,
-        source_type=analysis["source_type"],
-        detected_type=analysis["detected_type"],
-        status="preview",
-        processor=analysis["processor"],
-        original_text=(text or "")[:10000] or None,
-        extracted_text=analysis.get("extracted_text") or None,
-        proposal_json=json.dumps(proposals, ensure_ascii=False),
-        confidence=Decimal(str(analysis["confidence"])),
-        notes="; ".join(dict.fromkeys(warnings))[:4000] or None,
-    )
-    db.add(capture)
-    if document:
-        document.document_type = (
-            analysis["detected_type"]
-            if analysis["detected_type"] in {"bank_statement", "credit_card", "payroll"}
-            else "smart_capture"
-        )
-        document.status = "capture_preview"
-    db.flush()
-    audit(
+    capture = await _analyze_and_persist_capture(
         db,
         user,
-        "capture.preview",
-        "capture_draft",
-        capture.id,
-        {
-            "source_type": capture.source_type,
-            "detected_type": capture.detected_type,
-            "processor": capture.processor,
-            "items": len(proposals),
-        },
+        document,
+        text=text,
+        filename=filename,
+        content_type=content_type,
+        payload=payload,
+        document_type=document_type,
+        account=account,
     )
     db.commit()
     return _capture_response(capture)
@@ -2976,9 +3218,57 @@ def cancel_capture(
     item.status = "cancelled"
     if item.document:
         item.document.status = "capture_cancelled"
+    job = item.processing_job
+    if job is not None and job.status not in {"completed", "failed"}:
+        capture_worker.mark_job_failed(db, job, error_code="cancelled_by_user")
     audit(db, user, "capture.cancel", "capture_draft", item.id)
     db.commit()
     return {"ok": True}
+
+
+@router.post("/captures/{capture_id}/retry")
+async def retry_capture(
+    capture_id: str,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    job_session_factory: Callable[[], Session] = Depends(get_capture_job_session_factory),
+) -> dict:
+    """Re-run OCR/audio processing for a capture whose worker job ended in
+    `failed` -- the only user-facing path that moves a job back to
+    `queued` (see `docs/WORK_ORDER_ASYNC_OCR_AUDIO_WORKER.md` items 4-5).
+    Never creates a new `CaptureDraft`/`Document`: it re-processes the
+    exact same rows in place, exactly like the worker's own crash-recovery
+    reclaim does."""
+
+    capture = db.scalar(
+        select(CaptureDraft).where(
+            CaptureDraft.id == capture_id,
+            CaptureDraft.household_id == user.household_id,
+        )
+    )
+    if not capture:
+        raise HTTPException(status_code=404, detail="Captura não encontrada")
+    job = capture.processing_job
+    if job is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Esta captura não usa processamento assíncrono",
+        )
+    if job.status != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Só é possível reprocessar capturas com falha (status atual: {job.status})",
+        )
+    capture_worker.reset_job_for_retry(db, job)
+    capture.status = "queued"
+    capture.notes = None
+    audit(db, user, "capture.retry", "capture_draft", capture.id, {"job_type": job.job_type, "attempts": job.attempts})
+    db.commit()
+    background_tasks.add_task(
+        _run_capture_job_background, job.id, None, session_factory=job_session_factory
+    )
+    return _capture_response(capture)
 
 
 @router.post("/captures/{capture_id}/confirm")
@@ -3000,6 +3290,13 @@ def confirm_capture(
         raise HTTPException(status_code=409, detail="Esta captura já foi confirmada")
     if capture.status == "cancelled":
         raise HTTPException(status_code=409, detail="Esta captura foi cancelada")
+    if capture.status in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="Esta captura ainda está sendo processada")
+    if capture.status == "failed":
+        raise HTTPException(
+            status_code=409,
+            detail="O processamento desta captura falhou; use /captures/{id}/retry antes de confirmar",
+        )
     selected = [item for item in payload.items if item.selected]
     if not selected:
         raise HTTPException(status_code=422, detail="Selecione ao menos um item para confirmar")
