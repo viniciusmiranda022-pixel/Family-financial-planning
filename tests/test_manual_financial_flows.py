@@ -24,8 +24,10 @@ Uses the same isolated-engine + `TestClient` + `/api/auth/setup` pattern as
 
 import json
 import os
+import re
 import uuid
 from decimal import Decimal
+from pathlib import Path
 
 from cryptography.fernet import Fernet
 from sqlalchemy import create_engine, select
@@ -218,6 +220,119 @@ def test_manual_refund_offsets_expense_without_becoming_income():
             )
             assert event is not None
             assert json.loads(event.details)["movement_type"] == "refund"
+
+
+def test_dashboard_publishes_large_entry_threshold_matching_backend_enforcement():
+    """Regression for the slice 5 PR review's merge block: `app/static/app.js`
+    used to recompute `Math.max(5000, cash_cap * 2)` independently in the
+    browser to decide whether to show a confirmation dialog before
+    submitting a large entry -- a second, client-side copy of the exact
+    policy `_large_entry_threshold()` (`app/api.py`) already enforces
+    server-side on every mutable money-entry endpoint. Two implementations
+    of the same financial rule can silently diverge if the backend formula
+    ever changes without a matching frontend edit; `docs/GO_LIVE_MANUAL_UX_PLAN.md`
+    line 114 ("a UI nunca calcula uma política financeira diferente do
+    backend") and this slice's Work Order (paridade UI/backend) forbid
+    exactly that.
+
+    The fix removed the frontend formula: `GET /dashboard` now publishes
+    the backend's own `_large_entry_threshold(profile)` result under
+    `noncanonical.large_entry_threshold`, and `largeEntryThreshold()` in
+    `app/static/app.js` reads that published value instead of
+    recalculating it (see the assertion against the frontend source below).
+
+    This test proves the *value* half of that parity: the published
+    number is not a hardcoded or stale figure -- it tracks
+    `monthly_cash_cap` exactly the way `_large_entry_threshold` defines it,
+    for both the floor branch (`max(5000, ...)` wins) and the
+    multiplication branch, and it is the exact number the backend actually
+    requires `confirmed_large_amount` for on a real mutation."""
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        itau = _create_account(client, name="Itaú Corrente")
+
+        # Default `monthly_cash_cap` is 0 (`app/models.py`): the floor
+        # branch of `max(5000, cash_cap * 2)` must win.
+        floor_dashboard = client.get("/api/dashboard?month=2026-08").json()
+        floor_entry = floor_dashboard["noncanonical"]["large_entry_threshold"]
+        assert floor_entry["value"] == 5000.0
+        assert floor_entry["source"] == "computed"
+        assert floor_entry["certified_by"] is None
+
+        # Raise `monthly_cash_cap` so the multiplication branch wins
+        # instead, and prove the published value moves with it.
+        profile = client.get("/api/profile").json()
+        profile["monthly_cash_cap"] = "4000"
+        assert client.put("/api/profile", json=profile).status_code == 200
+
+        raised_dashboard = client.get("/api/dashboard?month=2026-08").json()
+        published_threshold = raised_dashboard["noncanonical"]["large_entry_threshold"]["value"]
+        assert published_threshold == 8000.0  # max(5000, 4000 * 2)
+
+        # Parity with real enforcement: an amount one cent below the
+        # published threshold is accepted outright; the published
+        # threshold itself is rejected without `confirmed_large_amount`,
+        # matching `_large_entry_threshold`'s `>=` comparison exactly.
+        below = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-10",
+                "description": "Compra abaixo do limite",
+                "amount": published_threshold - 0.01,
+                "movement_type": "expense",
+                "account_id": itau,
+                "category_id": _non_system_category_id(client),
+            },
+        )
+        assert below.status_code == 201, below.text
+
+        at_threshold = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-10",
+                "description": "Compra no limite",
+                "amount": published_threshold,
+                "movement_type": "expense",
+                "account_id": itau,
+                "category_id": _non_system_category_id(client),
+            },
+        )
+        assert at_threshold.status_code == 409, at_threshold.text
+
+        confirmed = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-08-10",
+                "description": "Compra no limite confirmada",
+                "amount": published_threshold,
+                "movement_type": "expense",
+                "account_id": itau,
+                "category_id": _non_system_category_id(client),
+                "confirmed_large_amount": True,
+            },
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+
+def test_frontend_large_entry_threshold_has_no_parallel_financial_formula():
+    """Static-source regression: `app/static/app.js` has no JS test runner
+    in this project's CI (`frontend-syntax` only runs `node --check`), so
+    this is the deterministic, auditable way to prove the frontend's
+    `largeEntryThreshold()` never reintroduces the second, independent
+    `max(5000, cash_cap * 2)` formula this slice's PR review required
+    removed -- it must read the backend-published
+    `noncanonical.large_entry_threshold` value instead. See
+    `test_dashboard_publishes_large_entry_threshold_matching_backend_enforcement`
+    above for the matching value-parity proof."""
+    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    match = re.search(r"function largeEntryThreshold\(\)\s*\{.*?\n\}", source, re.DOTALL)
+    assert match, "largeEntryThreshold() not found in app/static/app.js"
+    body = match.group(0)
+    assert "noncanonical" in body and "large_entry_threshold" in body
+    assert "cash_cap" not in body
+    assert "5000" not in body
+    assert "* 2" not in body and "*2" not in body
 
 
 def test_manual_expense_at_sight_in_checking_account():
