@@ -264,9 +264,8 @@ uma segunda fonte de verdade.
 `POST /api/purchases/scenario-comparison` (`app/api.py::compare_purchase_scenarios`) compara duas a
 cinco alternativas hipotéticas de compra (preço, entrada, quantidade de parcelas, juros mensal e
 mês da compra) sem introduzir um segundo motor de cálculo. Cada alternativa é convertida em um
-`month -> valor` de parcelas (`_purchase_scenario_candidate_schedule`, reusando
-`_installment_remaining_schedule` -- a mesma função de fonte única já usada pelas parcelas de
-cartão persistidas -- e a fórmula de amortização price/Gauss, extraída de `_advisor_payment` para
+`month -> valor` de parcelas (`_purchase_scenario_candidate_schedule`, reusando a fórmula de
+amortização price/Gauss, extraída de `_advisor_payment` para
 `app.services.finance.amortized_installment_payment` para nunca existir em duas cópias) e somada,
 sem duplicar, às parcelas futuras já persistidas do household (`_future_installments`). O resultado
 alimenta o mesmo `_build_projection_gate_checks` que `GET /forecast` já usa -- agora com um
@@ -274,6 +273,21 @@ parâmetro opcional `extra_installments` --, então cada alternativa é literalm
 Projection Engine (`build_forecast`) e pelo Projection Validator (`validate_projection`) canônicos,
 preservando os três cenários normativos (`no_commission`/`delayed`/`expected`) e a autoridade de
 INV-005/006/018/022 sobre `trusted_for_projection`.
+
+`purchase_month` é, sem exceção, o primeiro mês em que a compra afeta a projeção: a entrada (se
+houver) e a primeira parcela do valor financiado (se houver) caem nesse mesmo mês, e cada parcela
+seguinte cai um mês depois da anterior -- aritmética de calendário direta, sem política financeira
+embutida (`for offset in range(installment_count): month_key(add_months(purchase_month, offset))`).
+Uma segunda revisão de engenharia neste PR bloqueou uma versão anterior que inferia "primeira
+parcela financiada só no mês seguinte" como convenção de mercado ("common retail installment
+plans") e reusava `_installment_remaining_schedule` (o contrato de parcelas *remanescentes após*
+uma parcela já observada em um `Transaction` real) com `installment_current=0` para fabricar um
+"mês zero" -- ambas eram semântica financeira nova não reutilizada de nenhum contrato canônico
+existente, e a primeira contradizia a própria documentação do campo `purchase_month`
+(`PurchaseScenarioAlternativeRequest`, `app/schemas.py`). A versão atual não usa
+`_installment_remaining_schedule` nesta função; ela continua sendo a fonte única para as parcelas de
+cartão já persistidas (`_future_installments`/`_project_installments`), que descrevem um cenário
+genuinamente diferente (uma parcela já observada em um `Transaction` real).
 
 Cada cenário publica apenas fatos determinísticos e não prescritivos (`final_balance`,
 `minimum_balance`, `final_uncovered_deficit`, `maximum_uncovered_deficit`,

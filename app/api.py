@@ -5627,37 +5627,46 @@ def _purchase_scenario_candidate_schedule(
 
     Reuses `app.services.finance.amortized_installment_payment` (the exact
     formula the Advisor chat's free-text parser already uses -- never a
-    second amortization formula) and
-    `_installment_remaining_schedule` (the single source of truth for
-    "which future months a commitment adds and how much", shared with
-    already-persisted card installments) to place the resulting amounts on
-    the calendar. No `Transaction`/`Obligation` row is read or written for
-    this candidate; it exists only in memory for this one request.
+    second amortization formula) for the amount of each installment. No
+    `Transaction`/`Obligation` row is read or written for this candidate; it
+    exists only in memory for this one request.
 
-    Convention (disclosed, not derived from `FINANCIAL_RULES`, since no
-    purchase-simulation feature existed before this one): the down payment,
-    if any, is due at `purchase_month`. The financed remainder (price minus
-    down payment) is due at `purchase_month` itself, in one lump sum,
-    *only* in the pure-cash case (no down payment at all and a single
-    installment) -- that is the one case with no time-separated financing.
-    Whenever a down payment exists, or more than one installment is
-    requested, the financed remainder's first installment is due the month
-    after `purchase_month` instead, matching common retail installment
-    plans; this keeps the calendar placement orthogonal to
-    `installment_count` (a lone financed installment is still a *future*
-    payment when it coexists with a down payment today, never silently
-    merged into the same month as the down payment -- see the engineering
-    review that caught this discontinuity at `installment_count == 1`).
+    `purchase_month` is, literally and without exception, the first month
+    this purchase affects the projection (matching its own field
+    documentation, `PurchaseScenarioAlternativeRequest.purchase_month`): the
+    down payment, if any, and the financed remainder's first installment
+    (if any) are both due in that same month; each subsequent installment
+    follows one month after the previous one. There is no inferred
+    "first installment due next month" gap -- an earlier revision of this
+    function introduced exactly that as a disclosed-but-unsourced
+    convention justified by "common retail installment plans", which the
+    engineering review on this PR correctly rejected as inventing calendar
+    semantics the Work Order forbids (`docs/WORK_ORDER_PURCHASE_SCENARIO_
+    COMPARISON.md`: reuse existing contracts, never a second one). This
+    version makes no assumption at all about when a real retailer would
+    charge the first installment; it only places `installment_count`
+    equal amounts starting at `purchase_month`, which is the one placement
+    consistent with `purchase_month`'s own documented meaning for every
+    combination of `down_payment`/`installment_count`.
+
+    `_installment_remaining_schedule` -- the single source of truth for
+    "which future months a commitment adds and how much" for
+    already-persisted card installments -- is deliberately *not* reused
+    here: its `installment_current`/`installment_total` contract describes
+    the months remaining *after* an installment that a real `Transaction`
+    already booked, which has no equivalent for a purchase that was only
+    compared, never made. Reusing it anyway (as the earlier revision did,
+    passing `installment_current=0` to fabricate a pre-first-installment
+    "month zero") does not turn its result into a canonical convention; it
+    would still be this function inventing one. Placing `installment_count`
+    equal amounts on consecutive months from `purchase_month` is instead
+    plain, unambiguous date arithmetic with no embedded financial policy.
     """
 
     financed_amount = money(alternative.price - alternative.down_payment)
-    pure_cash = alternative.down_payment == 0 and alternative.installment_count == 1
     if financed_amount <= 0:
         monthly_payment = Decimal("0")
         total_financed_cost = Decimal("0")
-    elif pure_cash:
-        monthly_payment = financed_amount
-        total_financed_cost = financed_amount
     else:
         monthly_payment, total_financed_cost = amortized_installment_payment(
             financed_amount, alternative.installment_count, alternative.monthly_interest_rate
@@ -5666,17 +5675,9 @@ def _purchase_scenario_candidate_schedule(
     if alternative.down_payment > 0:
         schedule[month_key(purchase_month)] = money(alternative.down_payment)
     if financed_amount > 0:
-        if pure_cash:
-            key = month_key(purchase_month)
+        for offset in range(alternative.installment_count):
+            key = month_key(add_months(purchase_month, offset))
             schedule[key] = schedule.get(key, Decimal("0")) + monthly_payment
-        else:
-            for key, value in _installment_remaining_schedule(
-                amount=monthly_payment,
-                installment_current=0,
-                installment_total=alternative.installment_count,
-                anchor_month=purchase_month,
-            ):
-                schedule[key] = schedule.get(key, Decimal("0")) + value
     return schedule, monthly_payment, total_financed_cost
 
 

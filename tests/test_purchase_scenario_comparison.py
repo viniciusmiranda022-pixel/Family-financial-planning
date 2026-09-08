@@ -242,7 +242,7 @@ def test_two_alternatives_differ_and_match_manual_projection_engine():
         )
         assert financed["monthly_payment"] == float(expected_monthly)
         assert financed["total_purchase_cost"] == float(expected_total)
-        expected_months = [month_key(add_months(datetime.date(2026, 10, 1), offset)) for offset in range(1, 7)]
+        expected_months = [month_key(add_months(datetime.date(2026, 10, 1), offset)) for offset in range(6)]
         assert [row["month"] for row in financed["candidate_installment_schedule"]] == expected_months
         assert all(row["amount"] == float(expected_monthly) for row in financed["candidate_installment_schedule"])
 
@@ -261,7 +261,7 @@ def test_two_alternatives_differ_and_match_manual_projection_engine():
         # build_forecast/validate_projection reproduce the API's numbers.
         schedule = {
             month_key(add_months(datetime.date(2026, 10, 1), offset)): expected_monthly
-            for offset in range(1, 7)
+            for offset in range(6)
         }
         forecast_input = ForecastInput(
             start_month=datetime.date(2026, 10, 1),
@@ -448,8 +448,8 @@ def test_persisted_installments_and_new_alternative_do_not_double_count():
         assert [row["card_installments"] for row in baseline_schedule] == [90.0, 90.0, 0.0, 0.0, 0.0, 0.0]
 
         # New alternative: 1200 over 4 interest-free installments, starting
-        # the month after purchase_month (2026-10 by default) -> 2026-11..
-        # 2027-02 at 300 each.
+        # AT purchase_month (2026-10 by default, the first month it affects
+        # the projection) -> 2026-10..2027-01 at 300 each.
         payload = {
             "alternatives": [
                 {
@@ -468,12 +468,12 @@ def test_persisted_installments_and_new_alternative_do_not_double_count():
         alt = next(item for item in data["alternatives"] if item["label"] == "Notebook novo")
 
         # Combined month -> amount, with no double counting:
-        # 2026-10: 90 (persisted only)
-        # 2026-11: 90 (persisted) + 300 (candidate) = 390
-        # 2026-12 .. 2027-02: 300 (candidate only)
-        # 2027-03: 0
+        # 2026-10: 90 (persisted) + 300 (candidate, its 1st installment) = 390
+        # 2026-11: 90 (persisted) + 300 (candidate, its 2nd installment) = 390
+        # 2026-12, 2027-01: 300 (candidate only, its 3rd/4th installments)
+        # 2027-02, 2027-03: 0
         combined = [row["card_installments"] for row in alt["commitment_schedule"]]
-        assert combined == [90.0, 390.0, 300.0, 300.0, 300.0, 0.0]
+        assert combined == [390.0, 390.0, 300.0, 300.0, 0.0, 0.0]
 
         # The other alternative in the same request must not see the first
         # alternative's candidate schedule either (each is evaluated in
@@ -862,12 +862,15 @@ def test_candidate_schedule_edge_cases():
         _set_profile(client, projection_end="2027-01-01")
 
         # (a) count == 1, no down payment: pure cash, whole price due at
-        # purchase_month (no time-separated financing at all).
-        # (b) count == 1, WITH a down payment: the down payment is still due
-        # at purchase_month, but the financed remainder is a genuine future
-        # installment (due the month after) -- it must never be silently
-        # merged into the down payment's month just because it is the only
-        # financed installment. Same total, different calendar placement.
+        # purchase_month.
+        # (b) count == 1, WITH a down payment: purchase_month is,
+        # unconditionally, the first month the purchase affects the
+        # projection (see `_purchase_scenario_candidate_schedule`'s
+        # docstring) -- the down payment and the financed remainder's one
+        # installment both fall in that same month, summing to the same
+        # total as (a). There is no inferred gap to a "next month" for the
+        # financed part; that was the exact invented calendar semantics an
+        # engineering review on this PR rejected.
         response_1 = client.post(
             ENDPOINT,
             json={
@@ -885,10 +888,7 @@ def test_candidate_schedule_edge_cases():
         assert with_down["monthly_payment"] == 600.0
         assert no_down["total_purchase_cost"] == with_down["total_purchase_cost"] == 1000.0
         assert no_down["candidate_installment_schedule"] == [{"month": "2026-10", "amount": 1000.0}]
-        assert with_down["candidate_installment_schedule"] == [
-            {"month": "2026-10", "amount": 400.0},
-            {"month": "2026-11", "amount": 600.0},
-        ]
+        assert with_down["candidate_installment_schedule"] == [{"month": "2026-10", "amount": 1000.0}]
 
         # (c) count > 1, no interest. (d) count > 1, with interest.
         response_2 = client.post(
@@ -922,6 +922,50 @@ def test_candidate_schedule_edge_cases():
         expected_monthly, expected_total = amortized_installment_payment(Decimal("1200"), 4, Decimal("0.03"))
         assert with_interest["monthly_payment"] == float(expected_monthly)
         assert with_interest["total_purchase_cost"] == float(expected_total)
+        # No down payment, count > 1: `purchase_month` (2026-10) is the
+        # month of the FIRST installment, not a month before it -- explicit
+        # regression for the engineering review's request #4 (no month
+        # displaced by an undocumented inference either with or without a
+        # down payment).
+        assert [row["month"] for row in no_interest["candidate_installment_schedule"]] == [
+            "2026-10",
+            "2026-11",
+            "2026-12",
+            "2027-01",
+        ]
+
+        # (e.5) count > 1 WITH a down payment: the down payment and the
+        # first financed installment both fall at purchase_month (summed in
+        # the same entry), and the remaining installments follow monthly --
+        # no gap between the down payment's month and the first financed
+        # installment.
+        response_2b = client.post(
+            ENDPOINT,
+            json={
+                "alternatives": [
+                    {
+                        "label": "WithDownMulti",
+                        "price": 1000,
+                        "down_payment": 200,
+                        "installment_count": 4,
+                        "monthly_interest_rate": 0,
+                    },
+                    {"label": "Filler", "price": 10, "down_payment": 0, "installment_count": 1},
+                ]
+            },
+        )
+        assert response_2b.status_code == 200, response_2b.text
+        with_down_multi = next(
+            item for item in response_2b.json()["alternatives"] if item["label"] == "WithDownMulti"
+        )
+        # financed = 1000 - 200 = 800 over 4 installments of 200 each.
+        assert with_down_multi["monthly_payment"] == 200.0
+        assert with_down_multi["candidate_installment_schedule"] == [
+            {"month": "2026-10", "amount": 400.0},  # 200 down payment + 200 (1st installment)
+            {"month": "2026-11", "amount": 200.0},
+            {"month": "2026-12", "amount": 200.0},
+            {"month": "2027-01", "amount": 200.0},
+        ]
 
         # (e) down_payment == price -> financed_amount == 0, regardless of
         # installment_count (single lump sum equal to the down payment,
