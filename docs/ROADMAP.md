@@ -163,7 +163,22 @@ série foi mesclado por conta própria.
 
 ## Fase 3 — Próximas evoluções
 
-- worker assíncrono para filas de OCR e áudio;
+### Em andamento
+
+- worker assíncrono para filas de OCR e áudio (`docs/WORK_ORDER_ASYNC_OCR_AUDIO_WORKER.md`): fila
+  durável `capture_processing_jobs` correlacionada a `capture_drafts`/`documents` por household,
+  claim atômico idempotente (`UPDATE ... WHERE status = ...`, sem depender de `SELECT ... FOR
+  UPDATE SKIP LOCKED`), submissão de `POST /captures/preview` não bloqueante via `BackgroundTasks`
+  do FastAPI, reconciliador de recuperação de falhas (`python -m app.cli.capture_worker`) que
+  reclama jobs travados em `processing` e falha explicitamente os que esgotaram tentativas, retry
+  explícito (`POST /captures/{id}/retry`) e migração aditiva/reversível `0011`; reutiliza
+  integralmente os processadores OCR (`pytesseract`/`pymupdf`/`pdfplumber`) e Whisper
+  (`faster-whisper`) existentes, sem segundo motor de OCR/transcrição/classificação; a confirmação
+  humana continua sendo a única via de criação de `Transaction`/`Obligation`/`PayrollRecord`;
+  pendente revisão do engenheiro responsável antes do merge.
+
+### Restante da Fase 3
+
 - regras editáveis e aprendizado pelas correções confirmadas;
 - comparação visual de cenários de compra;
 - notificações de vencimento no navegador;
