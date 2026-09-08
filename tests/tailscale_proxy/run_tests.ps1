@@ -663,6 +663,42 @@ Invoke-Test 'Set-VerifiedPrivateHttpsProxy reverte apenas a porta 443 quando a p
     } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
 }
 
+Invoke-Test 'Set-VerifiedPrivateHttpsProxy limpa o marcador quando a pos-verificacao falha E a remocao de emergencia tambem falha (BLOQUEIO DE MERGE #5)' {
+    $fake = New-FakeTailscaleRunner -EnableFunnelOnApply
+    $marker = New-TestMarkerPath
+    try {
+        # A remocao de emergencia ('serve --https=443 off') tambem falha --
+        # todo outro comando (o apply inicial, status) se comporta
+        # normalmente, entao o apply grava o marcador (exit 0) antes da
+        # pos-verificacao rejeitar o Funnel habilitado.
+        $failingOffRunner = {
+            param([string[]] $CliArgs)
+            if (($CliArgs -join ' ') -eq 'serve --https=443 off') {
+                return [pscustomobject]@{ ExitCode = 1; Output = 'falhou' }
+            }
+            & $fake.Runner $CliArgs
+        }.GetNewClosure()
+
+        $thrown = $null
+        try {
+            Set-VerifiedPrivateHttpsProxy -Port 8080 -Runner $failingOffRunner -MarkerPath $marker
+        } catch { $thrown = $_.Exception.Message }
+
+        Assert-True ($null -ne $thrown -and $thrown -match 'remocao de emergencia da porta 443 tambem falhou') `
+            'a falha dupla (pos-condicao + remocao de emergencia) deveria propagar o erro de intervencao manual'
+        Assert-True (-not (Get-ManagedProxyTarget -MarkerPath $marker)) `
+            'o registro local nao deveria continuar reivindicando um estado que falhou na pos-condicao e cuja remocao de emergencia tambem falhou'
+
+        # Regressao central do BLOQUEIO #5: com o marcador limpo, uma
+        # proxima execucao nao pode aceitar silenciosamente o estado vivo
+        # (ainda inseguro/divergente -- Funnel habilitado) como propriedade
+        # valida desta automacao so porque a forma parece limpa.
+        $liveState = Get-TailscaleServeState -Runner $fake.Runner
+        Assert-Throws { Assert-Serve443OwnedOrEmpty -ServeState $liveState -MarkerPath $marker } `
+            'sem marcador correspondente, o estado vivo nao comprovado nao deveria ser aceito como propriedade desta automacao'
+    } finally { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
 # ---------------------------------------------------------------------
 # Assert-ProxyStateSafe: unsafe states must be rejected
 # ---------------------------------------------------------------------

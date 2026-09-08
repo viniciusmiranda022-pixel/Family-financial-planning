@@ -513,6 +513,19 @@ function Set-VerifiedPrivateHttpsProxy {
         $originalMessage = $_.Exception.Message
         $off = & $Runner @('serve', '--https=443', 'off')
         if ($off.ExitCode -ne 0) {
+            # The target this call just applied already failed its safety
+            # post-condition (Assert-ProxyStateSafe), and the emergency
+            # removal meant to undo it also failed -- so the live port-443
+            # state is now proven unsafe/divergent AND still holds the
+            # marker Publish-PrivateHttpsProxy wrote on the earlier
+            # successful apply. Clear it before surfacing the incident:
+            # this automation must never keep asserting ownership of a
+            # state it explicitly failed to validate, or a later run's
+            # Assert-Serve443OwnedOrEmpty fail-closed gate could treat this
+            # unproven state as its own and silently build on it
+            # (BLOQUEIO DE MERGE #5). Never attempts `serve reset` or a
+            # second `off` here -- only the local marker is touched.
+            Clear-ManagedProxyTarget -MarkerPath $MarkerPath
             throw "Pos-condicao de seguranca falhou apos publicar o proxy, e a remocao de emergencia da porta 443 tambem falhou. Verifique manualmente agora com 'tailscale serve status'. Causa original: $originalMessage"
         }
         if ($priorTarget) {
