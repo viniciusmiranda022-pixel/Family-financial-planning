@@ -126,14 +126,24 @@ def claim_capture_job(
     worker crashed or was killed mid-job -- item 5, "recuperação de
     worker").
 
-    Uses one `UPDATE ... WHERE id = :id AND status = :observed_status` so
-    two callers racing on the same job (the request's own background task
-    and a concurrently-run reconciler sweep, or two reconciler sweeps)
-    cannot both believe they claimed it: only the statement whose `WHERE`
-    still matched at execution time affects a row; `rowcount == 0` tells
-    every loser it lost the race, and it returns `None` rather than
-    processing anything -- this is what makes duplicate delivery /
-    concurrent retry safe (item 4).
+    Uses one `UPDATE ... WHERE id = :id AND status = :observed_status AND
+    attempts = :observed_attempts` so two callers racing on the same job
+    (the request's own background task and a concurrently-run reconciler
+    sweep, or two reconciler sweeps) cannot both believe they claimed it.
+
+    `status` alone is not a sufficient compare-and-swap predicate for the
+    *reclaim* transition: it goes `processing` -> `processing` (only
+    `attempts`/`started_at`/`claimed_by` change), so a second reclaimer
+    that observed the same stale row before the first one committed would
+    still match `WHERE status = 'processing'` after that commit -- the
+    persisted value never actually changed. Comparing `attempts` too closes
+    this: every successful claim (initial or reclaim) increments it, so a
+    second racer's `WHERE ... AND attempts = :observed_attempts` is bound
+    to the pre-image it read and stops matching the instant the first
+    racer's claim commits. `rowcount == 0` then tells every loser it lost
+    the race, and it returns `None` rather than processing anything -- this
+    is what makes duplicate delivery / concurrent retry / concurrent
+    crash-recovery reclaim safe (item 4).
     """
 
     now = datetime.now(UTC)
@@ -148,9 +158,14 @@ def claim_capture_job(
     if not claimable:
         return None
     observed_status = job.status
+    observed_attempts = job.attempts
     result = db.execute(
         update(CaptureProcessingJob)
-        .where(CaptureProcessingJob.id == job_id, CaptureProcessingJob.status == observed_status)
+        .where(
+            CaptureProcessingJob.id == job_id,
+            CaptureProcessingJob.status == observed_status,
+            CaptureProcessingJob.attempts == observed_attempts,
+        )
         .values(
             status="processing",
             attempts=CaptureProcessingJob.attempts + 1,
@@ -164,6 +179,55 @@ def claim_capture_job(
         return None
     db.refresh(job)
     return job
+
+
+def finalize_capture_job(
+    db: Session,
+    job_id: str,
+    *,
+    status: str,
+    error_code: str | None = None,
+    duration_ms: int | None = None,
+) -> bool:
+    """Atomically transition `job_id` from `processing` to a terminal
+    status (`"completed"` or `"failed"`), succeeding only if it is still
+    the same `processing` attempt this call is finalizing. Returns whether
+    this call actually won that transition.
+
+    Closes the cancellation-vs-worker race flagged in review of this Work
+    Order: `app.api.cancel_capture` can move a job straight from
+    `processing` to `failed` (`error_code="cancelled_by_user"`), in its own
+    independently committed transaction, while a worker further along is
+    still mid-flight on that same job. Without this guard, a worker that
+    started before the cancellation could finish afterwards and
+    unconditionally overwrite that terminal state -- resurrecting a
+    cancelled capture with a freshly written proposal, or silently
+    replacing `"cancelled_by_user"` with a processing error.
+
+    Reuses the same compare-and-swap discipline as `claim_capture_job`:
+    `UPDATE ... WHERE status = 'processing'` only ever affects the row if
+    nothing else has already resolved it, so `rowcount == 0`
+    unambiguously means some other transaction (in practice, a
+    cancellation) already finalized this job first. The caller (see
+    `app.api._process_claimed_capture_job`) must then discard --
+    `db.rollback()` -- everything else it staged in this transaction (the
+    capture/document mutations `_analyze_and_persist_capture` made)
+    instead of committing a finalize that lost the race alongside them.
+    """
+
+    values: dict[str, object] = {
+        "status": status,
+        "completed_at": datetime.now(UTC),
+        "error_code": (error_code[:80] if error_code else None),
+    }
+    if duration_ms is not None:
+        values["duration_ms"] = max(0, duration_ms)
+    result = db.execute(
+        update(CaptureProcessingJob)
+        .where(CaptureProcessingJob.id == job_id, CaptureProcessingJob.status == "processing")
+        .values(**values)
+    )
+    return result.rowcount == 1
 
 
 def mark_job_completed(db: Session, job: CaptureProcessingJob, *, duration_ms: int | None = None) -> None:
@@ -286,6 +350,7 @@ __all__ = [
     "worker_identity",
     "create_capture_job",
     "claim_capture_job",
+    "finalize_capture_job",
     "mark_job_completed",
     "mark_job_failed",
     "reset_job_for_retry",

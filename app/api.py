@@ -2939,29 +2939,102 @@ async def _process_claimed_capture_job(
     encrypted original from disk instead. Either way the original file
     itself is never rewritten, never leaves this process, and is never
     logged.
+
+    Every row this function touches -- the draft, its document, the
+    account, the confirming user -- is looked up scoped to `job.household_id`,
+    never by bare id (`db.get`). The FKs on `capture_processing_jobs` do not
+    by themselves guarantee those rows all belong to the same household, so
+    an unscoped lookup could read/decrypt/mutate another household's data
+    if the persisted state were ever inconsistent; scoping every lookup and
+    fail-closing (finalizing the job as `failed` without processing
+    anything) the moment one doesn't correlate is what the Work Order's
+    "não permitir processamento cross-household" invariant actually
+    requires.
     """
+
+    def _finalize_or_discard(
+        *, status: str, error_code: str | None = None, duration_ms: int | None = None
+    ) -> bool:
+        """Atomically resolve `job` as terminal, or -- if it was already
+        resolved by someone else (a concurrent cancellation) -- roll back
+        anything staged in this transaction and report that we lost."""
+
+        won = capture_worker.finalize_capture_job(
+            db, job.id, status=status, error_code=error_code, duration_ms=duration_ms
+        )
+        if not won:
+            db.rollback()
+            logger.info(
+                "capture_processing_job_finalize_conflict",
+                extra={"job_id": job.id, "job_type": job.job_type, "household_id": job.household_id},
+            )
+        return won
 
     capture = db.get(CaptureDraft, job.capture_draft_id)
     if capture is None:
-        # Draft no longer exists (out-of-band cleanup) -- nothing left to
-        # do; finish the job honestly rather than leaving it "processing".
-        capture_worker.mark_job_completed(db, job)
-        db.commit()
+        # Draft no longer exists (out-of-band cleanup) -- benign; nothing
+        # left to do, finish the job honestly.
+        if _finalize_or_discard(status="completed"):
+            db.commit()
+        return
+    if capture.household_id != job.household_id:
+        # Fail closed: this job's own household_id disagrees with the
+        # draft it is correlated to (corrupted/inconsistent persisted
+        # state). Never touch `capture` here -- it belongs to a different
+        # household, so writing to it would itself be the cross-household
+        # mutation item 6 of the Work Order prohibits.
+        if _finalize_or_discard(status="failed", error_code="cross_household_state"):
+            db.commit()
         return
     if capture.status == "cancelled":
         # The household cancelled this draft while the job was in flight;
         # never resurrect a cancelled draft by writing a proposal onto it.
-        capture_worker.mark_job_completed(db, job)
-        db.commit()
+        if _finalize_or_discard(status="completed"):
+            db.commit()
         return
 
-    document = db.get(Document, job.document_id) if job.document_id else None
+    document = None
+    if job.document_id:
+        document = db.scalar(
+            select(Document).where(Document.id == job.document_id, Document.household_id == job.household_id)
+        )
+        if document is None:
+            if _finalize_or_discard(status="failed", error_code="cross_household_state"):
+                if capture.status not in {"confirmed", "cancelled"}:
+                    capture.status = "failed"
+                db.commit()
+            return
+
+    account = None
+    if document is not None and document.account_id:
+        account = db.scalar(
+            select(Account).where(Account.id == document.account_id, Account.household_id == job.household_id)
+        )
+        if account is None:
+            if _finalize_or_discard(status="failed", error_code="cross_household_state"):
+                if capture.status not in {"confirmed", "cancelled"}:
+                    capture.status = "failed"
+                document.status = "capture_failed"
+                db.commit()
+            return
+
+    actor_user = None
+    if capture.user_id:
+        actor_user = db.scalar(
+            select(User).where(User.id == capture.user_id, User.household_id == job.household_id)
+        )
+        if actor_user is None:
+            if _finalize_or_discard(status="failed", error_code="cross_household_state"):
+                if capture.status not in {"confirmed", "cancelled"}:
+                    capture.status = "failed"
+                if document is not None:
+                    document.status = "capture_failed"
+                db.commit()
+            return
+    actor = actor_user or SimpleNamespace(household_id=job.household_id, id=capture.user_id)
+
     capture.status = "processing"
     db.commit()
-
-    account = db.get(Account, document.account_id) if document and document.account_id else None
-    actor_user = db.get(User, capture.user_id) if capture.user_id else None
-    actor = actor_user or SimpleNamespace(household_id=job.household_id, id=capture.user_id)
 
     timer_started = time.perf_counter()
     try:
@@ -2979,28 +3052,23 @@ async def _process_claimed_capture_job(
             account=account,
             capture=capture,
         )
-        capture_worker.mark_job_completed(
-            db, job, duration_ms=round((time.perf_counter() - timer_started) * 1000)
-        )
-        db.commit()
+        duration_ms = round((time.perf_counter() - timer_started) * 1000)
+        if _finalize_or_discard(status="completed", duration_ms=duration_ms):
+            db.commit()
     except Exception:
         db.rollback()
         logger.exception(
             "capture_processing_job_failed",
             extra={"job_id": job.id, "job_type": job.job_type, "household_id": job.household_id},
         )
-        capture_worker.mark_job_failed(
-            db,
-            job,
-            error_code="processing_error",
-            duration_ms=round((time.perf_counter() - timer_started) * 1000),
-        )
-        capture = db.get(CaptureDraft, job.capture_draft_id)
-        if capture is not None:
-            capture.status = "failed"
-        if document is not None:
-            document.status = "capture_failed"
-        db.commit()
+        duration_ms = round((time.perf_counter() - timer_started) * 1000)
+        if _finalize_or_discard(status="failed", error_code="processing_error", duration_ms=duration_ms):
+            capture = db.get(CaptureDraft, job.capture_draft_id)
+            if capture is not None and capture.status not in {"confirmed", "cancelled"}:
+                capture.status = "failed"
+            if document is not None:
+                document.status = "capture_failed"
+            db.commit()
 
 
 def get_capture_job_session_factory() -> Callable[[], Session]:
@@ -3249,6 +3317,15 @@ async def retry_capture(
     )
     if not capture:
         raise HTTPException(status_code=404, detail="Captura não encontrada")
+    if capture.status == "cancelled":
+        # `cancel_capture` marks an in-flight job "failed"
+        # (`error_code="cancelled_by_user"`) as its own honest terminal
+        # state, so `job.status == "failed"` alone cannot distinguish a
+        # cancelled capture from a genuinely failed one here -- checking
+        # the draft's own status is what stops `/retry` from being a
+        # second path (besides the race `_process_claimed_capture_job`'s
+        # atomic finalize already closes) to resurrect a cancelled capture.
+        raise HTTPException(status_code=409, detail="Esta captura foi cancelada")
     job = capture.processing_job
     if job is None:
         raise HTTPException(
