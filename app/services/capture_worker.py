@@ -186,12 +186,15 @@ def finalize_capture_job(
     job_id: str,
     *,
     status: str,
+    claimed_attempt: int,
     error_code: str | None = None,
     duration_ms: int | None = None,
 ) -> bool:
     """Atomically transition `job_id` from `processing` to a terminal
     status (`"completed"` or `"failed"`), succeeding only if it is still
-    the same `processing` attempt this call is finalizing. Returns whether
+    the same `processing` *attempt* this call is finalizing -- `job.attempts`
+    as it stood right after `claim_capture_job` returned it, i.e. this
+    worker's lease version for the attempt it is finishing. Returns whether
     this call actually won that transition.
 
     Closes the cancellation-vs-worker race flagged in review of this Work
@@ -204,11 +207,28 @@ def finalize_capture_job(
     cancelled capture with a freshly written proposal, or silently
     replacing `"cancelled_by_user"` with a processing error.
 
+    Also closes a second, later-found race: `claim_capture_job`'s CAS on
+    `(status, attempts)` stops two *reclaimers* from both winning the same
+    stale pre-image, but `status` alone stopped there is not enough to stop
+    an *old* lease from finalizing a *newer* one. If worker A claims
+    attempt 1 and stalls past `stale_after_seconds`, worker B reclaims the
+    same job (bumping `attempts` to 2, `status` staying `"processing"`),
+    and A then finishes and calls this function -- a `WHERE status =
+    'processing'` predicate alone would still match, letting A publish
+    attempt 1's stale result (or terminal state) over attempt 2's lease.
+    Comparing `attempts == claimed_attempt` too closes this exactly like
+    `claim_capture_job` closes the reclaim race: A's `claimed_attempt` is
+    pinned to `1`, which no longer matches the persisted `2` the instant
+    B's reclaim commits, so A's finalize loses (`rowcount == 0`) and its
+    caller must discard everything else it staged, same as the
+    cancellation race below.
+
     Reuses the same compare-and-swap discipline as `claim_capture_job`:
-    `UPDATE ... WHERE status = 'processing'` only ever affects the row if
-    nothing else has already resolved it, so `rowcount == 0`
-    unambiguously means some other transaction (in practice, a
-    cancellation) already finalized this job first. The caller (see
+    `UPDATE ... WHERE status = 'processing' AND attempts = :claimed_attempt`
+    only ever affects the row if nothing else has already resolved or
+    superseded this exact attempt, so `rowcount == 0` unambiguously means
+    some other transaction (a cancellation, or a newer lease) already
+    finalized/superseded this job first. The caller (see
     `app.api._process_claimed_capture_job`) must then discard --
     `db.rollback()` -- everything else it staged in this transaction (the
     capture/document mutations `_analyze_and_persist_capture` made)
@@ -224,7 +244,11 @@ def finalize_capture_job(
         values["duration_ms"] = max(0, duration_ms)
     result = db.execute(
         update(CaptureProcessingJob)
-        .where(CaptureProcessingJob.id == job_id, CaptureProcessingJob.status == "processing")
+        .where(
+            CaptureProcessingJob.id == job_id,
+            CaptureProcessingJob.status == "processing",
+            CaptureProcessingJob.attempts == claimed_attempt,
+        )
         .values(**values)
     )
     return result.rowcount == 1
@@ -320,6 +344,15 @@ def fail_exhausted_stale_jobs(db: Session, *, stale_after_seconds: int) -> int:
     (unless the draft was already confirmed or cancelled by the household
     in the meantime, in which case its own terminal state stands).
 
+    Every draft/document lookup here is scoped by `job.household_id`
+    (never a bare `db.get(Model, id)` by primary key alone), exactly like
+    `app.api._process_claimed_capture_job` -- a job whose FKs have drifted
+    to point at another household's draft/document (corrupted/inconsistent
+    persisted state) must never have that foreign row loaded or mutated
+    just because its own attempt budget ran out. A job that fails this
+    correlation simply leaves the foreign draft/document untouched; only
+    its own `capture_processing_jobs` row is failed above.
+
     Caller is responsible for `db.commit()`.
     """
 
@@ -335,11 +368,19 @@ def fail_exhausted_stale_jobs(db: Session, *, stale_after_seconds: int) -> int:
     ).all()
     for job in stuck:
         mark_job_failed(db, job, error_code="worker_timeout_exhausted")
-        draft = db.get(CaptureDraft, job.capture_draft_id)
+        draft = db.scalar(
+            select(CaptureDraft).where(
+                CaptureDraft.id == job.capture_draft_id, CaptureDraft.household_id == job.household_id
+            )
+        )
         if draft is not None and draft.status not in {"confirmed", "cancelled"}:
             draft.status = "failed"
         if job.document_id:
-            document = db.get(Document, job.document_id)
+            document = db.scalar(
+                select(Document).where(
+                    Document.id == job.document_id, Document.household_id == job.household_id
+                )
+            )
             if document is not None:
                 document.status = "capture_failed"
     return len(stuck)

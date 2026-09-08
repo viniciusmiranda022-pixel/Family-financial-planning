@@ -2952,15 +2952,30 @@ async def _process_claimed_capture_job(
     requires.
     """
 
+    # Pinned at the exact attempt this call claimed (the value
+    # `claim_capture_job` returned right after its CAS `UPDATE` committed).
+    # Every `finalize_capture_job` call below must compare against this same
+    # frozen value, never a re-read of `job.attempts`, so that an old lease
+    # whose job was reclaimed out from under it (see
+    # `capture_worker.finalize_capture_job`'s docstring) cannot finalize a
+    # newer attempt it no longer owns.
+    claimed_attempt = job.attempts
+
     def _finalize_or_discard(
         *, status: str, error_code: str | None = None, duration_ms: int | None = None
     ) -> bool:
         """Atomically resolve `job` as terminal, or -- if it was already
-        resolved by someone else (a concurrent cancellation) -- roll back
-        anything staged in this transaction and report that we lost."""
+        resolved by someone else (a concurrent cancellation, or a newer
+        lease that reclaimed this job out from under this attempt) -- roll
+        back anything staged in this transaction and report that we lost."""
 
         won = capture_worker.finalize_capture_job(
-            db, job.id, status=status, error_code=error_code, duration_ms=duration_ms
+            db,
+            job.id,
+            status=status,
+            claimed_attempt=claimed_attempt,
+            error_code=error_code,
+            duration_ms=duration_ms,
         )
         if not won:
             db.rollback()
@@ -2970,20 +2985,39 @@ async def _process_claimed_capture_job(
             )
         return won
 
-    capture = db.get(CaptureDraft, job.capture_draft_id)
-    if capture is None:
+    # Scoped correlation check before ever loading the draft's row: reading
+    # only the `household_id` column (never the full `CaptureDraft`, which
+    # carries captured content -- `original_text`, `proposal_json`, etc.)
+    # is enough to decide, without materializing a foreign household's data
+    # in memory, whether this job's own `household_id` still agrees with
+    # the draft it is correlated to.
+    draft_household_id = db.scalar(
+        select(CaptureDraft.household_id).where(CaptureDraft.id == job.capture_draft_id)
+    )
+    if draft_household_id is None:
         # Draft no longer exists (out-of-band cleanup) -- benign; nothing
         # left to do, finish the job honestly.
         if _finalize_or_discard(status="completed"):
             db.commit()
         return
-    if capture.household_id != job.household_id:
+    if draft_household_id != job.household_id:
         # Fail closed: this job's own household_id disagrees with the
         # draft it is correlated to (corrupted/inconsistent persisted
-        # state). Never touch `capture` here -- it belongs to a different
-        # household, so writing to it would itself be the cross-household
-        # mutation item 6 of the Work Order prohibits.
+        # state). Never load the foreign draft's row here -- writing to it,
+        # or even reading its captured content, would itself be the
+        # cross-household processing item 6 of the Work Order prohibits.
         if _finalize_or_discard(status="failed", error_code="cross_household_state"):
+            db.commit()
+        return
+    capture = db.scalar(
+        select(CaptureDraft).where(
+            CaptureDraft.id == job.capture_draft_id, CaptureDraft.household_id == job.household_id
+        )
+    )
+    if capture is None:
+        # TOCTOU: the draft was removed between the household check above
+        # and this scoped fetch -- benign, same as "no longer exists".
+        if _finalize_or_discard(status="completed"):
             db.commit()
         return
     if capture.status == "cancelled":
@@ -3063,7 +3097,15 @@ async def _process_claimed_capture_job(
         )
         duration_ms = round((time.perf_counter() - timer_started) * 1000)
         if _finalize_or_discard(status="failed", error_code="processing_error", duration_ms=duration_ms):
-            capture = db.get(CaptureDraft, job.capture_draft_id)
+            # `db.rollback()` above expired every object in this session,
+            # including `capture` -- re-fetch it scoped by `job.household_id`
+            # (never a bare `db.get` by id) rather than trust the expired
+            # reference, exactly like the initial lookup above.
+            capture = db.scalar(
+                select(CaptureDraft).where(
+                    CaptureDraft.id == job.capture_draft_id, CaptureDraft.household_id == job.household_id
+                )
+            )
             if capture is not None and capture.status not in {"confirmed", "cancelled"}:
                 capture.status = "failed"
             if document is not None:
