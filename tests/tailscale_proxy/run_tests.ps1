@@ -709,6 +709,16 @@ Invoke-Test 'Assert-ProxyStateSafe aceita a publicacao propria mesmo com outro s
         'esta automacao nao e proprietaria de outras portas/servicos do mesmo no e nao deveria rejeita-las'
 }
 
+Invoke-Test 'Assert-ProxyStateSafe rejeita handler no caminho errado mesmo com o alvo correto (BLOQUEIO DE MERGE #4)' {
+    $unsafeState = New-ServeStateFixture @{
+        Web         = @{ 'app.ts.net:443' = @{ Handlers = @{ '/algum-prefixo' = @{ Proxy = 'http://127.0.0.1:8080' } } } }
+        TCP         = @{ '443' = @{ HTTPS = $true } }
+        AllowFunnel = @{ 'app.ts.net:443' = $false }
+    }
+    Assert-Throws { Assert-ProxyStateSafe -ServeState $unsafeState -ExpectedPort 8080 } `
+        'um handler publicado fora da raiz "/" nao deveria ser aceito como a superficie web esperada, mesmo com o Proxy correto'
+}
+
 Invoke-Test 'Assert-ProxyStateSafe rejeita alvo do Advisor publicado' {
     $unsafeState = New-ServeStateFixture @{
         Web         = @{ 'app.ts.net:443' = @{ Handlers = @{ '/' = @{ Proxy = 'http://127.0.0.1:8081' } } } }

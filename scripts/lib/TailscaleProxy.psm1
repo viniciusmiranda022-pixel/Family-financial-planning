@@ -435,9 +435,18 @@ function Assert-ProxyStateSafe {
         throw 'Estado inesperado do Tailscale Serve: nenhum endereco HTTPS (443) publicado para esta aplicacao.'
     }
 
+    # Reuses the same structural rule this automation's own mapping is
+    # defined by (Test-Serve443CleanRootMapping: exactly one handler, at
+    # "/", proxying to loopback) instead of a second, looser definition --
+    # a handler mounted at any other path (e.g. "/algum-prefixo") must be
+    # rejected even when its Proxy value happens to equal expectedTarget,
+    # because the web surface actually published would not be the
+    # application's expected root (BLOQUEIO DE MERGE #4).
+    if (-not (Test-Serve443CleanRootMapping -WebEntry $entry)) {
+        throw 'Estado inesperado do Tailscale Serve: o alvo publicado na porta 443 nao corresponde exatamente a aplicacao esperada.'
+    }
     $handlers = @($entry.Value.Handlers.PSObject.Properties)
-    $matchesTarget = $handlers | Where-Object { $_.Value.Proxy -eq $expectedTarget }
-    if (-not $matchesTarget -or $handlers.Count -ne 1) {
+    if ($handlers[0].Value.Proxy -ne $expectedTarget) {
         throw 'Estado inesperado do Tailscale Serve: o alvo publicado na porta 443 nao corresponde exatamente a aplicacao esperada.'
     }
 
