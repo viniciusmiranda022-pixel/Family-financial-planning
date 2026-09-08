@@ -259,6 +259,35 @@ snapshot/relatório/projeção. Dashboard, relatórios, projeção e Monthly Clo
 exatamente as mesmas linhas `Transaction`/`DocumentReconciliation` de sempre; esta tela não introduz
 uma segunda fonte de verdade.
 
+## Comparação visual de cenários de compra (Fase 3)
+
+`POST /api/purchases/scenario-comparison` (`app/api.py::compare_purchase_scenarios`) compara duas a
+cinco alternativas hipotéticas de compra (preço, entrada, quantidade de parcelas, juros mensal e
+mês da compra) sem introduzir um segundo motor de cálculo. Cada alternativa é convertida em um
+`month -> valor` de parcelas (`_purchase_scenario_candidate_schedule`, reusando
+`_installment_remaining_schedule` -- a mesma função de fonte única já usada pelas parcelas de
+cartão persistidas -- e a fórmula de amortização price/Gauss, extraída de `_advisor_payment` para
+`app.services.finance.amortized_installment_payment` para nunca existir em duas cópias) e somada,
+sem duplicar, às parcelas futuras já persistidas do household (`_future_installments`). O resultado
+alimenta o mesmo `_build_projection_gate_checks` que `GET /forecast` já usa -- agora com um
+parâmetro opcional `extra_installments` --, então cada alternativa é literalmente rodada pelo
+Projection Engine (`build_forecast`) e pelo Projection Validator (`validate_projection`) canônicos,
+preservando os três cenários normativos (`no_commission`/`delayed`/`expected`) e a autoridade de
+INV-005/006/018/022 sobre `trusted_for_projection`.
+
+A comparação é inteiramente simulativa e somente leitura: nenhuma `Transaction`, `Obligation`,
+`Commission`, `PayrollRecord` ou `Document` é lida além do necessário para reconstruir a projeção
+real do household, nenhuma é criada, e a sessão do banco nunca é commitada nesta rota -- inclusive
+o `FinancialSnapshot` que `build_snapshot` eventualmente prepara internamente (idempotente; só gera
+uma linha nova quando o checksum do período corrente já mudou) é descartado ao final da requisição
+sem commit. Cada invariant é avaliado em memória (`evaluate_invariant`/`assess_integrity`, funções
+puras, sem acesso a banco) em vez de `execute_integrity_run`, para que uma compra apenas comparada
+--nunca confirmada-- não deixe `IntegrityRun`/`IntegrityFinding` como se tivesse sido avaliada de
+verdade. Um `purchase_month` fora de `[próximo mês da projeção, projection_end]` é rejeitado (422)
+em vez de silenciosamente não aparecer na projeção. O frontend (`view-planning`, painel "Comparar
+cenários de compra") só reformata a resposta desta rota; não existe fórmula financeira paralela em
+`app/static/app.js` para esta funcionalidade (ver `tests/test_purchase_scenario_comparison_frontend.py`).
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila
