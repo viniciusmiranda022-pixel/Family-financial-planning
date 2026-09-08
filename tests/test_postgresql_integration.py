@@ -28,7 +28,7 @@ import asyncio
 import os
 import threading
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
@@ -59,6 +59,8 @@ from app.config import get_settings  # noqa: E402
 from app.models import (  # noqa: E402
     Account,
     AccountBalanceObservation,
+    CaptureDraft,
+    CaptureProcessingJob,
     Document,
     DocumentReconciliation,
     DuplicateGroup,
@@ -68,6 +70,7 @@ from app.models import (  # noqa: E402
     Transaction,
     User,
 )
+from app.services import capture_worker  # noqa: E402
 from tests.fixtures.fact_fingerprint import fact_fingerprint  # noqa: E402
 from tests.fixtures.synthetic_household import build_synthetic_household  # noqa: E402
 
@@ -648,3 +651,105 @@ def test_card_payment_link_concurrent_confirmations_do_not_leave_asymmetric_pair
         engine.dispose()
     finally:
         get_settings.cache_clear()
+
+
+def test_capture_job_finalize_cas_is_race_safe_on_real_postgresql() -> None:
+    """`docs/WORK_ORDER_ASYNC_OCR_AUDIO_WORKER.md` review (second
+    BLOQUEIO DE MERGE pass), item 1: `app.services.capture_worker.claim_capture_job`/
+    `finalize_capture_job` deliberately use a plain atomic `UPDATE ...
+    WHERE ...` compare-and-swap instead of `SELECT ... FOR UPDATE SKIP
+    LOCKED` specifically so the exact same claim/finalize code is
+    race-safe on both SQLite (the fast unit coverage in
+    `tests/test_async_capture_worker.py`) and PostgreSQL (production) --
+    see that module's docstring. This proves the property the SQLite
+    suite already covers extensively (`test_stale_lease_cannot_finalize_after_being_superseded_by_a_reclaim`
+    et al.) holds against the real engine too: a worker whose lease was
+    superseded by a newer reclaim (`attempts` bumped, `status` unchanged)
+    must not be able to finalize the job out from under the new lease,
+    even with PostgreSQL's own MVCC/row-visibility semantics in the loop
+    instead of SQLite's simpler single-writer locking.
+    """
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as db:
+            household = Household(name="Família CAS PostgreSQL")
+            db.add(household)
+            db.flush()
+            draft = CaptureDraft(
+                household_id=household.id,
+                source_type="image",
+                detected_type="auto",
+                status="processing",
+                processor="pending",
+                proposal_json="[]",
+            )
+            db.add(draft)
+            db.flush()
+            job = CaptureProcessingJob(
+                household_id=household.id,
+                capture_draft_id=draft.id,
+                document_id=None,
+                job_type="ocr",
+                content_type="image/png",
+                status="queued",
+                max_attempts=5,
+            )
+            db.add(job)
+            db.commit()
+            job_id = job.id
+
+        # Worker A claims attempt 1 on its own connection/session.
+        with Session(engine) as db_a:
+            claimed_a = capture_worker.claim_capture_job(
+                db_a, job_id, worker_id="worker-a", stale_after_seconds=600
+            )
+            assert claimed_a is not None
+            assert claimed_a.attempts == 1
+            claimed_attempt_a = claimed_a.attempts
+
+        # A's lease goes stale; worker B reclaims on a separate
+        # connection/session -- `status` stays `"processing"`, only
+        # `attempts` moves to 2.
+        with Session(engine) as db:
+            job = db.get(CaptureProcessingJob, job_id)
+            job.started_at = datetime.now(UTC) - timedelta(seconds=900)
+            db.commit()
+        with Session(engine) as db_b:
+            claimed_b = capture_worker.claim_capture_job(
+                db_b, job_id, worker_id="worker-b", stale_after_seconds=600
+            )
+            assert claimed_b is not None
+            assert claimed_b.attempts == 2
+
+        # A finally finishes and tries to finalize the attempt it
+        # originally claimed: must lose against real PostgreSQL, exactly
+        # like it does against SQLite.
+        with Session(engine) as db_a2:
+            won_a = capture_worker.finalize_capture_job(
+                db_a2, job_id, status="completed", claimed_attempt=claimed_attempt_a
+            )
+            assert won_a is False
+            db_a2.rollback()
+
+        with Session(engine) as db:
+            refreshed = db.get(CaptureProcessingJob, job_id)
+            assert refreshed.status == "processing"  # still B's in-flight attempt
+            assert refreshed.attempts == 2
+            assert refreshed.claimed_by == "worker-b"
+
+        # B, the legitimate owner of attempt 2, must still be able to
+        # finalize for real.
+        with Session(engine) as db_b2:
+            won_b = capture_worker.finalize_capture_job(
+                db_b2, job_id, status="completed", claimed_attempt=2
+            )
+            assert won_b is True
+            db_b2.commit()
+
+        with Session(engine) as db:
+            refreshed = db.get(CaptureProcessingJob, job_id)
+            assert refreshed.status == "completed"
+    finally:
+        engine.dispose()

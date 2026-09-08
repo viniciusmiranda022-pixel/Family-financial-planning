@@ -529,6 +529,75 @@ def test_exhausted_stale_job_is_failed_not_left_processing_forever() -> None:
         assert draft.status == "failed"
 
 
+def test_exhausted_stale_job_never_mutates_a_cross_household_draft_or_document() -> None:
+    """Review item 2 (second BLOQUEIO DE MERGE pass): `fail_exhausted_stale_jobs`
+    used to resolve its own job's correlated draft/document with a bare
+    `db.get(Model, id)` -- unscoped by household -- before mutating them.
+    If `capture_processing_jobs.household_id` ever drifted from the
+    household its FKs actually point at (corrupted/inconsistent persisted
+    state), that would load and mutate another household's rows during the
+    timeout reconciler, exactly the cross-household processing the Work
+    Order prohibits everywhere else. Only the job's own row may ever be
+    failed; the foreign draft/document must be read and left completely
+    untouched."""
+
+    with _TestSessionLocal() as db:
+        household_a = Household(name="Família Exaustão A")
+        household_b = Household(name="Família Exaustão B")
+        db.add_all([household_a, household_b])
+        db.flush()
+        foreign_draft = CaptureDraft(
+            household_id=household_b.id,
+            source_type="image",
+            detected_type="auto",
+            status="queued",
+            processor="pending",
+            proposal_json="[]",
+        )
+        foreign_document = Document(
+            household_id=household_b.id,
+            original_name="recibo-b.png",
+            document_type="smart_capture",
+            sha256="d" * 64,
+            encrypted_path="ignored-for-this-test",
+            status="capture_processing",
+        )
+        db.add_all([foreign_draft, foreign_document])
+        db.flush()
+        # Deliberately corrupted: job claims household A while its FKs
+        # actually point at household B's draft/document.
+        job = CaptureProcessingJob(
+            household_id=household_a.id,
+            capture_draft_id=foreign_draft.id,
+            document_id=foreign_document.id,
+            job_type="ocr",
+            content_type="image/png",
+            status="processing",
+            attempts=3,
+            max_attempts=3,
+            started_at=datetime.now(UTC) - timedelta(seconds=900),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+        foreign_draft_id, foreign_document_id = foreign_draft.id, foreign_document.id
+
+    with _TestSessionLocal() as db:
+        failed_count = capture_worker.fail_exhausted_stale_jobs(db, stale_after_seconds=600)
+        db.commit()
+    assert failed_count >= 1
+
+    with _TestSessionLocal() as db:
+        job = db.get(CaptureProcessingJob, job_id)
+        foreign_draft = db.get(CaptureDraft, foreign_draft_id)
+        foreign_document = db.get(Document, foreign_document_id)
+        assert job.status == "failed"
+        assert job.error_code == "worker_timeout_exhausted"
+        # The foreign household's rows: completely untouched.
+        assert foreign_draft.status == "queued"
+        assert foreign_document.status == "capture_processing"
+
+
 def test_household_isolation_on_capture_and_job_endpoints(monkeypatch) -> None:
     _fake_ocr(monkeypatch)
     client = _client()
@@ -753,6 +822,219 @@ def test_concurrent_reclaim_of_a_stale_job_is_race_safe(monkeypatch) -> None:
                 assert refreshed.status == "processing"
                 assert refreshed.attempts == 2  # incremented exactly once
                 assert refreshed.claimed_by == "worker-a"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_stale_lease_cannot_finalize_after_being_superseded_by_a_reclaim() -> None:
+    """Review item 1 (second BLOQUEIO DE MERGE pass): `claim_capture_job`'s
+    `(status, attempts)` CAS stops two reclaimers from both winning the
+    same stale pre-image, but does not by itself stop an *old* lease from
+    finalizing a *newer* one. Worker A claims attempt 1 and stalls past
+    `stale_after_seconds`; worker B reclaims the same job (bumping
+    `attempts` to 2, `status` staying `"processing"`); A then finally
+    finishes and tries to finalize the attempt it originally claimed. A
+    `WHERE status = 'processing'` predicate alone would still match --
+    `finalize_capture_job` must also pin `attempts` to the exact value the
+    caller claimed, so A's finalize loses and B's still-in-flight lease is
+    left completely untouched."""
+
+    with _TestSessionLocal() as db:
+        household = Household(name="Família Lease Antigo")
+        db.add(household)
+        db.flush()
+        draft = CaptureDraft(
+            household_id=household.id,
+            source_type="image",
+            detected_type="auto",
+            status="processing",
+            processor="pending",
+            proposal_json="[]",
+        )
+        db.add(draft)
+        db.flush()
+        job = CaptureProcessingJob(
+            household_id=household.id,
+            capture_draft_id=draft.id,
+            document_id=None,
+            job_type="ocr",
+            content_type="image/png",
+            status="queued",
+            max_attempts=5,
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    with _TestSessionLocal() as db_a:
+        claimed_a = capture_worker.claim_capture_job(
+            db_a, job_id, worker_id="worker-a", stale_after_seconds=600
+        )
+        assert claimed_a is not None
+        assert claimed_a.attempts == 1
+        claimed_attempt_a = claimed_a.attempts  # what `_process_claimed_capture_job` would pin
+
+    # Worker A is now stalled past `stale_after_seconds` -- backdate its
+    # lease directly (same technique the crash-recovery reconciler test
+    # uses) rather than actually sleeping.
+    with _TestSessionLocal() as db:
+        job = db.get(CaptureProcessingJob, job_id)
+        job.started_at = datetime.now(UTC) - timedelta(seconds=900)
+        db.commit()
+
+    with _TestSessionLocal() as db_b:
+        claimed_b = capture_worker.claim_capture_job(
+            db_b, job_id, worker_id="worker-b", stale_after_seconds=600
+        )
+        assert claimed_b is not None
+        assert claimed_b.attempts == 2  # B's reclaim bumped the lease version
+
+    # Worker A's finalize must lose: it is still bound to attempt 1, which
+    # no longer matches the persisted attempt 2.
+    with _TestSessionLocal() as db_a2:
+        won_a = capture_worker.finalize_capture_job(
+            db_a2, job_id, status="completed", claimed_attempt=claimed_attempt_a
+        )
+        assert won_a is False
+        db_a2.rollback()  # caller's responsibility on a lost race, per finalize_capture_job's contract
+
+    with _TestSessionLocal() as db:
+        refreshed = db.get(CaptureProcessingJob, job_id)
+        assert refreshed.status == "processing"  # still B's in-flight attempt
+        assert refreshed.attempts == 2
+        assert refreshed.claimed_by == "worker-b"
+
+    # B, the legitimate owner of attempt 2, must still be able to finalize.
+    with _TestSessionLocal() as db_b2:
+        won_b = capture_worker.finalize_capture_job(
+            db_b2, job_id, status="completed", claimed_attempt=2
+        )
+        assert won_b is True
+        db_b2.commit()
+
+    with _TestSessionLocal() as db:
+        refreshed = db.get(CaptureProcessingJob, job_id)
+        assert refreshed.status == "completed"
+
+
+def test_late_reclaim_completion_does_not_overwrite_a_newer_attempts_result(monkeypatch) -> None:
+    """Same interleaving as `test_stale_lease_cannot_finalize_after_being_superseded_by_a_reclaim`
+    above, but exercised through the full `_process_claimed_capture_job`
+    pipeline (not `finalize_capture_job` in isolation), and -- this is the
+    exact window review item 1 flagged -- with worker A trying to finalize
+    *before* worker B has itself finished processing (`status` is still
+    `"processing"`, only `attempts` has moved). A `WHERE status =
+    'processing'` predicate alone would still match A's premature finalize
+    and let it commit its own stale proposal; only pinning `attempts` too
+    stops it. Worker B then finishes for real, and its own -- undisturbed
+    -- result is what the draft ends up with."""
+
+    client = _client()
+    try:
+        with client:
+            household_id = _setup_household(
+                client,
+                household_name="Família Lease Corrida",
+                username="admin-lease-race-1",
+                password="senha-lease-race-segura-1",
+            )["household_id"]
+            _create_account(client)
+
+            with _TestSessionLocal() as db:
+                draft = CaptureDraft(
+                    household_id=household_id,
+                    source_type="image",
+                    detected_type="auto",
+                    status="queued",
+                    processor="pending",
+                    proposal_json="[]",
+                )
+                db.add(draft)
+                db.flush()
+                job = capture_worker.create_capture_job(
+                    db,
+                    household_id=household_id,
+                    capture_draft_id=draft.id,
+                    document_id=None,
+                    job_type="ocr",
+                    content_type="image/png",
+                    max_attempts=5,
+                )
+                db.commit()
+                draft_id, job_id = draft.id, job.id
+
+            def _ocr_that_stalls_until_reclaimed_by_worker_b(filename, payload, content_type):
+                # Worker A's OCR is still running when its lease goes
+                # stale: backdate `started_at` directly, then have worker B
+                # (a concurrent reconciler sweep) reclaim the job -- only
+                # `claim_capture_job` runs here, not the rest of B's
+                # pipeline, so `status` stays `"processing"` and B has not
+                # itself finalized anything yet when A's own OCR call now
+                # returns and A tries to finalize first.
+                with _TestSessionLocal() as backdate_db:
+                    stale_job = backdate_db.get(CaptureProcessingJob, job_id)
+                    stale_job.started_at = datetime.now(UTC) - timedelta(seconds=900)
+                    backdate_db.commit()
+                with _TestSessionLocal() as db_b_claim:
+                    claimed_b = capture_worker.claim_capture_job(
+                        db_b_claim, job_id, worker_id="worker-b", stale_after_seconds=600
+                    )
+                    assert claimed_b is not None
+                    assert claimed_b.attempts == 2
+                # Worker A's own (now stale) OCR result -- must never win.
+                return "Gastei R$ 45,00 no mercado hoje (worker A, stale)", "ocr_local"
+
+            monkeypatch.setattr(
+                smart_capture_module, "extract_document_text", _ocr_that_stalls_until_reclaimed_by_worker_b
+            )
+
+            with _TestSessionLocal() as db_a:
+                claimed_a = capture_worker.claim_capture_job(
+                    db_a, job_id, worker_id="worker-a", stale_after_seconds=600
+                )
+                assert claimed_a is not None
+                asyncio.run(
+                    api_module._process_claimed_capture_job(db_a, claimed_a, payload=_png_bytes())
+                )
+
+            with _TestSessionLocal() as db:
+                job = db.get(CaptureProcessingJob, job_id)
+                draft = db.get(CaptureDraft, draft_id)
+                # A's premature finalize must have lost: the job is still
+                # B's in-flight `"processing"` attempt, not resolved (let
+                # alone "completed") by A's stale attempt.
+                assert job.status == "processing"
+                assert job.attempts == 2
+                assert job.claimed_by == "worker-b"
+                # `capture.status = "processing"` is set and committed by
+                # `_process_claimed_capture_job` unconditionally, before the
+                # OCR/finalize race even starts -- that part of A's attempt
+                # is not what this test is about. What must NOT have landed
+                # is A's actual (post-race) proposal write.
+                assert draft.status == "processing"
+                assert draft.extracted_text is None  # A's stale text was never committed
+
+            # Worker B now finishes its own (already-claimed, still valid)
+            # attempt for real -- undisturbed by A's earlier, discarded try.
+            monkeypatch.setattr(
+                smart_capture_module,
+                "extract_document_text",
+                lambda *a, **k: ("Gastei R$ 99,00 no posto (worker B, real)", "ocr_local"),
+            )
+            with _TestSessionLocal() as db_b:
+                claimed_b = db_b.get(CaptureProcessingJob, job_id)
+                asyncio.run(
+                    api_module._process_claimed_capture_job(db_b, claimed_b, payload=_png_bytes())
+                )
+
+            with _TestSessionLocal() as db:
+                job = db.get(CaptureProcessingJob, job_id)
+                draft = db.get(CaptureDraft, draft_id)
+                assert job.status == "completed"
+                assert job.attempts == 2  # worker B's reclaimed attempt, not A's stale attempt 1
+                assert job.claimed_by == "worker-b"
+                assert "99,00" in draft.extracted_text  # B's real result persisted
+                assert "45,00" not in (draft.extracted_text or "")  # A's stale result never appears
     finally:
         app.dependency_overrides.clear()
 
