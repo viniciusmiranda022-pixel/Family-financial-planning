@@ -16,7 +16,7 @@ from app.services.classifier import (
     normalize_description,
 )
 
-PARSER_CONTRACT_VERSION = "2026.09.1"
+PARSER_CONTRACT_VERSION = "2026.09.2"
 
 
 @dataclass(frozen=True)
@@ -1019,12 +1019,50 @@ def _credit_card_declared_fields(text: str) -> dict[str, Decimal | str | None]:
 # still reuses everything downstream unchanged (the same `ParsedDocument`
 # shape, the same `reconcile_parsed_document`): only the label text each
 # issuer prints differs.
+_NUBANK_CURRENT_INVOICE_SUMMARY = re.compile(r"RESUMO\s+DA\s+FATURA\s+ATUAL", re.IGNORECASE)
+_NUBANK_SUMMARY_TOTAL = re.compile(
+    r"TOTAL\s+A\s+PAGAR[^\n]*?R?\$?\s*([\d.]+,\d{2})",
+    re.IGNORECASE,
+)
+_NUBANK_SUMMARY_PREVIOUS = re.compile(
+    r"FATURA\s+ANTERIOR[^\n]*?R?\$?\s*([\d.]+,\d{2})",
+    re.IGNORECASE,
+)
+
+
 def _nubank_credit_card_declared_fields(text: str) -> dict[str, Decimal | str | None]:
-    totals = re.findall(r"TOTAL\s+A\s+PAGAR.*?R?\$?\s*([\d.]+,\d{2})", text, re.IGNORECASE)
-    previous = re.findall(r"FATURA\s+ANTERIOR.*?R?\$?\s*([\d.]+,\d{2})", text, re.IGNORECASE)
+    """Read reconciliation facts only from Nubank's current-invoice summary.
+
+    Real textual invoices can repeat ``FATURA ANTERIOR`` and ``TOTAL A PAGAR``
+    outside ``RESUMO DA FATURA ATUAL`` in payment/financing simulations.
+    Those repeated labels are not the current invoice's reconciliation facts.
+
+    The parser therefore requires the explicit current-summary marker, then
+    takes the first ``TOTAL A PAGAR`` after it and only considers
+    ``FATURA ANTERIOR`` before that total. If that structural evidence is
+    absent, the field stays unknown instead of guessing from another block.
+    """
+
+    summary_marker = _NUBANK_CURRENT_INVOICE_SUMMARY.search(text)
+    if summary_marker is None:
+        return {"declared_total": None, "opening_balance": None}
+
+    summary_tail = text[summary_marker.end() :]
+    total_match = _NUBANK_SUMMARY_TOTAL.search(summary_tail)
+    if total_match is None:
+        return {"declared_total": None, "opening_balance": None}
+
+    # The first TOTAL A PAGAR closes the canonical "Resumo da fatura atual".
+    # Anything after it can be another offer/simulation carrying the same
+    # labels and must not influence the current invoice reconciliation.
+    summary_block = summary_tail[: total_match.end()]
+    previous_match = _NUBANK_SUMMARY_PREVIOUS.search(summary_block)
+
     return {
-        "declared_total": parse_decimal(totals[-1]) if totals else None,
-        "opening_balance": parse_decimal(previous[-1]) if previous else None,
+        "declared_total": parse_decimal(total_match.group(1)),
+        "opening_balance": (
+            parse_decimal(previous_match.group(1)) if previous_match is not None else None
+        ),
     }
 
 
