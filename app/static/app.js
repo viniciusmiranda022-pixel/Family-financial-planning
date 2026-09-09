@@ -43,6 +43,16 @@ const ledgerMovementLabels = {
 };
 const documentTypeLabels = { bank_statement: "Extrato", credit_card: "Cartão", payroll: "Holerite" };
 
+// Perfis separados para administrador e consulta (Fase 4,
+// docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md): this is UX-only. Every
+// mutable endpoint this hides/disables a control for already enforces the
+// same rule server-side with `app.api._require_admin` -- a consulta user who
+// bypasses the browser (curl, devtools) still gets a 403 with no side
+// effect. Never treat `isAdmin()` as the security boundary.
+function isAdmin() {
+  return Boolean(state.user && state.user.is_admin);
+}
+
 function largeEntryThreshold() {
   // Never recompute this policy in the browser -- `GET /dashboard`
   // publishes the exact confirmation limit `_large_entry_threshold()`
@@ -186,6 +196,10 @@ async function showApp() {
   document.querySelector("#current-user").textContent = state.user.name;
   document.querySelector("#nav-users").classList.toggle("hidden", !state.user.is_admin);
   document.querySelector("#nav-integrity").classList.toggle("hidden", !integrityUiEnabled());
+  // `.admin-only` static forms/controls (see index.html) are only ever a UX
+  // convenience -- `app/api.py::_require_admin` is what actually rejects a
+  // consulta user's request, regardless of this class.
+  document.body.classList.toggle("consulta-mode", !state.user.is_admin);
   await Promise.all([loadAccounts(), loadCategories()]);
   await navigate("dashboard");
   if (integrityUiEnabled()) await refreshIntegrityBanner();
@@ -730,7 +744,9 @@ async function refreshExpenseInstallmentPreview() {
 
 function movementEntryRow(item, columns) {
   const actionCell = item.manual
-    ? `<button class="danger-button delete-movement-entry" data-id="${escapeHtml(item.id)}">Excluir</button>`
+    ? isAdmin()
+      ? `<button class="danger-button delete-movement-entry" data-id="${escapeHtml(item.id)}">Excluir</button>`
+      : ""
     : '<span class="muted-copy">Importado</span>';
   return `<tr data-id="${escapeHtml(item.id)}">${columns(item)}<td class="right">${actionCell}</td></tr>`;
 }
@@ -912,17 +928,22 @@ async function loadTransactions() {
     // `category_id`/`excluded` changes rejected together by
     // `update_transaction` -- disabling the category select mirrors that
     // same guard instead of guaranteeing a 422 on every attempt.
-    const categoryLocked = Boolean(item.transfer_group_id);
-    const actions = !item.manual
-      ? `<button class="text-action toggle-transaction" data-id="${escapeHtml(item.id)}" data-excluded="${item.excluded}">${item.excluded ? "Reconsiderar" : "Ignorar"}</button>`
-      : isLinkedReconciliation
-        ? '<small class="muted-copy">Vinculado a pagamento de fatura — desvincule em Contas a pagar antes de excluir</small>'
-        : `<button class="danger-button delete-transaction" data-id="${escapeHtml(item.id)}">Excluir</button>`;
+    const categoryLocked = Boolean(item.transfer_group_id) || !isAdmin();
+    // Usuário de consulta nunca vê ação mutável aqui -- `PATCH`/`DELETE
+    // /transactions/{id}` já retornam 403 no backend (`_require_admin`);
+    // sem botão evita um clique que só resultaria em erro.
+    const actions = !isAdmin()
+      ? ""
+      : !item.manual
+        ? `<button class="text-action toggle-transaction" data-id="${escapeHtml(item.id)}" data-excluded="${item.excluded}">${item.excluded ? "Reconsiderar" : "Ignorar"}</button>`
+        : isLinkedReconciliation
+          ? '<small class="muted-copy">Vinculado a pagamento de fatura — desvincule em Contas a pagar antes de excluir</small>'
+          : `<button class="danger-button delete-transaction" data-id="${escapeHtml(item.id)}">Excluir</button>`;
     return `
     <tr data-id="${escapeHtml(item.id)}">
       <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
       <td><strong>${escapeHtml(item.description)}</strong>${item.installment ? `<br><small>Parcela ${escapeHtml(item.installment)}</small>` : ""}</td>
-      <td><select class="category-select" data-id="${escapeHtml(item.id)}" ${categoryLocked ? `disabled title="Uma perna de transferência não pode ter a categoria alterada isoladamente"` : ""}>${categoryOptions(item.category_id)}</select></td>
+      <td><select class="category-select" data-id="${escapeHtml(item.id)}" ${categoryLocked ? `disabled title="${!isAdmin() ? "Usuário de consulta não altera lançamentos" : "Uma perna de transferência não pode ter a categoria alterada isoladamente"}"` : ""}>${categoryOptions(item.category_id)}</select></td>
       <td>${escapeHtml(item.owner)}</td><td>${escapeHtml(item.account)}</td>
       <td>${ledgerProvenanceCell(item)}</td>
       <td>${item.possible_duplicate ? '<span class="status-chip warn">Possível duplicidade</span>' : item.excluded ? `<span class="status-chip muted">${item.manual ? "Fora do teto" : "Ignorado no cálculo"}</span>` : '<span class="status-chip ok">Considerado</span>'}</td>
@@ -973,13 +994,15 @@ async function loadCardPaymentReconciliations(month) {
     let actions;
     if (item.status === "linked") {
       counterpart = cardPaymentTransactionSummary(item.linked_transaction);
-      actions = `<button class="text-action unlink-card-payment" data-id="${escapeHtml(checkingId)}">Desvincular</button>`;
+      actions = isAdmin() ? `<button class="text-action unlink-card-payment" data-id="${escapeHtml(checkingId)}">Desvincular</button>` : "";
     } else if (item.status === "unmatched") {
       counterpart = '<span class="muted-copy">Nenhum lançamento de pagamento de fatura corresponde ainda.</span>';
       actions = "";
     } else {
       counterpart = item.candidates.map((candidate) => `<div>${cardPaymentTransactionSummary({ ...candidate, id: candidate.transaction_id })}${candidate.difference !== "0.00" ? ` <small>(diferença ${money.format(Number(candidate.difference))})</small>` : ""}</div>`).join("");
-      actions = item.candidates.map((candidate) => `<button class="text-action link-card-payment" data-checking-id="${escapeHtml(checkingId)}" data-card-id="${escapeHtml(candidate.transaction_id)}">Confirmar vínculo${item.candidates.length > 1 ? ` (${dateFormat.format(new Date(`${candidate.date}T00:00:00Z`))})` : ""}</button>`).join("");
+      actions = isAdmin()
+        ? item.candidates.map((candidate) => `<button class="text-action link-card-payment" data-checking-id="${escapeHtml(checkingId)}" data-card-id="${escapeHtml(candidate.transaction_id)}">Confirmar vínculo${item.candidates.length > 1 ? ` (${dateFormat.format(new Date(`${candidate.date}T00:00:00Z`))})` : ""}</button>`).join("")
+        : "";
     }
     return `
     <tr data-id="${escapeHtml(checkingId)}">
@@ -1029,9 +1052,9 @@ async function loadReviews() {
     <article class="review-card" data-review-id="${escapeHtml(item.id)}">
       <div class="review-icon">!</div>
       <div class="review-content"><h3>${escapeHtml(item.description)}</h3><p>${escapeHtml(item.details || item.reason)}${item.amount !== null ? ` • ${money.format(item.amount)}` : ""}${item.date ? ` • ${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}` : ""}${item.account ? ` • ${escapeHtml(item.account)}` : ""}</p>
-        ${item.transaction_id ? `<div class="review-controls"><select class="review-category" aria-label="Categoria">${categoryOptions(item.category_id)}</select><button class="text-action save-review-category" data-transaction-id="${escapeHtml(item.transaction_id)}">Salvar categoria</button><button class="text-action review-decision" data-transaction-id="${escapeHtml(item.transaction_id)}" data-action="consider">Considerar no cálculo</button><button class="text-action review-decision" data-transaction-id="${escapeHtml(item.transaction_id)}" data-action="ignore">Ignorar no cálculo</button></div>` : ""}
+        ${item.transaction_id && isAdmin() ? `<div class="review-controls"><select class="review-category" aria-label="Categoria">${categoryOptions(item.category_id)}</select><button class="text-action save-review-category" data-transaction-id="${escapeHtml(item.transaction_id)}">Salvar categoria</button><button class="text-action review-decision" data-transaction-id="${escapeHtml(item.transaction_id)}" data-action="consider">Considerar no cálculo</button><button class="text-action review-decision" data-transaction-id="${escapeHtml(item.transaction_id)}" data-action="ignore">Ignorar no cálculo</button></div>` : ""}
       </div>
-      <button class="secondary resolve-review" data-id="${escapeHtml(item.id)}">Apenas confirmar</button>
+      ${isAdmin() ? `<button class="secondary resolve-review" data-id="${escapeHtml(item.id)}">Apenas confirmar</button>` : ""}
     </article>
   `).join("") : '<div class="empty">Nenhuma pendência. Todos os lançamentos estão conciliados.</div>';
   document.querySelectorAll(".save-review-category").forEach((button) => button.addEventListener("click", async () => {
@@ -1057,11 +1080,11 @@ async function loadReviews() {
 async function loadIncome() {
   const [commissions, payroll] = await Promise.all([api("/commissions"), api("/payroll")]);
   document.querySelector("#commissions-table").innerHTML = commissions.length ? commissions.map((item) => `
-    <tr><td>${dateFormat.format(new Date(`${item.expected_date}T00:00:00Z`))}</td><td>${escapeHtml(item.description)}</td><td class="right">${money.format(item.gross)}</td><td class="right amount-expense">${money.format(item.tax)}</td><td class="right amount-income">${money.format(item.net)}</td><td class="right"><button class="danger-button delete-commission" data-id="${escapeHtml(item.id)}">Excluir</button></td></tr>
+    <tr><td>${dateFormat.format(new Date(`${item.expected_date}T00:00:00Z`))}</td><td>${escapeHtml(item.description)}</td><td class="right">${money.format(item.gross)}</td><td class="right amount-expense">${money.format(item.tax)}</td><td class="right amount-income">${money.format(item.net)}</td><td class="right">${isAdmin() ? `<button class="danger-button delete-commission" data-id="${escapeHtml(item.id)}">Excluir</button>` : ""}</td></tr>
   `).join("") : emptyRow(6, "Nenhuma comissão cadastrada");
   const kindLabels = { regular: "Salário", "13_first": "1ª do 13º", "13_second": "2ª do 13º", vacation_extra: "Férias adicionais", other: "Outro" };
   document.querySelector("#payroll-table").innerHTML = payroll.length ? payroll.map((item) => `
-    <tr><td>${dateFormat.format(new Date(`${item.payment_date}T00:00:00Z`))}</td><td>${escapeHtml(item.person_name)}</td><td>${kindLabels[item.kind] || escapeHtml(item.kind)}</td><td class="right amount-income">${money.format(item.net)}</td><td class="right">${item.manual ? `<button class="danger-button delete-payroll" data-id="${escapeHtml(item.id)}">Excluir</button>` : '<span class="status-chip muted">Importado</span>'}</td></tr>
+    <tr><td>${dateFormat.format(new Date(`${item.payment_date}T00:00:00Z`))}</td><td>${escapeHtml(item.person_name)}</td><td>${kindLabels[item.kind] || escapeHtml(item.kind)}</td><td class="right amount-income">${money.format(item.net)}</td><td class="right">${item.manual && isAdmin() ? `<button class="danger-button delete-payroll" data-id="${escapeHtml(item.id)}">Excluir</button>` : item.manual ? "" : '<span class="status-chip muted">Importado</span>'}</td></tr>
   `).join("") : emptyRow(5, "Nenhum holerite cadastrado");
   document.querySelectorAll(".delete-commission").forEach((button) => button.addEventListener("click", async () => {
     if (!window.confirm("Excluir esta comissão da projeção?")) return;
@@ -1079,6 +1102,14 @@ async function loadProfile() {
   const profile = await api("/profile");
   const form = document.querySelector("#profile-form");
   Object.entries(profile).forEach(([key, value]) => { if (form.elements[key] && value !== null) form.elements[key].value = value; });
+  // Perfis separados (Fase 4): usuário de consulta pode ver as premissas do
+  // perfil financeiro, mas `PUT /profile` já rejeita a escrita com 403 no
+  // backend (`_require_admin`) -- os campos ficam desabilitados e o botão
+  // de salvar escondido aqui apenas como UX; a barreira real é a da API.
+  Array.from(form.elements).forEach((element) => {
+    if (element.type !== "submit") element.disabled = !isAdmin();
+  });
+  form.querySelector('button[type="submit"]').classList.toggle("hidden", !isAdmin());
   renderDueNotificationsSettings();
 }
 
@@ -1095,7 +1126,7 @@ async function loadForecast() {
     <tr><td>${escapeHtml(item.month)}</td><td class="right">${money.format(item.salary)}</td><td class="right">${money.format(item.payroll_extras)}</td><td class="right amount-income">${money.format(item.commission_delayed)}</td><td class="right amount-expense">${money.format(item.obligations)}</td><td class="right amount-expense">${money.format(item.installments)}</td><td class="right amount-income">${money.format(item.investment_return_delayed)}</td><td class="right ${item.balance_delayed < data.summary.emergency_floor ? "amount-expense" : "amount-income"}">${money.format(item.balance_delayed)}</td></tr>
   `).join("") : emptyRow(8, "Configure as premissas financeiras");
   document.querySelector("#obligations-table").innerHTML = obligations.length ? obligations.map((item) => `
-    <tr><td>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))}</td><td><strong>${escapeHtml(item.name)}</strong></td><td>${escapeHtml(item.category)}</td><td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td><td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td><td class="right amount-expense">${money.format(item.amount)}</td><td class="right"><button class="danger-button delete-obligation" data-id="${escapeHtml(item.id)}">Excluir</button></td></tr>
+    <tr><td>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))}</td><td><strong>${escapeHtml(item.name)}</strong></td><td>${escapeHtml(item.category)}</td><td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td><td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td><td class="right amount-expense">${money.format(item.amount)}</td><td class="right">${isAdmin() ? `<button class="danger-button delete-obligation" data-id="${escapeHtml(item.id)}">Excluir</button>` : ""}</td></tr>
   `).join("") : emptyRow(7, "Nenhum compromisso ativo");
   document.querySelectorAll(".delete-obligation").forEach((button) => button.addEventListener("click", async () => {
     if (!window.confirm("Excluir este compromisso das projeções futuras?")) return;
@@ -2045,8 +2076,8 @@ function findingCardHtml(item) {
         <p>${escapeHtml(item.invariant_id)} • ${escapeHtml(item.period || "sem período")} • ${item.occurrence_count}x${item.last_seen_at ? ` • última vez ${dateFormat.format(new Date(item.last_seen_at))}` : ""}</p>
         <div class="review-controls">
           <button class="text-action view-finding-detail" data-id="${escapeHtml(item.id)}">Detalhe</button>
-          ${item.status === "open" ? `<button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="acknowledge" data-label="reconhecer">Reconhecer</button>` : ""}
-          ${item.status === "open" || item.status === "acknowledged" ? `
+          ${isAdmin() && item.status === "open" ? `<button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="acknowledge" data-label="reconhecer">Reconhecer</button>` : ""}
+          ${isAdmin() && (item.status === "open" || item.status === "acknowledged") ? `
             <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="resolve" data-label="resolver">Resolver</button>
             <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="ignore" data-label="ignorar">Ignorar</button>
             <button class="text-action finding-action" data-id="${escapeHtml(item.id)}" data-action="false-positive" data-label="marcar falso positivo">Falso positivo</button>
