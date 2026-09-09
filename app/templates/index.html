@@ -528,7 +528,7 @@
             <div class="advisor-title-row"><span class="step-label">INTELIGÊNCIA FINANCEIRA</span><span id="advisor-provider-status" class="status-chip muted">Verificando Codex…</span></div>
             <h2>Converse com seu consultor</h2>
             <p>Os cálculos são feitos pelo motor financeiro local. Quando o Codex estiver conectado, ele recebe somente um resumo dos resultados para explicá-los com clareza — nunca credenciais, documentos ou acesso ao banco.</p>
-            <div class="advisor-suggestions">
+            <div class="advisor-suggestions admin-only">
               <button class="secondary advisor-suggestion" type="button">Posso comprar algo de R$ 2.000 à vista?</button>
               <button class="secondary advisor-suggestion" type="button">Quanto saiu do banco e dos cartões neste mês?</button>
               <button class="secondary advisor-suggestion" type="button">Quais obrigações estão próximas?</button>
@@ -538,10 +538,17 @@
           </article>
           <article class="panel advisor-chat-panel">
             <div id="advisor-messages" class="advisor-messages" aria-live="polite"></div>
-            <form id="advisor-form" class="advisor-form">
+            <!-- `POST /advisor/chat` persists an AuditEvent of the question
+                 itself, so it is admin-only (see
+                 docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md and
+                 `app.api.advisor_chat`'s docstring) -- hiding the form here
+                 is UX only, the real barrier is `_require_admin` in the
+                 backend. -->
+            <form id="advisor-form" class="advisor-form admin-only">
               <input name="message" id="advisor-input" autocomplete="off" required maxlength="1000" placeholder="Digite sua pergunta financeira...">
               <button class="primary" type="submit">Analisar</button>
             </form>
+            <p class="consulta-only muted-copy">Usuário de consulta não envia perguntas ao consultor (a pergunta é registrada como um evento auditável). Peça a um administrador da família.</p>
           </article>
         </div>
       </section>
