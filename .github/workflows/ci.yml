@@ -135,7 +135,10 @@ jobs:
           foreach ($file in @(
             "scripts/setup-codex-windows.ps1",
             "scripts/run-codex-advisor.ps1",
-            "scripts/setup-tailscale.ps1"
+            "scripts/setup-tailscale.ps1",
+            "scripts/disable-tailscale-proxy.ps1",
+            "scripts/lib/TailscaleProxy.psm1",
+            "tests/tailscale_proxy/run_tests.ps1"
           )) {
             $tokens = $null
             $errors = $null
@@ -150,6 +153,19 @@ jobs:
             }
           }
           if ($failed) { exit 1 }
+      # docs/WORK_ORDER_AUTOMATED_HTTPS_PROXY.md: behavioral coverage for
+      # the automated Tailscale Serve proxy (prerequisite fail-closed
+      # checks, idempotent apply, drift rejection, Funnel/foreign-port
+      # rejection, rollback, no hardcoded secret/non-loopback IP). Runs
+      # here -- the existing PowerShell-scripts gate -- rather than as a
+      # new named job, to keep this a 12-gate CI (docs/ROADMAP.md,
+      # README.md) instead of introducing a 13th. Uses an in-memory fake
+      # Tailscale CLI plus a real loopback HTTP listener: no tailnet,
+      # credential, or external network access, per the Work Order's
+      # testing constraints.
+      - name: Tailscale proxy automation tests
+        shell: pwsh
+        run: ./tests/tailscale_proxy/run_tests.ps1
 
   docker-build:
     runs-on: ubuntu-latest

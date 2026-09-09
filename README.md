@@ -149,7 +149,7 @@ Em um servidor Linux cujo Docker tenha saída HTTPS normal, use:
 sh ./scripts/setup-codex.sh
 ```
 
-Para acesso privado fora de casa, siga [docs/TAILSCALE.md](docs/TAILSCALE.md). Não abra a porta `8090` no roteador e não habilite o Tailscale Funnel.
+Para acesso privado fora de casa, siga [docs/TAILSCALE.md](docs/TAILSCALE.md), que automatiza e verifica a publicação via `scripts/setup-tailscale.ps1`. Não abra a porta `8080` no roteador e não habilite o Tailscale Funnel.
 
 Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo do Privilège DI, mas não entram nas receitas ou saídas operacionais. A visão geral mostra a sobra que deve ir para essa conta ou o déficit que precisa ser coberto por ela. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
 

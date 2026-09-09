@@ -25,3 +25,8 @@ node_modules/
 .vscode/
 .DS_Store
 .venv312/
+
+# Local ownership record for the automated Tailscale Serve proxy
+# (scripts/lib/TailscaleProxy.psm1). Contains only a loopback target URL,
+# never a secret; per-machine and never meant to be shared/versioned.
+scripts/lib/.tailscale-proxy-state.json
