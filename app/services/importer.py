@@ -535,6 +535,7 @@ _NUBANK_DAY_SECTION_HEADER = re.compile(
 )
 _NUBANK_SECTION_HEADER = re.compile(r"^TOTAL DE (ENTRADAS|SA[IÍ]DAS)\b", re.IGNORECASE)
 _NUBANK_BARE_AMOUNT = re.compile(r"^-?[\d.]+,\d{2}$")
+_NUBANK_INLINE_AMOUNT = re.compile(r"^(.*?)\s+(-?[\d.]+,\d{2})$")
 
 
 def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
@@ -569,7 +570,29 @@ def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
         if normalized.startswith("SALDO") or normalized.startswith("RENDIMENTO"):
             pending_parts = []
             continue
-        if not _NUBANK_BARE_AMOUNT.match(line):
+        # Nubank has at least two textual extraction shapes in real PDFs:
+        #
+        # 1) description on one/more lines followed by a bare amount line;
+        # 2) the final description line already ends with the transaction amount,
+        #    while counterparty/bank metadata may continue on following lines.
+        #
+        # Direction is still determined ONLY by the current ENTRADAS/SAIDAS
+        # section. The numeric token itself never decides the sign.
+        inline = _NUBANK_INLINE_AMOUNT.match(line)
+        if inline and not _NUBANK_BARE_AMOUNT.fullmatch(line):
+            description_tail, raw_value = inline.groups()
+            description = " ".join([*pending_parts, description_tail.strip()]).strip()
+            pending_parts = []
+            if not description or _NON_TRANSACTION_TEXT.search(normalize_description(description)):
+                continue
+            if current_sign is None:
+                continue
+            value = abs(parse_decimal(raw_value))
+            amount = value if current_sign > 0 else -value
+            parsed.append(ParsedTransaction(current_day, description, amount, line_number))
+            continue
+
+        if not _NUBANK_BARE_AMOUNT.fullmatch(line):
             pending_parts.append(line)
             continue
         description = " ".join(pending_parts).strip()
