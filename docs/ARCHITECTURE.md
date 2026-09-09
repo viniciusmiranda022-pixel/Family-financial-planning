@@ -363,10 +363,11 @@ canônica é `app.api._require_admin(user)`: uma função pura, sem estado, que 
 primeira instrução do corpo do handler, antes de qualquer busca no banco -- inclusive antes de
 resolver se o id do path existe ou pertence ao household do usuário. Isso é deliberado: um usuário de
 consulta recebe sempre `403`, nunca `404`, o que evitaria vazar se um recurso de outro household
-existe. As únicas rotas mutáveis que **não** exigem `_require_admin` são `POST
-/integrity/semantic-audit` e `POST /advisor/chat`: ambas são análises consultivas sobre um veredito já
-calculado (ver "Fronteira do Codex Semantic Audit" acima) -- nunca criam, alteram ou resolvem um fato
-financeiro, mesmo escrevendo um evento de auditoria da própria consulta.
+existe. `POST /integrity/semantic-audit` e `POST /advisor/chat` também exigem `_require_admin`: ambas
+são análises consultivas sobre um veredito já calculado (ver "Fronteira do Codex Semantic Audit"
+acima) e nunca criam, alteram ou resolvem um fato financeiro, mas continuam sendo `POST`s que
+persistem um `AuditEvent` da própria consulta (`integrity.semantic_audit`, `advisor.question`) -- o
+Work Order trata isso como estado operacional, não como leitura, então não há exceção para elas.
 
 `GET /users` continua exigindo administrador (comportamento pré-existente, não introduzido por este
 slice): consulta nunca lista ou administra outros usuários da família. Toda demais rota de leitura
