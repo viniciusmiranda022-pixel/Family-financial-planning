@@ -25,6 +25,7 @@ this one.
 import os
 import uuid
 from dataclasses import dataclass
+from unittest import mock
 
 import pytest
 from cryptography.fernet import Fernet
@@ -227,23 +228,54 @@ def test_consulta_reads_household_data(roles: RoleFixture) -> None:
     assert roles.consulta.get("/api/users").status_code == 403
 
 
-def test_consulta_uses_consultative_advisor_and_semantic_audit(roles: RoleFixture) -> None:
-    """`POST /integrity/semantic-audit` and `POST /advisor/chat` are
-    consultative analyses over already-computed, canonical data -- neither
-    creates, alters, resolves, or decides a financial fact (see their
-    docstrings in `app/api.py`) -- so both stay reachable for consulta,
-    unlike every other mutating route this module checks below.
+def test_consulta_rejected_from_semantic_audit_and_advisor_chat_without_side_effect(
+    roles: RoleFixture,
+) -> None:
+    """`POST /integrity/semantic-audit` and `POST /advisor/chat` never
+    decide or alter a financial fact (see their docstrings in `app/api.py`),
+    but both are `POST`s that persist an `AuditEvent` of the consultative
+    call itself -- operational state, not a data read, per
+    `docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md`. `_require_admin` must
+    therefore reject consulta before either route ever reaches the Codex
+    client or `db.commit()`.
     """
 
-    audit_response = roles.consulta.post(
+    with (
+        mock.patch("app.api.run_semantic_audit") as semantic_audit_mock,
+        mock.patch("app.api.CodexAdvisorClient") as advisor_client_mock,
+    ):
+        audit_response = roles.consulta.post(
+            "/api/integrity/semantic-audit", json={"audit_type": "period_review"}
+        )
+        assert audit_response.status_code == 403, audit_response.text
+
+        chat_response = roles.consulta.post(
+            "/api/advisor/chat", json={"message": "Como está meu mês?"}
+        )
+        assert chat_response.status_code == 403, chat_response.text
+
+    semantic_audit_mock.assert_not_called()
+    advisor_client_mock.assert_not_called()
+
+    with _TestSessionLocal() as db:
+        success_events = db.scalars(
+            select(AuditEvent).where(
+                AuditEvent.event_type.in_(("integrity.semantic_audit", "advisor.question"))
+            )
+        ).all()
+        assert success_events == []
+
+    # Admin keeps full access to both: this is a role boundary, not a
+    # removal of the feature.
+    admin_audit_response = roles.admin.post(
         "/api/integrity/semantic-audit", json={"audit_type": "period_review"}
     )
-    assert audit_response.status_code == 200, audit_response.text
+    assert admin_audit_response.status_code == 200, admin_audit_response.text
 
-    chat_response = roles.consulta.post(
+    admin_chat_response = roles.admin.post(
         "/api/advisor/chat", json={"message": "Como está meu mês?"}
     )
-    assert chat_response.status_code == 200, chat_response.text
+    assert admin_chat_response.status_code == 200, admin_chat_response.text
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +540,13 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             },
         ),
         ("financial snapshot rebuild", "post", "/api/financial-snapshots/2026-08/rebuild", {}),
+        (
+            "integrity semantic audit",
+            "post",
+            "/api/integrity/semantic-audit",
+            {"json": {"audit_type": "period_review"}},
+        ),
+        ("advisor chat", "post", "/api/advisor/chat", {"json": {"message": "Como está meu mês?"}}),
     ]
 
 
