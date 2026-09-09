@@ -1314,8 +1314,16 @@ def integrity_semantic_audit(
     resolve findings, correct data, or change `status`/`score`/`trusted_for_*`.
     An unavailable/timed-out/invalid Codex response degrades to
     `semantic_audit.available = False` and never to a false "pass".
+
+    Role boundary (`docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md`): never
+    changing a financial fact does not make this route read-only -- it is a
+    `POST` that runs an integrity audit and persists an `AuditEvent` of its
+    own invocation, both of which the Work Order's acceptance criteria treat
+    as operational state, not as a data read. `_require_admin` therefore
+    runs first, exactly like every other mutating route.
     """
 
+    _require_admin(user)
     try:
         integrity_status = consolidated_integrity_status(
             db,
@@ -6667,6 +6675,17 @@ def advisor_chat(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    """Consultative, explanation-only chat over already-computed metrics.
+
+    Role boundary (`docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md`): like
+    `POST /integrity/semantic-audit`, never deciding or altering a financial
+    fact does not make this route read-only -- it is a `POST` that persists
+    an `AuditEvent` of the question itself, which the Work Order's
+    acceptance criteria treat as operational state. `_require_admin` runs
+    first, exactly like every other mutating route.
+    """
+
+    _require_admin(user)
     conversation_message = _advisor_conversation_message(payload)
     target_month = _advisor_month(conversation_message)
     selected_month = month_key(target_month)
