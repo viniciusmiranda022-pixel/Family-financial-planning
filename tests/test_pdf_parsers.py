@@ -435,6 +435,38 @@ def test_nubank_bank_statement_inline_amount_new_day_header_flushes_prior_transa
     assert result.difference == Decimal("0.00")
 
 
+def test_nubank_bank_statement_inline_amount_metadata_does_not_leak_into_next_transaction() -> None:
+    # BLOQUEIO DE MERGE (PR #57): a metadata continuation line between two
+    # inline-amount transactions in the *same* section was being prepended
+    # to the description of the *following* transaction instead of being
+    # attached to the transaction it actually belongs to. Work Order
+    # requirements 5 and 7: preserve metadata deterministically without
+    # attaching it to the next transaction, and keep multiple same-section
+    # transactions separate.
+    parsed = parse_document_contract(
+        "extrato.pdf",
+        fx.nubank_bank_statement_pdf_inline_amount_metadata_then_second(),
+        "bank_statement",
+    )
+    assert parsed.parser_name == "nubank_bank_statement_pdf"
+    assert len(parsed.transactions) == 2
+
+    first, second = parsed.transactions
+    assert first.description == "Recebimento Pix Fulano de Tal BANCO EXEMPLO S.A. Agência: 1 Conta: 0000"
+    assert first.amount == Decimal("50.00")
+    assert first.booked_at == date(2026, 8, 20)
+
+    # The metadata line must not leak into the second transaction's own
+    # description.
+    assert second.description == "Recebimento Pix Ciclano da Silva"
+    assert second.amount == Decimal("100.00")
+    assert second.booked_at == date(2026, 8, 20)
+
+    result = reconcile_parsed_document(parsed)
+    assert result.status == "reconciled"
+    assert result.difference == Decimal("0.00")
+
+
 # ---------------------------------------------------------------------------
 # Mercado Pago -- fatura (credit card)
 # ---------------------------------------------------------------------------

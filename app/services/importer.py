@@ -602,6 +602,17 @@ def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
     current_day: date | None = None
     current_sign: int | None = None
     pending_parts: list[str] = []
+    # True once an inline-amount transaction has been emitted and no
+    # transaction-closing line has resolved since: any text accumulated in
+    # `pending_parts` while this holds is trailing metadata continuation for
+    # that already-emitted transaction (Work Order requirement 5), never the
+    # start of the *next* transaction's own description. False means
+    # `pending_parts` (if any) is instead a description still being built
+    # for a not-yet-closed bare-amount-line transaction (legacy layout), so
+    # it belongs to whichever line closes it next. Reset to False by
+    # `attach_trailing_metadata()` (whatever was pending has been resolved)
+    # and after a bare-format emit; set True after an inline emit.
+    pending_is_trailing_metadata = False
 
     def attach_trailing_metadata() -> None:
         # Text accumulated since the last emitted transaction that never
@@ -612,9 +623,10 @@ def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
         # fabricating a second, amount-less transaction from it. If nothing
         # has been emitted yet, there is nothing to attach it to and it is
         # simply dropped -- never turned into a fabricated transaction.
-        nonlocal pending_parts
+        nonlocal pending_parts, pending_is_trailing_metadata
         extra = " ".join(part for part in pending_parts if part).strip()
         pending_parts = []
+        pending_is_trailing_metadata = False
         if not extra or not parsed:
             return
         last = parsed[-1]
@@ -666,6 +678,13 @@ def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
         if not bare and not inline:
             pending_parts.append(line)
             continue
+        if pending_is_trailing_metadata:
+            # `pending_parts` belongs to the transaction already emitted,
+            # not to this new one (Work Order requirement 7: multiple
+            # transactions in the same section stay separate even when a
+            # metadata continuation line sits between two inline amounts).
+            # Flush it there first so this line starts a clean description.
+            attach_trailing_metadata()
         if bare:
             description = _strip_trailing_separator(" ".join(pending_parts))
             raw_amount = line
@@ -674,12 +693,15 @@ def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
             description = _strip_trailing_separator(" ".join([*pending_parts, tail]))
         pending_parts = []
         if not description or _NON_TRANSACTION_TEXT.search(normalize_description(description)):
+            pending_is_trailing_metadata = False
             continue
         if current_sign is None:
+            pending_is_trailing_metadata = False
             continue
         value = abs(parse_decimal(raw_amount))
         amount = value if current_sign > 0 else -value
         parsed.append(ParsedTransaction(current_day, description, amount, line_number))
+        pending_is_trailing_metadata = bool(inline)
     attach_trailing_metadata()
     if not parsed:
         raise ValueError("Extrato Nubank sem lançamentos textuais reconhecíveis; encaminhado para revisão")

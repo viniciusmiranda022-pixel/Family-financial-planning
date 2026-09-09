@@ -327,6 +327,31 @@ def nubank_bank_statement_pdf_inline_amount_multiple_and_footer() -> bytes:
     return render_single_column_pdf(NUBANK_BANK_STATEMENT_INLINE_MULTIPLE_LINES)
 
 
+# A fourth inline-amount fixture isolating the combination the "multiple"
+# fixture above deliberately leaves out: two inline transactions in the
+# *same* section where the first is followed by a metadata continuation
+# line before the second transaction's own inline-amount line. The
+# continuation must attach to the first transaction, never leak into the
+# second's description (BLOQUEIO DE MERGE, PR #57: metadata continuation
+# was being prepended to the wrong -- following -- transaction).
+NUBANK_BANK_STATEMENT_INLINE_METADATA_THEN_SECOND_LINES = (
+    "Nubank",
+    "01 DE AGOSTO DE 2026 a 31 DE AGOSTO DE 2026",
+    "Saldo inicial R$ 1.000,00",
+    "Total de entradas R$ 150,00",
+    "Total de saidas R$ 0,00",
+    "Saldo final do periodo R$ 1.150,00",
+    "20 AGO 2026 Total de entradas + 150,00",
+    "Recebimento Pix Fulano de Tal 50,00",
+    "BANCO EXEMPLO S.A. Agência: 1 Conta: 0000",
+    "Recebimento Pix Ciclano da Silva 100,00",
+)
+
+
+def nubank_bank_statement_pdf_inline_amount_metadata_then_second() -> bytes:
+    return render_single_column_pdf(NUBANK_BANK_STATEMENT_INLINE_METADATA_THEN_SECOND_LINES)
+
+
 # A third inline-amount fixture isolating the day-header flush case: a
 # transaction's trailing metadata continuation line is followed directly by
 # a *new day* header (no intervening "Total de ..." section switch). The
