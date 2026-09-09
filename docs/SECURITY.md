@@ -25,7 +25,10 @@
 - acesso remoto privado por identidade e dispositivo no Tailscale, sem porta pública;
 - serviço Codex isolado, sem credenciais do banco e sem acesso ao volume de documentos;
 - cálculo financeiro determinístico antes de qualquer explicação gerada por IA;
-- OCR e transcrição locais com confirmação humana antes da gravação.
+- OCR e transcrição locais com confirmação humana antes da gravação;
+- perfis de administrador e consulta (Fase 4): toda rota mutável exige `app.api._require_admin`,
+  fail-closed e verificado no backend antes de qualquer busca por id -- ver "Perfis de administrador e
+  consulta (Fase 4)" em `docs/ARCHITECTURE.md`.
 
 ## Antes da produção
 
