@@ -316,6 +316,126 @@ def test_nubank_bank_statement_zero_movement_is_not_fabricated() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Nubank -- extrato de conta, real `pdfplumber` inline-amount layout.
+# `docs/WORK_ORDER_NUBANK_BANK_STATEMENT_PDFPLUMBER_LAYOUT.md`: the amount
+# sits at the end of the transaction's own description line instead of on a
+# bare line by itself, and counterparty/bank metadata for that transaction
+# may continue on the following line(s).
+# ---------------------------------------------------------------------------
+
+
+def test_nubank_bank_statement_inline_amount_matches_work_order_example() -> None:
+    # Pins the Work Order's own "Synthetic shape" example verbatim: one
+    # inline-amount entrada followed by its metadata continuation line, a
+    # section switch, then one inline-amount saída with its own metadata
+    # continuation line, flushed by end of document.
+    parsed = parse_document_contract(
+        "extrato.pdf", fx.nubank_bank_statement_pdf_inline_amount(), "bank_statement"
+    )
+    assert parsed.parser_name == "nubank_bank_statement_pdf"
+    assert len(parsed.transactions) == 2
+
+    entrada, saida = parsed.transactions
+    assert entrada.amount == Decimal("300.00")
+    assert entrada.booked_at == date(2026, 8, 14)
+    assert "Transferência recebida pelo Pix Pessoa Exemplo" in entrada.description
+    # Metadata continuation line is preserved, not dropped.
+    assert "BANCO EXEMPLO S.A." in entrada.description
+    assert "Agência: 1 Conta: 0000" in entrada.description
+    # The inline layout's trailing "-" separator is punctuation, not part
+    # of the description and not a sign.
+    assert not entrada.description.rstrip().endswith("-")
+
+    assert saida.amount == Decimal("-300.00")
+    assert saida.booked_at == date(2026, 8, 14)
+    assert "Transferência enviada pelo Pix Pessoa Exemplo - BANCO DESTINO" in saida.description
+    assert "Agência: 2 Conta: 1111" in saida.description
+
+    # Aggregate lines never appear in parsed transactions.
+    assert not any("TOTAL DE" in t.description.upper() for t in parsed.transactions)
+
+
+def test_nubank_bank_statement_inline_amount_declared_fields_and_reconciliation() -> None:
+    parsed = parse_document_contract(
+        "extrato.pdf", fx.nubank_bank_statement_pdf_inline_amount(), "bank_statement"
+    )
+    assert parsed.declared_fields["opening_balance"] == Decimal("1000.00")
+    assert parsed.declared_fields["closing_balance"] == Decimal("1000.00")
+    assert parsed.declared_fields["as_of_date"] == "2026-08-31"
+
+    result = reconcile_parsed_document(parsed)
+    assert result.status == "reconciled"
+    assert result.difference == Decimal("0.00")
+
+
+def test_nubank_bank_statement_inline_amount_keeps_multiple_transactions_separate() -> None:
+    # Work Order acceptance criterion: two transactions in the same section
+    # must remain separate even when each amount appears inline with no
+    # metadata continuation between them.
+    parsed = parse_document_contract(
+        "extrato.pdf",
+        fx.nubank_bank_statement_pdf_inline_amount_multiple_and_footer(),
+        "bank_statement",
+    )
+    assert parsed.parser_name == "nubank_bank_statement_pdf"
+    assert len(parsed.transactions) == 2
+
+    first, second = parsed.transactions
+    assert first.description == "Recebimento Pix Fulano de Tal"
+    assert first.amount == Decimal("50.00")
+    assert second.description == "Recebimento Pix Ciclano da Silva"
+    assert second.amount == Decimal("100.00")
+    for txn in parsed.transactions:
+        assert txn.booked_at == date(2026, 8, 20)
+
+
+def test_nubank_bank_statement_inline_amount_ignores_footer_boilerplate() -> None:
+    # Work Order acceptance criterion: footer/disclaimer lines are never
+    # appended to a transaction and never produce a transaction of their
+    # own.
+    parsed = parse_document_contract(
+        "extrato.pdf",
+        fx.nubank_bank_statement_pdf_inline_amount_multiple_and_footer(),
+        "bank_statement",
+    )
+    last = parsed.transactions[-1]
+    for marker in ("ATENDIMENTO", "OUVIDORIA", "CNPJ", "0800", "PAGAMENTOS"):
+        assert marker not in last.description.upper()
+    assert len(parsed.transactions) == 2
+
+    result = reconcile_parsed_document(parsed)
+    assert result.status == "reconciled"
+    assert result.difference == Decimal("0.00")
+
+
+def test_nubank_bank_statement_inline_amount_new_day_header_flushes_prior_transaction() -> None:
+    # Work Order acceptance criterion: a new date header flushes the prior
+    # transaction (attaching its trailing metadata) and updates
+    # `booked_at`, without leaking that metadata into the transaction that
+    # follows the header.
+    parsed = parse_document_contract(
+        "extrato.pdf",
+        fx.nubank_bank_statement_pdf_inline_amount_day_header_flush(),
+        "bank_statement",
+    )
+    assert len(parsed.transactions) == 2
+
+    first, second = parsed.transactions
+    assert first.booked_at == date(2026, 8, 14)
+    assert first.amount == Decimal("100.00")
+    assert "Recebimento Pix Fulano de Tal" in first.description
+    assert "Agencia 1 Conta 0000" in first.description
+
+    assert second.booked_at == date(2026, 8, 20)
+    assert second.amount == Decimal("50.00")
+    assert second.description == "Recebimento Pix Ciclano da Silva"
+
+    result = reconcile_parsed_document(parsed)
+    assert result.status == "reconciled"
+    assert result.difference == Decimal("0.00")
+
+
+# ---------------------------------------------------------------------------
 # Mercado Pago -- fatura (credit card)
 # ---------------------------------------------------------------------------
 
