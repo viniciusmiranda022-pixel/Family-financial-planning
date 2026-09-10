@@ -27,7 +27,7 @@ from app.models import (
     Transaction,
 )
 from app.services.classifier import normalize_description
-from app.services.finance import add_months, money
+from app.services.finance import add_months, money, month_key
 from app.services.financial_engine import FinancialEngineInput, calculate_actual_snapshot
 from app.services.financial_integrity import consolidated_integrity_status
 
@@ -49,7 +49,15 @@ def _expense_signature(transaction: Transaction, account_type: str | None) -> tu
     # FAMILY_FINANCE_CARD_COMPETENCE_V11
     period: object = transaction.booked_at
     if account_type == "credit_card":
-        period = transaction.competence or (transaction.booked_at.year, transaction.booked_at.month)
+        # A persisted `competence` is always the canonical "YYYY-MM" string
+        # `month_key` produces (see `_card_invoice_competence`). The
+        # fallback for a transaction with no persisted competence (e.g. one
+        # created outside the manual-entry/import pipeline) must match that
+        # same string shape -- a bare `(year, month)` tuple never equals the
+        # string form, so two same-period card expenses would silently
+        # never be recognized as duplicates of each other purely because of
+        # this type mismatch, not because they actually differ.
+        period = transaction.competence or month_key(transaction.booked_at)
     return (
         period,
         normalize_description(transaction.description),
@@ -75,7 +83,20 @@ def consolidated_transactions(
                 and_(
                     Account.account_type == "credit_card",
                     or_(
-                        Transaction.competence == start.strftime("%Y-%m"),
+                        # `competence` ("YYYY-MM") sorts lexicographically
+                        # the same as chronological order, so a half-open
+                        # string range mirrors the `booked_at` range below --
+                        # this must hold for a multi-month window (e.g.
+                        # `cut_plan`'s 6-month lookback, `_build_report_payload`'s
+                        # 1-12 month range), not just the single-month window
+                        # `build_snapshot` always passes. Comparing only
+                        # against `start`'s own month here previously dropped
+                        # every card transaction whose invoice competence
+                        # fell in any later month of the window.
+                        and_(
+                            Transaction.competence >= start.strftime("%Y-%m"),
+                            Transaction.competence < end.strftime("%Y-%m"),
+                        ),
                         and_(
                             Transaction.competence.is_(None),
                             Transaction.booked_at >= start,
@@ -786,6 +807,7 @@ def _snapshot_monetary_fields(snapshot: FinancialSnapshot) -> dict[str, Decimal]
         "operating_income": money(snapshot.operating_income),
         "operating_expenses": money(snapshot.operating_expenses),
         "operating_result": money(snapshot.operating_result),
+        "bank_cash_in": money(snapshot.bank_cash_in),
         "bank_cash_out": money(snapshot.bank_cash_out),
         "card_spend": money(snapshot.card_spend),
         "closing_liquidity_balance": money(snapshot.closing_liquidity_balance),
