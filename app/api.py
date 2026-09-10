@@ -261,7 +261,14 @@ def _expense_signature(transaction: Transaction, account_type: str | None) -> tu
     # FAMILY_FINANCE_CARD_COMPETENCE_V11
     period: object = transaction.booked_at
     if account_type == "credit_card":
-        period = transaction.competence or (transaction.booked_at.year, transaction.booked_at.month)
+        # A persisted `competence` is always the canonical "YYYY-MM" string
+        # `month_key` produces (see `_card_invoice_competence`). The
+        # fallback for a transaction with no persisted competence must match
+        # that same string shape -- a bare `(year, month)` tuple never
+        # equals the string form, so two same-period card expenses would
+        # silently never be recognized as duplicates of each other purely
+        # because of this type mismatch, not because they actually differ.
+        period = transaction.competence or month_key(transaction.booked_at)
     return (
         period,
         normalize_description(transaction.description),
@@ -289,7 +296,20 @@ def _consolidated_transactions(
                 and_(
                     Account.account_type == "credit_card",
                     or_(
-                        Transaction.competence == start.strftime("%Y-%m"),
+                        # `competence` ("YYYY-MM") sorts lexicographically
+                        # the same as chronological order, so a half-open
+                        # string range mirrors the `booked_at` range below --
+                        # this must hold for the multi-month windows this
+                        # function is actually called with (`cut_plan`'s
+                        # 6-month lookback, `_build_report_payload`'s 1-12
+                        # month range). Comparing only against `start`'s own
+                        # month here previously dropped every card
+                        # transaction whose invoice competence fell in any
+                        # later month of the window.
+                        and_(
+                            Transaction.competence >= start.strftime("%Y-%m"),
+                            Transaction.competence < end.strftime("%Y-%m"),
+                        ),
                         and_(
                             Transaction.competence.is_(None),
                             Transaction.booked_at >= start,
@@ -5607,7 +5627,21 @@ def obligation_payment_candidates(
     )
 
 
-def _privilege_account(db: Session, household_id: str) -> Account:
+def _privilege_account(db: Session, household_id: str, *, required: bool = True) -> Account | None:
+    """Resolve the household's single Privilège DI investment account.
+
+    A household that has not created any `investment` account yet is not an
+    ambiguity -- it is the ordinary state of a fresh household, before it has
+    ever used the Privilège-funding feature (`FAMILY_FINANCE_PRIVILEGE_FUNDING_V15`).
+    Callers that need a real account to fund/redeem against keep `required=True`
+    (the default) and get the existing fail-closed 422 either way -- zero
+    candidates or more than one with no unique "PRIVILEGE" match, never a
+    guess. Callers that only *observe* the account when one exists (profile
+    read/write) pass `required=False` and get `None` back for the "not
+    configured yet" case, while an unresolved ambiguity among *existing*
+    investment accounts still raises: guessing which one is Privilège would
+    be worse than surfacing the conflict.
+    """
     investments = list(
         db.scalars(
             select(Account).where(
@@ -5625,6 +5659,8 @@ def _privilege_account(db: Session, household_id: str) -> Account:
         return matches[0]
     if not matches and len(investments) == 1:
         return investments[0]
+    if not investments and not required:
+        return None
     raise HTTPException(
         status_code=422,
         detail="Não foi possível identificar unicamente a conta Privilège DI.",
@@ -6196,16 +6232,19 @@ def get_profile(user: User = Depends(get_current_user), db: Session = Depends(ge
     # FAMILY_FINANCE_PROFILE_CONFIRMED_BALANCE_SYNC_V17
     current_confirmed_balance = item.investment_balance
     try:
-        privilege_account = _privilege_account(db, user.household_id)
-        current_observation = _latest_active_balance_observation(
-            db,
-            household_id=user.household_id,
-            account_id=privilege_account.id,
-        )
-        if current_observation is not None:
-            current_confirmed_balance = money(current_observation.amount)
+        privilege_account = _privilege_account(db, user.household_id, required=False)
+        if privilege_account is not None:
+            current_observation = _latest_active_balance_observation(
+                db,
+                household_id=user.household_id,
+                account_id=privilege_account.id,
+            )
+            if current_observation is not None:
+                current_confirmed_balance = money(current_observation.amount)
     except HTTPException:
-        current_observation = None
+        # Ambiguous Privilège account among *existing* investment accounts:
+        # fall back to the legacy scalar rather than guessing which one to trust.
+        pass
     db.commit()
     return {
         "monthly_salary_net": decimal_value(item.monthly_salary_net),
@@ -6230,11 +6269,21 @@ def update_profile(
     values = payload.model_dump()
     desired_confirmed_balance = money(payload.investment_balance)
 
-    privilege_account = _privilege_account(db, user.household_id)
-    current_observation = _latest_active_balance_observation(
-        db,
-        household_id=user.household_id,
-        account_id=privilege_account.id,
+    # `required=False`: a household that has not created any investment
+    # account yet has nothing to sync an observation against -- that is the
+    # ordinary state before the Privilège-funding feature is first used, not
+    # an ambiguity, and must not block the rest of the profile (salary, cash
+    # cap, etc.) from being saved. An unresolved ambiguity among *existing*
+    # investment accounts still raises 422 from `_privilege_account` itself.
+    privilege_account = _privilege_account(db, user.household_id, required=False)
+    current_observation = (
+        _latest_active_balance_observation(
+            db,
+            household_id=user.household_id,
+            account_id=privilege_account.id,
+        )
+        if privilege_account is not None
+        else None
     )
 
     today = date.today()
@@ -6251,7 +6300,11 @@ def update_profile(
     for field, value in values.items():
         setattr(item, field, value)
 
-    balance_changed = (
+    # No Privilège account resolved yet: there is no observation trail to
+    # reconcile against, so this is not a "confirmed balance changed" event --
+    # `item.investment_balance` below still stores the plain scalar the
+    # household declared, exactly as it did before this feature existed.
+    balance_changed = privilege_account is not None and (
         current_observation is None
         or money(current_observation.amount) != desired_confirmed_balance
     )
