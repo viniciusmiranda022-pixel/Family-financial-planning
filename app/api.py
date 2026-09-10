@@ -1938,6 +1938,10 @@ def rollback_card_competence_repair_endpoint(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except NoLongerCandidateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BlockedCandidateError as exc:
+        raise HTTPException(
+            status_code=422, detail={"message": str(exc), "blocked": list(exc.blocked)}
+        ) from exc
     except CardCompetenceRepairError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

@@ -44,6 +44,18 @@ Design constraints from the Work Order, all enforced here:
   competence change could corrupt that unresolved/settled comparison) and on
   a `trusted` `MonthlyFinancialClose` covering either the old or the new
   competence period.
+- Rollback shares that same `trusted`-close barrier: `_trusted_close_reasons`
+  (extracted from `_blocked_reasons` so both directions call one function)
+  is checked, atomically and before any mutation, against the *repair's own*
+  before/after periods read back from the `AuditEvent` -- never a
+  recomputed or client-supplied period. A close that was `trusted` when a
+  transaction moved out of its period, or has since been trusted by an
+  independent human decision, blocks the rollback exactly like it blocks a
+  forward apply. This module never reopens a close on the caller's behalf;
+  an administrator must use the canonical `reopen` flow (with a reason) to
+  unblock a stuck rollback -- see the Work Order's rollback section, updated
+  to remove the ambiguity that let this asymmetry ship in the first review
+  round.
 - Only `Transaction.competence` (and the ORM's own `updated_at`) ever
   changes. `booked_at`, `occurred_at`, `amount`, `fingerprint`,
   `duplicate_group_id`, `canonical_status`, and every other column the Work
@@ -222,6 +234,23 @@ def _candidate_rows(db: Session, *, household_id: str) -> list[tuple[Transaction
     )
 
 
+def _trusted_close_reasons(
+    db: Session, *, household_id: str, periods: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Fail-closed predicate on a `trusted` `MonthlyFinancialClose` covering
+    any of `periods`. Shared by `_blocked_reasons` (apply) and
+    `rollback_card_competence_repair` so both directions of this mechanism
+    enforce the exact same barrier -- see the module docstring's rollback
+    bullet for why the two must never diverge."""
+
+    reasons: list[str] = []
+    for period in dict.fromkeys(periods):  # de-dup, preserve order
+        close = get_monthly_close(db, household_id=household_id, period=period)
+        if close is not None and close.status == "trusted":
+            reasons.append(f"monthly_close_trusted:{period}")
+    return tuple(reasons)
+
+
 def _blocked_reasons(
     db: Session,
     *,
@@ -241,10 +270,7 @@ def _blocked_reasons(
         group = db.get(DuplicateGroup, transaction.duplicate_group_id)
         if group is not None and group.status == "open":
             reasons.append("duplicate_group_open")
-    for period in dict.fromkeys(periods):  # de-dup, preserve order
-        close = get_monthly_close(db, household_id=household_id, period=period)
-        if close is not None and close.status == "trusted":
-            reasons.append(f"monthly_close_trusted:{period}")
+    reasons.extend(_trusted_close_reasons(db, household_id=household_id, periods=periods))
     return tuple(reasons)
 
 
@@ -514,6 +540,33 @@ def rollback_card_competence_repair(
             "estado atual (nunca reparada, já revertida, ou alterada desde o "
             "reparo).",
             transaction_ids=tuple(missing),
+        )
+
+    # Same fail-closed barrier `apply_card_competence_repair` enforces,
+    # mirrored here: checked for every transaction, against the rollback's
+    # own before/current periods (never a client-supplied or recomputed
+    # period), atomically before any row is touched. A `trusted` close on
+    # either period means a human closing decision now covers a fact this
+    # rollback would change -- that requires an explicit `reopen` (with a
+    # reason) through the canonical monthly-close flow, never an implicit
+    # side effect of this endpoint. See the review that added this check:
+    # PR #82.
+    blocked = tuple(
+        {"transaction_id": tid, "reasons": list(reasons)}
+        for tid, (before_competence, current_competence) in plan.items()
+        for reasons in (
+            _trusted_close_reasons(
+                db, household_id=household_id, periods=(before_competence, current_competence)
+            ),
+        )
+        if reasons
+    )
+    if blocked:
+        raise BlockedCandidateError(
+            "Uma ou mais transações selecionadas estão cobertas por um fechamento "
+            "mensal trusted e exigem reabertura explícita (reopen) antes da "
+            "reversão.",
+            blocked=blocked,
         )
 
     batch_id = str(uuid.uuid4())

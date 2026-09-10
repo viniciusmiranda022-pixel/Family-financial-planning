@@ -228,7 +228,18 @@ O rollback deve:
 - usar audit trail/before_state real, nunca inferência;
 - validar que a transação ainda está no estado produzido pelo reparo antes de revertê-la;
 - ser race-safe pela revisão financeira;
-- recomputar os mesmos períodos derivados;
+- **bloquear atomicamente, antes de qualquer mutação, se o período antigo ou o
+  novo (os dois períodos do próprio rollback, lidos do `AuditEvent` do
+  reparo -- nunca um período recalculado ou informado pelo cliente) tiver um
+  `MonthlyFinancialClose.status == "trusted"`, com a mesma semântica
+  fail-closed do apply (critério 14).** Isto não é opcional nem inferido: a
+  primeira rodada de revisão do PR #82 encontrou esta ambiguidade -- o texto
+  original desta seção listava a barreira de revisão financeira mas omitia a
+  de fechamento trusted, o que teria permitido reabrir implicitamente um mês
+  fechado por decisão humana sem passar por `reopen`. O rollback nunca reabre
+  um fechamento sozinho; se um período estiver trusted, a única saída é o
+  administrador reabri-lo explicitamente (com motivo) pelo fluxo canônico
+  antes de repetir o rollback;
 - nunca restaurar dump automaticamente.
 
 O dump de produção é contingência/DR, não mecanismo normal de rollback desta feature.
@@ -264,11 +275,12 @@ Usar somente dados sintéticos nos testes e reproduzir, no mínimo:
 11. apply com id de outro household falha sem vazar existência;
 12. apply com candidato que deixou de ser candidato falha atomicamente;
 13. duplicidade aberta bloqueia;
-14. fechamento `trusted` em qualquer período afetado bloqueia;
+14. fechamento `trusted` em qualquer período afetado bloqueia, tanto no apply quanto no rollback (ver seção 10);
 15. auditoria before/after/reason é persistida;
 16. rollback lógico restaura exatamente a competência anterior quando o estado ainda permite;
 17. rollback stale/conflitante falha sem sobrescrever mudança posterior;
-18. nenhum lançamento é apagado ou recriado.
+18. nenhum lançamento é apagado ou recriado;
+19. rollback para um período (antigo ou novo) coberto por fechamento `trusted` falha atomicamente sem mutar `Transaction`, `AuditEvent` de rollback ou snapshot, e só prossegue após `reopen` explícito de todos os períodos afetados.
 
 ## Critérios de aceite financeiros obrigatórios
 

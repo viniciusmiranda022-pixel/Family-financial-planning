@@ -23,8 +23,9 @@ Covers:
 5. The mandatory financial-effect proof: budget/card-spend/category moves
    from the old period to the new one, exactly once, across dashboard,
    credit-card summary and report.
-6. Logical rollback: exact restoration, and fail-closed on a stale/
-   conflicting target.
+6. Logical rollback: exact restoration, fail-closed on a stale/conflicting
+   target, and fail-closed on a `trusted` monthly close covering either the
+   rollback's old or new period until an explicit `reopen`.
 """
 
 import os
@@ -1467,6 +1468,141 @@ def test_rollback_rejects_transaction_with_no_repair_history():
         )
         assert response.status_code == 409
         assert _get_transaction(session_factory, transaction_id).competence == "2026-09"
+
+
+def test_rollback_blocked_by_trusted_monthly_close_until_reopened():
+    """Engineering review on PR #82: `apply_card_competence_repair` fail-
+    closes on a `trusted` `MonthlyFinancialClose` covering either the old or
+    the new competence period, but the first cut of
+    `rollback_card_competence_repair` did not -- so repairing 2026-09 ->
+    2026-10, trusting either month through the canonical close flow, and
+    then rolling back would have silently moved a transaction back into a
+    period a human already closed, without going through `reopen`. Proves:
+    (1) rollback is blocked while *either* period is trusted, atomically --
+    no `Transaction`, rollback `AuditEvent` or snapshot changes; (2) trusting
+    only one of the two periods is still not enough, matching
+    `_blocked_reasons`'s "any of `periods`" semantics; (3) once both periods
+    are reopened through the canonical `reopen` flow (never auto-reopened by
+    this engine), the rollback proceeds and recomputes both periods exactly
+    like an unblocked rollback would."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        household_id = _household_id(session_factory)
+        _set_cash_cap(client, monthly_cash_cap=1000)
+        card = _create_account(
+            client, name="Itaú Cartão", account_type="credit_card", card_closing_day=2, card_due_day=9
+        )
+        category_id = _category_id(client)
+        transaction_id = _insert_legacy_transaction(
+            session_factory,
+            household_id=household_id,
+            account_id=card,
+            category_id=category_id,
+            booked_at=date(2026, 9, 15),
+            amount=200,
+            competence="2026-09",
+        )
+        preview = client.post("/api/maintenance/card-competence/preview").json()
+        apply_response = client.post(
+            "/api/maintenance/card-competence/apply",
+            json={
+                "transaction_ids": [transaction_id],
+                "expected_financial_revision": preview["financial_revision"],
+                "reason": "Reparo a ser revertido após fechamento",
+            },
+        )
+        assert apply_response.status_code == 200, apply_response.text
+        revision = apply_response.json()["financial_revision"]
+        assert _get_transaction(session_factory, transaction_id).competence == "2026-10"
+        snapshot_old_after_apply = _get_snapshot(session_factory, household_id=household_id, period="2026-09")
+        snapshot_new_after_apply = _get_snapshot(session_factory, household_id=household_id, period="2026-10")
+
+        # A human closes and trusts *both* the old and the new period through
+        # the canonical flow -- `MonthlyFinancialClose` is deliberately not a
+        # `FINANCIAL_REVISION_MODELS` row (see `app/models.py`), so this does
+        # not itself change `revision` and the apply's revision stays valid.
+        _trust_monthly_close(session_factory, household_id=household_id, period="2026-09")
+        _trust_monthly_close(session_factory, household_id=household_id, period="2026-10")
+
+        blocked_response = client.post(
+            "/api/maintenance/card-competence/rollback",
+            json={
+                "transaction_ids": [transaction_id],
+                "expected_financial_revision": revision,
+                "reason": "Não deveria reverter com fechamento trusted",
+            },
+        )
+        assert blocked_response.status_code == 422, blocked_response.text
+        blocked_detail = blocked_response.json()["detail"]
+        reasons = blocked_detail["blocked"][0]["reasons"]
+        assert "monthly_close_trusted:2026-09" in reasons
+        assert "monthly_close_trusted:2026-10" in reasons
+
+        # Nothing moved: the Transaction, the audit trail and both snapshots
+        # are exactly as they were right after apply.
+        assert _get_transaction(session_factory, transaction_id).competence == "2026-10"
+        with session_factory() as db:
+            rollback_event = db.scalar(
+                select(AuditEvent).where(
+                    AuditEvent.event_type == ROLLBACK_EVENT_TYPE,
+                    AuditEvent.entity_id == transaction_id,
+                )
+            )
+            assert rollback_event is None
+        assert (
+            _get_snapshot(session_factory, household_id=household_id, period="2026-09").card_spend
+            == snapshot_old_after_apply.card_spend
+        )
+        assert (
+            _get_snapshot(session_factory, household_id=household_id, period="2026-10").card_spend
+            == snapshot_new_after_apply.card_spend
+        )
+
+        # Reopening only one of the two trusted periods is still not enough
+        # -- the other one alone continues to block, atomically.
+        reopen_old = client.post("/api/monthly-closes/2026-09/reopen", json={"reason": "Reabertura para reverter"})
+        assert reopen_old.status_code == 200, reopen_old.text
+        still_blocked = client.post(
+            "/api/maintenance/card-competence/rollback",
+            json={
+                "transaction_ids": [transaction_id],
+                "expected_financial_revision": revision,
+                "reason": "Ainda não deveria reverter (outubro continua trusted)",
+            },
+        )
+        assert still_blocked.status_code == 422, still_blocked.text
+        still_blocked_reasons = still_blocked.json()["detail"]["blocked"][0]["reasons"]
+        assert still_blocked_reasons == ["monthly_close_trusted:2026-10"]
+        assert _get_transaction(session_factory, transaction_id).competence == "2026-10"
+
+        # Once both periods are explicitly reopened, the rollback proceeds
+        # and recomputes exactly like the unblocked case.
+        reopen_new = client.post("/api/monthly-closes/2026-10/reopen", json={"reason": "Reabertura para reverter"})
+        assert reopen_new.status_code == 200, reopen_new.text
+        rollback_response = client.post(
+            "/api/maintenance/card-competence/rollback",
+            json={
+                "transaction_ids": [transaction_id],
+                "expected_financial_revision": revision,
+                "reason": "Reparo aplicado por engano, ambos os fechamentos reabertos",
+            },
+        )
+        assert rollback_response.status_code == 200, rollback_response.text
+        assert _get_transaction(session_factory, transaction_id).competence == "2026-09"
+        with session_factory() as db:
+            rollback_event = db.scalar(
+                select(AuditEvent).where(
+                    AuditEvent.event_type == ROLLBACK_EVENT_TYPE,
+                    AuditEvent.entity_id == transaction_id,
+                )
+            )
+            assert rollback_event is not None
+        old_snapshot = _get_snapshot(session_factory, household_id=household_id, period="2026-09")
+        new_snapshot = _get_snapshot(session_factory, household_id=household_id, period="2026-10")
+        assert old_snapshot.card_spend == Decimal("200.00")
+        assert new_snapshot.card_spend == Decimal("0.00")
 
 
 # ---------------------------------------------------------------------------
