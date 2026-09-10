@@ -6,6 +6,22 @@ O projeto possui uma franquia mensal limitada de minutos do GitHub Actions. Essa
 
 O GitHub Actions é uma confirmação independente do head final; não deve ser usado como ambiente iterativo de desenvolvimento.
 
+## Orçamento mensal e limites operacionais
+
+A referência atual do projeto é uma franquia mensal de **2.000 minutos de Actions Linux**. O orçamento operacional normal é limitado a **1.600 minutos (80%)**, preservando **400 minutos (20%) como reserva técnica** para validações finais, hotfixes e situações excepcionais.
+
+Os limiares são:
+
+- **0–999 min (<50%) — normal:** seguir esta política, sempre com validação local antes do CI remoto.
+- **1.000 min (50%) — atenção:** revisar ritmo de consumo e eliminar execuções redundantes antes de novos pushes.
+- **1.500 min (75%) — contenção:** CI remoto deve ser reservado prioritariamente a heads maduros/finais; iteração deve ocorrer localmente.
+- **1.600 min (80%) — reserva técnica:** interromper consumo rotineiro. Novas execuções remotas somente para validação final necessária, hotfix crítico ou exceção explicitamente autorizada pelo engenheiro responsável.
+- **2.000 min (100%) — franquia esgotada:** não tentar contornar o bloqueio reduzindo gates; aguardar renovação ou usar infraestrutura equivalente previamente aprovada.
+
+Esses limiares **não autorizam merge sem os 12 gates obrigatórios para mudanças executáveis**. Se a reserva for insuficiente para validar o head final, o merge permanece bloqueado.
+
+O consumo deve ser consultado periodicamente em GitHub Billing > Metered usage > Actions Linux, especialmente antes de iniciar um novo slice ou solicitar nova execução remota.
+
 ## Princípios obrigatórios
 
 1. **Validação local primeiro.** Claude/Codex deve executar localmente os checks aplicáveis ao escopo antes de fazer push.
