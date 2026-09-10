@@ -403,6 +403,67 @@ def test_card_purchase_uses_statement_competence() -> None:
     assert shifted.status is InvariantStatus.FAIL
 
 
+def test_card_purchase_competence_matches_real_engine_open_invoice_hotfix() -> None:
+    """Regression for docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md:
+    unlike `test_card_purchase_uses_statement_competence` above (which only
+    proves the abstract evaluator compares two given facts correctly), this
+    proves INV-017 actually holds for the *real* canonical engine
+    (`app.api._card_invoice_competence`) against the exact bug scenario --
+    a card purchase made while the next invoice is still open. Before the
+    hotfix this fact would have been `2026-09` (`booked_at`'s own month);
+    the canonical engine must now report the still-open October invoice,
+    and feeding that into the same INV-017 evaluator this suite already
+    trusts must come back `pass`, never `fail` or `unknown`."""
+    from datetime import date as _date
+
+    from app.api import _card_invoice_competence
+    from app.models import Account
+
+    card = Account(
+        account_type="credit_card",
+        name="Cartão com fatura aberta",
+        card_closing_day=2,
+        card_due_day=9,
+    )
+    booked_at = _date(2026, 9, 15)
+    canonical_competence = _card_invoice_competence(card, booked_at)
+    assert canonical_competence == "2026-10"
+
+    matching = _evaluate(
+        "INV-017",
+        canonical_competence=canonical_competence,
+        counted_competence=canonical_competence,
+    )
+    assert matching.status is InvariantStatus.PASS
+
+    # The pre-hotfix bug's actual behaviour (counting under `booked_at`'s
+    # own month) must still be caught as a violation by the same rule.
+    pre_hotfix_bug = _evaluate(
+        "INV-017",
+        canonical_competence=canonical_competence,
+        counted_competence=booked_at.strftime("%Y-%m"),
+    )
+    assert pre_hotfix_bug.status is InvariantStatus.FAIL
+
+
+def test_card_purchase_without_configured_cycle_never_fabricates_a_competence() -> None:
+    """The canonical engine must fail closed (never guess) when the account
+    has no persisted `card_closing_day`/`card_due_day` -- INV-017 protects
+    against a *wrong* competence, and fail-closed is how the engine avoids
+    ever producing one to check in the first place."""
+    from datetime import date as _date
+
+    from fastapi import HTTPException
+
+    from app.api import _card_invoice_competence
+    from app.models import Account
+
+    card = Account(account_type="credit_card", name="Cartão sem ciclo")
+    with pytest.raises(HTTPException) as exc_info:
+        _card_invoice_competence(card, _date(2026, 9, 15))
+    assert exc_info.value.status_code == 422
+
+
 def test_projection_mismatch_blocks_trust() -> None:
     result = _evaluate(
         "INV-018",

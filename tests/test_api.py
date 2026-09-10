@@ -90,6 +90,14 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                 "account_type": "credit_card",
                 "owner_label": "Família",
                 "last_four": "1234",
+                # INV-017 (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md):
+                # a card expense's competence is derived from the account's
+                # own persisted cycle -- fail-closed without one. A cycle
+                # that closes on the last day of the month never rolls a
+                # purchase into the next month, keeping this flow's
+                # existing within-month dates unaffected.
+                "card_closing_day": 31,
+                "card_due_day": 31,
             },
         )
         assert account.status_code == 201

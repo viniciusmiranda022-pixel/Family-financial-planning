@@ -77,10 +77,22 @@ def _setup_household(client, *, household_name="Família Fluxos", username="admi
     return setup.json()
 
 
-def _create_account(client, *, name, account_type="checking", last_four=None):
+def _create_account(
+    client,
+    *,
+    name,
+    account_type="checking",
+    last_four=None,
+    card_closing_day=None,
+    card_due_day=None,
+):
     payload = {"name": name, "account_type": account_type}
     if last_four is not None:
         payload["last_four"] = last_four
+    if card_closing_day is not None:
+        payload["card_closing_day"] = card_closing_day
+    if card_due_day is not None:
+        payload["card_due_day"] = card_due_day
     response = client.post("/api/accounts", json=payload)
     assert response.status_code == 201, response.text
     return response.json()["id"]
@@ -399,11 +411,13 @@ def test_checking_account_expense_defaults_competence_to_booked_at_month():
 
 
 def test_credit_card_expense_without_explicit_competence_is_rejected():
-    """INV-017: a card purchase's competence follows the invoice, not
-    necessarily the purchase date. This app has no invoice entity yet to
-    derive that automatically (lands with the "Contas a pagar" slice), so
-    the command must fail closed instead of fabricating
-    `booked_at.strftime("%Y-%m")` -- see the engineering review on PR 47."""
+    """INV-017 (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md): a
+    card purchase's competence follows the invoice's configured cycle
+    (`card_closing_day`/`card_due_day`), never `booked_at`'s own month. A
+    card with no cycle persisted has no fact to derive that invoice from, so
+    `_card_invoice_competence` must fail closed instead of fabricating one
+    -- explicit competence cannot rescue that, since there is nothing to
+    validate it against either."""
     client, _ = _client()
     with client:
         _setup_household(client)
@@ -422,18 +436,26 @@ def test_credit_card_expense_without_explicit_competence_is_rejected():
             },
         )
         assert response.status_code == 422
-        assert "competência" in response.json()["detail"].lower()
+        assert "fechamento" in response.json()["detail"].lower()
 
 
 def test_credit_card_expense_persists_explicitly_confirmed_competence():
-    """The confirmed competence is persisted verbatim even when it differs
-    from `booked_at`'s month (e.g. a purchase near the statement's closing
-    date that lands in the *following* month's invoice) -- `booked_at`
-    itself is untouched, preserving it as lineage per INV-017."""
+    """When the card's cycle is configured, an explicitly confirmed
+    competence that matches the cycle's own calculation is accepted and
+    persisted verbatim, even when it differs from `booked_at`'s month (e.g.
+    a purchase near the statement's closing date that lands in the
+    *following* month's invoice) -- `booked_at` itself stays untouched,
+    preserved as lineage per INV-017."""
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         response = client.post(
@@ -544,7 +566,12 @@ def test_manual_expense_in_credit_card_account_carries_card_lineage():
     with client:
         _setup_household(client)
         nubank_card = _create_account(
-            client, name="Nubank Cartão", account_type="credit_card", last_four="4242"
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            last_four="4242",
+            card_closing_day=25,
+            card_due_day=25,
         )
         category_id = _non_system_category_id(client)
 
@@ -574,7 +601,13 @@ def test_manual_installment_expense_populates_installment_and_card_fields():
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         response = client.post(
@@ -613,7 +646,13 @@ def test_manual_installment_feeds_canonical_projection_without_duplicating_obser
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         # Parcela 2/4 observed in August.
@@ -674,7 +713,13 @@ def test_future_installments_anchors_schedule_on_confirmed_competence_not_booked
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         response = client.post(
@@ -709,7 +754,13 @@ def test_future_installments_replaces_observed_competence_month_without_duplicat
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         first = client.post(
@@ -961,7 +1012,13 @@ def test_installment_preview_reflects_already_persisted_commitments():
     client, _ = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         itau = _create_account(client, name="Itaú Corrente", account_type="checking")
         category_id = _non_system_category_id(client)
 
@@ -1017,7 +1074,13 @@ def test_installment_preview_anchors_on_confirmed_competence_not_booked_at():
     client, _ = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
 
         preview = client.get(
             "/api/transactions/manual/installment-preview",
@@ -1046,7 +1109,13 @@ def test_installment_preview_matches_persisted_projection_for_divergent_competen
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         params = {
@@ -1103,7 +1172,13 @@ def test_installment_preview_simulates_series_replacement_for_next_observed_inst
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         first = client.post(
@@ -1273,4 +1348,4 @@ def test_installment_preview_requires_competence_for_card_account():
             },
         )
         assert response.status_code == 422
-        assert "competência" in response.json()["detail"].lower()
+        assert "fechamento" in response.json()["detail"].lower()
