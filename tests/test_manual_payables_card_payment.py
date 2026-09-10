@@ -91,10 +91,22 @@ def _setup_household(
     return household_id
 
 
-def _create_account(client, *, name, account_type="checking", last_four=None):
+def _create_account(
+    client,
+    *,
+    name,
+    account_type="checking",
+    last_four=None,
+    card_closing_day=None,
+    card_due_day=None,
+):
     payload = {"name": name, "account_type": account_type}
     if last_four is not None:
         payload["last_four"] = last_four
+    if card_closing_day is not None:
+        payload["card_closing_day"] = card_closing_day
+    if card_due_day is not None:
+        payload["card_due_day"] = card_due_day
     response = client.post("/api/accounts", json=payload)
     assert response.status_code == 201, response.text
     return response.json()["id"]
@@ -1038,7 +1050,13 @@ def test_paid_invoice_appears_in_ledger_without_double_counting_purchases() -> N
     with client:
         household = _setup_household(client, session_factory)
         itau = _create_account(client, name="Itaú Corrente")
-        cartao = _create_account(client, name="Itaú Cartão", account_type="credit_card")
+        cartao = _create_account(
+            client,
+            name="Itaú Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         purchase = client.post(
             "/api/transactions",
             json={

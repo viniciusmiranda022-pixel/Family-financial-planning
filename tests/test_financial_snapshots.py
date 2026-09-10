@@ -156,11 +156,17 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
             institution="Banco",
             account_type="credit_card",
         )
+        checking = Account(
+            household_id=household.id,
+            name="Conta Corrente",
+            institution="Banco",
+            account_type="checking",
+        )
         expense = Category(household_id=household.id, name="Compras")
         income = Category(household_id=household.id, name="Receitas")
         reconciliation = Category(household_id=household.id, name="Conciliação")
         patrimonial = Category(household_id=household.id, name="Transferência patrimonial")
-        db.add_all([investment, card, expense, income, reconciliation, patrimonial])
+        db.add_all([investment, card, checking, expense, income, reconciliation, patrimonial])
         db.flush()
         profile = FinancialProfile(
             household_id=household.id,
@@ -200,6 +206,21 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
                     amount="100",
                     transaction_type="reconciliation",
                     suffix="2",
+                    excluded=True,
+                ),
+                # Card payment has two reconciliation legs (INV-002): this is the
+                # checking-side cash debit that `pay_card_invoice`/`link_card_payment`
+                # always create alongside the card-side "payment received" leg above
+                # (suffix "2"). `card_payments` is counted once here, on the checking
+                # leg only -- see `app/services/financial_snapshots.py::_collect`.
+                _transaction(
+                    household,
+                    checking,
+                    reconciliation,
+                    booked_at=date(2026, 8, 10),
+                    amount="-100",
+                    transaction_type="reconciliation",
+                    suffix="6",
                     excluded=True,
                 ),
                 _transaction(

@@ -916,30 +916,16 @@ function selectedExpenseEntryAccount() {
 // disabled fields are excluded from `FormData` (`formJson`), so the backend
 // never even receives an explicit `competence` for a non-card submission,
 // matching `_resolve_expense_competence`'s policy without a second rule here.
-function cardClosingDay(account) {
-  if (!account || account.account_type !== "credit_card") return null;
-
-  const label = `${account.institution || ""} ${account.name || ""}`
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toUpperCase();
-
-  if (label.includes("ITAU")) return 2;
-  if (label.includes("NUBANK")) return 24;
-  if (label.includes("MERCADO PAGO") || label.includes("MERCADOPAGO")) return 9;
-  return null;
-}
-
-function cardInvoiceCompetence(bookedAt, closingDay) {
-  if (!bookedAt || !closingDay) return "";
-
-  const [year, month, day] = bookedAt.split("-").map(Number);
-  if (!year || !month || !day) return "";
-
-  if (day <= closingDay) return `${year}-${String(month).padStart(2, "0")}`;
-  if (month === 12) return `${year + 1}-01`;
-  return `${year}-${String(month + 1).padStart(2, "0")}`;
-}
+// PRIORIDADE 0 hotfix (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md,
+// PR #81): this file used to also define `cardClosingDay`/
+// `cardInvoiceCompetence`, a second, JavaScript competence engine that
+// hardcoded Itau/Nubank/Mercado Pago closing days by account label and
+// recomputed the invoice month with a simpler (and by then stale) formula
+// than the backend's `_card_invoice_competence` -- exactly the "calculo de
+// competencia no JavaScript" the Work Order forbids. Neither function was
+// ever called (the field they would have fed is unconditionally disabled
+// above), so removing them changes no behavior; they were dead weight one
+// accidental call away from silently disagreeing with the backend again.
 
 // FAMILY_FINANCE_CARD_CYCLE_UI_V13_4
 // FAMILY_FINANCE_PRIVILEGE_FUNDING_V15
