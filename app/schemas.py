@@ -431,3 +431,25 @@ class PurchaseScenarioComparisonRequest(BaseModel):
         if len(labels) != len(set(labels)):
             raise ValueError("Cada alternativa precisa de um rótulo único")
         return self
+
+
+class CardCompetenceRepairApplyRequest(BaseModel):
+    """`docs/WORK_ORDER_CARD_COMPETENCE_REPAIR_P0.md`, "Aplicação explícita,
+    seletiva e race-safe": the client selects which preview candidates to
+    apply and proves it read a specific financial revision -- it never sends
+    a `target_competence` of its own; the backend always recomputes it
+    through `app.services.card_competence.card_invoice_competence`.
+    """
+
+    transaction_ids: list[str] = Field(min_length=1, max_length=500)
+    expected_financial_revision: int = Field(ge=0)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class CardCompetenceRepairRollbackRequest(BaseModel):
+    """Mirrors `CardCompetenceRepairApplyRequest` for the logical-rollback
+    endpoint -- same explicit selection and revision-guard contract."""
+
+    transaction_ids: list[str] = Field(min_length=1, max_length=500)
+    expected_financial_revision: int = Field(ge=0)
+    reason: str = Field(min_length=3, max_length=1000)

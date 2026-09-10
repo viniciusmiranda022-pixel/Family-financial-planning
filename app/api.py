@@ -58,6 +58,8 @@ from app.schemas import (
     AccountRequest,
     AdvisorRequest,
     CaptureConfirmRequest,
+    CardCompetenceRepairApplyRequest,
+    CardCompetenceRepairRollbackRequest,
     CardInvoicePaymentRequest,
     CardPaymentLinkRequest,
     CardPaymentUnlinkRequest,
@@ -91,6 +93,20 @@ from app.security import (
     verify_password,
 )
 from app.services import capture_worker
+from app.services.card_competence import (
+    card_invoice_competence,
+    resolve_expense_competence,
+)
+from app.services.card_competence_repair import (
+    BlockedCandidateError,
+    CardCompetenceRepairError,
+    NoLongerCandidateError,
+    StaleRevisionError,
+    apply_card_competence_repair,
+    preview_card_competence_repair,
+    rollback_card_competence_repair,
+    serialize_candidate,
+)
 from app.services.card_payment_reconciliation import (
     CardPaymentLinkError,
     link_card_payment,
@@ -1837,6 +1853,105 @@ def reopen_monthly_close_endpoint(
     db.commit()
     db.refresh(close)
     return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
+
+
+# ---------------------------------------------------------------------------
+# P0 -- historical card-competence repair
+# (docs/WORK_ORDER_CARD_COMPETENCE_REPAIR_P0.md). Admin-only, household-
+# scoped, preview/apply/rollback around `app.services.card_competence_repair`
+# -- see that module's docstring for the full contract. No competence
+# formula lives here; every number these three endpoints surface or persist
+# came from that service, which itself only ever calls
+# `app.services.card_competence.card_invoice_competence`.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/maintenance/card-competence/preview")
+def preview_card_competence_repair_endpoint(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    result = preview_card_competence_repair(db, household_id=user.household_id)
+    return {
+        "financial_revision": result["financial_revision"],
+        "periods_affected": result["periods_affected"],
+        "eligible_count": result["eligible_count"],
+        "blocked_count": result["blocked_count"],
+        "candidates": [serialize_candidate(candidate) for candidate in result["candidates"]],
+    }
+
+
+@router.post("/maintenance/card-competence/apply")
+def apply_card_competence_repair_endpoint(
+    payload: CardCompetenceRepairApplyRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        result = apply_card_competence_repair(
+            db,
+            household_id=user.household_id,
+            transaction_ids=tuple(payload.transaction_ids),
+            expected_financial_revision=payload.expected_financial_revision,
+            reason=payload.reason,
+            user_id=user.id,
+        )
+    except StaleRevisionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NoLongerCandidateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BlockedCandidateError as exc:
+        raise HTTPException(
+            status_code=422, detail={"message": str(exc), "blocked": list(exc.blocked)}
+        ) from exc
+    except CardCompetenceRepairError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    db.commit()
+    return {
+        "batch_id": result.batch_id,
+        "applied": list(result.applied),
+        "periods_recomputed": list(result.periods_recomputed),
+        "financial_revision": result.financial_revision,
+    }
+
+
+@router.post("/maintenance/card-competence/rollback")
+def rollback_card_competence_repair_endpoint(
+    payload: CardCompetenceRepairRollbackRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        result = rollback_card_competence_repair(
+            db,
+            household_id=user.household_id,
+            transaction_ids=tuple(payload.transaction_ids),
+            expected_financial_revision=payload.expected_financial_revision,
+            reason=payload.reason,
+            user_id=user.id,
+        )
+    except StaleRevisionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NoLongerCandidateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BlockedCandidateError as exc:
+        raise HTTPException(
+            status_code=422, detail={"message": str(exc), "blocked": list(exc.blocked)}
+        ) from exc
+    except CardCompetenceRepairError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    db.commit()
+    return {
+        "batch_id": result.batch_id,
+        "reverted": list(result.reverted),
+        "periods_recomputed": list(result.periods_recomputed),
+        "financial_revision": result.financial_revision,
+    }
 
 
 @router.get("/users")
@@ -6400,72 +6515,23 @@ def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
 # this used to be two functions of the same name -- a dead
 # `_credit_card_closing_day`/`_card_invoice_competence(*, booked_at,
 # closing_day)` pair that hardcoded Itaú/Nubank/Mercado Pago closing days by
-# bank name, silently shadowed by this real implementation below (the one
-# every caller actually resolved to, since Python keeps only the last
-# definition of a name). Neither the hardcoded pair nor a second competence
-# formula belongs here -- this is the single canonical helper every consumer
-# (manual entry, Smart Capture confirmation, installment preview/projection)
-# must call; it always derives competence from the account's own persisted
-# `card_closing_day`/`card_due_day`, never from its name.
-def _card_invoice_competence(account: Account, booked_at: date) -> str:
-    if account.account_type != "credit_card":
-        return booked_at.strftime("%Y-%m")
-    closing_day = account.card_closing_day
-    due_day = account.card_due_day
-    if not closing_day or not due_day:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"O cartão {account.name} não tem fechamento/vencimento configurados. "
-                "Configure o ciclo antes de lançar a compra."
-            ),
-        )
-    closing_month = booked_at.replace(day=1)
-    if booked_at.day > closing_day:
-        closing_month = add_months(closing_month, 1)
-    due_month = add_months(closing_month, 1 if due_day < closing_day else 0)
-    return month_key(due_month)
-
-
-def _resolve_expense_competence(
-    *,
-    account: Account | None = None,
-    account_type: str | None = None,
-    competence: str | None,
-    booked_at: date,
-) -> str:
-    booked_month = booked_at.strftime("%Y-%m")
-    resolved_type = account.account_type if account is not None else account_type
-
-    if resolved_type == "credit_card":
-        if account is None:
-            if competence is None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Compra no cartão exige conta com ciclo configurado.",
-                )
-            return competence
-
-        calculated = _card_invoice_competence(account, booked_at)
-        if competence is not None and competence != calculated:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"A competência informada ({competence}) diverge do ciclo do cartão. "
-                    f"Pelo fechamento/vencimento, esta compra pertence à fatura {calculated}."
-                ),
-            )
-        return calculated
-
-    if competence is not None and competence != booked_month:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Competência divergente da data do lançamento só é permitida para cartões; "
-                "contas correntes usam o mês da própria data."
-            ),
-        )
-    return booked_month
+# bank name, silently shadowed by this real implementation (the one every
+# caller actually resolved to, since Python keeps only the last definition
+# of a name).
+#
+# P0 (docs/WORK_ORDER_CARD_COMPETENCE_REPAIR_P0.md, "Arquitetura
+# obrigatória" item 1): the formula itself now lives in
+# `app.services.card_competence`, the single canonical implementation every
+# consumer -- manual entry, Smart Capture confirmation, installment
+# preview/projection, and the historical repair detector/repairer
+# (`app.services.card_competence_repair`) -- must call. These two names stay
+# bound here, unchanged, purely so every existing call site in this module
+# and the public test surface (`tests/test_card_open_invoice_competence.py`
+# imports `from app.api import _card_invoice_competence,
+# _resolve_expense_competence`) keep working without a second copy of either
+# function ever existing.
+_card_invoice_competence = card_invoice_competence
+_resolve_expense_competence = resolve_expense_competence
 
 
 
