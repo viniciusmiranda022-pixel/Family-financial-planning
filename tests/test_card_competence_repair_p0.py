@@ -1467,3 +1467,73 @@ def test_rollback_rejects_transaction_with_no_repair_history():
         )
         assert response.status_code == 409
         assert _get_transaction(session_factory, transaction_id).competence == "2026-09"
+
+
+# ---------------------------------------------------------------------------
+# 9. INV-017 itself, before and after the repair.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_makes_inv017_pass_for_the_repaired_transaction():
+    """docs/WORK_ORDER_CARD_COMPETENCE_REPAIR_P0.md, "Critérios de aceite
+    financeiros obrigatórios": 'INV-017 passa'. Feeds the real persisted
+    `competence` (before and after the repair) and the real canonical engine
+    output into the exact same INV-017 evaluator
+    `tests/test_financial_invariants.py` trusts -- never a second,
+    P0-private notion of what INV-017 means."""
+
+    from app.services.financial_invariants import InvariantContext, InvariantScope, InvariantStatus
+    from app.services.invariant_registry import evaluate_invariant
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        household_id = _household_id(session_factory)
+        card = _create_account(
+            client, name="Itaú Cartão", account_type="credit_card", card_closing_day=2, card_due_day=9
+        )
+        category_id = _category_id(client)
+        booked_at = date(2026, 9, 15)
+        transaction_id = _insert_legacy_transaction(
+            session_factory,
+            household_id=household_id,
+            account_id=card,
+            category_id=category_id,
+            booked_at=booked_at,
+            amount=200,
+            competence="2026-09",
+        )
+
+        def _inv017_status() -> "InvariantStatus":
+            transaction = _get_transaction(session_factory, transaction_id)
+            with session_factory() as db:
+                account = db.get(Account, card)
+                canonical = card_invoice_competence(account, booked_at)
+            return evaluate_invariant(
+                "INV-017",
+                InvariantContext(
+                    facts={
+                        "canonical_competence": canonical,
+                        "counted_competence": transaction.competence,
+                    },
+                    scope=InvariantScope.TRANSACTION,
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    period="2026-09",
+                    trace_id="trace-p0-inv017-test",
+                ),
+            ).status
+
+        assert _inv017_status().name == "FAIL"
+
+        preview = client.post("/api/maintenance/card-competence/preview").json()
+        response = client.post(
+            "/api/maintenance/card-competence/apply",
+            json={
+                "transaction_ids": [transaction_id],
+                "expected_financial_revision": preview["financial_revision"],
+                "reason": "Reparo para satisfazer INV-017",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert _inv017_status().name == "PASS"
