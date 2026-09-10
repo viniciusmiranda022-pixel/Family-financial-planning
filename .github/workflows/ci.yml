@@ -2,8 +2,19 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+
+# CI is intentionally PR-centric to preserve the repository's limited monthly
+# GitHub-hosted runner allowance. The final executable PR head must still pass
+# all 12 gates before merge; main is not run a second time automatically after
+# that successful validation. Use workflow_dispatch for exceptional direct-main
+# validation. See docs/CI_POLICY.md.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
