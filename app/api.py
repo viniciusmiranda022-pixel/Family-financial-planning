@@ -58,6 +58,8 @@ from app.schemas import (
     AccountRequest,
     AdvisorRequest,
     CaptureConfirmRequest,
+    CardCompetenceRepairApplyRequest,
+    CardCompetenceRepairRollbackRequest,
     CardInvoicePaymentRequest,
     CardPaymentLinkRequest,
     CardPaymentUnlinkRequest,
@@ -94,6 +96,16 @@ from app.services import capture_worker
 from app.services.card_competence import (
     card_invoice_competence,
     resolve_expense_competence,
+)
+from app.services.card_competence_repair import (
+    BlockedCandidateError,
+    CardCompetenceRepairError,
+    NoLongerCandidateError,
+    StaleRevisionError,
+    apply_card_competence_repair,
+    preview_card_competence_repair,
+    rollback_card_competence_repair,
+    serialize_candidate,
 )
 from app.services.card_payment_reconciliation import (
     CardPaymentLinkError,
@@ -1841,6 +1853,101 @@ def reopen_monthly_close_endpoint(
     db.commit()
     db.refresh(close)
     return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
+
+
+# ---------------------------------------------------------------------------
+# P0 -- historical card-competence repair
+# (docs/WORK_ORDER_CARD_COMPETENCE_REPAIR_P0.md). Admin-only, household-
+# scoped, preview/apply/rollback around `app.services.card_competence_repair`
+# -- see that module's docstring for the full contract. No competence
+# formula lives here; every number these three endpoints surface or persist
+# came from that service, which itself only ever calls
+# `app.services.card_competence.card_invoice_competence`.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/maintenance/card-competence/preview")
+def preview_card_competence_repair_endpoint(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    result = preview_card_competence_repair(db, household_id=user.household_id)
+    return {
+        "financial_revision": result["financial_revision"],
+        "periods_affected": result["periods_affected"],
+        "eligible_count": result["eligible_count"],
+        "blocked_count": result["blocked_count"],
+        "candidates": [serialize_candidate(candidate) for candidate in result["candidates"]],
+    }
+
+
+@router.post("/maintenance/card-competence/apply")
+def apply_card_competence_repair_endpoint(
+    payload: CardCompetenceRepairApplyRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        result = apply_card_competence_repair(
+            db,
+            household_id=user.household_id,
+            transaction_ids=tuple(payload.transaction_ids),
+            expected_financial_revision=payload.expected_financial_revision,
+            reason=payload.reason,
+            user_id=user.id,
+        )
+    except StaleRevisionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NoLongerCandidateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BlockedCandidateError as exc:
+        raise HTTPException(
+            status_code=422, detail={"message": str(exc), "blocked": list(exc.blocked)}
+        ) from exc
+    except CardCompetenceRepairError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    db.commit()
+    return {
+        "batch_id": result.batch_id,
+        "applied": list(result.applied),
+        "periods_recomputed": list(result.periods_recomputed),
+        "financial_revision": result.financial_revision,
+    }
+
+
+@router.post("/maintenance/card-competence/rollback")
+def rollback_card_competence_repair_endpoint(
+    payload: CardCompetenceRepairRollbackRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        result = rollback_card_competence_repair(
+            db,
+            household_id=user.household_id,
+            transaction_ids=tuple(payload.transaction_ids),
+            expected_financial_revision=payload.expected_financial_revision,
+            reason=payload.reason,
+            user_id=user.id,
+        )
+    except StaleRevisionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NoLongerCandidateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CardCompetenceRepairError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    db.commit()
+    return {
+        "batch_id": result.batch_id,
+        "reverted": list(result.reverted),
+        "periods_recomputed": list(result.periods_recomputed),
+        "financial_revision": result.financial_revision,
+    }
 
 
 @router.get("/users")
