@@ -16,7 +16,7 @@ from app.services.classifier import (
     normalize_description,
 )
 
-PARSER_CONTRACT_VERSION = "2026.09.2"
+PARSER_CONTRACT_VERSION = "2026.09.3"
 
 
 @dataclass(frozen=True)
@@ -96,7 +96,7 @@ def parse_date(value: str) -> date:
 # literal "PARCELA" word when the separator is the word "DE" instead of "/"
 # so a coincidental "<number> de <number>" in an unrelated description can't
 # be misread as an installment.
-_INSTALLMENT_SLASH = re.compile(r"(?:PARCELA\s*)?(\d{1,2})\s*/\s*(\d{1,2})")
+_INSTALLMENT_SLASH = re.compile(r"PARCELA\s*(\d{1,2})\s*/\s*(\d{1,2})")
 _INSTALLMENT_DE = re.compile(r"PARCELA\s*(\d{1,2})\s*DE\s*(\d{1,2})")
 
 

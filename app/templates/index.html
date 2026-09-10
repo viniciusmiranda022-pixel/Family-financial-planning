@@ -113,7 +113,7 @@
         </div>
         <div class="kpi-grid">
           <article id="liquidity-kpi-card" class="kpi highlight"><span id="kpi-liquidity-name">Saldo após fechamento no Privilège DI</span><strong id="kpi-investment">R$ 0,00</strong><small id="kpi-liquidity-caption">Saldo informado ajustado pelo resultado do período</small></article>
-          <article class="kpi cash-in"><span>Entrou no mês</span><strong id="kpi-cash-in">R$ 0,00</strong><small>Somente receitas; sem resgates e estornos</small></article>
+          <article class="kpi cash-in"><span>Entrou no mês</span><strong id="kpi-cash-in">R$ 0,00</strong><small>Receitas, recebimentos e reembolsos; sem resgates, transferências e conciliações</small></article>
           <article class="kpi cash-out"><span>Saiu das contas</span><strong id="kpi-cash-out">R$ 0,00</strong><small id="kpi-cash-out-caption">Cartões e compromissos aparecem separados</small></article>
           <article class="kpi"><span>Gasto no mês</span><strong id="kpi-spending">R$ 0,00</strong><small id="kpi-cap-caption">de R$ 0,00</small></article>
           <article class="kpi" id="remaining-cap-card"><span>Disponível no teto</span><strong id="kpi-remaining">R$ 0,00</strong><small id="kpi-remaining-caption">Sem contar parcelas antigas</small></article>
@@ -167,6 +167,43 @@
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">FLUXO POR ORIGEM</span><h2>Entradas e saídas por banco e cartão</h2><small>Valores operacionais líquidos. Aplicações, resgates, transferências internas e pagamento de fatura não são contabilizados.</small></div></div>
           <div class="table-wrap"><table><thead><tr><th>Banco / cartão</th><th>Tipo</th><th class="right">Entrou</th><th class="right">Saiu</th><th class="right">Estornos</th></tr></thead><tbody id="cash-flow-accounts-table"></tbody></table></div>
+        </article>
+        <!-- FAMILY_FINANCE_CARD_SUMMARY_V10 -->
+        <article class="panel credit-card-summary-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="step-label">CARTÕES DE CRÉDITO</span>
+              <h2 id="credit-card-summary-title">Gastos por cartão</h2>
+              <small id="credit-card-summary-note">Compras realizadas e parcelas futuras, sem duplicar o pagamento da fatura.</small>
+            </div>
+          </div>
+          <div class="credit-card-summary-totals">
+            <div class="credit-card-total-card">
+              <small>REALIZADO NO MÊS</small>
+              <strong id="credit-card-total-actual">R$ 0,00</strong>
+            </div>
+            <div class="credit-card-total-card">
+              <small>PARCELAS PREVISTAS NO MÊS</small>
+              <strong id="credit-card-total-projected">R$ 0,00</strong>
+            </div>
+            <div class="credit-card-total-card">
+              <small>PARCELADO APÓS ESTE MÊS</small>
+              <strong id="credit-card-total-future">R$ 0,00</strong>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Cartão</th>
+                  <th class="right">Realizado no mês</th>
+                  <th class="right">Parcelas previstas</th>
+                  <th class="right">Parcelado depois</th>
+                </tr>
+              </thead>
+              <tbody id="credit-card-summary-table"></tbody>
+            </table>
+          </div>
         </article>
         <article class="panel obligation-alert-panel">
           <div class="panel-heading"><div><span class="step-label">ALERTAS</span><h2>Obrigações próximas do vencimento</h2><small>O sistema alerta com 30 dias de antecedência e destaca os últimos 7 dias.</small></div><button data-go="planning" class="secondary">Ver planejamento</button></div>
@@ -343,6 +380,13 @@
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Supermercado" maxlength="500"></label>
             <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
             <label>Conta ou cartão<select name="account_id" id="expense-entry-account" required></select></label>
+            <label id="expense-entry-funding-field">Origem do dinheiro
+              <select name="funding_source" id="expense-entry-funding">
+                <option value="account">O valor já estava na conta</option>
+                <option value="privilege">Retirei do Privilège DI</option>
+              </select>
+              <small id="expense-entry-funding-hint">Se usar Privilège, o saldo é reduzido automaticamente sem criar uma segunda despesa.</small>
+            </label>
             <label>Natureza / categoria<select name="category_id" id="expense-entry-category" required></select></label>
             <label id="expense-entry-custom-category-field" class="hidden">Qual é a nova categoria?<input name="category_name" id="expense-entry-custom-category" maxlength="100" placeholder="Ex.: Jardinagem"></label>
             <label id="expense-entry-competence-field">Competência (mês da fatura)<input type="month" name="competence" id="expense-entry-competence"><small id="expense-entry-competence-hint"></small></label>
@@ -642,7 +686,11 @@
             <label>Vale-refeição por dia<input type="number" name="meal_allowance_daily" step="0.01" min="0" required></label>
             <label>Dias trabalhados/mês<input type="number" name="workdays_month" min="0" max="31" required></label>
             <label>Nome da conta central de liquidez<input name="investment_name" required><small>Ex.: Itaú Privilège DI</small></label>
-            <label>Saldo atual da conta<input type="number" name="investment_balance" step="0.01" min="0" required></label>
+            <label>Saldo atual confirmado da conta
+              <input type="number" name="investment_balance" step="0.01" min="0" required>
+              <small>Este é o mesmo saldo da Visão geral. Ao salvar um novo valor, ele vira o saldo confirmado atual. Rentabilidade e IR alteram as projeções, não fabricam um saldo confirmado.</small>
+              <!-- FAMILY_FINANCE_PROFILE_BALANCE_HELP_V17 -->
+            </label>
             <label>Retorno bruto anual<input type="number" name="investment_gross_annual_rate" step="0.0001" min="0" max="1" required><small>0,14 corresponde a 14% a.a.</small></label>
             <label>IR conservador dos ganhos<input type="number" name="investment_income_tax_rate" step="0.001" min="0" max="1" required><small>0,225 corresponde a 22,5%</small></label>
             <label>Projetar até<input type="date" name="projection_end" required></label>
@@ -662,6 +710,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/app.js?v={{ asset_version }}" defer></script>
+  <script src="/static/app.js?v={{ asset_version }}-card-cycles-local-v3" defer></script>
 </body>
 </html>

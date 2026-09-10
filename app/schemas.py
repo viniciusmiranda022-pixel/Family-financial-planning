@@ -29,6 +29,8 @@ class AccountRequest(BaseModel):
     account_type: str = Field(default="checking", pattern="^(checking|credit_card|investment|cash)$")
     owner_label: str = Field(default="Família", max_length=80)
     last_four: str | None = Field(default=None, pattern=r"^\d{4}$")
+    card_closing_day: int | None = Field(default=None, ge=1, le=31)
+    card_due_day: int | None = Field(default=None, ge=1, le=31)
 
 
 class TransactionUpdate(BaseModel):
@@ -58,6 +60,8 @@ class ManualTransactionRequest(BaseModel):
     # slice), so it must be a human-confirmed fact instead of one silently
     # fabricated from `booked_at` -- see `create_manual_transaction`.
     competence: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    # FAMILY_FINANCE_PRIVILEGE_FUNDING_V15
+    funding_source: str = Field(default="account", pattern="^(account|privilege)$")
     confirmed_large_amount: bool = False
 
     @model_validator(mode="after")
@@ -71,6 +75,8 @@ class ManualTransactionRequest(BaseModel):
                 raise ValueError("A parcela atual não pode ser maior que o total de parcelas")
         if self.competence is not None and self.movement_type != "expense":
             raise ValueError("Competência explícita só se aplica a despesas")
+        if self.funding_source == "privilege" and self.movement_type != "expense":
+            raise ValueError("Privilège DI como origem só se aplica a despesas")
         return self
 
 
@@ -136,6 +142,7 @@ class CaptureItemRequest(BaseModel):
     installment_current: int | None = Field(default=None, ge=1, le=999)
     installment_total: int | None = Field(default=None, ge=1, le=999)
     card_last_four: str | None = Field(default=None, pattern=r"^\d{4}$")
+    funding_source: str = Field(default="account", pattern="^(account|privilege)$")
 
     @model_validator(mode="after")
     def validate_kind_fields(self) -> "CaptureItemRequest":
@@ -148,6 +155,11 @@ class CaptureItemRequest(BaseModel):
             and abs(abs(self.signed_amount) - self.amount) > Decimal("0.01")
         ):
             raise ValueError("O valor assinado precisa corresponder ao valor do lançamento")
+        if (
+            self.funding_source == "privilege"
+            and (self.kind != "transaction" or self.movement_type != "expense")
+        ):
+            raise ValueError("Privilège DI como origem só se aplica a uma despesa")
         if self.kind == "obligation" and not self.due_date:
             raise ValueError("Boletos e obrigações precisam de vencimento")
         if self.kind == "payroll" and (not self.competence or not self.payment_date):
@@ -189,6 +201,31 @@ class ObligationRequest(BaseModel):
     recurrence_months: int = Field(default=0, ge=0, le=120)
     occurrence_count: int = Field(default=1, ge=1, le=240)
     category: str = Field(default="general", max_length=60)
+
+
+class ObligationPaymentRequest(BaseModel):
+    transaction_id: str | None = Field(default=None, max_length=36)
+    account_id: str | None = Field(default=None, max_length=36)
+    paid_at: date | None = None
+    description: str | None = Field(default=None, min_length=2, max_length=500)
+    funding_source: str = Field(default="account", pattern="^(account|privilege)$")
+    confirmed_large_amount: bool = False
+
+    @model_validator(mode="after")
+    def validate_payment_source(self) -> "ObligationPaymentRequest":
+        has_transaction = bool(self.transaction_id)
+        has_account = bool(self.account_id)
+        if has_transaction == has_account:
+            raise ValueError(
+                "Escolha exatamente uma origem: lançamento existente ou conta para criar o pagamento"
+            )
+        if has_account and self.paid_at is None:
+            raise ValueError("Informe a data do pagamento")
+        return self
+
+
+class ObligationPaymentUndoRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
 
 
 class ProfileRequest(BaseModel):
