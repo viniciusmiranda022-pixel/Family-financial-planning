@@ -172,14 +172,35 @@ def test_manual_refund_offsets_expense_without_becoming_income():
     (`docs/FINANCIAL_INVARIANTS.md`) is proven at the invariant-evaluator
     level by `tests/test_financial_invariants.py::
     test_refund_offsets_expense_without_creating_income`; this test proves
-    the same property end-to-end through the actual manual-entry command
-    and `GET /dashboard`, matching the rigor already applied to the other
-    11 flows in this file and in `tests/test_manual_transfers.py`.
+    the same property end-to-end through the actual manual-entry command,
+    `GET /dashboard` and `GET /reports`, matching the rigor already applied
+    to the other 11 flows in this file and in `tests/test_manual_transfers.py`.
 
     `_operating_expenses = max(0, expenses - refunds)`
     (`app/services/financial_snapshots.py`), so a refund must reduce
-    `spending` by exactly its amount and must never touch `cash_in` -- an
-    estorno is a expense offset, never operational income."""
+    `spending` by exactly its amount -- an estorno is always an expense
+    offset, never operational income (INV-016: "efeito em receita
+    operacional == 0"). That is a distinct claim from what `cash_in` means:
+
+    - `docs/FINANCIAL_RULES.md` line 14: "Estorno é crédito."
+    - `docs/INTEGRITY_IMPLEMENTATION_PLAN.md` keeps `operating_income` and
+      `bank_cash_in` as separate metrics by contract -- the first is
+      operational revenue, the second is real cash movement in the account.
+    - `dashboard_monetary_publication()` publishes `cash_in =
+      snapshot.bank_cash_in` (`app/services/financial_snapshots.py`), not
+      `operating_income` -- so a refund credited to a non-card account
+      *must* raise `GET /dashboard`'s `cash_in`, exactly like the real bank
+      statement would show it, while never raising operational income.
+
+    Engineering decision on PR #81 (2026-09-10, resolving the Technical
+    Challenge this test previously raised): `_collect()` crediting
+    `bank_cash_in` for a non-card refund is the correct, deliberate
+    contract (`f365a0d`), and this test's prior assertion
+    (`cash_in == before cash_in`) was the stale one. This test now proves
+    both halves of the contract end-to-end: `GET /dashboard`'s `cash_in`
+    (real bank inflow) rises by the refund, while `GET /reports`'s
+    per-month `cash_in` (which aliases `operating_income`, see
+    `report_month_monetary_publication`) does not move at all."""
     client, session_factory = _client()
     with client:
         _setup_household(client)
@@ -200,6 +221,8 @@ def test_manual_refund_offsets_expense_without_becoming_income():
         assert expense.status_code == 201, expense.text
 
         before = client.get("/api/dashboard?month=2026-08").json()
+        before_report = client.get("/api/reports?end_month=2026-08&months=1").json()
+        before_operating_income = before_report["monthly"][0]["cash_in"]
         response = client.post(
             "/api/transactions",
             json={
@@ -214,8 +237,19 @@ def test_manual_refund_offsets_expense_without_becoming_income():
         transaction_id = response.json()["id"]
 
         after = client.get("/api/dashboard?month=2026-08").json()
+        after_report = client.get("/api/reports?end_month=2026-08&months=1").json()
+        after_operating_income = after_report["monthly"][0]["cash_in"]
+
         assert after["spending"] == before["spending"] - 100
-        assert after["cash_in"] == before["cash_in"]
+        # Real bank inflow: the refund lands in the checking account, so the
+        # dashboard's `cash_in` (== `bank_cash_in`) must rise by exactly it.
+        assert after["cash_in"] == before["cash_in"] + 100
+        # Never operational income: `GET /reports`'s `cash_in` (== the same
+        # snapshot's `operating_income`) must stay untouched by the refund,
+        # matching INV-016 and the invariant-evaluator-level proof in
+        # `test_financial_invariants.py::
+        # test_refund_offsets_expense_without_creating_income`.
+        assert after_operating_income == before_operating_income
 
         rows = client.get("/api/transactions?month=2026-08").json()
         row = next(item for item in rows if item["id"] == transaction_id)
