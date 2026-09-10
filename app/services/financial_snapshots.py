@@ -11,7 +11,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -46,9 +46,10 @@ class SnapshotSource:
 
 
 def _expense_signature(transaction: Transaction, account_type: str | None) -> tuple[object, ...]:
+    # FAMILY_FINANCE_CARD_COMPETENCE_V11
     period: object = transaction.booked_at
     if account_type == "credit_card":
-        period = (transaction.booked_at.year, transaction.booked_at.month)
+        period = transaction.competence or (transaction.booked_at.year, transaction.booked_at.month)
     return (
         period,
         normalize_description(transaction.description),
@@ -70,8 +71,27 @@ def consolidated_transactions(
         .outerjoin(Document, Document.id == Transaction.document_id)
         .where(
             Transaction.household_id == household_id,
-            Transaction.booked_at >= start,
-            Transaction.booked_at < end,
+            or_(
+                and_(
+                    Account.account_type == "credit_card",
+                    or_(
+                        Transaction.competence == start.strftime("%Y-%m"),
+                        and_(
+                            Transaction.competence.is_(None),
+                            Transaction.booked_at >= start,
+                            Transaction.booked_at < end,
+                        ),
+                    ),
+                ),
+                and_(
+                    or_(
+                        Account.account_type != "credit_card",
+                        Account.account_type.is_(None),
+                    ),
+                    Transaction.booked_at >= start,
+                    Transaction.booked_at < end,
+                ),
+            ),
         )
         .order_by(Transaction.booked_at, Transaction.created_at, Transaction.id)
     ).all()
@@ -280,7 +300,14 @@ def _collect(
     )
     sources = [opening_source]
     opening_uncovered_deficit = Decimal("0")
-    if previous_snapshot is not None and Decimal(previous_snapshot.closing_uncovered_deficit) > 0:
+    # Missing/untrusted opening-liquidity evidence must not become a
+    # fabricated debt in the next month. Carry a monetary deficit only when
+    # the predecessor itself had trusted balance evidence.
+    if (
+        previous_snapshot is not None
+        and previous_snapshot.payload.get("balance_evidence_trusted", False)
+        and Decimal(previous_snapshot.closing_uncovered_deficit) > 0
+    ):
         opening_uncovered_deficit = money(previous_snapshot.closing_uncovered_deficit)
         sources.append(
             SnapshotSource(
@@ -331,23 +358,37 @@ def _collect(
             contribution = abs(amount)
         elif category_name == "Conciliação" or transaction.transaction_type == "reconciliation":
             role = "canonical"
-            metric = "card_payments"
-            totals[metric] += abs(amount)
-            contribution = abs(amount)
-        elif (
-            transaction.transaction_type == "income"
-            and amount > 0
-            and not transaction.excluded
-            and category_name == "Receitas"
-        ):
-            metric = "operating_income"
-            totals["income"] += amount
+            # A card payment has two reconciliation legs: checking debit and card-side
+            # payment-received evidence. Count the cash payment once, on the checking
+            # account only; the card leg is lineage/support, never a second payment.
+            if account_type == "checking" and amount < 0:
+                metric = "card_payments"
+                totals[metric] += abs(amount)
+                contribution = abs(amount)
+            else:
+                metric = "reconciliation_support"
+                contribution = None
+        elif transaction.transaction_type == "income" and amount > 0 and not transaction.excluded:
+            # FAMILY_FINANCE_NONOPERATING_CASH_IN_V3
+            # Every real positive bank movement belongs to cash flow. Only the canonical
+            # "Receitas" category is operating income; reimbursements/debt repayments
+            # must not inflate household income.
             totals["bank_in"] += amount
             contribution = amount
-        elif transaction.transaction_type == "refund" and amount > 0:
+            if category_name == "Receitas":
+                metric = "operating_income"
+                totals["income"] += amount
+            else:
+                metric = "non_operating_cash_in"
+        elif transaction.transaction_type == "refund" and amount > 0 and not transaction.excluded:
             metric = "refunds"
             totals["refunds"] += amount
-            totals["card_refunds" if account_type == "credit_card" else "bank_refunds"] += amount
+            if account_type == "credit_card":
+                totals["card_refunds"] += amount
+            else:
+                # A bank-side reimbursement is a real cash inflow. It still offsets
+                # operating expense economically, but must remain visible in flow.
+                totals["bank_in"] += amount
             categories[category_name] = categories.get(category_name, Decimal("0")) - amount
             contribution = amount
         elif (
@@ -375,6 +416,7 @@ def _collect(
         )
         if contribution is not None and metric in {
             "operating_income",
+            "non_operating_cash_in",
             "bank_cash_out",
             "card_spend",
             "refunds",
@@ -392,10 +434,12 @@ def _collect(
                     "refunds": Decimal("0"),
                 },
             )
-            if metric == "operating_income":
+            if metric in {"operating_income", "non_operating_cash_in"}:
                 account["cash_in"] += contribution
             elif metric == "refunds":
                 account["refunds"] += contribution
+                if account_type != "credit_card":
+                    account["cash_in"] += contribution
             else:
                 account["gross_out"] += contribution
 
@@ -431,7 +475,7 @@ def _collect(
             operating_income=totals["income"],
             operating_expenses=max(Decimal("0"), totals["expenses"] - totals["refunds"]),
             bank_cash_in=totals["bank_in"],
-            bank_cash_out=max(Decimal("0"), totals["bank_out"] - totals["bank_refunds"]),
+            bank_cash_out=max(Decimal("0"), totals["bank_out"]),
             investments=totals["investments"],
             redemptions=totals["redemptions"],
             internal_transfers=totals["internal_transfers"],
@@ -493,8 +537,14 @@ def _serialize_accounts(accounts: dict[str, dict[str, Any]]) -> list[dict[str, A
     for account in accounts.values():
         cash_in = money(account["cash_in"])
         refunds = money(account["refunds"])
-        cash_out = money(max(Decimal("0"), account["gross_out"] - refunds))
         account_type = account["account_type"]
+        # Card refunds reduce card spending; bank refunds are already represented
+        # as explicit cash inflow and therefore must not erase the original cash out.
+        cash_out = money(
+            max(Decimal("0"), account["gross_out"] - refunds)
+            if account_type == "credit_card"
+            else account["gross_out"]
+        )
         serialized.append(
             {
                 **{key: account[key] for key in ("account_id", "account", "institution", "account_type")},
@@ -1037,7 +1087,7 @@ def dashboard_monetary_publication(
     monetary = dashboard_monetary_dataset(snapshot, profile=profile)
     return {
         "spending": monetary["operating_expenses"],
-        "cash_in": monetary["operating_income"],
+        "cash_in": money(snapshot.bank_cash_in),
         "cash_out": monetary["operating_expenses"],
         "bank_cash_out": monetary["bank_cash_out"],
         "card_spending": monetary["card_spend"],
@@ -1104,7 +1154,7 @@ def _dashboard_financial_engine_truth(
     )
     return {
         "spending": engine["operating_expenses"],
-        "cash_in": engine["operating_income"],
+        "cash_in": engine["bank_cash_in"],
         "cash_out": engine["operating_expenses"],
         "bank_cash_out": engine["bank_cash_out"],
         "card_spending": engine["card_spend"],

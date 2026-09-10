@@ -30,3 +30,8 @@ node_modules/
 # (scripts/lib/TailscaleProxy.psm1). Contains only a loopback target URL,
 # never a secret; per-machine and never meant to be shared/versioned.
 scripts/lib/.tailscale-proxy-state.json
+
+# Local hotfix / repair artifacts
+.local-backups/
+*.dump
+*.pre_*

@@ -571,3 +571,82 @@ tr:last-child td { border-bottom: 0; }
   .report-analysis-grid, .report-analysis-grid.categories-layout { grid-template-columns: 1fr 1fr; }
   .trend-chart svg { min-width: 0; }
 }
+
+
+/* FAMILY_FINANCE_OBLIGATION_PAYMENT_V8 */
+.obligation-paid { color: #107052; background: #dff5ec; }
+.obligation-row-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.obligation-payment-dialog {
+  width: min(640px, calc(100vw - 28px));
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+  border: 0;
+  border-radius: 18px;
+  padding: 0;
+  color: var(--ink);
+  background: white;
+  box-shadow: 0 28px 80px rgba(16, 42, 67, .28);
+}
+.obligation-payment-dialog::backdrop { background: rgba(16, 42, 67, .48); backdrop-filter: blur(2px); }
+.obligation-payment-dialog form { display: grid; gap: 17px; padding: 24px; }
+.obligation-payment-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.obligation-payment-heading h2 { margin: 3px 0 0; color: var(--navy); font-size: 22px; }
+.obligation-payment-summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 15px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: var(--soft-green);
+}
+.obligation-payment-summary strong { color: var(--navy); font-size: 22px; }
+.obligation-payment-summary span { color: var(--muted); font-size: 12px; }
+.obligation-payment-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
+.obligation-payment-fields .full { grid-column: 1 / -1; }
+.obligation-payment-actions { display: flex; justify-content: flex-end; gap: 10px; padding-top: 4px; }
+@media (max-width: 650px) {
+  .obligation-payment-fields { grid-template-columns: 1fr; }
+  .obligation-payment-fields .full { grid-column: auto; }
+  .obligation-payment-summary { align-items: flex-start; flex-direction: column; }
+}
+
+
+/* FAMILY_FINANCE_CARD_SUMMARY_V10 */
+.credit-card-summary-panel { overflow: hidden; }
+.credit-card-summary-totals {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 4px 0 18px;
+}
+.credit-card-total-card {
+  padding: 15px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f8fafc;
+}
+.credit-card-total-card small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .07em;
+}
+.credit-card-total-card strong {
+  display: block;
+  margin-top: 7px;
+  color: var(--navy);
+  font-size: 21px;
+  letter-spacing: -.03em;
+}
+.credit-card-horizon {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+@media (max-width: 760px) {
+  .credit-card-summary-totals { grid-template-columns: 1fr; }
+}
