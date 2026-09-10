@@ -3,6 +3,7 @@
 # Revises: 0011
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0012"
