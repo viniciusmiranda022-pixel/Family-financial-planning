@@ -413,7 +413,13 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             b"2026-07-31,iFood - NuPay,33.40\n"
             b"2026-08-04,iFood - NuPay,44.88\n"
             b"2026-08-03,Pagamento recebido,-1724.90\n"
-            b"2026-08-02,Spotify 1/4,31.90\n"
+            # `app.services.importer._installment` requires the literal
+            # "PARCELA" word before the "N/M" pair -- a bare "1/4" is never
+            # recognized, on purpose (avoids misreading a coincidental
+            # number pair in an unrelated description as an installment).
+            # This is the real Itaú/Nubank phrasing the parser's own
+            # docstring documents, not just this fixture's shorthand.
+            b"2026-08-02,Spotify PARCELA 1/4,31.90\n"
         )
         upload = client.post(
             "/api/imports",
