@@ -3572,6 +3572,25 @@ def confirm_capture(
                 transaction_type = "refund"
                 category = category_for(db, user.household_id, "Reembolsos e estornos")
 
+            # INV-017 (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md):
+            # a confirmed capture is just another expense-creation path and
+            # must resolve competence through the exact same canonical
+            # helper `create_manual_transaction` uses -- never a second,
+            # parallel `booked_at.strftime("%Y-%m")` calculation that would
+            # ignore the account's configured card cycle. Non-expense
+            # movements (income/transfer/reconciliation/refund) keep the
+            # pre-existing date-based competence; the invoice-cycle concept
+            # only applies to card purchases.
+            competence = (
+                _resolve_expense_competence(
+                    account=account,
+                    competence=None,
+                    booked_at=proposal.booked_at,
+                )
+                if movement_type == "expense"
+                else proposal.booked_at.strftime("%Y-%m")
+            )
+
             parsed = ParsedTransaction(
                 booked_at=proposal.booked_at,
                 description=proposal.description,
@@ -3600,7 +3619,7 @@ def confirm_capture(
                 fingerprint=fingerprint,
                 source_line=proposal.source_line,
                 occurred_at=proposal.booked_at,
-                competence=proposal.booked_at.strftime("%Y-%m"),
+                competence=competence,
                 classification_source="capture_confirmed",
                 classification_version=PARSER_CONTRACT_VERSION,
                 canonical_status="unassigned",
@@ -4191,8 +4210,6 @@ def create_manual_transaction(
             account=account,
             competence=payload.competence,
             booked_at=payload.booked_at,
-            account_name=account.name,
-            account_institution=account.institution,
         )
     else:
         competence = payload.booked_at.strftime("%Y-%m")
@@ -4462,8 +4479,6 @@ def preview_manual_installment(
         account=account,
         competence=competence,
         booked_at=booked_at,
-        account_name=account.name,
-        account_institution=account.institution,
     )
     anchor_month = _installment_anchor_month(competence=resolved_competence, booked_at=booked_at)
     schedule = _installment_remaining_schedule(
@@ -6326,36 +6341,19 @@ def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
     return values
 
 
-def _credit_card_closing_day(
-    *,
-    account_name: str | None,
-    account_institution: str | None,
-) -> int | None:
-    label = normalize_description(
-        " ".join(
-            part.strip()
-            for part in (account_institution or "", account_name or "")
-            if part and part.strip()
-        )
-    )
-    if "ITAU" in label:
-        return 2
-    if "NUBANK" in label:
-        return 24
-    if "MERCADO PAGO" in label or "MERCADOPAGO" in label:
-        return 9
-    return None
-
-
-def _card_invoice_competence(*, booked_at: date, closing_day: int) -> str:
-    if booked_at.day <= closing_day:
-        return booked_at.strftime("%Y-%m")
-    if booked_at.month == 12:
-        return f"{booked_at.year + 1:04d}-01"
-    return f"{booked_at.year:04d}-{booked_at.month + 1:02d}"
-
-
 # FAMILY_FINANCE_CARD_CYCLES_PRIVILEGE_V13
+#
+# Hotfix (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md, PR #81):
+# this used to be two functions of the same name -- a dead
+# `_credit_card_closing_day`/`_card_invoice_competence(*, booked_at,
+# closing_day)` pair that hardcoded Itaú/Nubank/Mercado Pago closing days by
+# bank name, silently shadowed by this real implementation below (the one
+# every caller actually resolved to, since Python keeps only the last
+# definition of a name). Neither the hardcoded pair nor a second competence
+# formula belongs here -- this is the single canonical helper every consumer
+# (manual entry, Smart Capture confirmation, installment preview/projection)
+# must call; it always derives competence from the account's own persisted
+# `card_closing_day`/`card_due_day`, never from its name.
 def _card_invoice_competence(account: Account, booked_at: date) -> str:
     if account.account_type != "credit_card":
         return booked_at.strftime("%Y-%m")
