@@ -28,6 +28,15 @@ body { margin: 0; color: var(--ink); background: radial-gradient(circle at 85% 4
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }
 .hidden { display: none !important; }
+/* Perfis separados (Fase 4): esconde controles mutáveis para o modo
+   consulta. UX apenas -- a autorização real é sempre do backend
+   (`app.api._require_admin`), nunca desta classe. */
+body.consulta-mode .admin-only { display: none !important; }
+/* Inverse of `.admin-only`: content shown only to the consulta profile
+   (e.g. explaining why a control above it is hidden). Hidden by default so
+   it never flashes before `consulta-mode` is applied post-login. */
+.consulta-only { display: none !important; }
+body.consulta-mode .consulta-only { display: block !important; }
 .eyebrow, .step-label { color: var(--teal); font-size: 11px; font-weight: 800; letter-spacing: .14em; margin: 0 0 7px; }
 .brand-mark { display: grid; place-items: center; width: 54px; height: 54px; border-radius: 16px; color: white; background: linear-gradient(135deg, #1ca37e, #0f766e); font-weight: 900; box-shadow: 0 12px 24px rgba(15, 118, 110, .28); }
 .brand-mark.small { width: 38px; height: 38px; border-radius: 11px; font-size: 13px; box-shadow: none; }

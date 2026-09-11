@@ -353,6 +353,40 @@ seria um fato fabricado -- o Work Order proíbe exatamente isso ("não inferir v
 inexistentes"). Somente `Obligation` (campo `due_date` obrigatório, sem valor nulo) alimenta esta
 funcionalidade.
 
+## Perfis de administrador e consulta (Fase 4)
+
+`docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md`. Reutiliza `User.is_admin` (já existente desde o
+bootstrap) como o único fato de autorização; não há uma segunda tabela ou enum de papéis. A fronteira
+canônica é `app.api._require_admin(user)`: uma função pura, sem estado, que levanta `403` quando
+`user.is_admin` é falso. Toda rota mutável (`create`/`update`/`delete`/`import`/`confirm`/`link`/
+`unlink`/`resolve`/`run`/`trust`/`reopen`/`rebuild`/configuração) chama essa mesma função como a
+primeira instrução do corpo do handler, antes de qualquer busca no banco -- inclusive antes de
+resolver se o id do path existe ou pertence ao household do usuário. Isso é deliberado: um usuário de
+consulta recebe sempre `403`, nunca `404`, o que evitaria vazar se um recurso de outro household
+existe. `POST /integrity/semantic-audit` e `POST /advisor/chat` também exigem `_require_admin`: ambas
+são análises consultivas sobre um veredito já calculado (ver "Fronteira do Codex Semantic Audit"
+acima) e nunca criam, alteram ou resolvem um fato financeiro, mas continuam sendo `POST`s que
+persistem um `AuditEvent` da própria consulta (`integrity.semantic_audit`, `advisor.question`) -- o
+Work Order trata isso como estado operacional, não como leitura, então não há exceção para elas.
+
+`GET /users` continua exigindo administrador (comportamento pré-existente, não introduzido por este
+slice): consulta nunca lista ou administra outros usuários da família. Toda demais rota de leitura
+(`dashboard`, lançamentos, contas, relatórios, projeções, obrigações etc.) permanece acessível a
+qualquer usuário autenticado do household, papel algum. `POST /users` já era, antes deste slice, a
+única rota que decide `is_admin` de um novo usuário -- como ela mesma passou a exigir
+`_require_admin`, um usuário de consulta nunca cria nem promove um administrador; não existe rota de
+auto-edição de papel.
+
+O isolamento por `household_id` continua sendo a camada abaixo de `_require_admin`, não substituída
+por ela: os dois fecham falhas diferentes (papel dentro do household vs. fronteira entre households) e
+ambos permanecem fail-closed independentemente um do outro.
+
+No frontend (`app/static/app.js`, `app/templates/index.html`), a classe CSS `admin-only` e o
+helper `isAdmin()` escondem ou desabilitam formulários e botões mutáveis para consulta -- inclusive o
+formulário de perfil financeiro, que fica visível (leitura) porém com campos desabilitados e o botão
+de salvar oculto. Isso é UX pura, documentado como tal em cada ponto do código: a barreira real é
+sempre `_require_admin` no backend, nunca esta classe ou este helper.
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila

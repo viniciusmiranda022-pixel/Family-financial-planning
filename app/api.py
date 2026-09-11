@@ -1406,8 +1406,16 @@ def integrity_semantic_audit(
     resolve findings, correct data, or change `status`/`score`/`trusted_for_*`.
     An unavailable/timed-out/invalid Codex response degrades to
     `semantic_audit.available = False` and never to a false "pass".
+
+    Role boundary (`docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md`): never
+    changing a financial fact does not make this route read-only -- it is a
+    `POST` that runs an integrity audit and persists an `AuditEvent` of its
+    own invocation, both of which the Work Order's acceptance criteria treat
+    as operational state, not as a data read. `_require_admin` therefore
+    runs first, exactly like every other mutating route.
     """
 
+    _require_admin(user)
     try:
         integrity_status = consolidated_integrity_status(
             db,
@@ -1484,6 +1492,7 @@ def _finding_lifecycle_action(
     action: str,
     apply,
 ) -> dict:
+    _require_admin(user)
     finding = _finding_or_404(db, user, finding_id)
     before_state = {"status": finding.status}
     try:
@@ -2067,6 +2076,7 @@ def accounts(user: User = Depends(get_current_user), db: Session = Depends(get_d
 def create_account(
     payload: AccountRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
+    _require_admin(user)
     account = Account(household_id=user.household_id, **payload.model_dump())
     db.add(account)
     try:
@@ -2085,6 +2095,7 @@ def create_account_balance_observation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     account = db.scalar(
         select(Account).where(
             Account.id == payload.account_id,
@@ -2620,6 +2631,7 @@ async def import_document(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     try:
         account = _resolve_import_account(db, user, account_id, document_type)
         payload = await _read_upload_within_limit(file, settings.max_upload_mb)
@@ -2719,6 +2731,7 @@ async def import_documents_batch(
     new branch to keep in sync.
     """
 
+    _require_admin(user)
     if not files:
         raise HTTPException(status_code=400, detail="Envie ao menos um arquivo")
     if len(files) > settings.max_batch_files:
@@ -2899,6 +2912,7 @@ def rerun_document_reconciliation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     document = db.scalar(
         select(Document).where(
             Document.id == document_id,
@@ -3370,6 +3384,7 @@ async def create_capture_preview(
     db: Session = Depends(get_db),
     job_session_factory: Callable[[], Session] = Depends(get_capture_job_session_factory),
 ) -> dict:
+    _require_admin(user)
     if not (text and text.strip()) and file is None:
         raise HTTPException(status_code=422, detail="Escreva uma mensagem ou envie um arquivo")
     if text and len(text) > 10000:
@@ -3504,6 +3519,7 @@ def cancel_capture(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     item = db.scalar(
         select(CaptureDraft).where(
             CaptureDraft.id == capture_id,
@@ -3543,6 +3559,7 @@ async def retry_capture(
     exact same rows in place, exactly like the worker's own crash-recovery
     reclaim does."""
 
+    _require_admin(user)
     capture = db.scalar(
         select(CaptureDraft).where(
             CaptureDraft.id == capture_id,
@@ -3589,6 +3606,7 @@ def confirm_capture(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     capture = db.scalar(
         select(CaptureDraft).where(
             CaptureDraft.id == capture_id,
@@ -4257,6 +4275,7 @@ def create_manual_transaction(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     account = db.scalar(
         select(Account).where(
             Account.id == payload.account_id,
@@ -4467,6 +4486,7 @@ def create_manual_transfer(
     duplicate-detection/audit building blocks every other manual command
     already uses -- no parallel financial engine.
     """
+    _require_admin(user)
     from_account = db.scalar(
         select(Account).where(
             Account.id == payload.from_account_id,
@@ -4659,6 +4679,7 @@ def update_transaction(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     transaction = db.scalar(
         select(Transaction).where(
             Transaction.id == transaction_id, Transaction.household_id == user.household_id
@@ -4876,6 +4897,7 @@ def delete_manual_transaction(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     transaction = db.scalar(
         select(Transaction).where(
             Transaction.id == transaction_id,
@@ -5018,6 +5040,7 @@ def reviews(user: User = Depends(get_current_user), db: Session = Depends(get_db
 def resolve_review(
     review_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
+    _require_admin(user)
     item = db.scalar(
         select(ReviewItem).where(ReviewItem.id == review_id, ReviewItem.household_id == user.household_id)
     )
@@ -5088,6 +5111,7 @@ def resolve_persisted_duplicate_group(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     try:
         group = resolve_duplicate_group(
             db,
@@ -5137,6 +5161,7 @@ def link_card_payment_reconciliation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     try:
         checking, card = link_card_payment(
             db,
@@ -5180,6 +5205,7 @@ def unlink_card_payment_reconciliation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     try:
         transaction, counterpart = unlink_card_payment(
             db, household_id=user.household_id, transaction_id=payload.transaction_id
@@ -5245,6 +5271,7 @@ def pay_card_invoice_reconciliation(
     can never be counted as a new expense; the invoice's own purchases
     remain the only economic expense facts.
     """
+    _require_admin(user)
     paying_account = db.scalar(
         select(Account).where(
             Account.id == payload.paying_account_id,
@@ -5533,6 +5560,7 @@ def commissions(user: User = Depends(get_current_user), db: Session = Depends(ge
 def create_commission(
     payload: CommissionRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
+    _require_admin(user)
     item = Commission(household_id=user.household_id, **payload.model_dump())
     db.add(item)
     db.flush()
@@ -5548,6 +5576,7 @@ def delete_commission(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     item = db.scalar(
         select(Commission).where(
             Commission.id == commission_id,
@@ -5590,6 +5619,7 @@ def payroll(user: User = Depends(get_current_user), db: Session = Depends(get_db
 def create_payroll(
     payload: PayrollRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
+    _require_admin(user)
     item = PayrollRecord(household_id=user.household_id, **payload.model_dump())
     db.add(item)
     db.flush()
@@ -5604,6 +5634,7 @@ def delete_manual_payroll(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     item = db.scalar(
         select(PayrollRecord).where(
             PayrollRecord.id == payroll_id,
@@ -5979,6 +6010,7 @@ def pay_obligation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     item = _get_payable_obligation(
         db, household_id=user.household_id, obligation_id=obligation_id
     )
@@ -6217,6 +6249,7 @@ def unpay_obligation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     item = _get_payable_obligation(
         db, household_id=user.household_id, obligation_id=obligation_id
     )
@@ -6299,6 +6332,7 @@ def obligations(user: User = Depends(get_current_user), db: Session = Depends(ge
 def create_obligation(
     payload: ObligationRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
+    _require_admin(user)
     item = Obligation(household_id=user.household_id, **payload.model_dump())
     db.add(item)
     db.flush()
@@ -6313,6 +6347,7 @@ def delete_obligation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     item = db.scalar(
         select(Obligation).where(
             Obligation.id == obligation_id,
@@ -6380,6 +6415,7 @@ def get_profile(user: User = Depends(get_current_user), db: Session = Depends(ge
 def update_profile(
     payload: ProfileRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
+    _require_admin(user)
     item = profile_for(db, user.household_id)
     values = payload.model_dump()
     desired_confirmed_balance = money(payload.investment_balance)
@@ -7408,6 +7444,7 @@ def rebuild_financial_snapshot(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    _require_admin(user)
     start = _month_start(period)
     snapshot = build_snapshot(
         db,
@@ -8099,6 +8136,17 @@ def advisor_chat(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    """Consultative, explanation-only chat over already-computed metrics.
+
+    Role boundary (`docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md`): like
+    `POST /integrity/semantic-audit`, never deciding or altering a financial
+    fact does not make this route read-only -- it is a `POST` that persists
+    an `AuditEvent` of the question itself, which the Work Order's
+    acceptance criteria treat as operational state. `_require_admin` runs
+    first, exactly like every other mutating route.
+    """
+
+    _require_admin(user)
     conversation_message = _advisor_conversation_message(payload)
     target_month = _advisor_month(conversation_message)
     selected_month = month_key(target_month)

@@ -55,7 +55,7 @@
       <nav id="main-nav">
         <button data-view="dashboard" class="active"><span>⌂</span>Visão geral</button>
         <button data-view="reports"><span>▥</span>Relatórios</button>
-        <button data-view="capture"><span>●</span>Lançar agora</button>
+        <button data-view="capture" class="admin-only"><span>●</span>Lançar agora</button>
         <button data-view="entradas"><span>↓</span>Entradas</button>
         <button data-view="saidas"><span>↑</span>Saídas</button>
         <button data-view="payables"><span>▤</span>Contas a pagar</button>
@@ -291,7 +291,7 @@
         <div class="capture-layout">
           <article class="panel capture-composer">
             <div class="panel-heading"><div><span class="step-label">CENTRAL INTELIGENTE</span><h2>Conte o que aconteceu</h2><small>Escreva, grave um áudio ou envie um documento. Nada será gravado antes da sua confirmação.</small></div></div>
-            <form id="capture-form" class="capture-form">
+            <form id="capture-form" class="capture-form admin-only">
               <label class="full">Mensagem
                 <textarea name="text" id="capture-text" rows="4" maxlength="4000" placeholder="Ex.: Gastei R$ 150 com combustível ontem no cartão Itaú"></textarea>
               </label>
@@ -308,7 +308,7 @@
             <div class="security-note"><strong>Controle antes da gravação</strong><p>OCR, transcrição e classificação podem errar. Confira data, valor, conta e categoria na próxima etapa.</p></div>
           </article>
 
-          <article id="capture-preview-panel" class="panel capture-preview-panel hidden">
+          <article id="capture-preview-panel" class="panel capture-preview-panel hidden admin-only">
             <div class="panel-heading"><div><span class="step-label">PRÉVIA EDITÁVEL</span><h2>Confira antes de confirmar</h2><small id="capture-preview-summary"></small></div><span id="capture-confidence" class="metric-pill">0%</span></div>
             <div id="capture-preview-notes" class="capture-notes hidden"></div>
             <div id="capture-preview-items" class="capture-preview-items"></div>
@@ -329,7 +329,7 @@
         <div class="two-column form-layout">
           <article class="panel">
             <div class="panel-heading"><div><span class="step-label">NOVO ARQUIVO</span><h2>Importar documento</h2></div></div>
-            <form id="import-form" class="form-grid">
+            <form id="import-form" class="form-grid admin-only">
               <label id="import-account-field">Conta ou cartão<select name="account_id" id="import-account" required></select></label>
               <label>Tipo de documento<select name="document_type" id="import-document-type"><option value="bank_statement">Extrato bancário</option><option value="credit_card">Fatura/cartão de crédito</option><option value="payroll">Holerite</option></select></label>
               <label class="file-field full"><input type="file" name="file" accept=".pdf,.csv,.txt,.ofx,.qfx" multiple required><span><strong>Selecionar um ou vários arquivos (PDF, CSV ou OFX)</strong><small>Máximo de 25 MB por arquivo, até 20 arquivos por lote. Holerites devem ser enviados em PDF.</small></span></label>
@@ -338,7 +338,7 @@
           </article>
           <article class="panel compact">
             <div class="panel-heading"><div><span class="step-label">CADASTRO</span><h2>Nova conta</h2></div></div>
-            <form id="account-form" class="form-grid">
+            <form id="account-form" class="form-grid admin-only">
               <label>Nome<input name="name" placeholder="Itaú conta corrente" required></label>
               <label>Instituição<input name="institution" placeholder="Itaú"></label>
               <label>Tipo<select name="account_type"><option value="checking">Conta corrente</option><option value="credit_card">Cartão</option><option value="investment">Investimento</option><option value="cash">Dinheiro</option></select></label>
@@ -358,7 +358,7 @@
       <section id="view-entradas" class="view">
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">RECEITA</span><h2>Registrar entrada</h2><small>Só renda econômica real: salário, comissão, recebimento eventual. Dinheiro que apenas entrou por transferência, resgate de investimento ou estorno não pode virar receita aqui.</small></div></div>
-          <form id="income-entry-form" class="form-grid three">
+          <form id="income-entry-form" class="form-grid three admin-only">
             <label>Data<input type="date" name="booked_at" required></label>
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Salário de agosto" maxlength="500"></label>
             <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
@@ -375,7 +375,7 @@
       <section id="view-saidas" class="view">
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">DESPESA</span><h2>Registrar saída</h2><small>Despesa à vista em conta ou cartão, com categoria e competência. Para compra parcelada, informe parcela atual e total; a prévia de parcelas futuras usa a mesma projeção canônica do painel de Planejamento.</small></div></div>
-          <form id="expense-entry-form" class="form-grid three">
+          <form id="expense-entry-form" class="form-grid three admin-only">
             <label>Data<input type="date" name="booked_at" required></label>
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Supermercado" maxlength="500"></label>
             <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
@@ -413,7 +413,7 @@
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">PAGAMENTO DE FATURA</span><h2>Registrar pagamento manual</h2><small>Pagamento de fatura é conciliação, nunca uma nova despesa (INV-002); as compras da fatura continuam sendo os fatos de despesa. Origem dos recursos, conta pagadora e fatura são sempre confirmadas por você.</small></div></div>
-          <form id="pay-invoice-form" class="form-grid three">
+          <form id="pay-invoice-form" class="form-grid three admin-only">
             <input type="hidden" name="card_transaction_id">
             <label class="full-on-mobile">Fatura selecionada<input id="pay-invoice-summary" disabled placeholder="Escolha uma fatura pendente acima"></label>
             <label>Conta pagadora<select name="paying_account_id" id="pay-invoice-account" required></select></label>
@@ -435,7 +435,7 @@
       <section id="view-transferencias" class="view">
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">ENTRE CONTAS</span><h2>Transferir entre contas da família</h2><small>Movimenta duas contas do mesmo household sem virar receita ou despesa (INV-001). Origem e destino precisam ser contas distintas já cadastradas; nada é inferido automaticamente.</small></div></div>
-          <form id="transfer-form" class="form-grid three">
+          <form id="transfer-form" class="form-grid three admin-only">
             <label>Data<input type="date" name="booked_at" required></label>
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Reforço da reserva"></label>
             <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
@@ -446,7 +446,7 @@
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">MOVIMENTAÇÃO PATRIMONIAL</span><h2>Aplicação, resgate e estorno</h2><small>Receita e despesa têm telas próprias em Entradas e Saídas; aqui ficam apenas aplicação/resgate de investimento e estorno, que não são receita nem despesa.</small></div></div>
-          <form id="transaction-form" class="form-grid three">
+          <form id="transaction-form" class="form-grid three admin-only">
             <label>Data<input type="date" name="booked_at" required></label>
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Resgate para pagar fatura"></label>
             <label>Tipo de movimentação<select name="movement_type" id="transaction-movement-type"><option value="investment">Aplicação/investimento</option><option value="redemption">Resgate de investimento</option><option value="refund">Reembolso/estorno</option></select></label>
@@ -501,7 +501,7 @@
         <div class="two-column form-layout">
           <article class="panel">
             <div class="panel-heading"><div><span class="step-label">RENDA VARIÁVEL</span><h2>Adicionar comissão</h2></div></div>
-            <form id="commission-form" class="form-grid">
+            <form id="commission-form" class="form-grid admin-only">
               <label class="full">Descrição<input name="description" required placeholder="Projeto / recebível"></label>
               <label>Previsão<input type="date" name="expected_date" required></label>
               <label>Valor bruto<input type="number" name="gross_amount" min="0.01" step="0.01" required></label>
@@ -512,7 +512,7 @@
           </article>
           <article class="panel">
             <div class="panel-heading"><div><span class="step-label">FOLHA</span><h2>Adicionar holerite ou extra</h2></div></div>
-            <form id="payroll-form" class="form-grid">
+            <form id="payroll-form" class="form-grid admin-only">
               <label>Nome<input name="person_name" required></label>
               <label>Tipo<select name="payroll_kind"><option value="regular">Salário regular</option><option value="13_first">1ª parcela do 13º</option><option value="13_second">2ª parcela do 13º</option><option value="vacation_extra">Adicional líquido de férias</option><option value="other">Outro</option></select></label>
               <label>Competência<input type="date" name="competence" required></label>
@@ -535,7 +535,7 @@
         <div class="two-column form-layout">
           <article class="panel">
             <div class="panel-heading"><div><span class="step-label">COMPROMISSOS</span><h2>Adicionar obrigação</h2></div></div>
-            <form id="obligation-form" class="form-grid">
+            <form id="obligation-form" class="form-grid admin-only">
               <label class="full">Nome<input name="name" required placeholder="Parcela ou reforço"></label>
               <label>Primeiro vencimento<input type="date" name="due_date" required></label>
               <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
@@ -572,7 +572,7 @@
             <div class="advisor-title-row"><span class="step-label">INTELIGÊNCIA FINANCEIRA</span><span id="advisor-provider-status" class="status-chip muted">Verificando Codex…</span></div>
             <h2>Converse com seu consultor</h2>
             <p>Os cálculos são feitos pelo motor financeiro local. Quando o Codex estiver conectado, ele recebe somente um resumo dos resultados para explicá-los com clareza — nunca credenciais, documentos ou acesso ao banco.</p>
-            <div class="advisor-suggestions">
+            <div class="advisor-suggestions admin-only">
               <button class="secondary advisor-suggestion" type="button">Posso comprar algo de R$ 2.000 à vista?</button>
               <button class="secondary advisor-suggestion" type="button">Quanto saiu do banco e dos cartões neste mês?</button>
               <button class="secondary advisor-suggestion" type="button">Quais obrigações estão próximas?</button>
@@ -582,10 +582,17 @@
           </article>
           <article class="panel advisor-chat-panel">
             <div id="advisor-messages" class="advisor-messages" aria-live="polite"></div>
-            <form id="advisor-form" class="advisor-form">
+            <!-- `POST /advisor/chat` persists an AuditEvent of the question
+                 itself, so it is admin-only (see
+                 docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md and
+                 `app.api.advisor_chat`'s docstring) -- hiding the form here
+                 is UX only, the real barrier is `_require_admin` in the
+                 backend. -->
+            <form id="advisor-form" class="advisor-form admin-only">
               <input name="message" id="advisor-input" autocomplete="off" required maxlength="1000" placeholder="Digite sua pergunta financeira...">
               <button class="primary" type="submit">Analisar</button>
             </form>
+            <p class="consulta-only muted-copy">Usuário de consulta não envia perguntas ao consultor (a pergunta é registrada como um evento auditável). Peça a um administrador da família.</p>
           </article>
         </div>
       </section>
@@ -594,7 +601,7 @@
         <article class="panel">
           <div class="panel-heading">
             <div><span class="step-label">FINANCIAL INTEGRITY ENGINE</span><h2>Status de integridade</h2><small>Score e gates são calculados apenas pelo motor determinístico. O Codex nunca altera estes números.</small></div>
-            <button id="integrity-run-full" class="primary" type="button">Executar auditoria completa</button>
+            <button id="integrity-run-full" class="primary admin-only" type="button">Executar auditoria completa</button>
           </div>
           <div class="kpi-grid" id="integrity-summary-cards"></div>
         </article>
@@ -604,9 +611,9 @@
             <div><span class="step-label">FECHAMENTO MENSAL</span><h2>Monthly Financial Close</h2><small>Executar checks, confiar (trusted) e reabrir são ações separadas e deliberadas.</small></div>
             <div class="inline-controls">
               <input type="month" id="close-period">
-              <button id="close-run" class="secondary" type="button">Executar fechamento</button>
-              <button id="close-trust" class="primary" type="button">Marcar trusted</button>
-              <button id="close-reopen" class="danger-button" type="button">Reabrir</button>
+              <button id="close-run" class="secondary admin-only" type="button">Executar fechamento</button>
+              <button id="close-trust" class="primary admin-only" type="button">Marcar trusted</button>
+              <button id="close-reopen" class="danger-button admin-only" type="button">Reabrir</button>
             </div>
           </div>
           <div id="close-status"></div>
