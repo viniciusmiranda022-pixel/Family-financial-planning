@@ -21,7 +21,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -47,6 +47,8 @@ from app.models import (
     Household,
     IntegrityFinding,
     IntegrityRun,
+    MfaFactor,
+    MfaRecoveryCode,
     Obligation,
     PayrollRecord,
     ReviewItem,
@@ -71,6 +73,9 @@ from app.schemas import (
     IntegrityRunRequest,
     LoginRequest,
     ManualTransactionRequest,
+    MfaChallengeRequest,
+    MfaEnrollConfirmRequest,
+    MfaReauthRequest,
     MonthlyCloseReopenRequest,
     ObligationPaymentRequest,
     ObligationPaymentUndoRequest,
@@ -86,13 +91,22 @@ from app.schemas import (
     UserCreateRequest,
 )
 from app.security import (
+    PENDING_PURPOSE_ENROLL,
+    PENDING_PURPOSE_VERIFY,
+    bump_session_version,
+    clear_pending_cookie,
     clear_session_cookie,
     get_current_user,
+    get_enroll_pending_user,
+    get_verify_pending_user,
     hash_password,
+    mfa_pending_expires_at,
+    set_pending_cookie,
     set_session_cookie,
     verify_password,
 )
 from app.services import capture_worker
+from app.services import mfa as mfa_service
 from app.services.card_competence import (
     card_invoice_competence,
     resolve_expense_competence,
@@ -1129,6 +1143,276 @@ def public_status(db: Session = Depends(get_db)) -> dict:
     return {"configured": bool(db.scalar(select(func.count(User.id))))}
 
 
+# ---------------------------------------------------------------------------
+# Fase 4 -- MFA local TOTP (docs/WORK_ORDER_LOCAL_MFA_TOTP.md)
+#
+# Auth state machine:
+#
+#   ANONYMOUS --username+senha válida--> PASSWORD_VERIFIED
+#     --sem fator confirmado----> MFA_ENROLL_PENDING (ffp_mfa_pending, purpose=enroll)
+#     --fator já confirmado----> MFA_VERIFY_PENDING  (ffp_mfa_pending, purpose=verify)
+#   MFA_VERIFY_PENDING/ENROLL_PENDING --TOTP/recovery válido--> FULLY_AUTHENTICATED (ffp_session)
+#
+# `ffp_mfa_pending` never authenticates any endpoint that depends on
+# `get_current_user`: it is a distinctly named cookie read by a distinct
+# FastAPI dependency (`get_enroll_pending_user`/`get_verify_pending_user`),
+# so no route protected by the normal dependency can ever be reached with
+# only a pending token, independent of any bug in this module's own logic.
+# ---------------------------------------------------------------------------
+
+
+def _mfa_factor_for(db: Session, user: User) -> MfaFactor | None:
+    return db.scalar(select(MfaFactor).where(MfaFactor.user_id == user.id))
+
+
+def _aware_utc(value: datetime | None) -> datetime | None:
+    """Normalize a `DateTime(timezone=True)` MFA column value read back
+    from the database for a Python-level comparison against
+    `datetime.now(UTC)`.
+
+    PostgreSQL always returns a timezone-aware value for this column type;
+    SQLite (used in tests) always returns a naive one regardless -- every
+    value this app ever writes to such a column is already UTC
+    (`datetime.now(UTC)`), so a naive value is safely assumed to already be
+    UTC. Same idiom as `app.services.capture_worker._aware_utc`.
+    """
+
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
+def _mfa_locked(factor: MfaFactor, now: datetime) -> bool:
+    locked_until = _aware_utc(factor.locked_until)
+    return bool(locked_until and locked_until > now)
+
+
+def _mfa_pending_expired(factor: MfaFactor, now: datetime) -> bool:
+    expires_at = _aware_utc(factor.pending_setup_expires_at)
+    return bool(expires_at and expires_at <= now)
+
+
+def _stage_pending_secret(db: Session, user: User, factor: MfaFactor | None) -> tuple[MfaFactor, str, bool]:
+    """Return `(factor, plaintext_secret, generated_new)` for an enrollment
+    or reconfiguration in progress.
+
+    Reuses the existing pending secret while it has not expired, so a user
+    who reloads the QR screen keeps scanning the same code instead of
+    invalidating their authenticator app's in-progress setup; mints a fresh
+    one otherwise ("Setup expirado não ativa MFA e deve exigir novo
+    segredo. Não reutilizar indefinidamente segredo de enrollment
+    abandonado.").
+    """
+
+    now = datetime.now(UTC)
+    if factor is None:
+        factor = MfaFactor(user_id=user.id)
+        db.add(factor)
+        db.flush()
+    if (
+        factor.pending_secret_encrypted
+        and factor.pending_setup_expires_at
+        and not _mfa_pending_expired(factor, now)
+    ):
+        return factor, mfa_service.decrypt_secret(factor.pending_secret_encrypted), False
+    secret = mfa_service.generate_totp_secret()
+    factor.pending_secret_encrypted = mfa_service.encrypt_secret(secret)
+    factor.pending_setup_started_at = now
+    factor.pending_setup_expires_at = mfa_pending_expires_at()
+    # A brand-new secret has no history of its own -- any prior pending
+    # secret's accepted timestep is meaningless against this one.
+    factor.pending_last_accepted_timestep = None
+    db.flush()
+    return factor, secret, True
+
+
+def _raise_mfa_locked() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="Muitas tentativas inválidas. Tente novamente em alguns minutos.",
+    )
+
+
+def _register_mfa_failure(db: Session, factor: MfaFactor) -> MfaFactor:
+    """Atomically increment `failed_attempts` and, once it reaches the
+    configured threshold, set `locked_until` -- both computed inside the
+    `UPDATE` itself (SQL-side arithmetic and `CASE`, not a Python
+    read-modify-write), so two concurrent invalid attempts against the
+    same factor cannot both read the same pre-image and lose an increment
+    (same compare-free counter idiom as `app.services.capture_worker`).
+
+    Flushes and refreshes `factor` from the database *without* committing:
+    every MFA route commits exactly once, at the very end, so a failed
+    attempt's rate-limit bookkeeping and its `AuditEvent` land in the same
+    transaction instead of two separate commits that could diverge on a
+    crash between them.
+    """
+
+    settings = get_settings()
+    now = datetime.now(UTC)
+    lock_at = now + timedelta(seconds=settings.mfa_rate_limit_lockout_seconds)
+    db.execute(
+        update(MfaFactor)
+        .where(MfaFactor.id == factor.id)
+        .values(
+            failed_attempts=MfaFactor.failed_attempts + 1,
+            locked_until=case(
+                (MfaFactor.failed_attempts + 1 >= settings.mfa_rate_limit_max_attempts, lock_at),
+                else_=MfaFactor.locked_until,
+            ),
+        )
+    )
+    db.flush()
+    db.refresh(factor)
+    return factor
+
+
+def _reset_mfa_lockout(factor: MfaFactor) -> None:
+    factor.failed_attempts = 0
+    factor.locked_until = None
+
+
+def _accept_timestep(db: Session, factor: MfaFactor, timestep: int, *, pending: bool) -> bool:
+    """Atomic anti-replay accept.
+
+    Succeeds only if `timestep` is strictly newer than whatever the target
+    column currently is (`NULL` counts as older than anything). Two
+    concurrent requests validating the same code race this single `UPDATE
+    ... WHERE`; the loser's predicate stops matching the instant the
+    winner's write lands, so `rowcount == 0` unambiguously means "this
+    exact timestep is already spent" -- by this request or a concurrent
+    one (Work Order: "duas validações concorrentes do mesmo código
+    resultam em no máximo uma aceitação"). Portable across SQLite and
+    PostgreSQL: it relies only on one `UPDATE` statement's WHERE being
+    evaluated atomically with its write, not on dialect-specific locking.
+
+    `pending` selects which of the two independent counters this check
+    guards -- see `MfaFactor.pending_last_accepted_timestep`'s docstring
+    for why the active and pending secrets must never share one.
+    """
+
+    column = MfaFactor.pending_last_accepted_timestep if pending else MfaFactor.last_accepted_timestep
+    result = db.execute(
+        update(MfaFactor)
+        .where(MfaFactor.id == factor.id, or_(column.is_(None), column < timestep))
+        .values({column: timestep})
+    )
+    return result.rowcount == 1
+
+
+def _verify_totp_challenge(
+    db: Session, factor: MfaFactor, secret_encrypted: str, code: str, *, pending: bool
+) -> bool:
+    """Verify `code` against `secret_encrypted`, enforcing anti-replay
+    (against the active or pending counter, per `pending`) and updating
+    the shared rate-limit counters in-memory (the caller commits). Never
+    raises on a wrong code -- each route phrases its own HTTP response so
+    enrollment-confirm, login-verify and reconfiguration-confirm can each
+    audit/respond appropriately."""
+
+    secret = mfa_service.decrypt_secret(secret_encrypted)
+    timestep = mfa_service.verify_totp(secret, code)
+    if timestep is None or not _accept_timestep(db, factor, timestep, pending=pending):
+        _register_mfa_failure(db, factor)
+        return False
+    _reset_mfa_lockout(factor)
+    return True
+
+
+def _consume_recovery_code(db: Session, factor: MfaFactor, candidate: str) -> bool:
+    """Atomically consume one unused recovery code matching `candidate`.
+    The `UPDATE ... WHERE used_at IS NULL` predicate means a code raced by
+    two concurrent requests is consumed by at most one of them, and an
+    already-used code can never authenticate again."""
+
+    code_hash = mfa_service.hash_recovery_code(candidate)
+    result = db.execute(
+        update(MfaRecoveryCode)
+        .where(
+            MfaRecoveryCode.factor_id == factor.id,
+            MfaRecoveryCode.code_hash == code_hash,
+            MfaRecoveryCode.used_at.is_(None),
+        )
+        .values(used_at=datetime.now(UTC))
+    )
+    if result.rowcount != 1:
+        _register_mfa_failure(db, factor)
+        return False
+    _reset_mfa_lockout(factor)
+    return True
+
+
+def _verify_mfa_challenge(db: Session, factor: MfaFactor, payload) -> bool:
+    """Shared TOTP-or-recovery-code dispatch for `payload` objects shaped
+    like `MfaChallengeRequest`/`MfaReauthRequest` (both carry mutually
+    exclusive `code`/`recovery_code` fields, enforced by their own
+    validators)."""
+
+    if payload.code:
+        if not factor.secret_encrypted:
+            return False
+        return _verify_totp_challenge(db, factor, factor.secret_encrypted, payload.code, pending=False)
+    return _consume_recovery_code(db, factor, payload.recovery_code or "")
+
+
+def _issue_recovery_codes(db: Session, factor: MfaFactor) -> list[str]:
+    """Invalidate every existing recovery code for `factor` (marking it
+    used, never deleting it -- keeps a row for count/audit purposes) and
+    persist a fresh set of 10, returning the plaintext once. Per Work
+    Order: "regenerar conjunto invalida todos os códigos anteriores.\""""
+
+    now = datetime.now(UTC)
+    db.execute(
+        update(MfaRecoveryCode)
+        .where(MfaRecoveryCode.factor_id == factor.id, MfaRecoveryCode.used_at.is_(None))
+        .values(used_at=now)
+    )
+    plaintext_codes = mfa_service.generate_recovery_codes()
+    for code in plaintext_codes:
+        db.add(MfaRecoveryCode(factor_id=factor.id, code_hash=mfa_service.hash_recovery_code(code)))
+    db.flush()
+    return plaintext_codes
+
+
+def _activate_pending_secret(db: Session, factor: MfaFactor) -> bool:
+    """Copy the staged `pending_secret_encrypted` over the active
+    `secret_encrypted`, clear the staging columns, and reset the replay/
+    rate-limit counters for the newly active factor.
+
+    Returns whether this was a *reconfiguration* (an active secret already
+    existed) as opposed to the very first enrollment -- callers use this to
+    choose between the `mfa.enrolled` and `mfa.reconfigured` audit events.
+    The previous secret is never referenced again after this call, but
+    nothing here revokes sessions; only the reconfiguration route (which
+    already required a full session plus re-authentication before staging
+    a new secret) does that, matching "nunca invalidar o fator antigo
+    antes da confirmação do novo."
+    """
+
+    was_reconfigure = factor.secret_encrypted is not None
+    factor.secret_encrypted = factor.pending_secret_encrypted
+    factor.confirmed_at = datetime.now(UTC)
+    factor.pending_secret_encrypted = None
+    factor.pending_setup_started_at = None
+    factor.pending_setup_expires_at = None
+    factor.last_accepted_timestep = None
+    factor.pending_last_accepted_timestep = None
+    factor.failed_attempts = 0
+    factor.locked_until = None
+    return was_reconfigure
+
+
+def _recovery_codes_remaining(db: Session, factor: MfaFactor) -> int:
+    return int(
+        db.scalar(
+            select(func.count(MfaRecoveryCode.id)).where(
+                MfaRecoveryCode.factor_id == factor.id, MfaRecoveryCode.used_at.is_(None)
+            )
+        )
+        or 0
+    )
+
+
 @router.post("/auth/setup", status_code=status.HTTP_201_CREATED)
 def setup(payload: SetupRequest, response: Response, db: Session = Depends(get_db)) -> dict:
     if db.scalar(select(func.count(User.id))):
@@ -1162,16 +1446,13 @@ def setup(payload: SetupRequest, response: Response, db: Session = Depends(get_d
     db.flush()
     audit(db, user, "system.setup", "household", household.id)
     db.commit()
-    set_session_cookie(response, user.id)
-    return {
-        "configured": True,
-        "user": {
-            "id": user.id,
-            "name": user.name,
-            "username": user.username,
-            "is_admin": user.is_admin,
-        },
-    }
+    # Fase 4: mesmo o primeiro usuário (administrador) precisa concluir o
+    # segundo fator antes de qualquer sessão completa -- "MFA obrigatório
+    # para todo usuário ativo" não abre exceção para quem faz o setup
+    # inicial. `/auth/setup` só cria a conta; o restante do fluxo é
+    # idêntico ao enrollment obrigatório de `/auth/login`.
+    set_pending_cookie(response, user.id, PENDING_PURPOSE_ENROLL)
+    return {"configured": True, "mfa_required": True, "mode": "enroll"}
 
 
 @router.post("/auth/login")
@@ -1179,28 +1460,219 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
     user = db.scalar(select(User).where(User.username == payload.username.lower(), User.active.is_(True)))
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Usuário ou senha inválidos")
-    set_session_cookie(response, user.id)
+    # Work Order decision 4: "Nenhuma sessão completa depois da senha."
+    # `ffp_session` is never issued here -- only a short-TTL pending
+    # cookie. `auth.login`/`mfa.authenticated` are audited once the second
+    # factor actually succeeds (see `mfa_verify`/`mfa_enroll_confirm`),
+    # since that is the point authentication is actually complete now.
+    factor = _mfa_factor_for(db, user)
+    if factor is None or factor.confirmed_at is None:
+        set_pending_cookie(response, user.id, PENDING_PURPOSE_ENROLL)
+        return {"mfa_required": True, "mode": "enroll"}
+    set_pending_cookie(response, user.id, PENDING_PURPOSE_VERIFY)
+    return {"mfa_required": True, "mode": "verify"}
+
+
+@router.post("/auth/mfa/enroll/start")
+def mfa_enroll_start(user: User = Depends(get_enroll_pending_user), db: Session = Depends(get_db)) -> dict:
+    factor = _mfa_factor_for(db, user)
+    factor, secret, generated_new = _stage_pending_secret(db, user, factor)
+    if generated_new:
+        audit(db, user, "mfa.enrollment_started")
+    db.commit()
+    uri = mfa_service.provisioning_uri(secret, username=user.username)
+    return {
+        "secret": secret,
+        "otpauth_uri": uri,
+        "qr_code": mfa_service.qr_code_data_uri(uri),
+        "expires_at": factor.pending_setup_expires_at,
+    }
+
+
+@router.post("/auth/mfa/enroll/confirm")
+def mfa_enroll_confirm(
+    payload: MfaEnrollConfirmRequest,
+    response: Response,
+    user: User = Depends(get_enroll_pending_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    factor = _mfa_factor_for(db, user)
+    if factor is None or not factor.pending_secret_encrypted:
+        raise HTTPException(
+            status_code=400, detail="Nenhuma configuração de MFA pendente. Inicie o enrollment novamente."
+        )
+    now = datetime.now(UTC)
+    if _mfa_locked(factor, now):
+        audit(db, user, "mfa.rate_limited")
+        db.commit()
+        _raise_mfa_locked()
+    if _mfa_pending_expired(factor, now):
+        factor.pending_secret_encrypted = None
+        factor.pending_setup_started_at = None
+        factor.pending_setup_expires_at = None
+        db.commit()
+        raise HTTPException(status_code=400, detail="Configuração expirada. Gere um novo QR Code.")
+    if not _verify_totp_challenge(db, factor, factor.pending_secret_encrypted, payload.code, pending=True):
+        audit(db, user, "mfa.challenge_failed")
+        db.commit()
+        raise HTTPException(status_code=401, detail="Código inválido")
+    was_reconfigure = _activate_pending_secret(db, factor)
+    recovery_codes = _issue_recovery_codes(db, factor)
+    audit(db, user, "mfa.reconfigured" if was_reconfigure else "mfa.enrolled")
+    clear_pending_cookie(response)
+    set_session_cookie(response, user)
     audit(db, user, "auth.login")
     db.commit()
     return {
-        "id": user.id,
-        "name": user.name,
-        "username": user.username,
-        "is_admin": user.is_admin,
+        "user": {"id": user.id, "name": user.name, "username": user.username, "is_admin": user.is_admin},
+        "recovery_codes": recovery_codes,
     }
+
+
+@router.post("/auth/mfa/verify")
+def mfa_verify(
+    payload: MfaChallengeRequest,
+    response: Response,
+    user: User = Depends(get_verify_pending_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    factor = _mfa_factor_for(db, user)
+    if factor is None or not factor.confirmed_at:
+        # Unreachable through the normal flow: `login()` only ever issues a
+        # "verify" pending cookie when a confirmed factor already exists.
+        # Handled as a hard failure rather than silently falling back to
+        # enrollment, so a forged/stale pending token can never grant any
+        # state on its own.
+        raise HTTPException(status_code=401, detail="MFA não configurado")
+    now = datetime.now(UTC)
+    if _mfa_locked(factor, now):
+        audit(db, user, "mfa.rate_limited")
+        db.commit()
+        _raise_mfa_locked()
+    if not _verify_mfa_challenge(db, factor, payload):
+        audit(db, user, "mfa.challenge_failed")
+        db.commit()
+        raise HTTPException(status_code=401, detail="Código inválido")
+    clear_pending_cookie(response)
+    set_session_cookie(response, user)
+    audit(db, user, "mfa.recovery_code_used" if payload.recovery_code else "mfa.authenticated")
+    audit(db, user, "auth.login")
+    db.commit()
+    return {"id": user.id, "name": user.name, "username": user.username, "is_admin": user.is_admin}
+
+
+@router.post("/auth/mfa/reconfigure/start")
+def mfa_reconfigure_start(
+    payload: MfaReauthRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> dict:
+    if not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Senha atual incorreta")
+    factor = _mfa_factor_for(db, user)
+    if factor is None or not factor.confirmed_at:
+        raise HTTPException(status_code=400, detail="MFA ainda não foi configurado")
+    now = datetime.now(UTC)
+    if _mfa_locked(factor, now):
+        audit(db, user, "mfa.rate_limited")
+        db.commit()
+        _raise_mfa_locked()
+    if not _verify_mfa_challenge(db, factor, payload):
+        audit(db, user, "mfa.challenge_failed")
+        db.commit()
+        raise HTTPException(status_code=401, detail="Segundo fator inválido")
+    factor, secret, _generated_new = _stage_pending_secret(db, user, factor)
+    db.commit()
+    uri = mfa_service.provisioning_uri(secret, username=user.username)
+    return {
+        "secret": secret,
+        "otpauth_uri": uri,
+        "qr_code": mfa_service.qr_code_data_uri(uri),
+        "expires_at": factor.pending_setup_expires_at,
+    }
+
+
+@router.post("/auth/mfa/reconfigure/confirm")
+def mfa_reconfigure_confirm(
+    payload: MfaEnrollConfirmRequest,
+    response: Response,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    factor = _mfa_factor_for(db, user)
+    if factor is None or not factor.pending_secret_encrypted:
+        raise HTTPException(status_code=400, detail="Nenhuma reconfiguração pendente. Inicie novamente.")
+    now = datetime.now(UTC)
+    if _mfa_locked(factor, now):
+        audit(db, user, "mfa.rate_limited")
+        db.commit()
+        _raise_mfa_locked()
+    if _mfa_pending_expired(factor, now):
+        factor.pending_secret_encrypted = None
+        factor.pending_setup_started_at = None
+        factor.pending_setup_expires_at = None
+        db.commit()
+        raise HTTPException(status_code=400, detail="Configuração expirada. Gere um novo QR Code.")
+    if not _verify_totp_challenge(db, factor, factor.pending_secret_encrypted, payload.code, pending=True):
+        audit(db, user, "mfa.challenge_failed")
+        db.commit()
+        raise HTTPException(status_code=401, detail="Código inválido")
+    _activate_pending_secret(db, factor)  # always a reconfiguration on this route
+    recovery_codes = _issue_recovery_codes(db, factor)
+    # "Incrementar session_version/revogar sessões" then "criar uma nova
+    # sessão completa para a operação atual somente depois do fluxo
+    # concluído": `bump_session_version` refreshes `user` in-memory too, so
+    # the cookie issued right after embeds the *new* version instead of
+    # the one this very request authenticated with.
+    bump_session_version(db, user)
+    audit(db, user, "mfa.reconfigured")
+    set_session_cookie(response, user)
+    db.commit()
+    return {"recovery_codes": recovery_codes}
+
+
+@router.post("/auth/mfa/recovery-codes/regenerate")
+def mfa_recovery_codes_regenerate(
+    payload: MfaReauthRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> dict:
+    if not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Senha atual incorreta")
+    factor = _mfa_factor_for(db, user)
+    if factor is None or not factor.confirmed_at:
+        raise HTTPException(status_code=400, detail="MFA ainda não foi configurado")
+    now = datetime.now(UTC)
+    if _mfa_locked(factor, now):
+        audit(db, user, "mfa.rate_limited")
+        db.commit()
+        _raise_mfa_locked()
+    if not _verify_mfa_challenge(db, factor, payload):
+        audit(db, user, "mfa.challenge_failed")
+        db.commit()
+        raise HTTPException(status_code=401, detail="Segundo fator inválido")
+    recovery_codes = _issue_recovery_codes(db, factor)
+    audit(db, user, "mfa.recovery_codes_regenerated")
+    db.commit()
+    return {"recovery_codes": recovery_codes}
 
 
 @router.post("/auth/logout")
 def logout(response: Response, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     clear_session_cookie(response)
+    clear_pending_cookie(response)
     audit(db, user, "auth.logout")
     db.commit()
     return {"ok": True}
 
 
 @router.get("/auth/me")
-def me(user: User = Depends(get_current_user)) -> dict:
-    return {"id": user.id, "name": user.name, "username": user.username, "is_admin": user.is_admin}
+def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    factor = _mfa_factor_for(db, user)
+    return {
+        "id": user.id,
+        "name": user.name,
+        "username": user.username,
+        "is_admin": user.is_admin,
+        "mfa_enabled": bool(factor and factor.confirmed_at),
+        "mfa_recovery_codes_remaining": _recovery_codes_remaining(db, factor) if factor else 0,
+    }
 
 
 @router.post("/integrity/runs", status_code=status.HTTP_201_CREATED)
