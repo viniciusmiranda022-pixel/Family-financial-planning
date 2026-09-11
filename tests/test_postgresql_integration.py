@@ -44,6 +44,7 @@ from sqlalchemy import create_engine, func, inspect, select, text  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from alembic import command  # noqa: E402
+from app.api import _accept_timestep  # noqa: E402
 from app.cli.backfill import process_household  # noqa: E402
 from app.cli.initial_load import (  # noqa: E402
     AccountSeed,
@@ -67,6 +68,7 @@ from app.models import (  # noqa: E402
     DuplicateGroup,
     FinancialSnapshot,
     Household,
+    MfaFactor,
     Obligation,
     Transaction,
     User,
@@ -877,6 +879,111 @@ def test_exhausted_reconciler_cas_is_race_safe_on_real_postgresql() -> None:
             assert job_row.duration_ms == 1234
             assert draft_row.status == "processing"  # never overwritten to "failed"
             assert document_row.status == "capture_processing"  # never overwritten
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_mfa_concurrent_totp_accept_of_same_timestep_yields_exactly_one_success_on_real_postgresql() -> None:
+    """Engineer review of PR #83 (2026-09-11), BLOQUEIO DE MERGE item 2: the
+    PR's own evidence claimed `tests/test_postgresql_integration.py`
+    "additionally proves [anti-replay] under genuine thread concurrency
+    against real PostgreSQL", but at that head this file only carried the
+    `MFA_ENCRYPTION_KEY` env var and the Alembic head bump -- no such test
+    existed. `tests/test_mfa.py::test_concurrent_accept_of_same_timestep_yields_at_most_one_success`
+    only proves `app.api._accept_timestep` is a correct atomic CAS when
+    called *sequentially* (`db_a.commit()` happens before `_accept_timestep`
+    is even called on `db_b`) -- useful, portable coverage, but not a
+    concurrency proof. The Work Order is explicit: "duas validações
+    concorrentes do mesmo código resultam em no máximo uma aceitação."
+
+    This proves it under a real two-connection PostgreSQL race, not merely
+    by reading the code: the first connection accepts the timestep and
+    deliberately holds its transaction open before commit; a second, fully
+    concurrent connection attempts to accept the *exact same* timestep for
+    the *exact same* factor and must block on PostgreSQL's row-level write
+    lock for as long as the first transaction stays open, then observe the
+    now-committed acceptance and correctly lose the race (`rowcount == 0`)
+    instead of a lost update silently letting both "accept".
+    """
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as setup_db:
+            household = Household(name="Família MFA Concorrência PostgreSQL")
+            setup_db.add(household)
+            setup_db.flush()
+            user = User(
+                household_id=household.id,
+                name="Usuário MFA Concorrência",
+                username=f"mfa-concur-{household.id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            setup_db.add(user)
+            setup_db.flush()
+            factor = MfaFactor(
+                user_id=user.id,
+                secret_encrypted="not-a-real-encrypted-secret",
+                confirmed_at=datetime.now(UTC),
+            )
+            setup_db.add(factor)
+            setup_db.commit()
+            factor_id = factor.id
+
+        timestep = 424242  # arbitrary, shared by both concurrent attempts
+
+        second_blocked_confirmed = threading.Event()
+        second_done = threading.Event()
+        second_error: list[BaseException] = []
+        second_accepted: list[bool] = []
+
+        def _second_attempt() -> None:
+            try:
+                second_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(second_engine) as second_db:
+                    second_factor = second_db.get(MfaFactor, factor_id)
+                    accepted = _accept_timestep(second_db, second_factor, timestep, pending=False)
+                    second_db.commit()
+                    second_accepted.append(accepted)
+                second_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001 - surfaced via assertion below
+                second_error.append(exc)
+            finally:
+                second_done.set()
+
+        with Session(engine) as first_db:
+            first_factor = first_db.get(MfaFactor, factor_id)
+            first_accepted = _accept_timestep(first_db, first_factor, timestep, pending=False)
+            assert first_accepted is True
+            # Deliberately do not commit yet: the second connection's
+            # `UPDATE ... WHERE ...` against the same row must block on
+            # PostgreSQL's row-level write lock for as long as this
+            # transaction stays open -- proving the two attempts genuinely
+            # overlap instead of merely running one after the other.
+            worker = threading.Thread(target=_second_attempt, daemon=True)
+            worker.start()
+            still_blocked = not second_done.wait(timeout=1.0)
+            assert still_blocked, (
+                "second connection completed before the first transaction "
+                "committed -- the row lock is not actually serializing"
+            )
+            second_blocked_confirmed.set()
+            first_db.commit()
+
+        assert second_done.wait(timeout=10.0), "second connection never finished"
+        if second_error:
+            raise second_error[0]
+        assert second_accepted == [False], (
+            "the concurrent second acceptance of the exact same timestep must "
+            "lose the race once it observes the first connection's commit"
+        )
+
+        with Session(engine) as verify_db:
+            factor_row = verify_db.get(MfaFactor, factor_id)
+            assert factor_row.last_accepted_timestep == timestep
         engine.dispose()
     finally:
         get_settings.cache_clear()
