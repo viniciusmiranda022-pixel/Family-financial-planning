@@ -70,6 +70,7 @@ os.environ.setdefault(
 )
 os.environ.setdefault("SECRET_KEY", "smart-capture-competence-p0-test-secret-long-enough-value")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -77,6 +78,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Transaction  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 
 def _client():
@@ -106,6 +108,9 @@ def _setup_household(client, *, username="admin-smart-capture-p0"):
         },
     )
     assert setup.status_code == 201
+    assert setup.json()["mfa_required"] is True
+    assert setup.json()["mode"] == "enroll"
+    complete_mfa_enrollment(client)
 
 
 def _create_card(client, *, name, closing_day, due_day):
