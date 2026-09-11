@@ -17,6 +17,19 @@ Método: leitura direta dos documentos normativos pelo executor, seguida de seis
 código independentes e somente-leitura (uma por área de domínio), cada uma reportando evidência
 `arquivo:linha`. Toda afirmação abaixo é rastreável a uma dessas fontes.
 
+**Correções de revisão (2026-09-11, ENGINEERING REVIEW no PR #88, head `0a2da43`):**
+
+1. `AccountBalanceObservation` isolada deixou de ser suficiente para materializar
+   `liquidity_used`/`liquidity_deposit` em `reconcile_actual_liquidity` (§4 Slice 1, §8 Technical
+   Challenge #1, §6 item 3) — agora exige movimento de transferência importado/observado no extrato
+   bancário ou ação explicitamente confirmada pelo usuário/Assistente; uma observação de saldo
+   isolada só atualiza a posição soberana e pode sinalizar `reconciliation_divergence`.
+2. `EntryTypeTemplate`/tipos aprendidos de Entrada/Saída reatribuído de "Slice 8 (ou incremental
+   3-5)" para Slice 4 (mecanismo de aprendizado do Assistente), com apresentação UX-only no Slice 5
+   (§1.4, §3.6, §4).
+3. Removida a recomendação de paralelizar o Slice 6; mantido sequenciamento estrito
+   0→1→2→3→4→5→6→7→8, preservando apenas a nota arquitetural de independência técnica (§7, §9).
+
 ---
 
 ## 1. Matriz MANTER / ALTERAR / REMOVER / MIGRAR
@@ -72,7 +85,7 @@ hoje; requer schema/dado novo, aditivo.
 | `Transaction.refund_of_transaction_id` (FK autorreferente) | 2 | Mesmo padrão já usado por `Transaction.linked_transaction_id` (migração `0004`) |
 | `Investment` + `InvestmentValuation` (histórico imutável) | 6 | Reutiliza o padrão de observação imutável + `supersedes_id` já usado por `AccountBalanceObservation` |
 | `AssistantActionEvent` (log estruturado do Assistente) | 4 | Estende `AuditEvent` em vez de duplicar a trilha de auditoria genérica |
-| `EntryTypeTemplate`/tipos aprendidos de Entrada/Saída | 8 (ou incremental 3-5) | Reutiliza o ciclo de vida já comprovado de `ClassificationRule` (`observed -> suggested -> pending_acceptance -> active`) |
+| `EntryTypeTemplate`/tipos aprendidos de Entrada/Saída | 4 (mecanismo de aprendizado; apresentação UX-only no Slice 5) | Reutiliza o ciclo de vida já comprovado de `ClassificationRule` (`observed -> suggested -> pending_acceptance -> active`) |
 | Backfill de `CardInvoice` a partir de `Transaction` histórico | 8 | Segue o padrão somente-leitura + insert aditivo já usado por `app.cli.backfill`; nunca escreve em `Transaction` |
 
 ---
@@ -233,7 +246,16 @@ A execução em si nunca é um motor novo: `typed_action` sempre corresponde a u
 endpoint/serviço determinístico já existente ou proposto no §4 (`pay_obligation`,
 `POST /card-invoices/{id}/pay`, `POST /captures/{id}/confirm`, etc.).
 
-### 3.6 Templates dinâmicos de Entrada/Saída (Slices 3/5, aceite formal no 8)
+### 3.6 Templates dinâmicos de Entrada/Saída (Slice 4; apresentação UX-only no Slice 5)
+
+**Correção de revisão (2026-09-11):** a atribuição original ("Slice 8, ou incremental 3-5") era
+ambígua e conflitava com a sequência normativa. O rebaseline (§"Slice 4 — Assistente Financeiro
+operacional... e aprendizado") já inclui explicitamente aprendizado do Assistente no Slice 4;
+portanto o mecanismo de tipo aprendido (tabela, ciclo de vida, ativação por administrador) pertence
+ao Slice 4. O Slice 5 fica restrito à apresentação/UX (exibir "Outra entrada"/"Outra saída" com os
+templates já `active` nos seletores de Entradas/Saídas) — nenhuma lógica de aprendizado nova é
+criada no Slice 5. O Slice 8 permanece reservado a migração/reconciliação real e E2E/smoke de
+go-live, sem lógica de produto nova.
 
 Reaproveita o ciclo de vida já testado de `classification_rules`
 (`docs/FINANCIAL_INVARIANTS.md:198-222`): nova tabela `entry_type_templates` com
@@ -249,9 +271,14 @@ Reutilizando estruturas existentes; nenhum motor financeiro/reconciliação para
 
 - **Slice 1** — `financial_engine.py` ganha `settle_liquidity_projection` (a função atual,
   renomeada/isolada para uso exclusivo da projeção) e `reconcile_actual_liquidity` (novo: só produz
-  `liquidity_used`/`liquidity_deposit` quando há `AccountBalanceObservation` ou movimento
-  confirmado explicitamente no período; caso contrário, `closing_liquidity_balance = opening` e um
-  novo campo `unexplained_operating_result` é exposto para revisão humana, nunca mascarado).
+  `liquidity_used`/`liquidity_deposit` quando há um movimento de transferência importado/observado
+  no extrato bancário ou uma ação explicitamente confirmada pelo usuário/Assistente no período —
+  correção de revisão de 2026-09-11: uma `AccountBalanceObservation` isolada **nunca** basta, pois
+  prova a posição soberana num instante, não a causa; ela apenas atualiza a posição soberana e pode
+  gerar `reconciliation_divergence`/`unexplained_operating_result` para revisão humana, mas não
+  fabrica um resgate/aplicação específico. Na ausência de movimento importado/observado ou ação
+  confirmada, `closing_liquidity_balance = opening` e o campo `unexplained_operating_result` é
+  exposto para revisão humana, nunca mascarado).
   Novo endpoint `POST /liquidity/confirm-movement` (mesmo padrão de `funding_source` do
   `pay_obligation`) para o usuário confirmar explicitamente um resgate/aplicação. Extensão do
   payload de snapshot/dashboard com `observed_balance`, `movements_since_observation`,
@@ -281,10 +308,17 @@ Reutilizando estruturas existentes; nenhum motor financeiro/reconciliação para
   escrita exclusiva do Assistente). `POST /assistant/actions/{id}/undo` só é aceito quando o
   `typed_action` subjacente já tem um caminho de reversão determinístico (reaproveita
   `unpay_obligation`, `card_payment_reconciliations/unlink`, exclusão auditada de lançamento
-  manual).
+  manual). Ainda neste slice: nova tabela `entry_type_templates` (§3.6) e endpoints
+  `POST /entry-type-templates` (criação, status inicial `observed`/`suggested`) e
+  `POST /entry-type-templates/{id}/activate` (restrito a administrador, mesma barreira de
+  `POST /classification-rules/{id}/activate`) — mecanismo de aprendizado do Assistente para "Outra
+  entrada"/"Outra saída".
 - **Slice 5** — puramente frontend: renomeação/reordenação de `data-view` em
   `app/templates/index.html`, absorção das views antigas como abas contextuais dentro das novas,
-  remoção de "Lançar agora" como item de `#main-nav`. Nenhum endpoint novo.
+  remoção de "Lançar agora" como item de `#main-nav`. Nenhum endpoint novo. Único ponto não
+  puramente cosmético: os seletores de Entradas/Saídas passam a listar os `entry_type_templates`
+  já `active` (criados no Slice 4) como opções reutilizáveis — apresentação apenas, nenhuma lógica
+  de aprendizado nova.
 - **Slice 6** — CRUD simples sobre `Investment`/`InvestmentValuation` (`POST/GET/PATCH
   /investments`, `POST /investments/{id}/valuations`), reaproveitando o padrão de
   `POST /account-balances` (observação imutável + `supersedes_id`). Dashboard/patrimônio somam
@@ -327,7 +361,7 @@ Reutilizando estruturas existentes; nenhum motor financeiro/reconciliação para
 |---|---|---|---|---|
 | 1 | Pagamento de fatura nunca duplica gasto | `test_manual_payment_with_sufficient_amount_is_reconciliation_with_zero_new_expense` (INV-002) | — | Pagamento **parcial** também não duplica gasto (Slice 2) |
 | 2 | Aplicação/resgate Privilège↔Corrente nunca vira renda/despesa | INV-003/004 (`test_application_is_patrimonial_movement`, `test_redemption_is_not_operating_income`) | — | — (não afetado pelo Slice 1) |
-| 3 | Resultado operacional negativo nunca fabrica resgate | — | `test_liquidity_transition_never_produces_negative_balance`, `test_deficit_uses_all_available_liquidity_before_becoming_uncovered`, `test_safety_floor_never_blocks_real_deficit_coverage`, 4 testes de `test_property_based_financial_rules.py:116-181`, `test_financial_snapshots.py:1671,1744` — todos precisam ser rescopados para "projeção", não "fato realizado" | `test_actual_snapshot_never_fabricates_liquidity_withdrawal_without_observed_or_confirmed_movement` |
+| 3 | Resultado operacional negativo nunca fabrica resgate | — | `test_liquidity_transition_never_produces_negative_balance`, `test_deficit_uses_all_available_liquidity_before_becoming_uncovered`, `test_safety_floor_never_blocks_real_deficit_coverage`, 4 testes de `test_property_based_financial_rules.py:116-181`, `test_financial_snapshots.py:1671,1744` — todos precisam ser rescopados para "projeção", não "fato realizado" | `test_actual_snapshot_never_fabricates_liquidity_withdrawal_without_transfer_movement_or_confirmed_action` **e** `test_account_balance_observation_alone_never_materializes_liquidity_transfer` (observação de saldo isolada só pode gerar `reconciliation_divergence`/`unexplained_operating_result`, nunca `liquidity_used`/`liquidity_deposit`) |
 | 4 | Saldo observado posterior não sofre subtração dupla | `test_point_in_time_balance_becomes_next_period_opening_evidence` (documenta o comportamento atual — preservar como caso de fronteira) | — | Observação **intra-período** deve refletir imediatamente, não só no período seguinte |
 | 5 | Compra de cartão não reduz saldo antes do pagamento | `tests/test_card_open_invoice_competence.py` (suite completa) | — | — |
 | 6 | Fatura fechada não paga é COMPROMETIDO | — | — | Suite completa nova para `CardInvoice` (estado `closed`) |
@@ -368,7 +402,14 @@ Slice 4 (Assistente Financeiro operacional)
 Slice 5 (UX e navegação alvo)
    │  depende de: 1–4 substancialmente prontos (evita navegar para fluxo inacabado)
    │  pode iniciar renomeação mecânica de abas em paralelo, mas a integração final aguarda 4
-Slice 6 (Patrimônio e investimentos) — independente; pode rodar em paralelo a 2–5
+   ▼
+Slice 6 (Patrimônio e investimentos)
+   │  nota arquitetural: tecnicamente independente de 2–5 (CRUD de
+   │  `Investment`/`InvestmentValuation` não compartilha tabela nem serviço com
+   │  cartões/obrigações/Assistente/navegação) — mas isso é só uma observação de dependências, não
+   │  uma recomendação de execução. Correção de revisão (2026-09-11): a governança do P0 #87 exige
+   │  sequenciamento estrito 0→1→2→3→4→5→6→7→8; Slice 6 não deve ser iniciado/executado em paralelo
+   │  a 2–5.
    │  bloqueia: 7 (relatório patrimonial)
    ▼
 Slice 7 (Gastos & Economia + Relatórios)
@@ -428,9 +469,15 @@ grave não mencionada explicitamente no Work Order.
 do escopo de projeção (`projection_engine.py`) daqui para frente. Para o snapshot **realizado**
 (`calculate_actual_snapshot`), substituir a chamada por uma nova função
 (`reconcile_actual_liquidity`, esboçada no §4) que só produz `liquidity_used`/`liquidity_deposit`
-quando há evidência (`AccountBalanceObservation` no período ou movimento explicitamente confirmado
-pelo usuário/Assistente); na ausência de evidência, expõe `unexplained_operating_result` para
-revisão humana em vez de fabricar o movimento.
+quando há evidência de movimento — um movimento de transferência importado/observado no extrato
+bancário ou uma ação explicitamente confirmada pelo usuário/Assistente. **Correção de revisão
+(2026-09-11):** `AccountBalanceObservation` sozinha não é evidência suficiente — ela prova a posição
+soberana num instante, não a causa do delta; usá-la isoladamente para materializar
+`liquidity_used`/`liquidity_deposit` seria permissivo demais frente ao rebaseline §4.3/§5.1. Uma
+observação de saldo, isolada, apenas atualiza a posição soberana e pode expor
+`reconciliation_divergence` (delta não explicado); na ausência de movimento importado/observado ou
+ação confirmada, expõe `unexplained_operating_result` para revisão humana em vez de fabricar o
+movimento.
 
 **Trade-offs:** preserva 100% da funcionalidade de projeção sem alterar sua semântica (que já está
 correta e não é alvo de nenhuma crítica do rebaseline); adiciona uma segunda função no motor, mas
@@ -467,5 +514,7 @@ projeção.
   navegação) é funcionalidade **nova**, não uma correção de comportamento incorreto — o sistema
   atual não "faz errado", ele simplesmente ainda não expõe esses conceitos.
 - Recomendação de início: Slice 1, seguindo a alternativa proposta no Technical Challenge #1,
-  seguido de Slice 2. Slice 6 (investimentos) pode ser paralelizado por ser independente, se o
-  engenheiro preferir ganho de valor mais cedo.
+  seguido de Slice 2, respeitando o sequenciamento estrito 0→1→2→3→4→5→6→7→8 exigido pela
+  governança do P0 #87 (correção de revisão de 2026-09-11 — a recomendação anterior de paralelizar
+  o Slice 6 foi removida). Slice 6 (investimentos) é tecnicamente independente de 2–5 como nota
+  arquitetural (§7), mas não deve ser adiantado nem executado em paralelo.
