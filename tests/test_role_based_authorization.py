@@ -320,6 +320,36 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
         ("monthly close trust", "post", "/api/monthly-closes/2026-08/trust", {}),
         ("monthly close reopen", "post", "/api/monthly-closes/2026-08/reopen", {"json": reason}),
         (
+            "card competence repair preview",
+            "post",
+            "/api/maintenance/card-competence/preview",
+            {},
+        ),
+        (
+            "card competence repair apply",
+            "post",
+            "/api/maintenance/card-competence/apply",
+            {
+                "json": {
+                    "transaction_ids": ["missing-transaction-id"],
+                    "expected_financial_revision": 0,
+                    "reason": "tentativa de acesso indevido",
+                }
+            },
+        ),
+        (
+            "card competence repair rollback",
+            "post",
+            "/api/maintenance/card-competence/rollback",
+            {
+                "json": {
+                    "transaction_ids": ["missing-transaction-id"],
+                    "expected_financial_revision": 0,
+                    "reason": "tentativa de acesso indevido",
+                }
+            },
+        ),
+        (
             "user create",
             "post",
             "/api/users",
@@ -519,6 +549,18 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             {"json": {"name": "Conta indevida", "due_date": "2026-08-10", "amount": "50.00"}},
         ),
         ("obligation delete", "delete", "/api/obligations/missing", {}),
+        (
+            "obligation pay",
+            "post",
+            "/api/obligations/missing/pay",
+            {"json": {"transaction_id": "missing-transaction-id"}},
+        ),
+        (
+            "obligation unpay",
+            "post",
+            "/api/obligations/missing/unpay",
+            {"json": reason},
+        ),
         (
             "profile update",
             "put",

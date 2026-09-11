@@ -69,6 +69,9 @@ class Account(Base, TimestampMixin):
     account_type: Mapped[str] = mapped_column(String(30), default="checking")
     owner_label: Mapped[str] = mapped_column(String(80), default="Família")
     last_four: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    # FAMILY_FINANCE_CARD_CYCLES_PRIVILEGE_V13
+    card_closing_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    card_due_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -309,6 +312,9 @@ class PayrollRecord(Base, TimestampMixin):
 class Obligation(Base, TimestampMixin):
     __tablename__ = "obligations"
 
+    # FAMILY_FINANCE_OBLIGATION_PAYMENT_V8
+    # active=False continua significando cancelada/desativada. O estado de
+    # pagamento é separado para que uma obrigação paga continue auditável.
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     household_id: Mapped[str] = mapped_column(ForeignKey("households.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(200))
@@ -317,7 +323,31 @@ class Obligation(Base, TimestampMixin):
     recurrence_months: Mapped[int] = mapped_column(Integer, default=0)
     occurrence_count: Mapped[int] = mapped_column(Integer, default=1)
     category: Mapped[str] = mapped_column(String(60), default="general")
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    paid_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    paid_transaction_id: Mapped[str | None] = mapped_column(
+        ForeignKey("transactions.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
+    payment_transaction_created: Mapped[bool] = mapped_column(Boolean, default=False)
+    funding_source: Mapped[str] = mapped_column(String(20), default="account")
+    funding_transaction_id: Mapped[str | None] = mapped_column(
+        ForeignKey("transactions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    funding_balance_observation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("account_balance_observations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    paid_transaction: Mapped[Transaction | None] = relationship(
+        foreign_keys=[paid_transaction_id]
+    )
 
 
 class FinancialProfile(Base, TimestampMixin):

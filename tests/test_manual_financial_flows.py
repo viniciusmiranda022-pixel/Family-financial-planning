@@ -77,10 +77,22 @@ def _setup_household(client, *, household_name="Família Fluxos", username="admi
     return setup.json()
 
 
-def _create_account(client, *, name, account_type="checking", last_four=None):
+def _create_account(
+    client,
+    *,
+    name,
+    account_type="checking",
+    last_four=None,
+    card_closing_day=None,
+    card_due_day=None,
+):
     payload = {"name": name, "account_type": account_type}
     if last_four is not None:
         payload["last_four"] = last_four
+    if card_closing_day is not None:
+        payload["card_closing_day"] = card_closing_day
+    if card_due_day is not None:
+        payload["card_due_day"] = card_due_day
     response = client.post("/api/accounts", json=payload)
     assert response.status_code == 201, response.text
     return response.json()["id"]
@@ -160,14 +172,35 @@ def test_manual_refund_offsets_expense_without_becoming_income():
     (`docs/FINANCIAL_INVARIANTS.md`) is proven at the invariant-evaluator
     level by `tests/test_financial_invariants.py::
     test_refund_offsets_expense_without_creating_income`; this test proves
-    the same property end-to-end through the actual manual-entry command
-    and `GET /dashboard`, matching the rigor already applied to the other
-    11 flows in this file and in `tests/test_manual_transfers.py`.
+    the same property end-to-end through the actual manual-entry command,
+    `GET /dashboard` and `GET /reports`, matching the rigor already applied
+    to the other 11 flows in this file and in `tests/test_manual_transfers.py`.
 
     `_operating_expenses = max(0, expenses - refunds)`
     (`app/services/financial_snapshots.py`), so a refund must reduce
-    `spending` by exactly its amount and must never touch `cash_in` -- an
-    estorno is a expense offset, never operational income."""
+    `spending` by exactly its amount -- an estorno is always an expense
+    offset, never operational income (INV-016: "efeito em receita
+    operacional == 0"). That is a distinct claim from what `cash_in` means:
+
+    - `docs/FINANCIAL_RULES.md` line 14: "Estorno é crédito."
+    - `docs/INTEGRITY_IMPLEMENTATION_PLAN.md` keeps `operating_income` and
+      `bank_cash_in` as separate metrics by contract -- the first is
+      operational revenue, the second is real cash movement in the account.
+    - `dashboard_monetary_publication()` publishes `cash_in =
+      snapshot.bank_cash_in` (`app/services/financial_snapshots.py`), not
+      `operating_income` -- so a refund credited to a non-card account
+      *must* raise `GET /dashboard`'s `cash_in`, exactly like the real bank
+      statement would show it, while never raising operational income.
+
+    Engineering decision on PR #81 (2026-09-10, resolving the Technical
+    Challenge this test previously raised): `_collect()` crediting
+    `bank_cash_in` for a non-card refund is the correct, deliberate
+    contract (`f365a0d`), and this test's prior assertion
+    (`cash_in == before cash_in`) was the stale one. This test now proves
+    both halves of the contract end-to-end: `GET /dashboard`'s `cash_in`
+    (real bank inflow) rises by the refund, while `GET /reports`'s
+    per-month `cash_in` (which aliases `operating_income`, see
+    `report_month_monetary_publication`) does not move at all."""
     client, session_factory = _client()
     with client:
         _setup_household(client)
@@ -188,6 +221,8 @@ def test_manual_refund_offsets_expense_without_becoming_income():
         assert expense.status_code == 201, expense.text
 
         before = client.get("/api/dashboard?month=2026-08").json()
+        before_report = client.get("/api/reports?end_month=2026-08&months=1").json()
+        before_operating_income = before_report["monthly"][0]["cash_in"]
         response = client.post(
             "/api/transactions",
             json={
@@ -202,8 +237,19 @@ def test_manual_refund_offsets_expense_without_becoming_income():
         transaction_id = response.json()["id"]
 
         after = client.get("/api/dashboard?month=2026-08").json()
+        after_report = client.get("/api/reports?end_month=2026-08&months=1").json()
+        after_operating_income = after_report["monthly"][0]["cash_in"]
+
         assert after["spending"] == before["spending"] - 100
-        assert after["cash_in"] == before["cash_in"]
+        # Real bank inflow: the refund lands in the checking account, so the
+        # dashboard's `cash_in` (== `bank_cash_in`) must rise by exactly it.
+        assert after["cash_in"] == before["cash_in"] + 100
+        # Never operational income: `GET /reports`'s `cash_in` (== the same
+        # snapshot's `operating_income`) must stay untouched by the refund,
+        # matching INV-016 and the invariant-evaluator-level proof in
+        # `test_financial_invariants.py::
+        # test_refund_offsets_expense_without_creating_income`.
+        assert after_operating_income == before_operating_income
 
         rows = client.get("/api/transactions?month=2026-08").json()
         row = next(item for item in rows if item["id"] == transaction_id)
@@ -399,11 +445,13 @@ def test_checking_account_expense_defaults_competence_to_booked_at_month():
 
 
 def test_credit_card_expense_without_explicit_competence_is_rejected():
-    """INV-017: a card purchase's competence follows the invoice, not
-    necessarily the purchase date. This app has no invoice entity yet to
-    derive that automatically (lands with the "Contas a pagar" slice), so
-    the command must fail closed instead of fabricating
-    `booked_at.strftime("%Y-%m")` -- see the engineering review on PR 47."""
+    """INV-017 (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md): a
+    card purchase's competence follows the invoice's configured cycle
+    (`card_closing_day`/`card_due_day`), never `booked_at`'s own month. A
+    card with no cycle persisted has no fact to derive that invoice from, so
+    `_card_invoice_competence` must fail closed instead of fabricating one
+    -- explicit competence cannot rescue that, since there is nothing to
+    validate it against either."""
     client, _ = _client()
     with client:
         _setup_household(client)
@@ -422,18 +470,26 @@ def test_credit_card_expense_without_explicit_competence_is_rejected():
             },
         )
         assert response.status_code == 422
-        assert "competência" in response.json()["detail"].lower()
+        assert "fechamento" in response.json()["detail"].lower()
 
 
 def test_credit_card_expense_persists_explicitly_confirmed_competence():
-    """The confirmed competence is persisted verbatim even when it differs
-    from `booked_at`'s month (e.g. a purchase near the statement's closing
-    date that lands in the *following* month's invoice) -- `booked_at`
-    itself is untouched, preserving it as lineage per INV-017."""
+    """When the card's cycle is configured, an explicitly confirmed
+    competence that matches the cycle's own calculation is accepted and
+    persisted verbatim, even when it differs from `booked_at`'s month (e.g.
+    a purchase near the statement's closing date that lands in the
+    *following* month's invoice) -- `booked_at` itself stays untouched,
+    preserved as lineage per INV-017."""
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         response = client.post(
@@ -544,7 +600,12 @@ def test_manual_expense_in_credit_card_account_carries_card_lineage():
     with client:
         _setup_household(client)
         nubank_card = _create_account(
-            client, name="Nubank Cartão", account_type="credit_card", last_four="4242"
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            last_four="4242",
+            card_closing_day=25,
+            card_due_day=25,
         )
         category_id = _non_system_category_id(client)
 
@@ -574,7 +635,13 @@ def test_manual_installment_expense_populates_installment_and_card_fields():
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         response = client.post(
@@ -613,7 +680,13 @@ def test_manual_installment_feeds_canonical_projection_without_duplicating_obser
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         # Parcela 2/4 observed in August.
@@ -674,7 +747,13 @@ def test_future_installments_anchors_schedule_on_confirmed_competence_not_booked
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         response = client.post(
@@ -709,7 +788,13 @@ def test_future_installments_replaces_observed_competence_month_without_duplicat
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         first = client.post(
@@ -961,7 +1046,13 @@ def test_installment_preview_reflects_already_persisted_commitments():
     client, _ = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         itau = _create_account(client, name="Itaú Corrente", account_type="checking")
         category_id = _non_system_category_id(client)
 
@@ -1017,7 +1108,13 @@ def test_installment_preview_anchors_on_confirmed_competence_not_booked_at():
     client, _ = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
 
         preview = client.get(
             "/api/transactions/manual/installment-preview",
@@ -1046,7 +1143,13 @@ def test_installment_preview_matches_persisted_projection_for_divergent_competen
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         params = {
@@ -1103,7 +1206,13 @@ def test_installment_preview_simulates_series_replacement_for_next_observed_inst
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        nubank_card = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        nubank_card = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=25,
+        )
         category_id = _non_system_category_id(client)
 
         first = client.post(
@@ -1273,4 +1382,4 @@ def test_installment_preview_requires_competence_for_card_account():
             },
         )
         assert response.status_code == 422
-        assert "competência" in response.json()["detail"].lower()
+        assert "fechamento" in response.json()["detail"].lower()

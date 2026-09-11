@@ -192,6 +192,27 @@ série foi mesclado por conta própria.
 - observabilidade e alertas;
 - rotina documentada de atualização e rollback.
 
+## Evolução futura registrada — Family Finance AI Assistant via WhatsApp
+
+Epic **#71**. Fonte de verdade: [`WHATSAPP_AI_ASSISTANT_PLAN.md`](./WHATSAPP_AI_ASSISTANT_PLAN.md).
+
+Objetivo: transformar o WhatsApp em uma interface conversacional para **WRITE + QUERY + CONTEXT + ADVISOR**, usando linguagem natural livre e composição dinâmica de tools do backend.
+
+Princípio obrigatório: **LLM entende e orquestra; o Family Finance calcula, valida e persiste**. Não haverá catálogo fechado de perguntas, `if/else` por frase, SQL gerado pelo modelo ou novo motor financeiro paralelo. O LLM não tem acesso direto ao banco e nenhuma escrita ocorre sem draft, prévia e confirmação humana.
+
+Sequência planejada:
+
+1. #72 — WA-00: discovery, ADR, custos e contratos;
+2. #73 — WA-01: gateway WhatsApp, webhook e autorização de números;
+3. #74 — WA-02: orquestrador LLM tool-driven e camada semântica genérica;
+4. #75 — WA-03: WRITE com drafts, confirmação e idempotência;
+5. #76 — WA-04: QUERY/analytics genérico para perguntas livres;
+6. #77 — WA-05: contexto conversacional e follow-ups;
+7. #78 — WA-06: Advisor, comparações e projeções;
+8. #79 — WA-07: mídia, hardening, observabilidade e validação E2E.
+
+A iniciativa é backlog e não autoriza execução paralela. Deve respeitar `docs/NEXT_STEPS.md`, a fila normativa vigente, invariants financeiros, household isolation, RBAC e o objetivo de custo recorrente R$ 0,00. Qualquer dependência paga não aprovada deve parar em Technical Challenge.
+
 ## Fora do escopo inicial
 
 - conexão direta ao internet banking;

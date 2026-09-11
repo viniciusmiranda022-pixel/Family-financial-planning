@@ -90,6 +90,14 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                 "account_type": "credit_card",
                 "owner_label": "Família",
                 "last_four": "1234",
+                # INV-017 (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md):
+                # a card expense's competence is derived from the account's
+                # own persisted cycle -- fail-closed without one. A cycle
+                # that closes on the last day of the month never rolls a
+                # purchase into the next month, keeping this flow's
+                # existing within-month dates unaffected.
+                "card_closing_day": 31,
+                "card_due_day": 31,
             },
         )
         assert account.status_code == 201
@@ -405,7 +413,13 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             b"2026-07-31,iFood - NuPay,33.40\n"
             b"2026-08-04,iFood - NuPay,44.88\n"
             b"2026-08-03,Pagamento recebido,-1724.90\n"
-            b"2026-08-02,Spotify 1/4,31.90\n"
+            # `app.services.importer._installment` requires the literal
+            # "PARCELA" word before the "N/M" pair -- a bare "1/4" is never
+            # recognized, on purpose (avoids misreading a coincidental
+            # number pair in an unrelated description as an installment).
+            # This is the real Itaú/Nubank phrasing the parser's own
+            # docstring documents, not just this fixture's shorthand.
+            b"2026-08-02,Spotify PARCELA 1/4,31.90\n"
         )
         upload = client.post(
             "/api/imports",

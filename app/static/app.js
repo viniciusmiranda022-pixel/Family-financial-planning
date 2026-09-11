@@ -119,6 +119,39 @@ function toast(message, error = false) {
 }
 
 async function api(path, options = {}) {
+  // FAMILY_FINANCE_OBLIGATION_FUNDING_PROMPT_V13_4
+  if (
+    /^\/obligations\/[^/]+\/pay$/.test(path)
+    && String(options.method || "GET").toUpperCase() === "POST"
+    && typeof options.body === "string"
+  ) {
+    let body;
+    try {
+      body = JSON.parse(options.body);
+    } catch (_) {
+      body = null;
+    }
+
+    if (body && !body.funding_source) {
+      const answer = window.prompt(
+        "De onde saiu o dinheiro para este pagamento?\\n\\n"
+        + "Digite P = retirei do Privilège DI\\n"
+        + "Digite C = o valor já estava na conta pagadora\\n\\n"
+        + "Cancelar = não concluir o pagamento."
+      );
+      if (answer === null) {
+        throw new Error("Pagamento cancelado antes da confirmação da origem do recurso.");
+      }
+
+      const normalized = String(answer).trim().toUpperCase();
+      if (!["P", "C"].includes(normalized)) {
+        throw new Error("Origem inválida. Digite P para Privilège DI ou C para conta pagadora.");
+      }
+
+      body.funding_source = normalized === "P" ? "privilege" : "account";
+      options = { ...options, body: JSON.stringify(body) };
+    }
+  }
   const response = await fetch(`/api${path}`, {
     credentials: "same-origin",
     headers: options.body instanceof FormData ? {} : { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -269,6 +302,7 @@ async function loadAccounts() {
     ? checkingAccounts.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} • ${escapeHtml(item.owner_label)}</option>`).join("")
     : '<option value="">Cadastre uma conta corrente primeiro</option>';
   updateExpenseCompetenceField();
+  updateExpenseFundingField();
   const captureSelect = document.querySelector("#capture-account");
   if (captureSelect) {
     const selected = captureSelect.value;
@@ -376,17 +410,220 @@ function renderDashboardPulse(report) {
   document.querySelector("#dashboard-average-detail").textContent = `${report.covered_months} de ${report.months} meses possuem movimentações.`;
 }
 
+// FAMILY_FINANCE_CARD_SUMMARY_V10
+function renderCreditCardSummary(data, selectedLabel) {
+  const rows = data?.rows || [];
+  const totals = data?.totals || {};
+  const isFuture = data?.month > currentMonthKey();
+
+  document.querySelector("#credit-card-summary-title").textContent =
+    `Gastos por cartão em ${selectedLabel}`;
+  document.querySelector("#credit-card-summary-note").textContent = isFuture
+    ? "Para mês futuro, a coluna de parcelas previstas mostra os compromissos já conhecidos. Pagamento da fatura não é contado novamente."
+    : "Realizado vem das compras lançadas na competência. Pagamento da fatura é apenas conciliação e não é contado novamente.";
+
+  document.querySelector("#credit-card-total-actual").textContent =
+    money.format(Number(totals.actual_spending || 0));
+  document.querySelector("#credit-card-total-projected").textContent =
+    money.format(Number(totals.projected_installments || 0));
+  document.querySelector("#credit-card-total-future").textContent =
+    money.format(Number(totals.future_installments_after_month || 0));
+
+  document.querySelector("#credit-card-summary-table").innerHTML = rows.length
+    ? rows.map((item) => `
+      <tr>
+        <td>
+          <strong>${escapeHtml(item.account)}</strong>
+          ${item.last_projected_month ? `<small class="credit-card-horizon">parcelas conhecidas até ${escapeHtml(shortMonthLabel(item.last_projected_month))}</small>` : ""}
+        </td>
+        <td class="right amount-expense">${money.format(Number(item.actual_spending || 0))}</td>
+        <td class="right ${Number(item.projected_installments || 0) > 0 ? "amount-expense" : ""}">${money.format(Number(item.projected_installments || 0))}</td>
+        <td class="right">${money.format(Number(item.future_installments_after_month || 0))}</td>
+      </tr>
+    `).join("")
+    : emptyRow(4, "Nenhum cartão de crédito ativo cadastrado");
+}
+
+
+// FAMILY_FINANCE_FUTURE_OVERVIEW_V16
+// FAMILY_FINANCE_FUTURE_OVERVIEW_FIX_V16_1
+// FAMILY_FINANCE_ESTIMATED_LIQUIDITY_CAPTION_V16_2
+function setDashboardKpiLabel(valueSelector, label) {
+  const value = document.querySelector(valueSelector);
+  const title = value?.closest(".kpi")?.querySelector("span");
+  if (title) title.textContent = label;
+}
+function setDashboardKpiCaption(valueSelector, caption) {
+  const value = document.querySelector(valueSelector);
+  const small = value?.closest(".kpi")?.querySelector("small");
+  if (small) small.textContent = caption;
+}
+// FAMILY_FINANCE_CURRENT_MONTH_CONFIRMED_BALANCE_SYNC_V17
+async function applyCurrentMonthConfirmedLiquidity(selectedMonth) {
+  if (selectedMonth !== currentMonthKey()) return;
+
+  const fact = await api("/liquidity/current-confirmed");
+  const currentBalance = Number(fact.amount || 0);
+  const formattedDate = fact.as_of_date
+    ? dateFormat.format(new Date(`${fact.as_of_date}T00:00:00Z`))
+    : "data não informada";
+
+  document.querySelector("#kpi-liquidity-name").textContent =
+    `Saldo atual confirmado no ${fact.name || "Privilège DI"}`;
+  document.querySelector("#kpi-investment").textContent =
+    money.format(currentBalance);
+  document.querySelector("#kpi-liquidity-caption").textContent =
+    `Confirmado em ${formattedDate} • o mesmo saldo exibido em Configurações`;
+}
+
+async function applyFutureMonthDashboardSemantics(summary, selectedMonth, selectedLabel) {
+  if (selectedMonth <= currentMonthKey()) return;
+
+  const [forecast, currentLiquidityFact] = await Promise.all([
+    api("/forecast"),
+    api("/liquidity/current-confirmed"),
+  ]);
+  const row = (forecast.rows || []).find((item) => item.month === selectedMonth);
+  if (!row) return;
+
+  const cardPosted = Number(summary.card_spending || 0);
+  const cardProjected = Number(row.installments || 0);
+  const cardKnown = cardPosted + cardProjected;
+  const obligations = Number(row.obligations || 0);
+  const commitmentsKnown = cardKnown + obligations;
+  const fixedIncome = Number(row.salary || 0) + Number(row.payroll_extras || 0);
+  const expectedCommission = Number(row.commission_expected || 0);
+  const currentLiquidity = Number(currentLiquidityFact.amount || 0);
+
+  document.querySelector("#kpi-liquidity-name").textContent =
+    `Saldo atual confirmado no ${summary.liquidity_name || "Privilège DI"}`;
+  document.querySelector("#kpi-investment").textContent = money.format(currentLiquidity);
+  // FAMILY_FINANCE_ROLLING_LIQUIDITY_ESTIMATE_V16_3
+  // Projeção acumulada: o fechamento estimado de um mês vira a base do seguinte.
+  // O teto mensal NÃO é tratado como uma despesa adicional aqui; ele é apenas limite.
+  const rowsThroughSelected = (forecast.rows || [])
+    .filter((item) => item.month > currentMonthKey() && item.month <= selectedMonth)
+    .sort((a, b) => a.month.localeCompare(b.month));
+
+  const monthlySummaries = await Promise.all(
+    rowsThroughSelected.map((item) =>
+      item.month === selectedMonth
+        ? Promise.resolve(summary)
+        : api(`/dashboard?month=${encodeURIComponent(item.month)}`)
+    )
+  );
+
+  let estimatedLiquidity = currentLiquidity;
+  rowsThroughSelected.forEach((item, index) => {
+    const monthSummary = monthlySummaries[index] || {};
+    const monthPostedCards = Number(monthSummary.card_spending || 0);
+    const monthProjectedCards = Number(item.installments || 0);
+    const monthObligations = Number(item.obligations || 0);
+    const monthKnownOutflows =
+      monthPostedCards + monthProjectedCards + monthObligations;
+
+    const monthExpectedInflows =
+      Number(item.salary || 0)
+      + Number(item.payroll_extras || 0)
+      + Number(item.commission_expected || 0);
+
+    estimatedLiquidity += monthExpectedInflows - monthKnownOutflows;
+  });
+
+  document.querySelector("#kpi-liquidity-caption").textContent =
+    `Estimativa acumulada até ${selectedLabel}: ${money.format(estimatedLiquidity)} • considera entradas previstas e compromissos conhecidos`;
+  document.querySelector("#liquidity-kpi-card")?.classList.remove("under-floor");
+
+  setDashboardKpiLabel("#kpi-cash-in", "Entradas previstas fixas");
+  document.querySelector("#kpi-cash-in").textContent = money.format(fixedIncome);
+  setDashboardKpiCaption(
+    "#kpi-cash-in",
+    expectedCommission > 0
+      ? `Salário/extras cadastrados; comissão esperada de ${money.format(expectedCommission)} fica separada na projeção`
+      : "Salário e extras cadastrados; sem resgates ou transferências"
+  );
+
+  setDashboardKpiLabel("#kpi-cash-out", "Já saiu das contas");
+  document.querySelector("#kpi-cash-out").textContent = money.format(Number(summary.bank_cash_out || 0));
+  document.querySelector("#kpi-cash-out-caption").textContent =
+    `Previsto: cartões ${money.format(cardKnown)} • outras obrigações ${money.format(obligations)} • total ${money.format(commitmentsKnown)}`;
+
+  setDashboardKpiLabel("#kpi-spending", "Gasto previsto no mês");
+  document.querySelector("#kpi-spending").textContent = money.format(commitmentsKnown);
+  document.querySelector("#kpi-cap-caption").textContent =
+    `Inclui cartões ${money.format(cardKnown)} • outras obrigações ${money.format(obligations)} em ${selectedLabel}`;
+
+  const cap = Number(summary.cash_cap || row.cash_cap || 0);
+  const remainingCap = cap - commitmentsKnown;
+
+  setDashboardKpiLabel("#kpi-remaining", "Disponível no teto");
+  const remainingValue = document.querySelector("#kpi-remaining");
+  remainingValue.textContent = money.format(remainingCap);
+  remainingValue.classList.toggle("amount-expense", remainingCap < 0);
+  document.querySelector("#remaining-cap-card")?.classList.toggle("over-budget", remainingCap < 0);
+  document.querySelector("#kpi-remaining-caption").textContent =
+    remainingCap < 0
+      ? `Gastos conhecidos ultrapassam o teto em ${money.format(Math.abs(remainingCap))}`
+      : `Teto ${money.format(cap)} menos gastos conhecidos de ${money.format(commitmentsKnown)}`;
+
+  const percent = cap > 0 ? Math.round((commitmentsKnown / cap) * 100) : 0;
+  const bar = document.querySelector("#budget-progress");
+  if (bar) {
+    bar.style.width = `${Math.min(Math.max(percent, 0), 100)}%`;
+    bar.classList.toggle("over", percent > 100);
+  }
+  const pill = document.querySelector("#budget-percent");
+  if (pill) {
+    pill.textContent = `${percent}%`;
+    pill.classList.toggle("over", percent > 100);
+  }
+  const budgetUsed = document.querySelector("#budget-used");
+  if (budgetUsed) budgetUsed.textContent = `${money.format(commitmentsKnown)} em gastos conhecidos`;
+  const budgetTotal = document.querySelector("#budget-total");
+  if (budgetTotal) budgetTotal.textContent = `${money.format(cap)} de teto`;
+
+  const bridge = document.querySelector("#liquidity-bridge");
+  if (bridge) {
+    bridge.classList.remove("deposit","withdrawal");
+    bridge.classList.add("balanced");
+    const icon=bridge.querySelector(".liquidity-bridge-icon");
+    if (icon) icon.textContent="↔";
+  }
+  const bridgeLabel=document.querySelector("#liquidity-bridge-label");
+  if (bridgeLabel) bridgeLabel.textContent=`Compromissos de ${selectedLabel} ainda não movimentaram o Privilège`;
+  const bridgeDetail=document.querySelector("#liquidity-bridge-detail");
+  if (bridgeDetail) bridgeDetail.textContent=
+    "Cartões e obrigações futuras são previsão. O saldo só muda quando houver pagamento real ou resgate confirmado.";
+  const bridgeValueLabel=document.querySelector("#liquidity-bridge-value-label");
+  if (bridgeValueLabel) bridgeValueLabel.textContent="Compromissos conhecidos";
+  const bridgeValue=document.querySelector("#liquidity-bridge-value");
+  if (bridgeValue) bridgeValue.textContent=money.format(commitmentsKnown);
+  const bridgeBalance=document.querySelector("#liquidity-bridge-balance");
+  if (bridgeBalance) bridgeBalance.textContent=`Saldo atual confirmado ${money.format(currentLiquidity)}`;
+
+  const categoriesTitle=document.querySelector("#monthly-categories-title");
+  if (categoriesTitle) categoriesTitle.textContent=`Compras já lançadas para ${selectedLabel} por categoria`;
+}
 async function loadDashboard() {
   const monthControl = document.querySelector("#dashboard-month");
   if (!monthControl.value) monthControl.value = currentMonthKey();
   const selectedMonth = monthControl.value;
-  const [summary, transactions, cutPlan, pulse] = await Promise.all([
+  // FAMILY_FINANCE_FUTURE_DASHBOARD_V7
+  // Snapshot = realizado; forecast = compromissos futuros conhecidos.
+  const isFutureMonth = selectedMonth > currentMonthKey();
+  const [summary, transactions, cutPlan, pulse, forecast] = await Promise.all([
     api(`/dashboard?month=${encodeURIComponent(selectedMonth)}`),
     api(`/transactions?limit=8&month=${encodeURIComponent(selectedMonth)}`),
     api(`/cut-plan?month=${encodeURIComponent(selectedMonth)}`),
     api(`/reports?end_month=${encodeURIComponent(selectedMonth)}&months=6`),
+    isFutureMonth ? api(`/forecast`) : Promise.resolve(null),
   ]);
+  const forecastRow = forecast?.rows?.find((item) => item.month === selectedMonth) || null;
+  const forecastInstallments = Number(forecastRow?.installments || 0);
+  const forecastObligations = Number(forecastRow?.obligations || 0);
+  const forecastKnownCommitments = forecastInstallments + forecastObligations;
   const selectedLabel = monthLabel(summary.month);
+  const cardSummary = await api(`/credit-cards/summary?month=${encodeURIComponent(summary.month)}`);
   state.dashboard = summary;
   monthControl.value = summary.month;
   document.querySelector("#dashboard-period-label").textContent = selectedLabel;
@@ -397,24 +634,51 @@ async function loadDashboard() {
   const liquidityWithdrawal = Number(summary.liquidity_withdrawal || 0);
   const liquidityDeposit = Number(summary.liquidity_deposit || 0);
   const liquidityUncovered = Number(summary.liquidity_uncovered_deficit || 0);
-  document.querySelector("#kpi-liquidity-name").textContent = `Saldo após fechamento no ${liquidityName}`;
-  document.querySelector("#kpi-investment").textContent = money.format(summary.liquidity_balance);
-  document.querySelector("#kpi-liquidity-caption").textContent = liquidityUncovered > 0
-    ? `Saldo informado de ${money.format(liquidityStarting)} totalmente consumido • faltam ${money.format(liquidityUncovered)}`
-    : liquidityWithdrawal > 0
-      ? `Saldo informado ${money.format(liquidityStarting)} • retirada de ${money.format(liquidityWithdrawal)}`
-      : liquidityDeposit > 0
-        ? `Saldo informado ${money.format(liquidityStarting)} + sobra de ${money.format(liquidityDeposit)}`
-        : `Saldo informado ${money.format(liquidityStarting)} • sem movimentação líquida`;
+  const currentObservation = summary.noncanonical?.current_liquidity_observation || null;
+  const observationMonth = String(currentObservation?.as_of_date || "").slice(0, 7);
+  const useCurrentObservation = (
+    observationMonth === selectedMonth
+    && currentObservation?.trusted === true
+    && typeof currentObservation.value === "number"
+  );
+  const liquidityDisplayed = useCurrentObservation
+    ? Number(currentObservation.value)
+    : Number(summary.liquidity_balance || 0);
+
+  if (useCurrentObservation) {
+    const observedDate = dateFormat.format(new Date(`${currentObservation.as_of_date}T00:00:00Z`));
+    document.querySelector("#kpi-liquidity-name").textContent = `Saldo atual confirmado no ${liquidityName}`;
+    document.querySelector("#kpi-investment").textContent = money.format(liquidityDisplayed);
+    document.querySelector("#kpi-liquidity-caption").textContent =
+      `Confirmado em ${observedDate} • fechamento calculado do mês: ${money.format(summary.liquidity_balance)}`;
+  } else {
+    document.querySelector("#kpi-liquidity-name").textContent = `Saldo após fechamento no ${liquidityName}`;
+    document.querySelector("#kpi-investment").textContent = money.format(summary.liquidity_balance);
+    document.querySelector("#kpi-liquidity-caption").textContent = liquidityUncovered > 0
+      ? `Saldo informado de ${money.format(liquidityStarting)} totalmente consumido • faltam ${money.format(liquidityUncovered)}`
+      : liquidityWithdrawal > 0
+        ? `Saldo informado ${money.format(liquidityStarting)} • retirada de ${money.format(liquidityWithdrawal)}`
+        : liquidityDeposit > 0
+          ? `Saldo informado ${money.format(liquidityStarting)} + sobra de ${money.format(liquidityDeposit)}`
+          : `Saldo informado ${money.format(liquidityStarting)} • sem movimentação líquida`;
+  }
   document.querySelector("#liquidity-kpi-card").classList.toggle(
     "under-floor",
-    liquidityClosing < Number(summary.emergency_floor || 0) || liquidityUncovered > 0,
+    liquidityDisplayed < Number(summary.emergency_floor || 0) || liquidityUncovered > 0,
   );
   document.querySelector("#kpi-cash-in").textContent = money.format(summary.cash_in);
   document.querySelector("#kpi-cash-out").textContent = money.format(summary.bank_cash_out);
-  document.querySelector("#kpi-cash-out-caption").textContent = `Cartões: ${money.format(summary.card_spending)} • compromissos totais: ${money.format(summary.cash_out)}`;
-  document.querySelector("#kpi-spending").textContent = money.format(summary.spending);
-  document.querySelector("#kpi-cap-caption").textContent = `de ${money.format(summary.cash_cap)} em ${selectedLabel}`;
+  document.querySelector("#kpi-cash-out-caption").textContent = isFutureMonth && forecastRow
+    ? `Previsto: cartões ${money.format(forecastInstallments)} • outras obrigações ${money.format(forecastObligations)} • total ${money.format(forecastKnownCommitments)}`
+    : isFutureMonth
+      ? "Nenhum compromisso futuro conhecido para este mês"
+      : `Cartões: ${money.format(summary.card_spending)} • compromissos totais: ${money.format(summary.cash_out)}`;
+  document.querySelector("#kpi-spending").textContent = money.format(
+    isFutureMonth && forecastRow ? forecastKnownCommitments : summary.spending,
+  );
+  document.querySelector("#kpi-cap-caption").textContent = isFutureMonth && forecastRow
+    ? `Compromissos conhecidos previstos em ${selectedLabel}`
+    : `de ${money.format(summary.cash_cap)} em ${selectedLabel}`;
   const remainingValue = document.querySelector("#kpi-remaining");
   remainingValue.textContent = money.format(summary.remaining_cap);
   remainingValue.classList.toggle("amount-expense", summary.remaining_cap < 0);
@@ -484,6 +748,7 @@ async function loadDashboard() {
       <tr><td><strong>${escapeHtml(item.account)}</strong></td><td>${escapeHtml(accountTypeLabels[item.account_type] || item.account_type)}</td><td class="right amount-income">${money.format(item.cash_in)}</td><td class="right amount-expense">${money.format(item.cash_out)}</td><td class="right">${money.format(item.refunds)}</td></tr>
     `).join("")
     : emptyRow(5, `Nenhuma movimentação operacional identificada em ${selectedLabel}`);
+  renderCreditCardSummary(cardSummary, selectedLabel);
   document.querySelector("#dashboard-obligation-alerts").innerHTML = summary.obligation_alerts.length
     ? summary.obligation_alerts.map((item) => `
       <div class="obligation-alert ${escapeHtml(item.alert_level)}"><div><strong>${escapeHtml(item.name)}</strong><small>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))} • ${escapeHtml(item.alert_label)}</small></div><span>${money.format(item.amount)}</span></div>
@@ -505,6 +770,8 @@ async function loadDashboard() {
   document.querySelector("#recent-transactions").innerHTML = transactions.length ? transactions.map((item) => `
     <tr><td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td><td>${escapeHtml(item.description)}</td><td><span class="status-chip">${escapeHtml(item.category)}</span></td><td>${escapeHtml(item.account)}</td><td class="right ${item.amount < 0 ? "amount-expense" : "amount-income"}">${money.format(item.amount)}</td></tr>
   `).join("") : emptyRow(5);
+  await applyCurrentMonthConfirmedLiquidity(selectedMonth);
+  await applyFutureMonthDashboardSemantics(summary, selectedMonth, selectedLabel);
 }
 
 function reportInsight(icon, label, value, detail, tone = "") {
@@ -663,20 +930,55 @@ function selectedExpenseEntryAccount() {
 // disabled fields are excluded from `FormData` (`formJson`), so the backend
 // never even receives an explicit `competence` for a non-card submission,
 // matching `_resolve_expense_competence`'s policy without a second rule here.
+// PRIORIDADE 0 hotfix (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md,
+// PR #81): this file used to also define `cardClosingDay`/
+// `cardInvoiceCompetence`, a second, JavaScript competence engine that
+// hardcoded Itau/Nubank/Mercado Pago closing days by account label and
+// recomputed the invoice month with a simpler (and by then stale) formula
+// than the backend's `_card_invoice_competence` -- exactly the "calculo de
+// competencia no JavaScript" the Work Order forbids. Neither function was
+// ever called (the field they would have fed is unconditionally disabled
+// above), so removing them changes no behavior; they were dead weight one
+// accidental call away from silently disagreeing with the backend again.
+
+// FAMILY_FINANCE_CARD_CYCLE_UI_V13_4
+// FAMILY_FINANCE_PRIVILEGE_FUNDING_V15
+function updateExpenseFundingField() {
+  const field = document.querySelector("#expense-entry-funding-field");
+  const select = document.querySelector("#expense-entry-funding");
+  if (!field || !select) return;
+
+  const account = selectedExpenseEntryAccount();
+  const canFund = ["checking", "cash"].includes(account?.account_type);
+  field.classList.toggle("hidden", !canFund);
+  select.disabled = !canFund;
+  if (!canFund) select.value = "account";
+
+  const hint = document.querySelector("#expense-entry-funding-hint");
+  if (hint) {
+    hint.textContent = canFund
+      ? "Escolha Privilège somente quando o resgate ainda não estiver registrado/importado."
+      : account?.account_type === "credit_card"
+        ? "Compra no cartão só usa o Privilège quando a fatura for paga."
+        : "Esta origem não se aplica à conta selecionada.";
+  }
+}
+
 function updateExpenseCompetenceField() {
   const field = document.querySelector("#expense-entry-competence");
   const hint = document.querySelector("#expense-entry-competence-hint");
-  const bookedAt = document.querySelector("#expense-entry-form").elements.booked_at.value;
-  const isCard = selectedExpenseEntryAccount()?.account_type === "credit_card";
-  field.required = isCard;
-  field.disabled = !isCard;
-  hint.textContent = isCard
-    ? "Compra no cartão: confirme o mês da fatura em que ela deve entrar; não é sempre o mês da compra (INV-017)."
-    : "Contas correntes usam sempre o mês da data do lançamento; não é editável (docs/FINANCIAL_RULES.md).";
-  if (isCard) {
-    if (!field.value && bookedAt) field.value = bookedAt.slice(0, 7);
-  } else {
-    field.value = bookedAt ? bookedAt.slice(0, 7) : "";
+  const account = selectedExpenseEntryAccount();
+  const isCard = account?.account_type === "credit_card";
+
+  if (field) {
+    field.required = false;
+    field.disabled = true;
+    field.value = "";
+  }
+  if (hint) {
+    hint.textContent = isCard
+      ? "Competência automática pelo fechamento/vencimento do cartão."
+      : "Competência automática pelo mês da data do lançamento.";
   }
 }
 
@@ -802,13 +1104,227 @@ async function loadSaidas() {
   });
 }
 
+// FAMILY_FINANCE_OBLIGATION_PAYMENT_V8
+let obligationPaymentContext = null;
+
+function obligationPaymentLocalToday() {
+  const now = new Date();
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+function obligationPaymentAccounts() {
+  return state.accounts.filter((account) => ["checking", "cash"].includes(account.account_type));
+}
+
+function ensureObligationPaymentDialog() {
+  let dialog = document.querySelector("#obligation-payment-dialog");
+  if (dialog) return dialog;
+
+  dialog = document.createElement("dialog");
+  dialog.id = "obligation-payment-dialog";
+  dialog.className = "obligation-payment-dialog";
+  dialog.innerHTML = `
+    <form id="obligation-payment-form">
+      <div class="obligation-payment-heading">
+        <div><span class="step-label">LIQUIDAR COMPROMISSO</span><h2 id="obligation-payment-title">Marcar como paga</h2></div>
+        <button type="button" class="text-button obligation-payment-close">Fechar</button>
+      </div>
+      <div class="obligation-payment-summary" id="obligation-payment-summary"></div>
+      <label>Como registrar o pagamento?
+        <select id="obligation-payment-source"></select>
+        <small>Se o débito já estiver no extrato, vincule-o. Caso contrário, crie a saída agora.</small>
+      </label>
+      <div id="obligation-payment-new-fields" class="obligation-payment-fields">
+        <label>Conta pagadora<select id="obligation-payment-account"></select></label>
+        <label>Data do pagamento<input type="date" id="obligation-payment-date"></label>
+        <label class="full">Descrição<input id="obligation-payment-description" maxlength="500"></label>
+      </div>
+      <div class="obligation-payment-actions">
+        <button type="button" class="secondary obligation-payment-close">Cancelar</button>
+        <button type="submit" class="primary">Marcar como paga</button>
+      </div>
+    </form>
+  `;
+  document.body.appendChild(dialog);
+
+  dialog.querySelectorAll(".obligation-payment-close").forEach((button) => {
+    button.addEventListener("click", () => dialog.close());
+  });
+  dialog.querySelector("#obligation-payment-source").addEventListener("change", () => {
+    const source = dialog.querySelector("#obligation-payment-source").value;
+    dialog.querySelector("#obligation-payment-new-fields").classList.toggle(
+      "hidden", source.startsWith("tx:")
+    );
+  });
+  dialog.querySelector("#obligation-payment-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!obligationPaymentContext) return;
+
+    const item = obligationPaymentContext.item;
+    const source = dialog.querySelector("#obligation-payment-source").value;
+    let body;
+    let sourceLabel;
+
+    if (source.startsWith("tx:")) {
+      const transactionId = source.slice(3);
+      const candidate = obligationPaymentContext.candidates.find(
+        (row) => row.transaction_id === transactionId
+      );
+      if (!candidate) {
+        toast("Lançamento selecionado não está mais disponível", true);
+        return;
+      }
+      body = { transaction_id: transactionId };
+      sourceLabel = `${candidate.account} • ${dateFormat.format(new Date(`${candidate.date}T00:00:00Z`))}`;
+    } else {
+      const accountId = dialog.querySelector("#obligation-payment-account").value;
+      const paidAt = dialog.querySelector("#obligation-payment-date").value;
+      const description = dialog.querySelector("#obligation-payment-description").value.trim();
+      const account = state.accounts.find((row) => row.id === accountId);
+      if (!accountId || !paidAt || description.length < 2) {
+        toast("Informe conta, data e descrição do pagamento", true);
+        return;
+      }
+      body = {
+        account_id: accountId,
+        paid_at: paidAt,
+        description,
+        confirmed_large_amount: true,
+      };
+      sourceLabel = `${account?.name || "Conta"} • ${dateFormat.format(new Date(`${paidAt}T00:00:00Z`))}`;
+    }
+
+    if (!window.confirm(
+      `Confirmar pagamento de ${item.name} no valor de ${money.format(Number(item.amount))}?\n\n${sourceLabel}`
+    )) return;
+
+    try {
+      await api(`/obligations/${item.id}/pay`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      dialog.close();
+      obligationPaymentContext = null;
+      toast("Obrigação marcada como paga; previsto substituído pelo realizado");
+      await refreshObligationPaymentViews();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+
+  return dialog;
+}
+
+async function openObligationPayment(obligationId) {
+  const item = (state.obligations || []).find((row) => row.id === obligationId);
+  if (!item) {
+    toast("Obrigação não encontrada na tela atual", true);
+    return;
+  }
+  try {
+    const candidates = await api(`/obligations/${obligationId}/payment-candidates`);
+    const accounts = obligationPaymentAccounts();
+    if (!candidates.length && !accounts.length) {
+      toast("Cadastre uma conta corrente antes de registrar o pagamento", true);
+      return;
+    }
+
+    const dialog = ensureObligationPaymentDialog();
+    obligationPaymentContext = { item, candidates };
+
+    dialog.querySelector("#obligation-payment-title").textContent = item.name;
+    dialog.querySelector("#obligation-payment-summary").innerHTML = `
+      <strong>${money.format(Number(item.amount))}</strong>
+      <span>Vencimento ${dateFormat.format(new Date(`${item.due_date}T00:00:00Z`))}</span>
+    `;
+
+    const source = dialog.querySelector("#obligation-payment-source");
+    source.innerHTML = [
+      ...candidates.map((candidate) => `
+        <option value="tx:${escapeHtml(candidate.transaction_id)}">
+          Usar débito existente • ${escapeHtml(candidate.account)} • ${escapeHtml(candidate.date)} • ${escapeHtml(candidate.description)}
+        </option>
+      `),
+      ...(accounts.length ? ['<option value="new">Criar novo lançamento de saída</option>'] : []),
+    ].join("");
+
+    source.value = candidates.length === 1 ? `tx:${candidates[0].transaction_id}` : (
+      accounts.length ? "new" : `tx:${candidates[0].transaction_id}`
+    );
+
+    const accountSelect = dialog.querySelector("#obligation-payment-account");
+    accountSelect.innerHTML = accounts.map((account) =>
+      `<option value="${escapeHtml(account.id)}">${escapeHtml(account.institution ? `${account.institution} • ${account.name}` : account.name)}</option>`
+    ).join("");
+    dialog.querySelector("#obligation-payment-date").value = obligationPaymentLocalToday();
+    dialog.querySelector("#obligation-payment-description").value = `Pagamento ${item.name}`;
+    dialog.querySelector("#obligation-payment-new-fields").classList.toggle(
+      "hidden", source.value.startsWith("tx:")
+    );
+
+    dialog.showModal();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function undoObligationPayment(obligationId) {
+  const item = (state.obligations || []).find((row) => row.id === obligationId);
+  const reason = window.prompt(
+    `Motivo para desfazer o pagamento de ${item?.name || "esta obrigação"}:`
+  );
+  if (reason === null) return;
+  if (reason.trim().length < 3) {
+    toast("Informe um motivo com pelo menos 3 caracteres", true);
+    return;
+  }
+  try {
+    const result = await api(`/obligations/${obligationId}/unpay`, {
+      method: "POST",
+      body: JSON.stringify({ reason: reason.trim() }),
+    });
+    toast(
+      result.transaction_deleted
+        ? "Pagamento desfeito e lançamento criado pelo sistema removido"
+        : "Pagamento desfeito; o lançamento bancário original foi preservado"
+    );
+    await refreshObligationPaymentViews();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function bindObligationPaymentActions() {
+  document.querySelectorAll(".pay-obligation").forEach((button) => {
+    button.addEventListener("click", () => openObligationPayment(button.dataset.id));
+  });
+  document.querySelectorAll(".unpay-obligation").forEach((button) => {
+    button.addEventListener("click", () => undoObligationPayment(button.dataset.id));
+  });
+}
+
+async function refreshObligationPaymentViews() {
+  await loadForecast();
+  await loadPayables();
+  await loadDashboard();
+}
+
 function payablesObligationRow(item) {
+  const singleOccurrence = Number(item.recurrence_months) === 0 && Number(item.occurrence_count) === 1;
+  const action = !isAdmin()
+    ? ""
+    : item.status === "paid"
+      ? `<button class="text-action unpay-obligation" data-id="${escapeHtml(item.id)}">Desfazer pagamento</button>`
+      : singleOccurrence
+        ? `<button class="text-action pay-obligation" data-id="${escapeHtml(item.id)}">Marcar como paga</button>`
+        : "";
   return `
     <tr>
       <td>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))}</td>
       <td><strong>${escapeHtml(item.name)}</strong></td>
-      <td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td>
-      <td class="right amount-expense">${money.format(item.amount)}</td>
+      <td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span>${action ? `<br>${action}` : ""}</td>
+      <td class="right ${item.status === "paid" ? "amount-income" : "amount-expense"}">${money.format(item.amount)}</td>
     </tr>
   `;
 }
@@ -830,9 +1346,11 @@ async function loadPayables() {
     api(`/card-payment-reconciliations/invoices${month ? `?period=${month}` : ""}`),
   ]);
 
+  state.obligations = obligations;
   document.querySelector("#payables-obligations-table").innerHTML = obligations.length
     ? obligations.map(payablesObligationRow).join("")
     : emptyRow(4, "Nenhuma obrigação cadastrada. Cadastre em Planejamento.");
+  bindObligationPaymentActions();
 
   const pending = invoices.filter((item) => item.status === "pending");
   document.querySelector("#payables-pending-invoices-table").innerHTML = pending.length ? pending.map((item) => `
@@ -1125,9 +1643,24 @@ async function loadForecast() {
   document.querySelector("#forecast-table").innerHTML = data.rows.length ? data.rows.map((item) => `
     <tr><td>${escapeHtml(item.month)}</td><td class="right">${money.format(item.salary)}</td><td class="right">${money.format(item.payroll_extras)}</td><td class="right amount-income">${money.format(item.commission_delayed)}</td><td class="right amount-expense">${money.format(item.obligations)}</td><td class="right amount-expense">${money.format(item.installments)}</td><td class="right amount-income">${money.format(item.investment_return_delayed)}</td><td class="right ${item.balance_delayed < data.summary.emergency_floor ? "amount-expense" : "amount-income"}">${money.format(item.balance_delayed)}</td></tr>
   `).join("") : emptyRow(8, "Configure as premissas financeiras");
-  document.querySelector("#obligations-table").innerHTML = obligations.length ? obligations.map((item) => `
-    <tr><td>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))}</td><td><strong>${escapeHtml(item.name)}</strong></td><td>${escapeHtml(item.category)}</td><td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td><td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td><td class="right amount-expense">${money.format(item.amount)}</td><td class="right">${isAdmin() ? `<button class="danger-button delete-obligation" data-id="${escapeHtml(item.id)}">Excluir</button>` : ""}</td></tr>
-  `).join("") : emptyRow(7, "Nenhum compromisso ativo");
+  state.obligations = obligations;
+  document.querySelector("#obligations-table").innerHTML = obligations.length ? obligations.map((item) => {
+    const singleOccurrence = Number(item.recurrence_months) === 0 && Number(item.occurrence_count) === 1;
+    const paymentAction = !isAdmin()
+      ? ""
+      : item.status === "paid"
+        ? `<button class="text-action unpay-obligation" data-id="${escapeHtml(item.id)}">Desfazer pagamento</button>`
+        : singleOccurrence
+          ? `<button class="text-action pay-obligation" data-id="${escapeHtml(item.id)}">Marcar como paga</button>`
+          : "";
+    const deleteAction = item.status === "paid" || !isAdmin()
+      ? ""
+      : `<button class="danger-button delete-obligation" data-id="${escapeHtml(item.id)}">Excluir</button>`;
+    return `
+      <tr><td>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))}</td><td><strong>${escapeHtml(item.name)}</strong></td><td>${escapeHtml(item.category)}</td><td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td><td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td><td class="right ${item.status === "paid" ? "amount-income" : "amount-expense"}">${money.format(item.amount)}</td><td class="right"><div class="obligation-row-actions">${paymentAction}${deleteAction}</div></td></tr>
+    `;
+  }).join("") : emptyRow(7, "Nenhum compromisso ativo");
+  bindObligationPaymentActions();
   document.querySelectorAll(".delete-obligation").forEach((button) => button.addEventListener("click", async () => {
     if (!window.confirm("Excluir este compromisso das projeções futuras?")) return;
     try { await api(`/obligations/${button.dataset.id}`, { method: "DELETE" }); await loadForecast(); toast("Compromisso excluído"); }
@@ -1473,6 +2006,35 @@ function captureCategoryOptions(item) {
   return options + `<option value="__other__" ${otherSelected ? "selected" : ""}>Outra categoria...</option>`;
 }
 
+// FAMILY_FINANCE_CAPTURE_FUNDING_VISIBILITY_V15_2
+function syncCaptureFundingField(card) {
+  if (!card) return;
+
+  const field = card.querySelector(".capture-funding-field");
+  const funding = card.querySelector('[data-field="funding_source"]');
+  if (!field || !funding) return;
+
+  const accountId = card.querySelector('[data-field="account_id"]')?.value || "";
+  const movementType = card.querySelector('[data-field="movement_type"]')?.value || "";
+  const account = state.accounts.find((item) => item.id === accountId);
+  const canUsePrivilege =
+    movementType === "expense"
+    && ["checking", "cash"].includes(account?.account_type);
+
+  field.classList.toggle("hidden", !canUsePrivilege);
+  funding.disabled = !canUsePrivilege;
+
+  if (!canUsePrivilege) {
+    funding.value = "account";
+  }
+}
+
+function syncCaptureFundingFields() {
+  document
+    .querySelectorAll('#capture-preview-items .capture-item[data-kind="transaction"]')
+    .forEach((card) => syncCaptureFundingField(card));
+}
+
 function captureWarnings(item) {
   const warnings = item.warnings || [];
   return warnings.length ? `<ul class="capture-warning-list">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : "";
@@ -1491,6 +2053,13 @@ function renderCaptureTransaction(item, index) {
         <label>Valor<input data-field="amount" type="number" min="0.01" step="0.01" value="${escapeHtml(item.amount)}" required></label>
         <label>Tipo<select data-field="movement_type"><option value="expense" ${item.movement_type === "expense" ? "selected" : ""}>Despesa</option><option value="income" ${item.movement_type === "income" ? "selected" : ""}>Receita</option><option value="investment" ${item.movement_type === "investment" ? "selected" : ""}>Aplicação/investimento</option><option value="redemption" ${item.movement_type === "redemption" ? "selected" : ""}>Resgate</option><option value="refund" ${item.movement_type === "refund" ? "selected" : ""}>Reembolso/estorno</option><option value="transfer" ${item.movement_type === "transfer" ? "selected" : ""}>Transferência interna</option><option value="reconciliation" ${item.movement_type === "reconciliation" ? "selected" : ""}>Pagamento/conciliação</option></select></label>
         <label>Conta ou cartão<select data-field="account_id" required>${captureAccountOptions(item.account_id)}</select></label>
+        <label class="capture-funding-field">Origem do dinheiro
+          <select data-field="funding_source">
+            <option value="account">O valor já estava na conta</option>
+            <option value="privilege">Retirei do Privilège DI</option>
+          </select>
+          <small>Para cartão, deixe "na conta"; o Privilège é tratado no pagamento da fatura.</small>
+        </label>
         <label>Categoria<select data-field="category_id" class="capture-category">${captureCategoryOptions(item)}</select></label>
         <label class="capture-new-category ${otherVisible ? "" : "hidden"}">Nova categoria<input data-field="category_name" value="${otherVisible ? escapeHtml(item.category_name) : ""}" maxlength="100" placeholder="Ex.: Jardinagem"></label>
         ${captureWarnings(item)}
@@ -1578,6 +2147,7 @@ function renderCapturePreview(capture, pollAttempt = 0) {
     : capture.items.length
       ? capture.items.map((item, index) => item.kind === "transaction" ? renderCaptureTransaction(item, index) : item.kind === "obligation" ? renderCaptureObligation(item, index) : renderCapturePayroll(item, index)).join("")
       : '<div class="capture-empty-preview">Não foi possível montar uma prévia automática. Escreva os dados principais no campo de mensagem e tente novamente.</div>';
+  syncCaptureFundingFields();
   document.querySelector("#capture-confirm").disabled = !capture.items.length || isPending || isFailed;
   document.querySelector("#capture-retry").classList.toggle("hidden", !isFailed);
   if (pollAttempt === 0) panel.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1586,6 +2156,18 @@ function renderCapturePreview(capture, pollAttempt = 0) {
   } else {
     stopCapturePoll();
   }
+}
+
+const capturePreviewItems = document.querySelector("#capture-preview-items");
+if (capturePreviewItems) {
+  capturePreviewItems.addEventListener("change", (event) => {
+    if (
+      event.target.matches('[data-field="account_id"]')
+      || event.target.matches('[data-field="movement_type"]')
+    ) {
+      syncCaptureFundingField(event.target.closest(".capture-item"));
+    }
+  });
 }
 
 function clearCaptureAudio() {
@@ -1628,6 +2210,7 @@ function capturePayload() {
         booked_at: value("booked_at"),
         movement_type: value("movement_type"),
         account_id: value("account_id"),
+        funding_source: value("funding_source") || "account",
         category_id: value("category_id") === "__other__" ? null : value("category_id"),
         category_name: value("category_id") === "__other__" ? value("category_name") : null,
         source_line: original.source_line || null,
@@ -2334,6 +2917,7 @@ document.querySelector("#refresh-expense-entries").addEventListener("click", loa
 document.querySelector("#expense-entry-category").addEventListener("change", updateExpenseCustomCategoryField);
 document.querySelector("#expense-entry-account").addEventListener("change", () => {
   updateExpenseCompetenceField();
+  updateExpenseFundingField();
   refreshExpenseInstallmentPreview();
 });
 document.querySelector("#expense-entry-form").elements.booked_at.addEventListener("change", updateExpenseCompetenceField);

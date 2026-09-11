@@ -21,7 +21,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -58,6 +58,8 @@ from app.schemas import (
     AccountRequest,
     AdvisorRequest,
     CaptureConfirmRequest,
+    CardCompetenceRepairApplyRequest,
+    CardCompetenceRepairRollbackRequest,
     CardInvoicePaymentRequest,
     CardPaymentLinkRequest,
     CardPaymentUnlinkRequest,
@@ -70,6 +72,8 @@ from app.schemas import (
     LoginRequest,
     ManualTransactionRequest,
     MonthlyCloseReopenRequest,
+    ObligationPaymentRequest,
+    ObligationPaymentUndoRequest,
     ObligationRequest,
     PayrollRequest,
     ProfileRequest,
@@ -89,6 +93,20 @@ from app.security import (
     verify_password,
 )
 from app.services import capture_worker
+from app.services.card_competence import (
+    card_invoice_competence,
+    resolve_expense_competence,
+)
+from app.services.card_competence_repair import (
+    BlockedCandidateError,
+    CardCompetenceRepairError,
+    NoLongerCandidateError,
+    StaleRevisionError,
+    apply_card_competence_repair,
+    preview_card_competence_repair,
+    rollback_card_competence_repair,
+    serialize_candidate,
+)
 from app.services.card_payment_reconciliation import (
     CardPaymentLinkError,
     link_card_payment,
@@ -207,6 +225,8 @@ DEFAULT_CATEGORIES = (
     ("Transferência interna", "#64748B", None, False),
     ("Repasses a confirmar", "#F59E0B", None, False),
     ("Reembolsos e estornos", "#22C55E", None, False),
+    ("Recebimentos e devoluções", "#0EA5E9", None, False),
+    ("Receitas", "#16A34A", None, False),
     ("Restaurantes e delivery", "#F97316", Decimal("0"), False),
     ("Mercado e itens domésticos", "#10B981", Decimal("0"), True),
     ("Água e energia da residência", "#0EA5E9", Decimal("650"), True),
@@ -254,9 +274,17 @@ def _month_start(value: str | None) -> date:
 
 
 def _expense_signature(transaction: Transaction, account_type: str | None) -> tuple[object, ...]:
+    # FAMILY_FINANCE_CARD_COMPETENCE_V11
     period: object = transaction.booked_at
     if account_type == "credit_card":
-        period = (transaction.booked_at.year, transaction.booked_at.month)
+        # A persisted `competence` is always the canonical "YYYY-MM" string
+        # `month_key` produces (see `_card_invoice_competence`). The
+        # fallback for a transaction with no persisted competence must match
+        # that same string shape -- a bare `(year, month)` tuple never
+        # equals the string form, so two same-period card expenses would
+        # silently never be recognized as duplicates of each other purely
+        # because of this type mismatch, not because they actually differ.
+        period = transaction.competence or month_key(transaction.booked_at)
     return (
         period,
         normalize_description(transaction.description),
@@ -280,8 +308,40 @@ def _consolidated_transactions(
         .outerjoin(Document, Document.id == Transaction.document_id)
         .where(
             Transaction.household_id == household_id,
-            Transaction.booked_at >= start,
-            Transaction.booked_at < end,
+            or_(
+                and_(
+                    Account.account_type == "credit_card",
+                    or_(
+                        # `competence` ("YYYY-MM") sorts lexicographically
+                        # the same as chronological order, so a half-open
+                        # string range mirrors the `booked_at` range below --
+                        # this must hold for the multi-month windows this
+                        # function is actually called with (`cut_plan`'s
+                        # 6-month lookback, `_build_report_payload`'s 1-12
+                        # month range). Comparing only against `start`'s own
+                        # month here previously dropped every card
+                        # transaction whose invoice competence fell in any
+                        # later month of the window.
+                        and_(
+                            Transaction.competence >= start.strftime("%Y-%m"),
+                            Transaction.competence < end.strftime("%Y-%m"),
+                        ),
+                        and_(
+                            Transaction.competence.is_(None),
+                            Transaction.booked_at >= start,
+                            Transaction.booked_at < end,
+                        ),
+                    ),
+                ),
+                and_(
+                    or_(
+                        Account.account_type != "credit_card",
+                        Account.account_type.is_(None),
+                    ),
+                    Transaction.booked_at >= start,
+                    Transaction.booked_at < end,
+                ),
+            ),
         )
         .order_by(Transaction.booked_at, Transaction.created_at, Transaction.id)
     ).all()
@@ -374,15 +434,17 @@ def _operational_cash_flow(rows: list[tuple[Transaction, str]]) -> dict:
             },
         )
         amount = Decimal(transaction.amount)
-        if (
-            transaction.transaction_type == "income"
-            and amount > 0
-            and not transaction.excluded
-            and category_name == "Receitas"
-        ):
+        if transaction.transaction_type == "income" and amount > 0 and not transaction.excluded:
+            # FAMILY_FINANCE_DASHBOARD_CASH_IN_V3
+            # Cash flow follows the bank fact, independently from whether the inflow is
+            # operating income (salary) or a non-operating receipt (e.g. debt repayment).
             item["cash_in"] += amount
-        elif transaction.transaction_type == "refund" and amount > 0:
+        elif transaction.transaction_type == "refund" and amount > 0 and not transaction.excluded:
             item["refunds"] += amount
+            if item["account_type"] != "credit_card":
+                # Bank reimbursement is a real entry. Card-side refund instead reduces
+                # card spending and does not create bank cash.
+                item["cash_in"] += amount
         elif transaction.transaction_type in {"expense", "refund"} and amount < 0:
             item["gross_out"] += abs(amount)
 
@@ -390,7 +452,11 @@ def _operational_cash_flow(rows: list[tuple[Transaction, str]]) -> dict:
     for item in accounts.values():
         cash_in = money(item["cash_in"])
         refunds = money(item["refunds"])
-        cash_out = money(max(Decimal("0"), item["gross_out"] - refunds))
+        cash_out = money(
+            max(Decimal("0"), item["gross_out"] - refunds)
+            if item["account_type"] == "credit_card"
+            else item["gross_out"]
+        )
         if cash_in == 0 and cash_out == 0 and refunds == 0:
             continue
         serialized.append(
@@ -502,15 +568,37 @@ def _obligation_timing(item: Obligation, reference: date | None = None) -> dict:
     }
 
 
-def _obligation_rows(db: Session, household_id: str, reference: date | None = None) -> list[dict]:
-    rows = db.scalars(
-        select(Obligation)
-        .where(Obligation.household_id == household_id, Obligation.active.is_(True))
-        .order_by(Obligation.due_date)
-    ).all()
+def _obligation_rows(
+    db: Session,
+    household_id: str,
+    reference: date | None = None,
+    *,
+    include_paid: bool = False,
+) -> list[dict]:
+    # FAMILY_FINANCE_OBLIGATION_PAYMENT_V8
+    query = select(Obligation).where(
+        Obligation.household_id == household_id,
+        Obligation.active.is_(True),
+    )
+    if not include_paid:
+        query = query.where(Obligation.status == "pending")
+    rows = db.scalars(query.order_by(Obligation.due_date)).all()
+
     result = []
     for item in rows:
-        timing = _obligation_timing(item, reference)
+        if item.status == "paid":
+            timing = {
+                "next_due_date": item.due_date,
+                "days_until_due": 0,
+                "alert_level": "paid",
+                "alert_label": (
+                    f"Pago em {item.paid_at.strftime('%d/%m/%Y')}"
+                    if item.paid_at
+                    else "Pago"
+                ),
+            }
+        else:
+            timing = _obligation_timing(item, reference)
         result.append(
             {
                 "id": item.id,
@@ -520,10 +608,14 @@ def _obligation_rows(db: Session, household_id: str, reference: date | None = No
                 "recurrence_months": item.recurrence_months,
                 "occurrence_count": item.occurrence_count,
                 "category": item.category,
+                "status": item.status,
+                "paid_at": item.paid_at,
+                "paid_transaction_id": item.paid_transaction_id,
+                "payment_transaction_created": item.payment_transaction_created,
                 **timing,
             }
         )
-    result.sort(key=lambda item: item["next_due_date"])
+    result.sort(key=lambda row: (row["status"] == "paid", row["next_due_date"]))
     return result
 
 
@@ -1770,6 +1862,105 @@ def reopen_monthly_close_endpoint(
     db.commit()
     db.refresh(close)
     return serialize_monthly_close(close, db=db, household_id=user.household_id, period=period)
+
+
+# ---------------------------------------------------------------------------
+# P0 -- historical card-competence repair
+# (docs/WORK_ORDER_CARD_COMPETENCE_REPAIR_P0.md). Admin-only, household-
+# scoped, preview/apply/rollback around `app.services.card_competence_repair`
+# -- see that module's docstring for the full contract. No competence
+# formula lives here; every number these three endpoints surface or persist
+# came from that service, which itself only ever calls
+# `app.services.card_competence.card_invoice_competence`.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/maintenance/card-competence/preview")
+def preview_card_competence_repair_endpoint(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    result = preview_card_competence_repair(db, household_id=user.household_id)
+    return {
+        "financial_revision": result["financial_revision"],
+        "periods_affected": result["periods_affected"],
+        "eligible_count": result["eligible_count"],
+        "blocked_count": result["blocked_count"],
+        "candidates": [serialize_candidate(candidate) for candidate in result["candidates"]],
+    }
+
+
+@router.post("/maintenance/card-competence/apply")
+def apply_card_competence_repair_endpoint(
+    payload: CardCompetenceRepairApplyRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        result = apply_card_competence_repair(
+            db,
+            household_id=user.household_id,
+            transaction_ids=tuple(payload.transaction_ids),
+            expected_financial_revision=payload.expected_financial_revision,
+            reason=payload.reason,
+            user_id=user.id,
+        )
+    except StaleRevisionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NoLongerCandidateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BlockedCandidateError as exc:
+        raise HTTPException(
+            status_code=422, detail={"message": str(exc), "blocked": list(exc.blocked)}
+        ) from exc
+    except CardCompetenceRepairError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    db.commit()
+    return {
+        "batch_id": result.batch_id,
+        "applied": list(result.applied),
+        "periods_recomputed": list(result.periods_recomputed),
+        "financial_revision": result.financial_revision,
+    }
+
+
+@router.post("/maintenance/card-competence/rollback")
+def rollback_card_competence_repair_endpoint(
+    payload: CardCompetenceRepairRollbackRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        result = rollback_card_competence_repair(
+            db,
+            household_id=user.household_id,
+            transaction_ids=tuple(payload.transaction_ids),
+            expected_financial_revision=payload.expected_financial_revision,
+            reason=payload.reason,
+            user_id=user.id,
+        )
+    except StaleRevisionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NoLongerCandidateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BlockedCandidateError as exc:
+        raise HTTPException(
+            status_code=422, detail={"message": str(exc), "blocked": list(exc.blocked)}
+        ) from exc
+    except CardCompetenceRepairError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    db.commit()
+    return {
+        "batch_id": result.batch_id,
+        "reverted": list(result.reverted),
+        "periods_recomputed": list(result.periods_recomputed),
+        "financial_revision": result.financial_revision,
+    }
 
 
 @router.get("/users")
@@ -3534,6 +3725,25 @@ def confirm_capture(
                 transaction_type = "refund"
                 category = category_for(db, user.household_id, "Reembolsos e estornos")
 
+            # INV-017 (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md):
+            # a confirmed capture is just another expense-creation path and
+            # must resolve competence through the exact same canonical
+            # helper `create_manual_transaction` uses -- never a second,
+            # parallel `booked_at.strftime("%Y-%m")` calculation that would
+            # ignore the account's configured card cycle. Non-expense
+            # movements (income/transfer/reconciliation/refund) keep the
+            # pre-existing date-based competence; the invoice-cycle concept
+            # only applies to card purchases.
+            competence = (
+                _resolve_expense_competence(
+                    account=account,
+                    competence=None,
+                    booked_at=proposal.booked_at,
+                )
+                if movement_type == "expense"
+                else proposal.booked_at.strftime("%Y-%m")
+            )
+
             parsed = ParsedTransaction(
                 booked_at=proposal.booked_at,
                 description=proposal.description,
@@ -3562,7 +3772,7 @@ def confirm_capture(
                 fingerprint=fingerprint,
                 source_line=proposal.source_line,
                 occurred_at=proposal.booked_at,
-                competence=proposal.booked_at.strftime("%Y-%m"),
+                competence=competence,
                 classification_source="capture_confirmed",
                 classification_version=PARSER_CONTRACT_VERSION,
                 canonical_status="unassigned",
@@ -3581,6 +3791,35 @@ def confirm_capture(
                 household_id=user.household_id,
             )
             duplicate = duplicate_group is not None
+            if proposal.funding_source == "privilege":
+                if proposal.movement_type != "expense":
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Privilège DI como origem só se aplica a despesas.",
+                    )
+                if structured_document:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Não é seguro descontar Privilège automaticamente ao confirmar "
+                            "extrato/fatura. Use essa origem em lançamento avulso/recibo."
+                        ),
+                    )
+                if duplicate:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "A captura foi identificada como possível duplicidade. "
+                            "Resolva antes de descontar o Privilège DI."
+                        ),
+                    )
+                _fund_expense_from_privilege(
+                    db,
+                    user=user,
+                    expense_transaction=transaction,
+                    expense_account=account,
+                    booked_at=proposal.booked_at,
+                )
             transaction.reviewed = not duplicate
             result["transactions"].append(transaction.id)
             if duplicate:
@@ -3896,6 +4135,140 @@ def transactions(
     return result
 
 
+# FAMILY_FINANCE_PRIVILEGE_FUNDING_V15
+def _fund_expense_from_privilege(
+    db: Session,
+    *,
+    user: User,
+    expense_transaction: Transaction,
+    expense_account: Account,
+    booked_at: date,
+) -> Decimal:
+    if expense_account.account_type == "credit_card":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Compra no cartão não pode descontar o Privilège no momento da compra. "
+                "Informe a origem do recurso quando a fatura for paga."
+            ),
+        )
+    if expense_account.account_type not in {"checking", "cash"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Privilège DI como origem só pode financiar despesa paga por conta corrente ou dinheiro.",
+        )
+
+    privilege = _privilege_account(db, user.household_id)
+    current = _latest_active_balance_observation(
+        db, household_id=user.household_id, account_id=privilege.id
+    )
+    if current is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Não existe saldo confirmado ativo para o Privilège DI.",
+        )
+    if current.as_of_date > booked_at:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Existe saldo do Privilège confirmado depois da data desta despesa. "
+                "Não vou descontar retroativamente para evitar dupla contagem."
+            ),
+        )
+
+    amount = money(abs(expense_transaction.amount))
+    current_amount = money(current.amount)
+    if current_amount < amount:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Saldo confirmado do Privilège ({current_amount}) é menor que a despesa ({amount}).",
+        )
+
+    new_amount = money(current_amount - amount)
+    trace_id = expense_transaction.trace_id or str(uuid.uuid4())
+    expense_transaction.trace_id = trace_id
+    expense_transaction.transfer_group_id = trace_id
+
+    category = category_for(db, user.household_id, "Transferência patrimonial")
+    description = f"Resgate Privilège DI para despesa: {expense_transaction.description}"
+    parsed = ParsedTransaction(
+        booked_at=booked_at,
+        description=description,
+        amount=amount,
+        source_line=1,
+        card_last_four=privilege.last_four,
+        occurred_at=booked_at,
+    )
+    funding_tx = Transaction(
+        household_id=user.household_id,
+        account_id=privilege.id,
+        category_id=category.id,
+        booked_at=booked_at,
+        description=description,
+        normalized_description=normalize_description(description),
+        amount=amount,
+        transaction_type="transfer",
+        owner_label=privilege.owner_label,
+        card_last_four=privilege.last_four,
+        fingerprint=transaction_fingerprint(privilege.id, parsed, privilege.owner_label),
+        source_line=1,
+        occurred_at=booked_at,
+        competence=booked_at.strftime("%Y-%m"),
+        classification_source="manual_confirmed",
+        classification_version=PARSER_CONTRACT_VERSION,
+        canonical_status="unassigned",
+        linked_transaction_id=expense_transaction.id,
+        transfer_group_id=trace_id,
+        trace_id=trace_id,
+        source_priority=source_priority("manual"),
+        confidence=Decimal("1"),
+        excluded=True,
+        possible_duplicate=False,
+        reviewed=True,
+    )
+    db.add(funding_tx)
+    db.flush()
+    expense_transaction.linked_transaction_id = funding_tx.id
+
+    balance = AccountBalanceObservation(
+        household_id=user.household_id,
+        account_id=privilege.id,
+        amount=new_amount,
+        as_of_date=booked_at,
+        observation_type="point_in_time",
+        source="manual_confirmed",
+        document_id=None,
+        confirmed_by=user.id,
+        confidence=Decimal("1.0000"),
+        supersedes_id=current.id,
+        trace_id=trace_id,
+    )
+    db.add(balance)
+    db.flush()
+    current.superseded_by_id = balance.id
+
+    audit(
+        db,
+        user,
+        "transaction.funding.privilege",
+        "transaction",
+        expense_transaction.id,
+        {
+            "expense_amount": str(amount),
+            "expense_account_id": expense_account.id,
+            "privilege_account_id": privilege.id,
+            "funding_transaction_id": funding_tx.id,
+            "balance_observation_id": balance.id,
+            "balance_before": str(current_amount),
+            "balance_after": str(new_amount),
+        },
+        reason="Usuário confirmou que a despesa foi paga com recurso retirado do Privilège DI.",
+        trace_id=trace_id,
+        source="manual_expense",
+    )
+    return new_amount
+
+
 @router.post("/transactions", status_code=201)
 def create_manual_transaction(
     payload: ManualTransactionRequest,
@@ -3988,7 +4361,7 @@ def create_manual_transaction(
 
     if payload.movement_type == "expense":
         competence = _resolve_expense_competence(
-            account_type=account.account_type,
+            account=account,
             competence=payload.competence,
             booked_at=payload.booked_at,
         )
@@ -4054,6 +4427,24 @@ def create_manual_transaction(
                 ),
             )
         )
+    funding_balance_after = None
+    if payload.movement_type == "expense" and payload.funding_source == "privilege":
+        if duplicate_group is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A despesa foi identificada como possível duplicidade. "
+                    "Resolva a duplicidade antes de descontar o Privilège DI."
+                ),
+            )
+        funding_balance_after = _fund_expense_from_privilege(
+            db,
+            user=user,
+            expense_transaction=transaction,
+            expense_account=account,
+            booked_at=payload.booked_at,
+        )
+
     audit(
         db,
         user,
@@ -4066,6 +4457,10 @@ def create_manual_transaction(
             "account_id": account.id,
             "competence": transaction.competence,
             "competence_explicitly_confirmed": payload.competence is not None,
+            "funding_source": payload.funding_source,
+            "privilege_balance_after": (
+                str(funding_balance_after) if funding_balance_after is not None else None
+            ),
         },
     )
     db.commit()
@@ -4236,7 +4631,7 @@ def preview_manual_installment(
     if not account:
         raise HTTPException(status_code=404, detail="Conta não encontrada")
     resolved_competence = _resolve_expense_competence(
-        account_type=account.account_type,
+        account=account,
         competence=competence,
         booked_at=booked_at,
     )
@@ -4303,6 +4698,24 @@ def update_transaction(
     is_linked_reconciliation = (
         transaction.linked_transaction_id is not None and transaction.transaction_type == "reconciliation"
     )
+    linked_paid_obligation = db.scalar(
+        select(Obligation).where(
+            Obligation.household_id == user.household_id,
+            Obligation.paid_transaction_id == transaction.id,
+            Obligation.active.is_(True),
+            Obligation.status == "paid",
+        )
+    )
+    if linked_paid_obligation and (
+        changes.get("excluded") is True or changes.get("possible_duplicate") is True
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Este lançamento liquida uma obrigação paga. Desfaça o pagamento da obrigação "
+                "antes de removê-lo dos totais ou marcá-lo como possível duplicidade"
+            ),
+        )
     if transaction.transfer_group_id is not None and (
         "excluded" in changes or "category_id" in changes
     ):
@@ -4392,6 +4805,92 @@ def update_transaction(
     return {"ok": True}
 
 
+# FAMILY_FINANCE_PRIVILEGE_DELETE_ROLLBACK_V15_4
+def _rollback_privilege_balance_for_deleted_transaction(
+    db: Session,
+    *,
+    user: User,
+    transaction: Transaction,
+) -> bool:
+    group_id = transaction.transfer_group_id or transaction.trace_id
+    if not group_id:
+        return False
+
+    observations = list(
+        db.scalars(
+            select(AccountBalanceObservation).where(
+                AccountBalanceObservation.household_id == user.household_id,
+                AccountBalanceObservation.trace_id == group_id,
+                AccountBalanceObservation.invalidated_at.is_(None),
+            )
+        ).all()
+    )
+    if not observations:
+        return False
+    if len(observations) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Existem múltiplas observações de saldo vinculadas a este lançamento. "
+                "A exclusão foi bloqueada para evitar inconsistência."
+            ),
+        )
+
+    balance = observations[0]
+    if balance.superseded_by_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Existe um saldo do Privilège confirmado depois deste lançamento. "
+                "Não é seguro excluir automaticamente."
+            ),
+        )
+
+    if not balance.supersedes_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A observação do Privilège não possui saldo anterior para restaurar. "
+                "A exclusão foi bloqueada."
+            ),
+        )
+
+    previous = db.scalar(
+        select(AccountBalanceObservation).where(
+            AccountBalanceObservation.id == balance.supersedes_id,
+            AccountBalanceObservation.household_id == user.household_id,
+        )
+    )
+    if previous is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Saldo anterior do Privilège não encontrado; exclusão bloqueada.",
+        )
+
+    previous.superseded_by_id = None
+    balance.invalidated_at = datetime.now(UTC)
+    balance.invalidated_by = user.id
+
+    audit(
+        db,
+        user,
+        "transaction.funding.privilege.rollback",
+        "transaction",
+        transaction.id,
+        {
+            "trace_id": group_id,
+            "balance_observation_id": balance.id,
+            "restored_observation_id": previous.id,
+            "balance_before_rollback": str(money(balance.amount)),
+            "balance_after_rollback": str(money(previous.amount)),
+        },
+        reason="Despesa financiada pelo Privilège foi excluída; saldo confirmado restaurado.",
+        trace_id=group_id,
+        source="transaction_delete",
+    )
+    return True
+
+
 @router.delete("/transactions/{transaction_id}")
 def delete_manual_transaction(
     transaction_id: str,
@@ -4407,6 +4906,28 @@ def delete_manual_transaction(
     )
     if not transaction:
         raise HTTPException(status_code=404, detail="Lançamento não encontrado")
+    linked_paid_obligation = db.scalar(
+        select(Obligation).where(
+            Obligation.household_id == user.household_id,
+            Obligation.paid_transaction_id == transaction.id,
+            Obligation.active.is_(True),
+            Obligation.status == "paid",
+        )
+    )
+    if linked_paid_obligation:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Este lançamento está vinculado a uma obrigação paga. "
+                "Use 'Desfazer pagamento' na obrigação antes de excluir o lançamento"
+            ),
+        )
+    _rollback_privilege_balance_for_deleted_transaction(
+        db,
+        user=user,
+        transaction=transaction,
+    )
+
     if transaction.document_id is not None:
         raise HTTPException(
             status_code=409,
@@ -5130,9 +5651,681 @@ def delete_manual_payroll(
     return {"ok": True}
 
 
+# FAMILY_FINANCE_OBLIGATION_PAYMENT_V8
+def _obligation_payment_category(
+    db: Session, household_id: str, obligation: Obligation
+) -> Category:
+    if obligation.category in {"asset_acquisition", "chacara"}:
+        name = "Aquisição da chácara"
+        color = "#15803D"
+        essential = True
+    elif obligation.category == "loan":
+        name = "Obrigações financeiras"
+        color = "#B7791F"
+        essential = True
+    else:
+        name = "Compromissos"
+        color = "#64748B"
+        essential = False
+
+    category = db.scalar(
+        select(Category).where(
+            Category.household_id == household_id,
+            func.lower(Category.name) == name.lower(),
+        )
+    )
+    if category:
+        return category
+    category = Category(
+        household_id=household_id,
+        name=name,
+        color=color,
+        cash_cap=Decimal("0"),
+        essential=essential,
+    )
+    db.add(category)
+    db.flush()
+    return category
+
+
+def _obligation_payment_candidate_rows(
+    db: Session, *, household_id: str, obligation: Obligation
+) -> list[dict]:
+    start = obligation.due_date - timedelta(days=31)
+    end = obligation.due_date + timedelta(days=31)
+
+    already_linked = set(
+        db.scalars(
+            select(Obligation.paid_transaction_id).where(
+                Obligation.household_id == household_id,
+                Obligation.paid_transaction_id.is_not(None),
+                Obligation.id != obligation.id,
+            )
+        ).all()
+    )
+
+    rows = db.execute(
+        select(Transaction, Account)
+        .join(Account, Account.id == Transaction.account_id)
+        .where(
+            Transaction.household_id == household_id,
+            Account.household_id == household_id,
+            Account.active.is_(True),
+            Account.account_type.in_(("checking", "cash")),
+            Transaction.booked_at >= start,
+            Transaction.booked_at <= end,
+            Transaction.amount == -money(obligation.amount),
+            Transaction.transaction_type == "expense",
+            Transaction.excluded.is_(False),
+            Transaction.possible_duplicate.is_(False),
+            Transaction.canonical_status != "supporting",
+        )
+    ).all()
+
+    candidates = []
+    for transaction, account in rows:
+        if transaction.id in already_linked:
+            continue
+        candidates.append(
+            {
+                "transaction_id": transaction.id,
+                "date": transaction.booked_at,
+                "description": transaction.description,
+                "amount": decimal_value(abs(transaction.amount)),
+                "account_id": account.id,
+                "account": _account_display(account),
+                "imported": transaction.document_id is not None,
+                "distance_days": abs((transaction.booked_at - obligation.due_date).days),
+            }
+        )
+    candidates.sort(key=lambda row: (row["distance_days"], row["date"], row["transaction_id"]))
+    return candidates[:20]
+
+
+def _get_payable_obligation(
+    db: Session, *, household_id: str, obligation_id: str
+) -> Obligation:
+    item = db.scalar(
+        select(Obligation).where(
+            Obligation.id == obligation_id,
+            Obligation.household_id == household_id,
+            Obligation.active.is_(True),
+        )
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Obrigação não encontrada")
+    return item
+
+
+@router.get("/obligations/{obligation_id}/payment-candidates")
+def obligation_payment_candidates(
+    obligation_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    item = _get_payable_obligation(
+        db, household_id=user.household_id, obligation_id=obligation_id
+    )
+    if item.status == "paid":
+        return []
+    return _obligation_payment_candidate_rows(
+        db, household_id=user.household_id, obligation=item
+    )
+
+
+def _privilege_account(db: Session, household_id: str, *, required: bool = True) -> Account | None:
+    """Resolve the household's single Privilège DI investment account.
+
+    A household that has not created any `investment` account yet is not an
+    ambiguity -- it is the ordinary state of a fresh household, before it has
+    ever used the Privilège-funding feature (`FAMILY_FINANCE_PRIVILEGE_FUNDING_V15`).
+    Callers that need a real account to fund/redeem against keep `required=True`
+    (the default) and get the existing fail-closed 422 either way -- zero
+    candidates or more than one with no unique "PRIVILEGE" match, never a
+    guess. Callers that only *observe* the account when one exists (profile
+    read/write) pass `required=False` and get `None` back for the "not
+    configured yet" case, while an unresolved ambiguity among *existing*
+    investment accounts still raises: guessing which one is Privilège would
+    be worse than surfacing the conflict.
+    """
+    investments = list(
+        db.scalars(
+            select(Account).where(
+                Account.household_id == household_id,
+                Account.active.is_(True),
+                Account.account_type == "investment",
+            )
+        ).all()
+    )
+    matches = [
+        account for account in investments
+        if "PRIVILEGE" in normalize_description(f"{account.institution} {account.name}")
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches and len(investments) == 1:
+        return investments[0]
+    if not investments and not required:
+        return None
+    raise HTTPException(
+        status_code=422,
+        detail="Não foi possível identificar unicamente a conta Privilège DI.",
+    )
+
+
+def _latest_active_balance_observation(
+    db: Session, *, household_id: str, account_id: str
+) -> AccountBalanceObservation | None:
+    return db.scalar(
+        select(AccountBalanceObservation)
+        .where(
+            AccountBalanceObservation.household_id == household_id,
+            AccountBalanceObservation.account_id == account_id,
+            AccountBalanceObservation.invalidated_at.is_(None),
+            AccountBalanceObservation.superseded_by_id.is_(None),
+        )
+        .order_by(
+            AccountBalanceObservation.as_of_date.desc(),
+            AccountBalanceObservation.created_at.desc(),
+        )
+        .limit(1)
+    )
+
+
+def _fund_obligation_from_privilege(
+    db: Session,
+    *,
+    user: User,
+    obligation: Obligation,
+    paid_at: date,
+) -> Decimal:
+    if (
+        obligation.funding_source == "privilege"
+        and obligation.funding_balance_observation_id
+    ):
+        privilege = _privilege_account(db, user.household_id)
+        current = _latest_active_balance_observation(
+            db, household_id=user.household_id, account_id=privilege.id
+        )
+        return money(current.amount) if current else Decimal("0")
+
+    privilege = _privilege_account(db, user.household_id)
+    current = _latest_active_balance_observation(
+        db, household_id=user.household_id, account_id=privilege.id
+    )
+    if current is None:
+        raise HTTPException(status_code=409, detail="Não existe saldo confirmado ativo para o Privilège DI.")
+    if current.as_of_date > paid_at:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Existe um saldo do Privilège confirmado depois da data deste pagamento. "
+                "Não vou descontar retroativamente para evitar dupla contagem."
+            ),
+        )
+
+    amount = money(obligation.amount)
+    current_amount = money(current.amount)
+    if current_amount < amount:
+        raise HTTPException(status_code=409, detail="Saldo confirmado do Privilège é menor que o valor a resgatar.")
+    new_amount = money(current_amount - amount)
+    trace_id = str(uuid.uuid4())
+
+    category = category_for(db, user.household_id, "Transferência patrimonial")
+    description = f"Resgate Privilège DI para {obligation.name}"
+    parsed = ParsedTransaction(
+        booked_at=paid_at,
+        description=description,
+        amount=amount,
+        source_line=1,
+        card_last_four=privilege.last_four,
+        occurred_at=paid_at,
+    )
+    funding_tx = Transaction(
+        household_id=user.household_id,
+        account_id=privilege.id,
+        category_id=category.id,
+        booked_at=paid_at,
+        description=description,
+        normalized_description=normalize_description(description),
+        amount=amount,
+        transaction_type="transfer",
+        owner_label=privilege.owner_label,
+        card_last_four=privilege.last_four,
+        fingerprint=transaction_fingerprint(privilege.id, parsed, privilege.owner_label),
+        source_line=1,
+        occurred_at=paid_at,
+        competence=paid_at.strftime("%Y-%m"),
+        classification_source="manual_confirmed",
+        classification_version=PARSER_CONTRACT_VERSION,
+        canonical_status="unassigned",
+        trace_id=trace_id,
+        source_priority=source_priority("manual"),
+        confidence=Decimal("1"),
+        excluded=True,
+        possible_duplicate=False,
+        reviewed=True,
+    )
+    db.add(funding_tx)
+    db.flush()
+
+    balance = AccountBalanceObservation(
+        household_id=user.household_id,
+        account_id=privilege.id,
+        amount=new_amount,
+        as_of_date=paid_at,
+        observation_type="point_in_time",
+        source="manual_confirmed",
+        document_id=None,
+        confirmed_by=user.id,
+        confidence=Decimal("1.0000"),
+        supersedes_id=current.id,
+        trace_id=trace_id,
+    )
+    db.add(balance)
+    db.flush()
+    current.superseded_by_id = balance.id
+
+    obligation.funding_source = "privilege"
+    obligation.funding_transaction_id = funding_tx.id
+    obligation.funding_balance_observation_id = balance.id
+
+    audit(
+        db,
+        user,
+        "obligation.funding.privilege",
+        "obligation",
+        obligation.id,
+        {
+            "amount": str(amount),
+            "privilege_account_id": privilege.id,
+            "funding_transaction_id": funding_tx.id,
+            "balance_observation_id": balance.id,
+            "balance_before": str(current_amount),
+            "balance_after": str(new_amount),
+        },
+        reason="Usuário confirmou que o pagamento foi financiado por resgate do Privilège DI.",
+        trace_id=trace_id,
+        source="obligation_payment",
+    )
+    return new_amount
+
+
+def _undo_obligation_privilege_funding(
+    db: Session, *, user: User, obligation: Obligation
+) -> None:
+    if obligation.funding_source != "privilege":
+        return
+
+    balance = None
+    if obligation.funding_balance_observation_id:
+        balance = db.scalar(
+            select(AccountBalanceObservation).where(
+                AccountBalanceObservation.id == obligation.funding_balance_observation_id,
+                AccountBalanceObservation.household_id == user.household_id,
+            )
+        )
+    if balance is not None:
+        if balance.invalidated_at is not None:
+            raise HTTPException(status_code=409, detail="A observação de saldo deste resgate já foi invalidada.")
+        if balance.superseded_by_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Há um saldo do Privilège confirmado depois deste pagamento; não é seguro desfazer automaticamente.",
+            )
+        previous = None
+        if balance.supersedes_id:
+            previous = db.scalar(
+                select(AccountBalanceObservation).where(
+                    AccountBalanceObservation.id == balance.supersedes_id,
+                    AccountBalanceObservation.household_id == user.household_id,
+                )
+            )
+        if previous is not None:
+            previous.superseded_by_id = None
+        balance.invalidated_at = datetime.now(UTC)
+        balance.invalidated_by = user.id
+
+    if obligation.funding_transaction_id:
+        funding_tx = db.scalar(
+            select(Transaction).where(
+                Transaction.id == obligation.funding_transaction_id,
+                Transaction.household_id == user.household_id,
+            )
+        )
+        if funding_tx is not None:
+            if funding_tx.document_id is not None:
+                raise HTTPException(status_code=409, detail="O resgate vinculado veio de importação e não pode ser apagado automaticamente.")
+            db.delete(funding_tx)
+
+    obligation.funding_source = "account"
+    obligation.funding_transaction_id = None
+    obligation.funding_balance_observation_id = None
+
+
+@router.post("/obligations/{obligation_id}/pay")
+def pay_obligation(
+    obligation_id: str,
+    payload: ObligationPaymentRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    item = _get_payable_obligation(
+        db, household_id=user.household_id, obligation_id=obligation_id
+    )
+    if item.status == "paid":
+        raise HTTPException(status_code=409, detail="Esta obrigação já está paga")
+    if item.recurrence_months != 0 or item.occurrence_count != 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Marcar como paga está disponível para obrigações de ocorrência única. "
+                "Cadastre cada parcela como uma obrigação individual para liquidá-la separadamente"
+            ),
+        )
+
+    transaction: Transaction | None = None
+    created_transaction = False
+
+    if payload.transaction_id:
+        transaction = db.scalar(
+            select(Transaction).where(
+                Transaction.id == payload.transaction_id,
+                Transaction.household_id == user.household_id,
+            )
+        )
+        if not transaction:
+            raise HTTPException(status_code=404, detail="Lançamento não encontrado")
+        account = db.scalar(
+            select(Account).where(
+                Account.id == transaction.account_id,
+                Account.household_id == user.household_id,
+                Account.active.is_(True),
+            )
+        )
+        if not account or account.account_type not in {"checking", "cash"}:
+            raise HTTPException(
+                status_code=422,
+                detail="O pagamento precisa sair de uma conta corrente ou caixa",
+            )
+        if (
+            transaction.transaction_type != "expense"
+            or transaction.excluded
+            or transaction.possible_duplicate
+            or transaction.canonical_status == "supporting"
+            or transaction.amount >= 0
+            or money(abs(transaction.amount)) != money(item.amount)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="O lançamento selecionado não é uma saída válida com o mesmo valor da obrigação",
+            )
+        used_by = db.scalar(
+            select(Obligation).where(
+                Obligation.household_id == user.household_id,
+                Obligation.paid_transaction_id == transaction.id,
+                Obligation.id != item.id,
+            )
+        )
+        if used_by:
+            raise HTTPException(
+                status_code=409,
+                detail="Este lançamento já está vinculado ao pagamento de outra obrigação",
+            )
+        paid_at = transaction.booked_at
+    else:
+        account = db.scalar(
+            select(Account).where(
+                Account.id == payload.account_id,
+                Account.household_id == user.household_id,
+                Account.active.is_(True),
+            )
+        )
+        if not account:
+            raise HTTPException(status_code=404, detail="Conta não encontrada")
+        if account.account_type not in {"checking", "cash"}:
+            raise HTTPException(
+                status_code=422,
+                detail="O pagamento precisa sair de uma conta corrente ou caixa",
+            )
+        assert payload.paid_at is not None
+        paid_at = payload.paid_at
+
+        profile = profile_for(db, user.household_id)
+        large_threshold = _large_entry_threshold(profile)
+        if item.amount >= large_threshold and not payload.confirmed_large_amount:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Este pagamento exige confirmação adicional por ser de valor elevado. "
+                    "Confirme novamente que o pagamento realmente aconteceu"
+                ),
+            )
+
+        nearby = _obligation_payment_candidate_rows(
+            db, household_id=user.household_id, obligation=item
+        )
+        collision = next(
+            (
+                candidate
+                for candidate in nearby
+                if candidate["account_id"] == account.id
+                and abs((candidate["date"] - paid_at).days) <= 7
+            ),
+            None,
+        )
+        if collision:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Já existe uma saída bancária compatível nesta conta e próxima desta data. "
+                    "Escolha esse lançamento existente para evitar duplicidade"
+                ),
+            )
+
+        category = _obligation_payment_category(db, user.household_id, item)
+        description = " ".join(
+            (payload.description or f"Pagamento {item.name}").split()
+        )
+        parsed = ParsedTransaction(
+            booked_at=paid_at,
+            description=description,
+            amount=-money(item.amount),
+            source_line=1,
+            card_last_four=account.last_four,
+            occurred_at=paid_at,
+        )
+        fingerprint = transaction_fingerprint(account.id, parsed, account.owner_label)
+
+        same_fingerprint = db.scalar(
+            select(Transaction).where(
+                Transaction.household_id == user.household_id,
+                Transaction.fingerprint == fingerprint,
+            )
+        )
+        if same_fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Já existe um lançamento manual idêntico. "
+                    "Use a opção de vincular lançamento existente"
+                ),
+            )
+
+        transaction = Transaction(
+            household_id=user.household_id,
+            account_id=account.id,
+            category_id=category.id,
+            booked_at=paid_at,
+            description=description,
+            normalized_description=normalize_description(description),
+            amount=-money(item.amount),
+            transaction_type="expense",
+            owner_label=account.owner_label,
+            card_last_four=account.last_four,
+            fingerprint=fingerprint,
+            source_line=1,
+            occurred_at=paid_at,
+            competence=paid_at.strftime("%Y-%m"),
+            classification_source="manual_confirmed",
+            classification_version=PARSER_CONTRACT_VERSION,
+            canonical_status="unassigned",
+            trace_id=str(uuid.uuid4()),
+            source_priority=source_priority("manual"),
+            confidence=Decimal("1"),
+            excluded=False,
+            possible_duplicate=False,
+            reviewed=True,
+        )
+        db.add(transaction)
+        db.flush()
+        created_transaction = True
+
+    assert transaction is not None
+    before_state = {
+        "status": item.status,
+        "paid_at": item.paid_at.isoformat() if item.paid_at else None,
+        "paid_transaction_id": item.paid_transaction_id,
+    }
+    item.status = "paid"
+    item.paid_at = paid_at
+    item.paid_transaction_id = transaction.id
+    item.payment_transaction_created = created_transaction
+
+    funding_balance = None
+    if payload.funding_source == "privilege":
+        funding_balance = _fund_obligation_from_privilege(
+            db,
+            user=user,
+            obligation=item,
+            paid_at=paid_at,
+        )
+    else:
+        item.funding_source = "account"
+        item.funding_transaction_id = None
+        item.funding_balance_observation_id = None
+
+    audit(
+        db,
+        user,
+        "obligation.pay",
+        "obligation",
+        item.id,
+        {
+            "transaction_id": transaction.id,
+            "transaction_created": created_transaction,
+            "amount": str(money(item.amount)),
+            "paid_at": paid_at.isoformat(),
+        },
+        before_state=before_state,
+        after_state={
+            "status": item.status,
+            "paid_at": paid_at.isoformat(),
+            "paid_transaction_id": transaction.id,
+            "payment_transaction_created": created_transaction,
+        },
+        reason="Pagamento confirmado pelo usuário",
+        trace_id=transaction.trace_id,
+        source="obligation_payment",
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "obligation_id": item.id,
+        "status": item.status,
+        "paid_at": item.paid_at,
+        "transaction_id": transaction.id,
+        "transaction_created": created_transaction,
+        "funding_source": item.funding_source,
+        "funding_balance": decimal_value(funding_balance) if funding_balance is not None else None,
+    }
+
+
+@router.post("/obligations/{obligation_id}/unpay")
+def unpay_obligation(
+    obligation_id: str,
+    payload: ObligationPaymentUndoRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    item = _get_payable_obligation(
+        db, household_id=user.household_id, obligation_id=obligation_id
+    )
+    if item.status != "paid":
+        raise HTTPException(status_code=409, detail="Esta obrigação não está marcada como paga")
+
+    transaction = None
+    if item.paid_transaction_id:
+        transaction = db.scalar(
+            select(Transaction).where(
+                Transaction.id == item.paid_transaction_id,
+                Transaction.household_id == user.household_id,
+            )
+        )
+
+    before_state = {
+        "status": item.status,
+        "paid_at": item.paid_at.isoformat() if item.paid_at else None,
+        "paid_transaction_id": item.paid_transaction_id,
+        "payment_transaction_created": item.payment_transaction_created,
+    }
+    transaction_id = item.paid_transaction_id
+    created_transaction = item.payment_transaction_created
+    funding_undone = item.funding_source == "privilege"
+    _undo_obligation_privilege_funding(db, user=user, obligation=item)
+
+    if created_transaction and transaction is not None:
+        if transaction.document_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="O lançamento vinculado é importado e não pode ser apagado automaticamente",
+            )
+        item.paid_transaction_id = None
+        item.payment_transaction_created = False
+        db.flush()
+        db.delete(transaction)
+    else:
+        item.paid_transaction_id = None
+        item.payment_transaction_created = False
+
+    item.status = "pending"
+    item.paid_at = None
+
+    audit(
+        db,
+        user,
+        "obligation.unpay",
+        "obligation",
+        item.id,
+        {
+            "transaction_id": transaction_id,
+            "transaction_deleted": bool(created_transaction and transaction is not None),
+        },
+        before_state=before_state,
+        after_state={
+            "status": "pending",
+            "paid_at": None,
+            "paid_transaction_id": None,
+            "payment_transaction_created": False,
+        },
+        reason=payload.reason,
+        source="obligation_payment",
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "obligation_id": item.id,
+        "status": item.status,
+        "transaction_deleted": bool(created_transaction and transaction is not None),
+        "funding_undone": funding_undone,
+    }
+
+
 @router.get("/obligations")
 def obligations(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict]:
-    return _obligation_rows(db, user.household_id)
+    return _obligation_rows(db, user.household_id, include_paid=True)
 
 
 @router.post("/obligations", status_code=201)
@@ -5163,8 +6356,22 @@ def delete_obligation(
     )
     if not item:
         raise HTTPException(status_code=404, detail="Compromisso não encontrado")
+    if item.status == "paid":
+        raise HTTPException(
+            status_code=409,
+            detail="Desfaça o pagamento antes de excluir uma obrigação paga",
+        )
     item.active = False
-    audit(db, user, "obligation.deactivate", "obligation", item.id, {"name": item.name})
+    item.status = "cancelled"
+    audit(
+        db,
+        user,
+        "obligation.deactivate",
+        "obligation",
+        item.id,
+        {"name": item.name},
+        after_state={"active": False, "status": "cancelled"},
+    )
     db.commit()
     return {"ok": True}
 
@@ -5172,6 +6379,22 @@ def delete_obligation(
 @router.get("/profile")
 def get_profile(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     item = profile_for(db, user.household_id)
+    # FAMILY_FINANCE_PROFILE_CONFIRMED_BALANCE_SYNC_V17
+    current_confirmed_balance = item.investment_balance
+    try:
+        privilege_account = _privilege_account(db, user.household_id, required=False)
+        if privilege_account is not None:
+            current_observation = _latest_active_balance_observation(
+                db,
+                household_id=user.household_id,
+                account_id=privilege_account.id,
+            )
+            if current_observation is not None:
+                current_confirmed_balance = money(current_observation.amount)
+    except HTTPException:
+        # Ambiguous Privilège account among *existing* investment accounts:
+        # fall back to the legacy scalar rather than guessing which one to trust.
+        pass
     db.commit()
     return {
         "monthly_salary_net": decimal_value(item.monthly_salary_net),
@@ -5181,7 +6404,7 @@ def get_profile(user: User = Depends(get_current_user), db: Session = Depends(ge
         "meal_allowance_daily": decimal_value(item.meal_allowance_daily),
         "workdays_month": item.workdays_month,
         "investment_name": item.investment_name,
-        "investment_balance": decimal_value(item.investment_balance),
+        "investment_balance": decimal_value(current_confirmed_balance),
         "investment_gross_annual_rate": decimal_value(item.investment_gross_annual_rate),
         "investment_income_tax_rate": decimal_value(item.investment_income_tax_rate),
         "projection_end": item.projection_end,
@@ -5194,16 +6417,125 @@ def update_profile(
 ) -> dict:
     _require_admin(user)
     item = profile_for(db, user.household_id)
-    for field, value in payload.model_dump().items():
+    values = payload.model_dump()
+    desired_confirmed_balance = money(payload.investment_balance)
+
+    # `required=False`: a household that has not created any investment
+    # account yet has nothing to sync an observation against -- that is the
+    # ordinary state before the Privilège-funding feature is first used, not
+    # an ambiguity, and must not block the rest of the profile (salary, cash
+    # cap, etc.) from being saved. An unresolved ambiguity among *existing*
+    # investment accounts still raises 422 from `_privilege_account` itself.
+    privilege_account = _privilege_account(db, user.household_id, required=False)
+    current_observation = (
+        _latest_active_balance_observation(
+            db,
+            household_id=user.household_id,
+            account_id=privilege_account.id,
+        )
+        if privilege_account is not None
+        else None
+    )
+
+    today = date.today()
+    if current_observation is not None and current_observation.as_of_date > today:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Existe saldo confirmado do Privilège em data futura "
+                f"({current_observation.as_of_date.isoformat()}). "
+                "Corrija essa data antes de salvar um novo saldo."
+            ),
+        )
+
+    for field, value in values.items():
         setattr(item, field, value)
-    audit(db, user, "profile.update", "financial_profile", item.id, payload.model_dump())
+
+    # No Privilège account resolved yet: there is no observation trail to
+    # reconcile against, so this is not a "confirmed balance changed" event --
+    # `item.investment_balance` below still stores the plain scalar the
+    # household declared, exactly as it did before this feature existed.
+    balance_changed = privilege_account is not None and (
+        current_observation is None
+        or money(current_observation.amount) != desired_confirmed_balance
+    )
+
+    new_observation = None
+    if balance_changed:
+        trace_id = str(uuid.uuid4())
+        new_observation = AccountBalanceObservation(
+            household_id=user.household_id,
+            account_id=privilege_account.id,
+            amount=desired_confirmed_balance,
+            as_of_date=today,
+            observation_type="point_in_time",
+            source="manual_confirmed",
+            document_id=None,
+            confirmed_by=user.id,
+            confidence=Decimal("1.0000"),
+            supersedes_id=current_observation.id if current_observation else None,
+            trace_id=trace_id,
+        )
+        db.add(new_observation)
+        db.flush()
+
+        if current_observation is not None:
+            current_observation.superseded_by_id = new_observation.id
+
+        audit(
+            db,
+            user,
+            "profile.investment_balance.confirm",
+            "account_balance_observation",
+            new_observation.id,
+            {
+                "account_id": privilege_account.id,
+                "previous_balance": (
+                    str(money(current_observation.amount))
+                    if current_observation is not None
+                    else None
+                ),
+                "confirmed_balance": str(desired_confirmed_balance),
+                "as_of_date": today.isoformat(),
+            },
+            reason="Saldo atual confirmado informado manualmente em Configurações.",
+            trace_id=trace_id,
+            source="profile_settings",
+        )
+
+    item.investment_balance = desired_confirmed_balance
+
+    audit(
+        db,
+        user,
+        "profile.update",
+        "financial_profile",
+        item.id,
+        {
+            **values,
+            "investment_balance": str(desired_confirmed_balance),
+            "confirmed_balance_changed": balance_changed,
+            "confirmed_balance_observation_id": (
+                new_observation.id if new_observation is not None else None
+            ),
+        },
+    )
     db.commit()
-    return {"ok": True}
+    return {
+        "ok": True,
+        "investment_balance": decimal_value(desired_confirmed_balance),
+        "confirmed_balance_changed": balance_changed,
+        "confirmed_balance_date": today.isoformat(),
+    }
 
 
 def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
     values: dict[str, Decimal] = {}
     for item in items:
+        # FAMILY_FINANCE_OBLIGATION_PAYMENT_V8
+        # Pago deixa de ser previsto. O débito real permanece no ledger.
+        if not item.active or item.status != "pending":
+            continue
         for occurrence in range(item.occurrence_count):
             due = add_months(item.due_date.replace(day=1), occurrence * item.recurrence_months)
             key = month_key(due)
@@ -5213,48 +6545,30 @@ def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
     return values
 
 
-def _resolve_expense_competence(*, account_type: str, competence: str | None, booked_at: date) -> str:
-    """Single source of truth for the competence (`YYYY-MM`) a manual expense
-    is recorded under, shared by `create_manual_transaction` and the
-    installment preview so the two can never diverge on the same policy.
+# FAMILY_FINANCE_CARD_CYCLES_PRIVILEGE_V13
+#
+# Hotfix (docs/WORK_ORDER_CARD_OPEN_INVOICE_COMPETENCE_HOTFIX.md, PR #81):
+# this used to be two functions of the same name -- a dead
+# `_credit_card_closing_day`/`_card_invoice_competence(*, booked_at,
+# closing_day)` pair that hardcoded Itaú/Nubank/Mercado Pago closing days by
+# bank name, silently shadowed by this real implementation (the one every
+# caller actually resolved to, since Python keeps only the last definition
+# of a name).
+#
+# P0 (docs/WORK_ORDER_CARD_COMPETENCE_REPAIR_P0.md, "Arquitetura
+# obrigatória" item 1): the formula itself now lives in
+# `app.services.card_competence`, the single canonical implementation every
+# consumer -- manual entry, Smart Capture confirmation, installment
+# preview/projection, and the historical repair detector/repairer
+# (`app.services.card_competence_repair`) -- must call. These two names stay
+# bound here, unchanged, purely so every existing call site in this module
+# and the public test surface (`tests/test_card_open_invoice_competence.py`
+# imports `from app.api import _card_invoice_competence,
+# _resolve_expense_competence`) keep working without a second copy of either
+# function ever existing.
+_card_invoice_competence = card_invoice_competence
+_resolve_expense_competence = resolve_expense_competence
 
-    `docs/FINANCIAL_RULES.md`: cartões são conciliados pela competência da
-    fatura; contas correntes usam a data exata do lançamento. So:
-    - `credit_card`: INV-017 -- the invoice's canonical competence is not
-      necessarily `booked_at`'s month, and this app has no invoice/fatura
-      entity yet to derive it automatically (lands with the "Contas a pagar"
-      slice). Fail closed instead of fabricating it: require the human to
-      explicitly confirm the competence.
-    - every other account type: competence is always `booked_at`'s month.
-      An explicitly provided `competence` that diverges from it is rejected
-      (422) rather than silently accepted/rewritten -- accepting it would
-      let a checking-account fact carry a fabricated period that contradicts
-      the bank statement's own date, which the reconciliation/projection
-      engines assume never happens for non-card accounts.
-    `booked_at` itself is never altered either way; it stays intact as the
-    lineage date.
-    """
-    booked_month = booked_at.strftime("%Y-%m")
-    if account_type == "credit_card":
-        if competence is None:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Compra no cartão exige confirmar a competência da fatura; ela não é "
-                    "derivada automaticamente da data da compra (INV-017)."
-                ),
-            )
-        return competence
-    if competence is not None and competence != booked_month:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Competência divergente da data do lançamento só é permitida para compras "
-                "no cartão (INV-017); contas correntes usam a data exata do lançamento "
-                "(docs/FINANCIAL_RULES.md)."
-            ),
-        )
-    return booked_month
 
 
 def _installment_anchor_month(*, competence: str | None, booked_at: date) -> date:
@@ -6201,6 +7515,111 @@ def financial_snapshot_lineage(
     }
 
 
+# FAMILY_FINANCE_CARD_SUMMARY_V10
+@router.get("/credit-cards/summary")
+def credit_cards_summary(
+    month: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    # actual_spending: mesmo snapshot canônico do dashboard.
+    # projected_installments/future_installments_after_month:
+    # mesmo motor canônico `_project_installments` usado pelo /forecast.
+    selected_start = _month_start(month)
+    selected_month = selected_start.strftime("%Y-%m")
+
+    snapshot = build_snapshot(
+        db,
+        household_id=user.household_id,
+        period=selected_month,
+        generated_by=user.id,
+    )
+    actual_rows = {
+        str(row.get("account_id")): row
+        for row in account_cash_flow_rows(snapshot)
+        if row.get("account_id") and row.get("account_type") == "credit_card"
+    }
+
+    cards = list(
+        db.scalars(
+            select(Account)
+            .where(
+                Account.household_id == user.household_id,
+                Account.active.is_(True),
+                Account.account_type == "credit_card",
+            )
+            .order_by(Account.institution, Account.name)
+        ).all()
+    )
+    installment_facts = _persisted_installment_rows(db, user.household_id)
+
+    rows = []
+    total_actual = Decimal("0")
+    total_projected = Decimal("0")
+    total_future_after = Decimal("0")
+
+    for card in cards:
+        actual_row = actual_rows.get(card.id, {})
+        actual_spending = money(
+            Decimal(str(actual_row.get("card_spending", 0) or 0))
+        )
+
+        card_facts = [
+            item for item in installment_facts
+            if item.account_id == card.id
+        ]
+        projection = _project_installments(card_facts)
+        projected_month = money(
+            Decimal(projection.get(selected_month, Decimal("0")))
+        )
+        projected_after = money(
+            sum(
+                (
+                    Decimal(value)
+                    for key, value in projection.items()
+                    if key > selected_month
+                ),
+                Decimal("0"),
+            )
+        )
+        projected_months = sorted(
+            key for key, value in projection.items()
+            if key >= selected_month and money(Decimal(value)) > 0
+        )
+
+        total_actual += actual_spending
+        total_projected += projected_month
+        total_future_after += projected_after
+
+        rows.append(
+            {
+                "account_id": card.id,
+                "account": _account_display(card),
+                "institution": card.institution,
+                "last_four": card.last_four,
+                "actual_spending": decimal_value(actual_spending),
+                "projected_installments": decimal_value(projected_month),
+                "future_installments_after_month": decimal_value(projected_after),
+                "first_projected_month": projected_months[0] if projected_months else None,
+                "last_projected_month": projected_months[-1] if projected_months else None,
+                "installment_source_rows": len(card_facts),
+            }
+        )
+
+    return {
+        "month": selected_month,
+        "rows": rows,
+        "totals": {
+            "actual_spending": decimal_value(money(total_actual)),
+            "projected_installments": decimal_value(money(total_projected)),
+            "future_installments_after_month": decimal_value(money(total_future_after)),
+        },
+        "accounting_note": (
+            "Pagamento de fatura é conciliação e não é somado novamente como gasto."
+        ),
+    }
+
+
 @router.get("/dashboard")
 def dashboard(
     month: str | None = None,
@@ -6261,6 +7680,47 @@ def dashboard(
             Commission.status != "cancelled",
         )
     )
+    current_liquidity_observation = None
+    liquidity_account = db.scalar(
+        select(Account)
+        .where(
+            Account.household_id == user.household_id,
+            Account.active.is_(True),
+            Account.account_type == "investment",
+            Account.name == profile.investment_name,
+        )
+        .limit(1)
+    )
+    if liquidity_account is not None:
+        observed = db.scalar(
+            select(AccountBalanceObservation)
+            .where(
+                AccountBalanceObservation.household_id == user.household_id,
+                AccountBalanceObservation.account_id == liquidity_account.id,
+                AccountBalanceObservation.as_of_date >= start,
+                AccountBalanceObservation.as_of_date < end,
+                AccountBalanceObservation.invalidated_at.is_(None),
+                AccountBalanceObservation.superseded_by_id.is_(None),
+                AccountBalanceObservation.source == "manual_confirmed",
+                AccountBalanceObservation.confidence >= Decimal("1"),
+            )
+            .order_by(
+                AccountBalanceObservation.as_of_date.desc(),
+                AccountBalanceObservation.created_at.desc(),
+            )
+            .limit(1)
+        )
+        if observed is not None:
+            current_liquidity_observation = {
+                "value": decimal_value(observed.amount),
+                "as_of_date": observed.as_of_date.isoformat(),
+                "account_id": observed.account_id,
+                "source": "account_balance_observation",
+                "freshness": "point_in_time",
+                "certified_by": "manual_confirmed",
+                "trusted": True,
+            }
+
     obligation_alerts = [
         item for item in _obligation_rows(db, user.household_id) if item["days_until_due"] <= 30
     ][:5]
@@ -6312,6 +7772,7 @@ def dashboard(
         # `certified_by`) for a consumer to tell it apart from the
         # `trusted_for_reports`-gated fields above.
         "noncanonical": {
+            "current_liquidity_observation": current_liquidity_observation,
             "future_commissions_gross": {
                 "value": decimal_value(future_commission),
                 "source": "live_query",
@@ -7180,4 +8641,29 @@ def advisor_chat(
         "snapshot_id": summary["snapshot_id"],
         "snapshot_checksum": summary["snapshot_checksum"],
         "integrity_status": summary["integrity_status"],
+    }
+
+# FAMILY_FINANCE_CURRENT_CONFIRMED_LIQUIDITY_V16_1
+@router.get("/liquidity/current-confirmed")
+def current_confirmed_liquidity(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    account = _privilege_account(db, user.household_id)
+    observation = _latest_active_balance_observation(
+        db,
+        household_id=user.household_id,
+        account_id=account.id,
+    )
+    if observation is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Saldo confirmado ativo do Privilège DI não encontrado.",
+        )
+    return {
+        "account_id": account.id,
+        "name": account.name,
+        "amount": decimal_value(money(observation.amount)),
+        "as_of_date": observation.as_of_date.isoformat(),
+        "observation_id": observation.id,
     }

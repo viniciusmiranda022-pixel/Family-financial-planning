@@ -109,10 +109,22 @@ def _create_household_admin(session_factory, *, household_name, username, passwo
         db.commit()
 
 
-def _create_account(client, *, name, account_type="checking", last_four=None):
+def _create_account(
+    client,
+    *,
+    name,
+    account_type="checking",
+    last_four=None,
+    card_closing_day=None,
+    card_due_day=None,
+):
     payload = {"name": name, "account_type": account_type}
     if last_four is not None:
         payload["last_four"] = last_four
+    if card_closing_day is not None:
+        payload["card_closing_day"] = card_closing_day
+    if card_due_day is not None:
+        payload["card_due_day"] = card_due_day
     response = client.post("/api/accounts", json=payload)
     assert response.status_code == 201, response.text
     return response.json()["id"]
@@ -412,7 +424,13 @@ def test_persisted_installments_and_new_alternative_do_not_double_count():
             investment_income_tax_rate=0,
             projection_end="2027-06-01",
         )
-        card_id = _create_account(client, name="Nubank Cartão", account_type="credit_card")
+        card_id = _create_account(
+            client,
+            name="Nubank Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=28,
+        )
         category_id = _non_system_category_id(client)
 
         real_installment = client.post(
@@ -558,7 +576,13 @@ def test_comparison_never_mutates_persisted_facts_or_integrity_history():
         _setup_household(client)
         _set_profile(client)
         checking_id = _create_account(client, name="Conta Corrente")
-        card_id = _create_account(client, name="Cartão", account_type="credit_card")
+        card_id = _create_account(
+            client,
+            name="Cartão",
+            account_type="credit_card",
+            card_closing_day=25,
+            card_due_day=28,
+        )
         category_id = _non_system_category_id(client)
 
         assert client.post(
