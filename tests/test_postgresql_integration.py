@@ -37,6 +37,7 @@ import pytest
 
 os.environ.setdefault("SECRET_KEY", "postgres-integration-test-secret-not-used-in-production")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+os.environ.setdefault("MFA_ENCRYPTION_KEY", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
 
 from alembic.config import Config  # noqa: E402
 from sqlalchemy import create_engine, func, inspect, select, text  # noqa: E402
@@ -130,7 +131,7 @@ def test_upgrade_empty_postgresql_database_to_head() -> None:
     }.issubset(tables)
     with engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0013"
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0014"
         )
     engine.dispose()
 
@@ -151,7 +152,7 @@ def test_upgrade_from_legacy_0002_baseline_preserves_existing_rows() -> None:
 
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0013"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0014"
         preserved_name = connection.execute(
             text("SELECT name FROM households WHERE id = :id"), {"id": household_id}
         ).scalar_one()

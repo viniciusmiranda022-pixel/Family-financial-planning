@@ -11,6 +11,20 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://family:family@db:5432/family_finance"
     secret_key: str = Field(min_length=32)
     file_encryption_key: str = Field(min_length=40)
+    # Fase 4 (docs/WORK_ORDER_LOCAL_MFA_TOTP.md, "Separação de chaves"):
+    # exclusive to encrypting the TOTP secret at rest. Never reused as
+    # SECRET_KEY/FILE_ENCRYPTION_KEY, and never falls back to plaintext if
+    # unset -- pydantic-settings raises at startup, matching the Work
+    # Order's "falhar explicitamente" requirement.
+    mfa_encryption_key: str = Field(min_length=40)
+    # TTL for both the pending-auth cookie (`ffp_mfa_pending`) and an
+    # unconfirmed TOTP secret's `setup_expires_at`. Kept as one value: the
+    # cookie already forces re-login at this boundary, so a second,
+    # independently-tracked expiry for the secret would only ever expire
+    # after the cookie already invalidated the flow.
+    mfa_pending_ttl_seconds: int = 300
+    mfa_rate_limit_max_attempts: int = 5
+    mfa_rate_limit_lockout_seconds: int = 300
     data_dir: Path = Path("/data")
     cookie_secure: bool = False
     session_hours: int = 12
