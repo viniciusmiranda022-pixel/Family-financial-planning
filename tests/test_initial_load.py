@@ -5,6 +5,7 @@ from decimal import Decimal
 
 os.environ.setdefault("SECRET_KEY", "initial-load-test-secret-not-used-in-production")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+os.environ.setdefault("MFA_ENCRYPTION_KEY", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
 
 import pytest  # noqa: E402
 from sqlalchemy import create_engine, func, select  # noqa: E402

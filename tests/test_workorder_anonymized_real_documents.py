@@ -65,6 +65,7 @@ from cryptography.fernet import Fernet
 
 os.environ.setdefault("SECRET_KEY", "anonymized-docs-test-secret-that-is-long-enough-aaaa")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-anonymized-docs-data-{uuid.uuid4().hex}")
 # `app.db.engine` is a process-wide singleton created from `DATABASE_URL` the
 # first time any test module imports `app.db`/`app.main` in this pytest run.
@@ -101,6 +102,7 @@ from app.models import (  # noqa: E402
 )
 from app.security import hash_password  # noqa: E402
 from tests.fixtures import pdf_documents as fx  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 from tests.fixtures.payroll_documents import (  # noqa: E402
     payroll_holerite_pdf,
     payroll_holerite_pdf_missing_identification,
@@ -139,6 +141,8 @@ def _setup_household(client: TestClient, *, household_name: str, username: str, 
         household_id = household.id
     login = client.post("/api/auth/login", json={"username": username, "password": password})
     assert login.status_code == 200
+    assert login.json() == {"mfa_required": True, "mode": "enroll"}
+    complete_mfa_enrollment(client)
     return {"household_id": household_id, "username": username}
 
 

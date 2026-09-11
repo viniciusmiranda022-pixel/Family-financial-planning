@@ -21,6 +21,7 @@ os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-finding-lifecycle-{uu
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-finding-lifecycle-data-{uuid.uuid4().hex}")
 os.environ.setdefault("SECRET_KEY", "finding-lifecycle-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 import pytest  # noqa: E402
 

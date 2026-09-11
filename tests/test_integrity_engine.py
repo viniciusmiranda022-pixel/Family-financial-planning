@@ -13,6 +13,7 @@ os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-integrity-{uuid.uuid4
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-integrity-data-{uuid.uuid4().hex}")
 os.environ.setdefault("SECRET_KEY", "integrity-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 import app.services.financial_integrity as financial_integrity_module  # noqa: E402
 from app.db import Base  # noqa: E402

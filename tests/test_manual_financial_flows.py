@@ -37,6 +37,7 @@ from sqlalchemy.pool import StaticPool
 os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-manual-flows-{uuid.uuid4().hex}.sqlite")
 os.environ.setdefault("SECRET_KEY", "manual-financial-flows-test-secret-long-enough-value")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -45,6 +46,7 @@ from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import AuditEvent, Household, Transaction, User  # noqa: E402
 from app.security import hash_password  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 
 def _client():
@@ -74,6 +76,8 @@ def _setup_household(client, *, household_name="Família Fluxos", username="admi
         },
     )
     assert setup.status_code == 201
+    assert setup.json() == {"configured": True, "mfa_required": True, "mode": "enroll"}
+    complete_mfa_enrollment(client)
     return setup.json()
 
 
@@ -968,6 +972,8 @@ def test_deleting_a_manual_transaction_is_isolated_by_household():
             json={"username": "admin-outra-delete", "password": "outra-senha-segura"},
         )
         assert login.status_code == 200, login.text
+        assert login.json() == {"mfa_required": True, "mode": "enroll"}
+        complete_mfa_enrollment(client)
 
         response = client.delete(f"/api/transactions/{transaction_id}")
         assert response.status_code == 404

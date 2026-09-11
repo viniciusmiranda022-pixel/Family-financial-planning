@@ -27,6 +27,7 @@ from sqlalchemy.pool import StaticPool
 
 os.environ.setdefault("SECRET_KEY", "monthly-close-api-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-monthly-close-api-data-{uuid.uuid4().hex}")
 
 import app.api as api_module  # noqa: E402
@@ -42,6 +43,7 @@ from app.models import (  # noqa: E402
     User,
 )
 from app.security import hash_password  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 PERIOD = "2026-08"
 
@@ -91,6 +93,8 @@ def test_monthly_close_lifecycle_and_finding_actions() -> None:
                 },
             )
             assert setup.status_code == 201
+            assert setup.json() == {"configured": True, "mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
 
             # No close yet: GET synthesizes a default without persisting anything.
             empty_state = client.get(f"/api/monthly-closes/{PERIOD}")
@@ -117,6 +121,8 @@ def test_monthly_close_lifecycle_and_finding_actions() -> None:
                     json={"username": "kelly-close", "password": "senha-kelly-segura"},
                 )
                 assert login.status_code == 200
+                assert login.json() == {"mfa_required": True, "mode": "enroll"}
+                complete_mfa_enrollment(member_client)
                 assert member_client.post(f"/api/monthly-closes/{PERIOD}/run").status_code == 403
                 assert member_client.post(f"/api/monthly-closes/{PERIOD}/trust").status_code == 403
                 assert member_client.post(
@@ -244,6 +250,8 @@ def test_monthly_close_lifecycle_and_finding_actions() -> None:
                     json={"username": "admin-outro", "password": "outra-senha-segura"},
                 )
                 assert other_login.status_code == 200
+                assert other_login.json() == {"mfa_required": True, "mode": "enroll"}
+                complete_mfa_enrollment(other_client)
                 assert other_client.get(f"/api/integrity/findings/{finding_id}").status_code == 404
                 assert other_client.post(
                     f"/api/integrity/findings/{finding_id}/resolve", json={"reason": "tentativa indevida"}
@@ -308,6 +316,8 @@ def test_monthly_close_reaches_trusted_for_a_real_clean_period() -> None:
                 json={"username": "admin-close-clean", "password": "senha-local-segura"},
             )
             assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
 
             investment = client.post(
                 "/api/accounts",
@@ -436,6 +446,8 @@ def test_run_to_trust_revision_barrier_blocks_stale_projection_input() -> None:
                 json={"username": "admin-close-revision-barrier", "password": "senha-local-segura"},
             )
             assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
 
             investment = client.post(
                 "/api/accounts",
@@ -580,6 +592,8 @@ def test_future_commissions_gross_stays_noncanonical_after_trust() -> None:
                 json={"username": "admin-close-commission", "password": "senha-local-segura"},
             )
             assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
 
             investment = client.post(
                 "/api/accounts",
@@ -708,6 +722,8 @@ def test_run_failure_leaves_no_snapshot_trace_but_still_records_the_failed_run(m
                 json={"username": "admin-close-failure", "password": "senha-local-segura"},
             )
             assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
 
             account = client.post(
                 "/api/accounts",

@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 # side effect of import order) still needs them to import `app.db`.
 os.environ.setdefault("SECRET_KEY", "synthetic-fixture-test-secret-not-used-in-production")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+os.environ.setdefault("MFA_ENCRYPTION_KEY", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
 
 from app.db import Base  # noqa: E402
 from app.services.financial_snapshots import build_snapshot  # noqa: E402

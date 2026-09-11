@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-duplicates-{uuid.uuid4().hex}.sqlite")
 os.environ.setdefault("SECRET_KEY", "duplicates-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.db import Base
 from app.models import Account, Document, DuplicateGroupMember, Household, Transaction, User

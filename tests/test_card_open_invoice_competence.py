@@ -41,6 +41,7 @@ from sqlalchemy.pool import StaticPool
 os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-card-competence-{uuid.uuid4().hex}.sqlite")
 os.environ.setdefault("SECRET_KEY", "card-competence-hotfix-test-secret-long-enough-value")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 import pytest  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
@@ -50,6 +51,7 @@ from app.api import _card_invoice_competence, _resolve_expense_competence  # noq
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Account, Transaction, User  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 
 def _client():
@@ -79,6 +81,9 @@ def _setup_household(client, *, username="admin-cartao"):
         },
     )
     assert setup.status_code == 201
+    assert setup.json()["mfa_required"] is True
+    assert setup.json()["mode"] == "enroll"
+    complete_mfa_enrollment(client)
 
 
 def _create_account(

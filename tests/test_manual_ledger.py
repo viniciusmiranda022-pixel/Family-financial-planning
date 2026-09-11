@@ -33,6 +33,7 @@ from sqlalchemy.pool import StaticPool
 os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-manual-ledger-{uuid.uuid4().hex}.sqlite")
 os.environ.setdefault("SECRET_KEY", "manual-ledger-test-secret-that-is-long-enough-aaaa")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -40,6 +41,10 @@ from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Account, AuditEvent, Category, Document, Household, Transaction, User  # noqa: E402
 from app.security import hash_password  # noqa: E402
+from tests.fixtures.mfa_enrollment import (  # noqa: E402
+    complete_mfa_enrollment,
+    complete_mfa_verification,
+)
 
 
 def _client():
@@ -60,7 +65,12 @@ def _client():
 
 def _setup_household(
     client, *, household_name="Família Livro-Razão", username="admin-ledger", password="senha-local-segura"
-):
+) -> str:
+    """Bootstrap the first admin for a fresh household and complete its
+    (necessarily first-ever) TOTP enrollment, leaving `client` holding a
+    full session. Returns the plaintext TOTP secret, for callers that log
+    this same user back in later in the same test via
+    `complete_mfa_verification`."""
     setup = client.post(
         "/api/auth/setup",
         json={
@@ -71,7 +81,8 @@ def _setup_household(
         },
     )
     assert setup.status_code == 201, setup.text
-    return setup.json()
+    assert setup.json() == {"configured": True, "mfa_required": True, "mode": "enroll"}
+    return complete_mfa_enrollment(client)
 
 
 def _create_household_admin(session_factory, *, household_name, username, password):
@@ -630,7 +641,7 @@ def test_ledger_transfer_filter_household_isolation_holds_for_legacy_rows() -> N
     used to hard-code."""
     client, session_factory = _client()
     with client:
-        _setup_household(client, household_name="Família A", username="admin-a-legacy")
+        secret_a = _setup_household(client, household_name="Família A", username="admin-a-legacy")
         checking_a = _create_account(client, name="Conta A")
         with session_factory() as db:
             household_a_id = db.scalar(select(User.household_id).where(User.username == "admin-a-legacy"))
@@ -649,6 +660,8 @@ def test_ledger_transfer_filter_household_isolation_holds_for_legacy_rows() -> N
             "/api/auth/login", json={"username": "admin-b-legacy", "password": "senha-local-segura"}
         )
         assert login_b.status_code == 200
+        assert login_b.json() == {"mfa_required": True, "mode": "enroll"}
+        complete_mfa_enrollment(client)
         checking_b = _create_account(client, name="Conta B")
         legacy_b = _legacy_transfer_row(
             session_factory,
@@ -666,6 +679,8 @@ def test_ledger_transfer_filter_household_isolation_holds_for_legacy_rows() -> N
             "/api/auth/login", json={"username": "admin-a-legacy", "password": "senha-local-segura"}
         )
         assert login_a.status_code == 200
+        assert login_a.json() == {"mfa_required": True, "mode": "verify"}
+        complete_mfa_verification(client, secret_a)
         transfer_rows_a = {row["id"] for row in _ledger(client, movement_type="transfer", limit=500)}
         assert legacy_a in transfer_rows_a
         assert legacy_b not in transfer_rows_a
@@ -749,7 +764,7 @@ def test_ledger_requires_authentication() -> None:
 def test_ledger_household_isolation() -> None:
     client, session_factory = _client()
     with client:
-        _setup_household(client, household_name="Família A", username="admin-a")
+        secret_a = _setup_household(client, household_name="Família A", username="admin-a")
         checking_a = _create_account(client, name="Conta A")
         fact_a = _create_manual_transaction(
             client, movement_type="income", amount=500, account_id=checking_a, description="Renda da família A"
@@ -760,6 +775,8 @@ def test_ledger_household_isolation() -> None:
         )
         login_b = client.post("/api/auth/login", json={"username": "admin-b", "password": "senha-local-segura"})
         assert login_b.status_code == 200
+        assert login_b.json() == {"mfa_required": True, "mode": "enroll"}
+        complete_mfa_enrollment(client)
         checking_b = _create_account(client, name="Conta B")
         fact_b = _create_manual_transaction(
             client, movement_type="income", amount=700, account_id=checking_b, description="Renda da família B"
@@ -773,6 +790,8 @@ def test_ledger_household_isolation() -> None:
 
         login_a = client.post("/api/auth/login", json={"username": "admin-a", "password": "senha-local-segura"})
         assert login_a.status_code == 200
+        assert login_a.json() == {"mfa_required": True, "mode": "verify"}
+        complete_mfa_verification(client, secret_a)
         rows_a = _ledger(client, limit=500)
         ids_a = {row["id"] for row in rows_a}
         assert fact_a["id"] in ids_a

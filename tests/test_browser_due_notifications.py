@@ -39,12 +39,14 @@ from sqlalchemy.pool import StaticPool
 os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-due-notifications-{uuid.uuid4().hex}.sqlite")
 os.environ.setdefault("SECRET_KEY", "browser-due-notifications-test-secret-long-enough-value")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import AuditEvent, Obligation, Transaction  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 ENDPOINT = "/api/obligations"
 
@@ -76,6 +78,9 @@ def _setup_household(client):
         },
     )
     assert setup.status_code == 201, setup.text
+    assert setup.json()["mfa_required"] is True
+    assert setup.json()["mode"] == "enroll"
+    complete_mfa_enrollment(client)
 
 
 def _row_counts(session_factory) -> dict:

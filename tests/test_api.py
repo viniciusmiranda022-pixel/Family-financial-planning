@@ -13,6 +13,7 @@ os.environ["DATABASE_URL"] = f"sqlite:////tmp/ffp-api-{TEST_ID}.sqlite"
 os.environ["DATA_DIR"] = f"/tmp/ffp-data-{TEST_ID}"
 os.environ["SECRET_KEY"] = "integration-test-secret-that-is-never-used-in-production"
 os.environ["FILE_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+os.environ["MFA_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
 os.environ["SESSION_SECURE"] = "false"
 
 from app.db import Base, SessionLocal, engine  # noqa: E402
@@ -28,6 +29,7 @@ from app.models import (  # noqa: E402
     Transaction,
 )
 from app.services.codex_client import CodexAdvisorClient, CodexResult  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 Base.metadata.create_all(bind=engine)
 
@@ -55,6 +57,9 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
             },
         )
         assert setup.status_code == 201
+        assert setup.json()["mfa_required"] is True
+        assert setup.json()["mode"] == "enroll"
+        complete_mfa_enrollment(client)
 
         empty_integrity_run = client.post("/api/integrity/runs", json={"scope": "global"})
         assert empty_integrity_run.status_code == 201
@@ -1135,7 +1140,9 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
                 json={"username": "kelly", "password": "senha-kelly-segura"},
             )
             assert family_login.status_code == 200
-            assert family_login.json()["is_admin"] is False
+            assert family_login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(family_client)
+            assert family_client.get("/api/auth/me").json()["is_admin"] is False
             assert family_client.get("/api/dashboard?month=2026-08").json()["spending"] == 76.78
             assert family_client.get("/api/users").status_code == 403
         assert client.delete(f"/api/users/{family_user.json()['id']}").status_code == 200

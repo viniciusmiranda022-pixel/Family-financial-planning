@@ -40,6 +40,7 @@ from sqlalchemy.pool import StaticPool
 
 os.environ.setdefault("SECRET_KEY", "card-competence-repair-p0-test-secret-long-enough-value")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-card-competence-repair-p0-data-{uuid.uuid4().hex}")
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -59,6 +60,7 @@ from app.models import (  # noqa: E402
 from app.security import hash_password  # noqa: E402
 from app.services.card_competence import card_invoice_competence  # noqa: E402
 from app.services.classifier import normalize_description  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 REPAIR_EVENT_TYPE = "transaction.card_competence_repair"
 REPAIR_BATCH_EVENT_TYPE = "card_competence_repair.batch"
@@ -92,6 +94,9 @@ def _setup_household(client, *, username="admin-repair", household_name="Famíli
         },
     )
     assert setup.status_code == 201, setup.text
+    assert setup.json()["mfa_required"] is True
+    assert setup.json()["mode"] == "enroll"
+    complete_mfa_enrollment(client)
 
 
 def _add_member(client, *, username, password="senha-membro-segura", is_admin=False):
@@ -106,6 +111,8 @@ def _add_member(client, *, username, password="senha-membro-segura", is_admin=Fa
 def _login(client, *, username, password):
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200, response.text
+    assert response.json() == {"mfa_required": True, "mode": "enroll"}
+    complete_mfa_enrollment(client)
 
 
 def _create_account(client, *, name, account_type="checking", card_closing_day=None, card_due_day=None):
