@@ -387,6 +387,43 @@ formulário de perfil financeiro, que fica visível (leitura) porém com campos 
 de salvar oculto. Isso é UX pura, documentado como tal em cada ponto do código: a barreira real é
 sempre `_require_admin` no backend, nunca esta classe ou este helper.
 
+## MFA local TOTP (Fase 4)
+
+`docs/WORK_ORDER_LOCAL_MFA_TOTP.md`. Estende a autenticação existente (senha `scrypt` + cookie
+assinado por `itsdangerous`) sem criar um provedor de identidade paralelo:
+
+- **Máquina de estados explícita.** `ANONYMOUS` -> (senha válida) -> `PASSWORD_VERIFIED` -> (sem fator
+  confirmado) `MFA_ENROLL_PENDING` ou (fator confirmado) `MFA_VERIFY_PENDING` -> (TOTP/recovery válido)
+  `FULLY_AUTHENTICATED`. Os dois estados pendentes usam um cookie próprio, `ffp_mfa_pending`
+  (`app.security.set_pending_cookie`/`get_enroll_pending_user`/`get_verify_pending_user`), assinado com
+  um *salt* `itsdangerous` distinto do de `ffp_session` e TTL curto (`mfa_pending_ttl_seconds`, 5 min
+  por padrão). `POST /auth/login`/`POST /auth/setup` nunca mais emitem `ffp_session` diretamente --
+  apenas `{"mfa_required": true, "mode": "enroll"|"verify"}` mais esse cookie pendente.
+- **`MfaFactor` (um por usuário) modela ativo e pendente na mesma linha.** `secret_encrypted`/
+  `confirmed_at` são o fator que um login realmente valida; `pending_secret_encrypted`/
+  `pending_setup_started_at`/`pending_setup_expires_at` hospedam um novo segredo em enrollment ou
+  reconfiguração *sem* desativar o fator ativo -- só a confirmação copia o pendente por cima do ativo
+  (`app.api._activate_pending_secret`). Isso evita lockout: o fator antigo continua validando login até
+  o novo ser confirmado.
+- **Duas contagens de anti-replay independentes.** `last_accepted_timestep` (contra o segredo ativo) e
+  `pending_last_accepted_timestep` (contra o pendente) são colunas separadas -- ver o docstring de
+  `MfaFactor` em `app/models.py`. Compartilhar uma única contagem faria a etapa de reautenticação da
+  reconfiguração (contra o segredo ativo) colidir com a etapa de confirmação (contra o pendente) sempre
+  que ambas caíssem no mesmo timestep de 30s, rejeitando um código legítimo como "replay".
+  `app.api._accept_timestep` aceita um `UPDATE ... WHERE <coluna> IS NULL OR <coluna> < :timestep`
+  atômico por chamada, condicionado à coluna certa.
+- **Rate limit e criptografia do segredo** seguem o mesmo modelo: `UPDATE` atômico com `CASE` para
+  `failed_attempts`/`locked_until` (`app.api._register_mfa_failure`), e `Fernet(MFA_ENCRYPTION_KEY)`
+  para o segredo em repouso (`app.services.mfa`), nunca `SECRET_KEY`/`FILE_ENCRYPTION_KEY`.
+- **`User.session_version`** é o mecanismo de revogação server-side: todo `ffp_session` embute a versão
+  vigente no momento da emissão; `get_current_user` rejeita qualquer cookie cuja versão não bata --
+  inclusive um cookie assinado antes desta coluna existir, que não carrega `sv` algum e portanto falha
+  fechado. Reconfiguração e o break-glass local (`app.cli.mfa`) incrementam essa versão
+  (`app.security.bump_session_version`) para revogar toda sessão anterior de uma vez.
+- **QR local.** `app.services.mfa.qr_code_data_uri` renderiza o PNG inteiramente no processo (biblioteca
+  `qrcode`) e devolve um `data:image/png;base64,...`; a URI `otpauth://` (biblioteca `pyotp`) nunca sai
+  do processo da aplicação.
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila
