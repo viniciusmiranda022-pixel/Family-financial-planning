@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 import pyotp
 import pytest
 from cryptography.fernet import Fernet
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from itsdangerous import URLSafeTimedSerializer
 from sqlalchemy import create_engine, func, select
@@ -222,6 +223,113 @@ def test_enroll_confirm_success_issues_session_and_ten_recovery_codes() -> None:
         assert all(row.used_at is None for row in rows)
     # Backend is authoritative: a normal financial endpoint now works.
     assert client.get("/api/auth/me").status_code == 200
+
+
+def test_stale_enroll_pending_cookie_cannot_hijack_an_already_confirmed_factor() -> None:
+    """Engineer review of PR #83 (2026-09-11), BLOQUEIO DE MERGE item 1:
+    a client/tab that validated the password *before* the user's first
+    enrollment finished keeps an `ffp_mfa_pending(enroll)` cookie that
+    `get_enroll_pending_user` accepts on `uid` + purpose alone, with no
+    check that the factor it might stage/confirm over is already
+    confirmed. Reproduces the exact scenario: client A logs in first and
+    holds a still-valid enroll-pending cookie; client B (same account --
+    e.g. a different device) logs in afterwards and completes enrollment
+    for real. Client A's stale cookie must not be able to stage a new
+    pending secret over the now-confirmed factor via `/enroll/start`, nor
+    confirm one via `/enroll/confirm` -- only `/auth/mfa/reconfigure/*`
+    (full session + current password + current TOTP/recovery) may replace
+    a confirmed factor."""
+
+    username = _unique("stale-enroll")
+    password = "senha-local-bem-segura"
+    _create_user(household_name=f"Família {username}", username=username, password=password, is_admin=True)
+
+    client_a = TestClient(app)
+    _login(client_a, username, password)  # holds ffp_mfa_pending(enroll), never finishes enrollment
+
+    client_b = TestClient(app)
+    _login(client_b, username, password)
+    secret_b = complete_mfa_enrollment(client_b)  # confirms the factor for real
+
+    factor_before = _factor_for(username)
+    assert factor_before.confirmed_at is not None
+    secret_encrypted_before = factor_before.secret_encrypted
+
+    # Client A's stale pending cookie must fail closed, not restage a
+    # secret over the now-confirmed factor.
+    start = client_a.post("/api/auth/mfa/enroll/start")
+    assert start.status_code == 409, start.text
+
+    # Even a direct confirm call (skipping /start) with a valid code for
+    # client B's real secret must fail closed rather than "reconfiguring"
+    # the account without any password/TOTP re-check.
+    forged_code = pyotp.TOTP(secret_b).now()
+    confirm = client_a.post("/api/auth/mfa/enroll/confirm", json={"code": forged_code})
+    assert confirm.status_code == 409, confirm.text
+
+    factor_after = _factor_for(username)
+    assert factor_after.confirmed_at == factor_before.confirmed_at
+    assert factor_after.secret_encrypted == secret_encrypted_before
+    assert factor_after.pending_secret_encrypted is None
+
+    # Client B's real session and secret are untouched by the attempt.
+    assert client_b.get("/api/auth/me").status_code == 200
+
+
+def test_stage_pending_secret_loses_race_to_a_confirm_that_commits_after_its_own_read() -> None:
+    """Proves `_stage_pending_secret(require_unconfirmed=True)`'s guard is
+    the atomic `UPDATE ... WHERE confirmed_at IS NULL`, not merely the
+    Python-level `if factor.confirmed_at is not None` check that precedes
+    it: session A reads a factor that is still unconfirmed and has no
+    pending secret yet (matching the very first `_mfa_factor_for` read a
+    real `/enroll/start` request does before generating anything), then a
+    *different* session B independently confirms that same factor (as a
+    different client's completed enrollment would) and commits -- all
+    before session A calls `_stage_pending_secret` with its own, now-stale
+    in-memory `factor` object, which still shows `confirmed_at is None`.
+    Session A's call must still be rejected, because the guard
+    re-evaluates against the database's current, post-commit state at
+    write time instead of trusting A's stale read -- exactly the property
+    that closes the race a plain Python-level check followed by a
+    separate, unconditional write would not."""
+
+    from app.api import _stage_pending_secret
+
+    username = _unique("race-enroll")
+    password = "senha-local-bem-segura"
+    user_id = _create_user(
+        household_name=f"Família {username}", username=username, password=password, is_admin=True
+    )
+
+    with _TestSessionLocal() as db_a, _TestSessionLocal() as db_b:
+        user_a = db_a.get(User, user_id)
+        factor_a = MfaFactor(user_id=user_id)
+        db_a.add(factor_a)
+        db_a.commit()
+        assert factor_a.confirmed_at is None
+        assert factor_a.pending_secret_encrypted is None  # skips the reuse-cached-secret branch below
+
+        # A different session independently confirms this exact factor
+        # (simulating a different client's completed enrollment) between
+        # A's read above and A's write below.
+        user_b = db_b.get(User, user_id)
+        factor_b = db_b.scalar(select(MfaFactor).where(MfaFactor.user_id == user_b.id))
+        factor_b.secret_encrypted = "not-a-real-encrypted-secret"
+        factor_b.confirmed_at = datetime.now(UTC)
+        db_b.commit()
+        assert factor_b.confirmed_at is not None
+
+        # Session A stages with its stale (still-unconfirmed, in its own
+        # memory) factor object -- must still be rejected.
+        assert factor_a.confirmed_at is None
+        with pytest.raises(HTTPException) as excinfo:
+            _stage_pending_secret(db_a, user_a, factor_a, require_unconfirmed=True)
+        assert excinfo.value.status_code == 409
+
+    factor_final = _factor_for(username)
+    assert factor_final.confirmed_at is not None
+    assert factor_final.secret_encrypted == "not-a-real-encrypted-secret"
+    assert factor_final.pending_secret_encrypted is None
 
 
 # ---------------------------------------------------------------------------

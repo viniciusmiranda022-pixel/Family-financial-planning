@@ -1192,7 +1192,16 @@ def _mfa_pending_expired(factor: MfaFactor, now: datetime) -> bool:
     return bool(expires_at and expires_at <= now)
 
 
-def _stage_pending_secret(db: Session, user: User, factor: MfaFactor | None) -> tuple[MfaFactor, str, bool]:
+def _raise_already_enrolled() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="MFA já configurado para este usuário. Use a reconfiguração para trocar o autenticador.",
+    )
+
+
+def _stage_pending_secret(
+    db: Session, user: User, factor: MfaFactor | None, *, require_unconfirmed: bool = False
+) -> tuple[MfaFactor, str, bool]:
     """Return `(factor, plaintext_secret, generated_new)` for an enrollment
     or reconfiguration in progress.
 
@@ -1202,6 +1211,23 @@ def _stage_pending_secret(db: Session, user: User, factor: MfaFactor | None) -> 
     one otherwise ("Setup expirado não ativa MFA e deve exigir novo
     segredo. Não reutilizar indefinidamente segredo de enrollment
     abandonado.").
+
+    `require_unconfirmed=True` (the fresh-enrollment callers) fails closed
+    with 409 instead of staging anything when `factor.confirmed_at` is
+    already set -- only `/auth/mfa/reconfigure/*` (which requires a full
+    session plus current password and current second factor) may replace a
+    confirmed factor. Without this, a stale `ffp_mfa_pending(enroll)`
+    cookie issued *before* the user's first enrollment (e.g. a second
+    device/tab that validated the password first but never finished
+    enrollment) would still pass `get_enroll_pending_user` after a
+    different client completed enrollment in the meantime, and could stage
+    -- then confirm -- a brand-new secret over the now-confirmed factor,
+    bypassing the "Reconfigurar autenticador" contract entirely (no current
+    password/TOTP re-check). The guard itself is an atomic
+    `UPDATE ... WHERE confirmed_at IS NULL`, not a Python-level check
+    followed by a separate write, so a factor confirmed by a concurrent
+    request between this function's read and its write still loses the
+    race instead of silently overwriting the just-confirmed secret.
     """
 
     now = datetime.now(UTC)
@@ -1209,6 +1235,8 @@ def _stage_pending_secret(db: Session, user: User, factor: MfaFactor | None) -> 
         factor = MfaFactor(user_id=user.id)
         db.add(factor)
         db.flush()
+    elif require_unconfirmed and factor.confirmed_at is not None:
+        _raise_already_enrolled()
     if (
         factor.pending_secret_encrypted
         and factor.pending_setup_expires_at
@@ -1216,13 +1244,33 @@ def _stage_pending_secret(db: Session, user: User, factor: MfaFactor | None) -> 
     ):
         return factor, mfa_service.decrypt_secret(factor.pending_secret_encrypted), False
     secret = mfa_service.generate_totp_secret()
-    factor.pending_secret_encrypted = mfa_service.encrypt_secret(secret)
-    factor.pending_setup_started_at = now
-    factor.pending_setup_expires_at = mfa_pending_expires_at()
-    # A brand-new secret has no history of its own -- any prior pending
-    # secret's accepted timestep is meaningless against this one.
-    factor.pending_last_accepted_timestep = None
-    db.flush()
+    stmt = update(MfaFactor).where(MfaFactor.id == factor.id)
+    if require_unconfirmed:
+        stmt = stmt.where(MfaFactor.confirmed_at.is_(None))
+    result = db.execute(
+        stmt.values(
+            pending_secret_encrypted=mfa_service.encrypt_secret(secret),
+            pending_setup_started_at=now,
+            # A brand-new secret has no history of its own -- any prior
+            # pending secret's accepted timestep is meaningless against it.
+            pending_setup_expires_at=mfa_pending_expires_at(),
+            pending_last_accepted_timestep=None,
+        )
+    )
+    if result.rowcount != 1:
+        if require_unconfirmed:
+            # Lost the race against a concurrent confirm that confirmed
+            # this exact factor between the read above and this UPDATE.
+            _raise_already_enrolled()
+        # `require_unconfirmed=False` only reaches here if the factor row
+        # itself vanished mid-request (the local break-glass CLI deletes
+        # it outright) -- unrelated to "already enrolled", so raise a
+        # distinct, accurate error instead of the misleading one above.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Fator MFA foi removido por um reset. Faça login novamente.",
+        )
+    db.refresh(factor)
     return factor, secret, True
 
 
@@ -1476,7 +1524,7 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
 @router.post("/auth/mfa/enroll/start")
 def mfa_enroll_start(user: User = Depends(get_enroll_pending_user), db: Session = Depends(get_db)) -> dict:
     factor = _mfa_factor_for(db, user)
-    factor, secret, generated_new = _stage_pending_secret(db, user, factor)
+    factor, secret, generated_new = _stage_pending_secret(db, user, factor, require_unconfirmed=True)
     if generated_new:
         audit(db, user, "mfa.enrollment_started")
     db.commit()
@@ -1497,6 +1545,14 @@ def mfa_enroll_confirm(
     db: Session = Depends(get_db),
 ) -> dict:
     factor = _mfa_factor_for(db, user)
+    if factor is not None and factor.confirmed_at is not None:
+        # Defense in depth alongside `_stage_pending_secret`'s atomic guard:
+        # a stale `ffp_mfa_pending(enroll)` cookie from before this user's
+        # first enrollment must never be able to (re)activate a factor that
+        # another client already confirmed in the meantime. Fails closed
+        # without touching pending state or issuing a session -- only
+        # `/auth/mfa/reconfigure/*` may replace a confirmed factor.
+        _raise_already_enrolled()
     if factor is None or not factor.pending_secret_encrypted:
         raise HTTPException(
             status_code=400, detail="Nenhuma configuração de MFA pendente. Inicie o enrollment novamente."
