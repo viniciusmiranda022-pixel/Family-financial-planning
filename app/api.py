@@ -4262,10 +4262,30 @@ def confirm_capture(
             # movements (income/transfer/reconciliation/refund) keep the
             # pre-existing date-based competence; the invoice-cycle concept
             # only applies to card purchases.
+            #
+            # Issue #84 (P0): a Smart Capture transaction proposal is never
+            # supposed to carry its own `competence` -- the frontend only
+            # renders that field for payroll items -- but `CaptureItemRequest`
+            # does not forbid it, so nothing stops a future capture-generation
+            # path (or an out-of-band client) from populating it. For a
+            # card-account expense, forward it into the same canonical
+            # resolver `create_manual_transaction` uses instead of discarding
+            # it unread: `resolve_expense_competence` then fails closed (422)
+            # on any value that diverges from the invoice cycle, so a
+            # conflicting competence is explicitly rejected -- never silently
+            # bypassed -- rather than only happening to be safe because this
+            # call site never looked at it. Non-card expenses are unaffected:
+            # only credit-card purchases have an invoice cycle to diverge
+            # from (INV-017 scope).
+            explicit_competence = (
+                proposal.competence.strftime("%Y-%m")
+                if proposal.competence is not None and account.account_type == "credit_card"
+                else None
+            )
             competence = (
                 _resolve_expense_competence(
                     account=account,
-                    competence=None,
+                    competence=explicit_competence,
                     booked_at=proposal.booked_at,
                 )
                 if movement_type == "expense"
