@@ -29,6 +29,7 @@ SQLite engine with `dependency_overrides[get_db]`).
 
 import os
 import uuid
+from datetime import date
 
 from cryptography.fernet import Fernet
 from sqlalchemy import create_engine, func, select
@@ -118,15 +119,23 @@ def test_recurring_obligation_surfaces_a_single_row_not_one_per_occurrence():
     single next occurrence), never once per remaining occurrence -- the
     notification UI keys its dedup/display purely off this list, so a
     duplicated row here would mean a duplicated (or repeatedly re-fired)
-    alert for the same underlying fact."""
+    alert for the same underlying fact.
+
+    The first occurrence is `due_date` itself with zero months added
+    (`_obligation_dates` / `_add_months_preserving_day`), so anchoring
+    `due_date` to `date.today()` keeps `next_due_date == due_date`
+    deterministic regardless of which calendar day the suite runs on --
+    no month-end/day-preservation arithmetic is involved for occurrence
+    zero, and no arbitrary future date is hardcoded."""
     client, _ = _client()
     with client:
         _setup_household(client)
+        due_date = date.today()
         created = client.post(
             "/api/obligations",
             json={
                 "name": "Assinatura mensal",
-                "due_date": "2026-09-10",
+                "due_date": due_date.isoformat(),
                 "amount": 49.9,
                 "recurrence_months": 1,
                 "occurrence_count": 12,
@@ -136,7 +145,7 @@ def test_recurring_obligation_surfaces_a_single_row_not_one_per_occurrence():
         rows = client.get(ENDPOINT).json()
         matching = [item for item in rows if item["name"] == "Assinatura mensal"]
         assert len(matching) == 1
-        assert matching[0]["next_due_date"] == "2026-09-10"
+        assert matching[0]["next_due_date"] == due_date.isoformat()
 
 
 def test_reading_obligations_never_mutates_any_financial_entity():
