@@ -11,7 +11,7 @@ from app.models import User
 from app.services.financial_invariants import FINANCIAL_RULES_VERSION
 
 settings = get_settings()
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.4.0"
 app = FastAPI(
     title=settings.app_name,
     version=APP_VERSION,
