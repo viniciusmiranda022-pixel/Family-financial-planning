@@ -453,3 +453,40 @@ class CardCompetenceRepairRollbackRequest(BaseModel):
     transaction_ids: list[str] = Field(min_length=1, max_length=500)
     expected_financial_revision: int = Field(ge=0)
     reason: str = Field(min_length=3, max_length=1000)
+
+
+class MfaEnrollConfirmRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class MfaChallengeRequest(BaseModel):
+    """Body shared by the login MFA challenge and reconfiguration/recovery
+    re-authentication: exactly one of a 6-digit TOTP code or a recovery
+    code, never both -- accepting both and treating either as sufficient
+    would silently let a caller skip whichever check it omits."""
+
+    code: str | None = Field(default=None, min_length=6, max_length=6, pattern=r"^\d{6}$")
+    recovery_code: str | None = Field(default=None, min_length=8, max_length=40)
+
+    @model_validator(mode="after")
+    def validate_single_factor(self) -> "MfaChallengeRequest":
+        if bool(self.code) == bool(self.recovery_code):
+            raise ValueError("Informe exatamente um: código TOTP ou código de recuperação")
+        return self
+
+
+class MfaReauthRequest(BaseModel):
+    """Strong re-authentication for reconfiguration/recovery-code
+    regeneration: current password plus current second factor, per the
+    Work Order's "Reconfiguração do autenticador" (never just the already
+    valid session cookie)."""
+
+    password: str = Field(min_length=1, max_length=200)
+    code: str | None = Field(default=None, min_length=6, max_length=6, pattern=r"^\d{6}$")
+    recovery_code: str | None = Field(default=None, min_length=8, max_length=40)
+
+    @model_validator(mode="after")
+    def validate_single_factor(self) -> "MfaReauthRequest":
+        if bool(self.code) == bool(self.recovery_code):
+            raise ValueError("Informe exatamente um: código TOTP ou código de recuperação")
+        return self

@@ -35,6 +35,7 @@ from sqlalchemy.pool import StaticPool
 os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-manual-payables-{uuid.uuid4().hex}.sqlite")
 os.environ.setdefault("SECRET_KEY", "manual-payables-test-secret-long-enough-value")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -50,6 +51,7 @@ from app.models import (  # noqa: E402
     User,
 )
 from app.security import hash_password  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 
 def _client():
@@ -86,6 +88,9 @@ def _setup_household(
         },
     )
     assert setup.status_code == 201
+    assert setup.json()["mfa_required"] is True
+    assert setup.json()["mode"] == "enroll"
+    complete_mfa_enrollment(client)
     with session_factory() as db:
         household_id = db.scalar(select(User.household_id).where(User.username == username.lower()))
     return household_id

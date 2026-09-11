@@ -29,6 +29,8 @@
 - perfis de administrador e consulta (Fase 4): toda rota mutável exige `app.api._require_admin`,
   fail-closed e verificado no backend antes de qualquer busca por id -- ver "Perfis de administrador e
   consulta (Fase 4)" em `docs/ARCHITECTURE.md`.
+- autenticação multifator local obrigatória (Fase 4, TOTP RFC 6238): senha correta nunca produz sessão
+  completa isoladamente -- ver "MFA local TOTP (Fase 4)" abaixo e `docs/WORK_ORDER_LOCAL_MFA_TOTP.md`.
 
 ## Antes da produção
 
@@ -79,13 +81,39 @@ mas toda análise ou classificação exige o segredo aleatório e a porta 8081 n
 Tailscale Serve. Ele é iniciado por uma tarefa do próprio usuário. Credenciais do Codex ficam fora
 do repositório em `%LOCALAPPDATA%\FamilyFinancialPlanning\codex`.
 
+## MFA local TOTP (Fase 4)
+
+`docs/WORK_ORDER_LOCAL_MFA_TOTP.md` é a especificação normativa completa. Resumo operacional:
+
+- todo usuário ativo (administrador ou consulta) precisa de um segundo fator TOTP confirmado para
+  receber `ffp_session`; senha correta isolada só produz um cookie `ffp_mfa_pending` de curta duração
+  (`MFA_ENCRYPTION_KEY`/`mfa_pending_ttl_seconds`), lido por uma dependência FastAPI distinta da que
+  protege as rotas financeiras (`app.security.get_current_user` nunca lê `ffp_mfa_pending`);
+- o segredo TOTP é criptografado em repouso com `MFA_ENCRYPTION_KEY` -- uma chave Fernet exclusiva,
+  nunca `SECRET_KEY` nem `FILE_ENCRYPTION_KEY`; a aplicação falha explicitamente na inicialização se
+  ela estiver ausente ou inválida (`app.services.mfa.MfaConfigurationError`), nunca cai para plaintext;
+- recovery codes (10 por enrollment/regeneração) só existem no banco como HMAC-SHA256 keyed pela
+  mesma chave -- nunca plaintext, nunca reversível;
+- anti-replay e rate limit são aplicados com `UPDATE ... WHERE` atômico e condicional
+  (`app.api._accept_timestep`/`_register_mfa_failure`), sem depender de `SELECT ... FOR UPDATE`, então
+  funcionam identicamente em SQLite (testes) e PostgreSQL (produção);
+- `session_version` em `User` permite revogar todo cookie de sessão emitido antes de uma
+  reconfiguração ou de um reset local -- um cookie assinado antes da existência dessa coluna (ou com
+  versão divergente) falha fechado;
+- reconfiguração do autenticador nunca desativa o fator anterior antes da confirmação do novo
+  (`MfaFactor.pending_secret_encrypted` fica lado a lado com o `secret_encrypted` ativo até a troca);
+- reset de emergência é exclusivamente local (`python -m app.cli.mfa reset --username <usuario>`,
+  `app.cli.mfa.reset_mfa_for_user`) -- nunca uma rota HTTP, nunca uma senha mestra ou código universal;
+- QR Code e URI `otpauth://` são gerados inteiramente no processo da aplicação (`qrcode`/`pyotp`); nenhum
+  segredo ou URI é enviado a um serviço externo.
+
 ## CI (PR 8)
 
 - `.github/workflows/ci.yml` usa apenas credenciais fixas e claramente falsas, nunca reaproveitadas
-  em produção: `SECRET_KEY`/`FILE_ENCRYPTION_KEY` de teste (o mesmo padrão que `tests/test_api.py`
-  já usa para seu próprio processo) e um usuário/senha `family`/`family` para o serviço PostgreSQL
-  descartável dos jobs `alembic-migration`/`integration-postgres`, que existe só durante o job e é
-  destruído ao final.
+  em produção: `SECRET_KEY`/`FILE_ENCRYPTION_KEY`/`MFA_ENCRYPTION_KEY` de teste (o mesmo padrão que
+  `tests/test_api.py` já usa para seu próprio processo) e um usuário/senha `family`/`family` para o
+  serviço PostgreSQL descartável dos jobs `alembic-migration`/`integration-postgres`, que existe só
+  durante o job e é destruído ao final.
 - Nenhum job de CI recebe documento, backup ou dado financeiro real; todo dado usado em teste é
   fictício (`tests/fixtures/synthetic_household.py`).
 - O serviço `advisor` não participa de nenhum job de CI; `advisor-contract-security` valida apenas o

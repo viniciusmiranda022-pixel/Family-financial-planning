@@ -15,6 +15,7 @@ os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-diagnostic-{uuid.uuid
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-diagnostic-data-{uuid.uuid4().hex}")
 os.environ.setdefault("SECRET_KEY", "diagnostic-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.cli.export_diagnostics import export_diagnostic  # noqa: E402
 from app.db import Base  # noqa: E402

@@ -29,6 +29,7 @@ from sqlalchemy.pool import StaticPool
 
 os.environ.setdefault("SECRET_KEY", "classification-rules-api-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-classification-rules-api-data-{uuid.uuid4().hex}")
 
 from app.db import Base, get_db  # noqa: E402
@@ -43,6 +44,10 @@ from app.models import (  # noqa: E402
 )
 from app.security import hash_password  # noqa: E402
 from app.services.classification_learning import record_confirmed_correction  # noqa: E402
+from tests.fixtures.mfa_enrollment import (  # noqa: E402
+    complete_mfa_enrollment,
+    complete_mfa_verification,
+)
 
 _test_engine = create_engine(
     "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -123,6 +128,8 @@ def test_classification_rule_lifecycle_requires_admin() -> None:
                 "/api/auth/login", json={"username": "admin-rules", "password": "senha-local-segura"}
             )
             assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            admin_secret = complete_mfa_enrollment(admin_client)
 
             member = admin_client.post(
                 "/api/users",
@@ -143,6 +150,8 @@ def test_classification_rule_lifecycle_requires_admin() -> None:
                 "/api/auth/login", json={"username": "kelly-rules", "password": "senha-kelly-segura"}
             )
             assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(member_client)
 
             assert member_client.post(f"/api/classification-rules/{rule_id}/activate").status_code == 403
             assert member_client.patch(
@@ -154,9 +163,12 @@ def test_classification_rule_lifecycle_requires_admin() -> None:
             ).status_code == 403
 
         with TestClient(app) as admin_client:
-            admin_client.post(
+            relogin = admin_client.post(
                 "/api/auth/login", json={"username": "admin-rules", "password": "senha-local-segura"}
             )
+            assert relogin.status_code == 200
+            assert relogin.json() == {"mfa_required": True, "mode": "verify"}
+            complete_mfa_verification(admin_client, admin_secret)
             activated = admin_client.post(f"/api/classification-rules/{rule_id}/activate")
             assert activated.status_code == 200
             assert activated.json()["status"] == "active"
@@ -261,10 +273,13 @@ def test_smart_capture_preview_rule_does_not_cross_movement_type() -> None:
         )
 
         with TestClient(app) as client:
-            client.post(
+            login = client.post(
                 "/api/auth/login",
                 json={"username": "admin-capture-cross", "password": "senha-local-segura"},
             )
+            assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
             activated = client.post(f"/api/classification-rules/{rule_id}/activate")
             assert activated.status_code == 200
 
@@ -360,10 +375,13 @@ def test_smart_capture_preview_text_path_uses_active_income_household_rule() -> 
         )
 
         with TestClient(app) as client:
-            client.post(
+            login = client.post(
                 "/api/auth/login",
                 json={"username": "admin-capture-text", "password": "senha-local-segura"},
             )
+            assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
             assert client.post(f"/api/classification-rules/{expense_rule_id}/activate").status_code == 200
             assert client.post(f"/api/classification-rules/{income_rule_id}/activate").status_code == 200
 
@@ -412,6 +430,8 @@ def test_classification_rule_endpoints_are_household_isolated() -> None:
                 "/api/auth/login", json={"username": "admin-rules-b", "password": "senha-local-segura"}
             )
             assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client_b)
 
             listed = client_b.get("/api/classification-rules").json()
             assert all(item["id"] != rule_id for item in listed)
@@ -448,9 +468,12 @@ def test_smart_capture_preview_uses_active_household_rule() -> None:
         csv_payload = b"date,title,amount\n2026-08-01,Papelaria Central,-45.00\n"
 
         with TestClient(app) as client:
-            client.post(
+            login = client.post(
                 "/api/auth/login", json={"username": "admin-capture", "password": "senha-local-segura"}
             )
+            assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
             activated = client.post(f"/api/classification-rules/{rule_id}/activate")
             assert activated.status_code == 200
 
@@ -516,10 +539,13 @@ def test_smart_capture_confirm_preserves_active_income_rule_category() -> None:
         )
 
         with TestClient(app) as client:
-            client.post(
+            login = client.post(
                 "/api/auth/login",
                 json={"username": "admin-confirm-income", "password": "senha-local-segura"},
             )
+            assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
             account = client.post(
                 "/api/accounts",
                 json={"name": "Conta corrente", "account_type": "checking", "owner_label": "Família"},
@@ -607,10 +633,13 @@ def test_smart_capture_text_capture_reconciliation_survives_preview_and_confirm(
         )
 
         with TestClient(app) as client:
-            client.post(
+            login = client.post(
                 "/api/auth/login",
                 json={"username": "admin-text-reconciliation", "password": "senha-local-segura"},
             )
+            assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
             account = client.post(
                 "/api/accounts",
                 json={"name": "Nubank", "account_type": "credit_card", "owner_label": "Família"},
@@ -663,10 +692,13 @@ def test_smart_capture_text_capture_patrimonial_transfer_survives_preview_and_co
         )
 
         with TestClient(app) as client:
-            client.post(
+            login = client.post(
                 "/api/auth/login",
                 json={"username": "admin-text-transfer", "password": "senha-local-segura"},
             )
+            assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
             account = client.post(
                 "/api/accounts",
                 json={"name": "Conta corrente", "account_type": "checking", "owner_label": "Família"},
@@ -736,10 +768,13 @@ def test_smart_capture_receipt_path_reconciliation_survives_preview_and_confirm(
         )
 
         with TestClient(app) as client:
-            client.post(
+            login = client.post(
                 "/api/auth/login",
                 json={"username": "admin-receipt-reconciliation", "password": "senha-local-segura"},
             )
+            assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
             account = client.post(
                 "/api/accounts",
                 json={"name": "Nubank", "account_type": "credit_card", "owner_label": "Família"},
@@ -792,10 +827,13 @@ def test_smart_capture_receipt_path_ordinary_purchase_stays_expense() -> None:
         )
 
         with TestClient(app) as client:
-            client.post(
+            login = client.post(
                 "/api/auth/login",
                 json={"username": "admin-receipt-expense", "password": "senha-local-segura"},
             )
+            assert login.status_code == 200
+            assert login.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
             account = client.post(
                 "/api/accounts",
                 json={"name": "Conta corrente", "account_type": "checking", "owner_label": "Família"},

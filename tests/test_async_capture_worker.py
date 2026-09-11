@@ -44,6 +44,7 @@ from sqlalchemy.pool import StaticPool
 
 os.environ.setdefault("SECRET_KEY", "async-capture-worker-test-secret-that-is-long-enough-aaaa")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-async-capture-data-{uuid.uuid4().hex}")
 
 import app.api as api_module  # noqa: E402
@@ -62,6 +63,7 @@ from app.models import (  # noqa: E402
 )
 from app.security import hash_password  # noqa: E402
 from app.services import capture_worker  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 _test_engine = create_engine(
     "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -106,6 +108,8 @@ def _setup_household(client: TestClient, *, household_name: str, username: str, 
         household_id = household.id
     login = client.post("/api/auth/login", json={"username": username, "password": password})
     assert login.status_code == 200
+    assert login.json() == {"mfa_required": True, "mode": "enroll"}
+    complete_mfa_enrollment(client)
     return {"household_id": household_id, "username": username}
 
 

@@ -64,6 +64,9 @@ input, select, textarea { width: 100%; border: 1px solid #cfd9df; border-radius:
 textarea { resize: vertical; line-height: 1.5; }
 input:focus, select:focus, textarea:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(15, 118, 110, .12); }
 .auth-form label { margin-bottom: 18px; }
+.mfa-qr { display: block; width: 220px; height: 220px; max-width: 100%; margin: 0 auto 18px; border-radius: 10px; border: 1px solid #cfd9df; padding: 10px; background: white; }
+.mfa-recovery-codes { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin: 16px 0; padding: 14px; list-style: none; border-radius: 10px; background: var(--soft-blue); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 14px; }
+.link-button { border: 0; background: transparent; color: var(--teal); font-weight: 700; text-decoration: underline; padding: 8px 0; cursor: pointer; }
 .primary, .secondary { border: 0; border-radius: 10px; padding: 12px 17px; font-weight: 800; transition: transform .16s, box-shadow .16s; }
 .primary { color: white; background: var(--teal); box-shadow: 0 7px 18px rgba(15, 118, 110, .18); }
 .secondary { color: var(--navy); background: var(--soft-blue); }

@@ -12,6 +12,7 @@ os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-plan-{uuid.uuid4().he
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-plan-data-{uuid.uuid4().hex}")
 os.environ.setdefault("SECRET_KEY", "plan-import-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.api import _forecast_obligations, _future_installments  # noqa: E402
 from app.db import Base  # noqa: E402

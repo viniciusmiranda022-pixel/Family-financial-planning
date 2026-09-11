@@ -17,8 +17,10 @@ dependencies = [
   "psycopg[binary]>=3.2,<4",
   "pymupdf>=1.25,<2",
   "pydantic-settings>=2.7,<3",
+  "pyotp>=2.9,<3",
   "pytesseract>=0.3.13,<1",
   "python-multipart>=0.0.18,<1",
+  "qrcode>=7.4,<8",
   "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.34,<1",
 ]

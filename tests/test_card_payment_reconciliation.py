@@ -25,6 +25,7 @@ from sqlalchemy.pool import StaticPool
 os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-card-payment-{uuid.uuid4().hex}.sqlite")
 os.environ.setdefault("SECRET_KEY", "card-payment-reconciliation-test-secret-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.db import Base, get_db  # noqa: E402
 from app.models import Account, AuditEvent, Household, Transaction, User  # noqa: E402
@@ -35,6 +36,7 @@ from app.services.card_payment_reconciliation import (  # noqa: E402
     list_card_payment_reconciliations,
     unlink_card_payment,
 )
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 from tests.fixtures.synthetic_household import build_synthetic_household  # noqa: E402
 
 
@@ -845,6 +847,8 @@ def test_http_endpoints_authorize_isolate_and_audit() -> None:
                 },
             )
             assert setup.status_code == 201
+            assert setup.json() == {"configured": True, "mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client)
 
             with test_session_factory() as db:
                 # Minimal rows directly under the household /api/auth/setup
@@ -946,6 +950,8 @@ def test_http_endpoints_authorize_isolate_and_audit() -> None:
                     json={"username": "admin-outra-card", "password": "outra-senha-segura"},
                 )
                 assert other_login.status_code == 200
+                assert other_login.json() == {"mfa_required": True, "mode": "enroll"}
+                complete_mfa_enrollment(other_client)
                 other_listing = other_client.get("/api/card-payment-reconciliations")
                 assert other_listing.status_code == 200
                 assert other_listing.json() == []

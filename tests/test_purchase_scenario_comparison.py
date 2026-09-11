@@ -25,6 +25,7 @@ from sqlalchemy.pool import StaticPool
 os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-scenario-comparison-{uuid.uuid4().hex}.sqlite")
 os.environ.setdefault("SECRET_KEY", "purchase-scenario-comparison-test-secret-long-enough-value")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -53,6 +54,7 @@ from app.services.finance import (  # noqa: E402
     month_key,
 )
 from app.services.projection_validator import validate_projection  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 ENDPOINT = "/api/purchases/scenario-comparison"
 
@@ -89,6 +91,8 @@ def _setup_household(client, *, household_name="Família Comparação", username
         },
     )
     assert setup.status_code == 201, setup.text
+    assert setup.json() == {"configured": True, "mfa_required": True, "mode": "enroll"}
+    complete_mfa_enrollment(client)
     return setup.json()
 
 
@@ -700,6 +704,8 @@ def test_household_isolation_obligations_do_not_leak_or_affect_other_household()
                 "/api/auth/login", json={"username": "admin-b", "password": "senha-local-segura"}
             )
             assert login_b.status_code == 200
+            assert login_b.json() == {"mfa_required": True, "mode": "enroll"}
+            complete_mfa_enrollment(client_b)
             _set_profile(
                 client_b,
                 monthly_salary_net=5000,

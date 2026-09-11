@@ -21,6 +21,11 @@ permissions:
 env:
   SECRET_KEY: ci-only-secret-never-used-outside-github-actions-aaaa
   FILE_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  # Fase 4 (docs/WORK_ORDER_LOCAL_MFA_TOTP.md): fake, fixed test-only key
+  # for encrypting the TOTP secret at rest -- never the production key, and
+  # deliberately distinct from FILE_ENCRYPTION_KEY above so the two never
+  # get confused in logs/diffs.
+  MFA_ENCRYPTION_KEY: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
 
 jobs:
   lint:

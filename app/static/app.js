@@ -215,6 +215,7 @@ function setMobileMenu(open) {
 function showAuth(configured) {
   document.querySelector("#app-shell").classList.add("hidden");
   document.querySelector("#auth-shell").classList.remove("hidden");
+  hideAllAuthForms();
   document.querySelector("#login-form").classList.toggle("hidden", !configured);
   document.querySelector("#setup-form").classList.toggle("hidden", configured);
 }
@@ -1629,6 +1630,7 @@ async function loadProfile() {
   });
   form.querySelector('button[type="submit"]').classList.toggle("hidden", !isAdmin());
   renderDueNotificationsSettings();
+  await renderMfaSettings();
 }
 
 async function loadForecast() {
@@ -1796,6 +1798,78 @@ function disableDueNotifications() {
   renderDueNotificationsSettings();
   toast("Notificações desativadas neste navegador");
 }
+
+// Fase 4 (docs/WORK_ORDER_LOCAL_MFA_TOTP.md), "Segurança da conta": MFA is
+// mandatory, so this panel never offers a way to turn it off -- only
+// reconfigure (new secret) and recovery-code regeneration, both gated by
+// the same password+second-factor re-authentication the backend enforces
+// (`/auth/mfa/reconfigure/start`, `/auth/mfa/recovery-codes/regenerate`).
+// `state.mfaReauthPurpose` tracks which of the two the open re-auth form is
+// currently for.
+async function refreshMfaStatusText() {
+  const status = document.querySelector("#mfa-status");
+  if (!status) return;
+  const me = await api("/auth/me");
+  status.textContent = me.mfa_enabled
+    ? `Autenticação em duas etapas: ativa · Códigos de recuperação restantes: ${me.mfa_recovery_codes_remaining}`
+    : "Autenticação em duas etapas: não configurada";
+}
+
+async function renderMfaSettings() {
+  if (!document.querySelector("#mfa-status")) return;
+  await refreshMfaStatusText();
+  document.querySelector("#mfa-reauth-form").classList.add("hidden");
+  document.querySelector("#mfa-reconfigure-confirm-form").classList.add("hidden");
+  document.querySelector("#mfa-new-recovery-codes").classList.add("hidden");
+}
+
+function openMfaReauth(purpose) {
+  state.mfaReauthPurpose = purpose;
+  const form = document.querySelector("#mfa-reauth-form");
+  form.reset();
+  form.classList.remove("hidden");
+  document.querySelector("#mfa-reconfigure-confirm-form").classList.add("hidden");
+  document.querySelector("#mfa-new-recovery-codes").classList.add("hidden");
+}
+
+document.querySelector("#mfa-reconfigure-open").addEventListener("click", () => openMfaReauth("reconfigure"));
+document.querySelector("#mfa-recovery-regenerate-open").addEventListener("click", () => openMfaReauth("regenerate"));
+document.querySelector("#mfa-reauth-cancel").addEventListener("click", () => document.querySelector("#mfa-reauth-form").classList.add("hidden"));
+
+document.querySelector("#mfa-reauth-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = formJson(event.target);
+  if (!payload.code) delete payload.code;
+  if (!payload.recovery_code) delete payload.recovery_code;
+  try {
+    if (state.mfaReauthPurpose === "reconfigure") {
+      const enrollment = await api("/auth/mfa/reconfigure/start", { method: "POST", body: JSON.stringify(payload) });
+      document.querySelector("#mfa-reauth-form").classList.add("hidden");
+      document.querySelector("#mfa-reconfigure-qr").src = enrollment.qr_code;
+      document.querySelector("#mfa-reconfigure-secret").value = enrollment.secret;
+      document.querySelector("#mfa-reconfigure-confirm-form").classList.remove("hidden");
+    } else {
+      const result = await api("/auth/mfa/recovery-codes/regenerate", { method: "POST", body: JSON.stringify(payload) });
+      document.querySelector("#mfa-reauth-form").classList.add("hidden");
+      document.querySelector("#mfa-new-recovery-codes-list").innerHTML = result.recovery_codes.map((code) => `<li>${escapeHtml(code)}</li>`).join("");
+      document.querySelector("#mfa-new-recovery-codes").classList.remove("hidden");
+      await refreshMfaStatusText();
+      toast("Novos códigos de recuperação gerados");
+    }
+  } catch (error) { toast(error.message, true); }
+});
+
+document.querySelector("#mfa-reconfigure-confirm-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const result = await api("/auth/mfa/reconfigure/confirm", { method: "POST", body: JSON.stringify(formJson(event.target)) });
+    document.querySelector("#mfa-reconfigure-confirm-form").classList.add("hidden");
+    document.querySelector("#mfa-new-recovery-codes-list").innerHTML = result.recovery_codes.map((code) => `<li>${escapeHtml(code)}</li>`).join("");
+    document.querySelector("#mfa-new-recovery-codes").classList.remove("hidden");
+    await refreshMfaStatusText();
+    toast("Autenticador reconfigurado");
+  } catch (error) { toast(error.message, true); }
+});
 
 function renderDueNotificationsPanel(items) {
   const list = document.querySelector("#due-notifications-list");
@@ -2855,15 +2929,91 @@ function drawForecast(rows, floor) {
   ctx.fillText(money.format(max), 0, 20); ctx.fillText(money.format(min), 0, height - 15);
 }
 
+// Fase 4 (docs/WORK_ORDER_LOCAL_MFA_TOTP.md): `/auth/setup` and
+// `/auth/login` never return a full session anymore -- only
+// `{mfa_required: true, mode: "enroll"|"verify"}`, plus a short-TTL
+// `ffp_mfa_pending` cookie the backend already set. This module never
+// decides whether MFA is required; it only renders whichever screen the
+// backend's `mode` names. `showApp()` is reachable only after
+// `/auth/mfa/enroll/confirm` or `/auth/mfa/verify` succeeds.
+function hideAllAuthForms() {
+  ["#login-form", "#setup-form", "#mfa-enroll-form", "#mfa-verify-form", "#mfa-recovery-codes-panel"]
+    .forEach((selector) => document.querySelector(selector).classList.add("hidden"));
+}
+
+async function beginMfaEnrollment() {
+  const enrollment = await api("/auth/mfa/enroll/start", { method: "POST" });
+  hideAllAuthForms();
+  document.querySelector("#mfa-enroll-qr").src = enrollment.qr_code;
+  document.querySelector("#mfa-enroll-secret").value = enrollment.secret;
+  document.querySelector("#mfa-enroll-form").classList.remove("hidden");
+}
+
+function beginMfaVerify() {
+  hideAllAuthForms();
+  const form = document.querySelector("#mfa-verify-form");
+  form.reset();
+  document.querySelector("#mfa-verify-recovery-label").classList.add("hidden");
+  document.querySelector("#mfa-verify-code-label").classList.remove("hidden");
+  form.elements.code.required = true;
+  form.classList.remove("hidden");
+}
+
+function showMfaRecoveryCodes(codes) {
+  hideAllAuthForms();
+  document.querySelector("#mfa-recovery-codes-list").innerHTML = codes.map((code) => `<li>${escapeHtml(code)}</li>`).join("");
+  document.querySelector("#mfa-recovery-codes-panel").classList.remove("hidden");
+}
+
 document.querySelector("#setup-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  try { state.user = await api("/auth/setup", { method: "POST", body: JSON.stringify(formJson(event.target)) }); state.user = state.user.user; await showApp(); toast("Ambiente criado com segurança"); }
-  catch (error) { toast(error.message, true); }
+  try {
+    await api("/auth/setup", { method: "POST", body: JSON.stringify(formJson(event.target)) });
+    await beginMfaEnrollment();
+  } catch (error) { toast(error.message, true); }
 });
 document.querySelector("#login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  try { state.user = await api("/auth/login", { method: "POST", body: JSON.stringify(formJson(event.target)) }); await showApp(); }
-  catch (error) { toast(error.message, true); }
+  try {
+    const result = await api("/auth/login", { method: "POST", body: JSON.stringify(formJson(event.target)) });
+    if (result.mode === "enroll") await beginMfaEnrollment();
+    else beginMfaVerify();
+  } catch (error) { toast(error.message, true); }
+});
+document.querySelector("#mfa-enroll-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const confirmation = await api("/auth/mfa/enroll/confirm", { method: "POST", body: JSON.stringify(formJson(event.target)) });
+    state.user = confirmation.user;
+    showMfaRecoveryCodes(confirmation.recovery_codes);
+  } catch (error) { toast(error.message, true); }
+});
+document.querySelector("#mfa-recovery-codes-continue").addEventListener("click", async () => {
+  await showApp();
+  toast("Autenticação em duas etapas ativada");
+});
+document.querySelector("#mfa-verify-toggle").addEventListener("click", () => {
+  const codeLabel = document.querySelector("#mfa-verify-code-label");
+  const recoveryLabel = document.querySelector("#mfa-verify-recovery-label");
+  const usingRecovery = !recoveryLabel.classList.contains("hidden");
+  codeLabel.classList.toggle("hidden", !usingRecovery);
+  recoveryLabel.classList.toggle("hidden", usingRecovery);
+  codeLabel.querySelector("input").required = usingRecovery;
+  recoveryLabel.querySelector("input").required = !usingRecovery;
+  document.querySelector("#mfa-verify-toggle").textContent = usingRecovery
+    ? "Usar um código de recuperação"
+    : "Usar o código do aplicativo autenticador";
+});
+document.querySelector("#mfa-verify-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = formJson(event.target);
+  // Backend rejects both/neither -- only send whichever field is active.
+  if (!payload.code) delete payload.code;
+  if (!payload.recovery_code) delete payload.recovery_code;
+  try {
+    state.user = await api("/auth/mfa/verify", { method: "POST", body: JSON.stringify(payload) });
+    await showApp();
+  } catch (error) { toast(error.message, true); }
 });
 document.querySelector("#logout-button").addEventListener("click", async () => { await api("/auth/logout", { method: "POST" }); state.user = null; stopDueNotifications(); showAuth(true); });
 document.querySelectorAll("#main-nav button").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));

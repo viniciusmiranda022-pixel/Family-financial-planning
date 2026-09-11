@@ -36,12 +36,14 @@ from sqlalchemy.pool import StaticPool
 
 os.environ.setdefault("SECRET_KEY", "role-based-authz-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("DATA_DIR", f"/tmp/ffp-role-authz-data-{uuid.uuid4().hex}")
 
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import AuditEvent, Category, Household, User  # noqa: E402
 from app.security import hash_password  # noqa: E402
+from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 _test_engine = create_engine(
     "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -137,6 +139,8 @@ def _setup_household(tag: str) -> RoleFixture:
         "/api/auth/login", json={"username": admin_username, "password": password}
     )
     assert login_admin.status_code == 200, login_admin.text
+    assert login_admin.json() == {"mfa_required": True, "mode": "enroll"}
+    complete_mfa_enrollment(admin)
 
     created = admin.post(
         "/api/users",
@@ -154,7 +158,9 @@ def _setup_household(tag: str) -> RoleFixture:
         "/api/auth/login", json={"username": consulta_username, "password": password}
     )
     assert login.status_code == 200, login.text
-    assert login.json()["is_admin"] is False
+    assert login.json() == {"mfa_required": True, "mode": "enroll"}
+    complete_mfa_enrollment(consulta)
+    assert consulta.get("/api/auth/me").json()["is_admin"] is False
 
     account = admin.post(
         "/api/accounts",

@@ -42,6 +42,36 @@
         <label>Senha<input type="password" name="password" required autocomplete="current-password"></label>
         <button class="primary full" type="submit">Entrar</button>
       </form>
+      <!-- Fase 4 (docs/WORK_ORDER_LOCAL_MFA_TOTP.md): obrigatório para todo
+           usuário ativo. Nenhuma tela financeira é acessível a partir daqui
+           -- o backend só emite `ffp_session` completo depois do segundo
+           fator; estas telas só existem enquanto o cookie é o `ffp_mfa_pending`
+           de curta duração. -->
+      <form id="mfa-enroll-form" class="auth-form hidden">
+        <span class="step-label">AUTENTICAÇÃO EM DUAS ETAPAS</span>
+        <h2>Configure seu autenticador</h2>
+        <p>Escaneie o QR Code com o Google Authenticator, Microsoft Authenticator ou outro aplicativo TOTP. Nenhum dado sai deste servidor.</p>
+        <img id="mfa-enroll-qr" alt="QR Code do autenticador" class="mfa-qr">
+        <label>Chave manual (se não puder escanear)<input id="mfa-enroll-secret" readonly></label>
+        <label>Código de 6 dígitos do aplicativo<input name="code" required minlength="6" maxlength="6" inputmode="numeric" pattern="\d{6}" autocomplete="one-time-code"></label>
+        <button class="primary full" type="submit">Confirmar e ativar</button>
+      </form>
+      <form id="mfa-verify-form" class="auth-form hidden">
+        <span class="step-label">AUTENTICAÇÃO EM DUAS ETAPAS</span>
+        <h2>Digite o código do autenticador</h2>
+        <p id="mfa-verify-hint">Abra seu aplicativo autenticador e informe o código atual.</p>
+        <label id="mfa-verify-code-label">Código de 6 dígitos<input name="code" minlength="6" maxlength="6" inputmode="numeric" pattern="\d{6}" autocomplete="one-time-code"></label>
+        <label id="mfa-verify-recovery-label" class="hidden">Código de recuperação<input name="recovery_code" autocomplete="off"></label>
+        <button class="primary full" type="submit">Entrar</button>
+        <button id="mfa-verify-toggle" class="link-button" type="button">Usar um código de recuperação</button>
+      </form>
+      <section id="mfa-recovery-codes-panel" class="auth-form hidden">
+        <span class="step-label">GUARDE ESTES CÓDIGOS</span>
+        <h2>Códigos de recuperação</h2>
+        <p>Cada código só pode ser usado uma vez, se você perder o acesso ao aplicativo autenticador. Eles não serão mostrados novamente.</p>
+        <ul id="mfa-recovery-codes-list" class="mfa-recovery-codes"></ul>
+        <button id="mfa-recovery-codes-continue" class="primary full" type="button">Já salvei meus códigos, continuar</button>
+      </section>
     </section>
   </main>
 
@@ -704,6 +734,36 @@
             <div class="form-action"><button class="primary" type="submit">Salvar premissas</button></div>
           </form>
           <div class="security-note"><strong>Como o Privilège DI funciona no sistema</strong><p>Ele é a conta central de liquidez da família: recebe a sobra do mês e cobre o déficit quando salário e outras receitas não bastam. Se o déficit superar o saldo, o Privilège zera e o restante aparece como dívida sem cobertura. O piso é uma meta de alerta, não dinheiro bloqueado.</p></div>
+        </article>
+        <article class="panel settings-panel" id="mfa-settings">
+          <div class="panel-heading"><div><span class="step-label">SEGURANÇA</span><h2>Autenticação em duas etapas</h2></div></div>
+          <p class="muted-copy">Obrigatória para todo usuário ativo. A senha sozinha nunca abre o sistema; o segundo fator (aplicativo autenticador TOTP) é validado no servidor a cada novo login.</p>
+          <div id="mfa-status" class="security-note"></div>
+          <div class="form-action">
+            <button id="mfa-reconfigure-open" class="secondary" type="button">Reconfigurar autenticador</button>
+            <button id="mfa-recovery-regenerate-open" class="secondary" type="button">Gerar novos códigos de recuperação</button>
+          </div>
+          <form id="mfa-reauth-form" class="form-grid hidden">
+            <p class="muted-copy">Confirme sua senha atual e o código do autenticador (ou um código de recuperação) para continuar.</p>
+            <label>Senha atual<input type="password" name="password" required autocomplete="current-password"></label>
+            <label>Código do autenticador<input name="code" minlength="6" maxlength="6" inputmode="numeric" pattern="\d{6}" autocomplete="one-time-code"></label>
+            <label>Ou código de recuperação<input name="recovery_code" autocomplete="off"></label>
+            <div class="form-action">
+              <button class="primary" type="submit">Continuar</button>
+              <button id="mfa-reauth-cancel" class="secondary" type="button">Cancelar</button>
+            </div>
+          </form>
+          <form id="mfa-reconfigure-confirm-form" class="form-grid hidden">
+            <p>Escaneie o novo QR Code e confirme com o código atual do aplicativo. O fator anterior continua válido até esta confirmação.</p>
+            <img id="mfa-reconfigure-qr" alt="Novo QR Code do autenticador" class="mfa-qr">
+            <label>Chave manual<input id="mfa-reconfigure-secret" readonly></label>
+            <label>Código de 6 dígitos<input name="code" required minlength="6" maxlength="6" inputmode="numeric" pattern="\d{6}" autocomplete="one-time-code"></label>
+            <div class="form-action"><button class="primary" type="submit">Confirmar novo autenticador</button></div>
+          </form>
+          <div id="mfa-new-recovery-codes" class="hidden">
+            <p><strong>Novos códigos de recuperação</strong> -- guarde-os agora, eles não serão mostrados novamente.</p>
+            <ul id="mfa-new-recovery-codes-list" class="mfa-recovery-codes"></ul>
+          </div>
         </article>
         <article class="panel settings-panel" id="due-notifications-settings">
           <div class="panel-heading"><div><span class="step-label">ALERTAS LOCAIS</span><h2>Notificações de vencimento no navegador</h2></div></div>

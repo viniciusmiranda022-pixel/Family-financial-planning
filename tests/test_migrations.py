@@ -313,6 +313,32 @@ EXPECTED_BACKFILL_RUN_COLUMNS = {
 
 EXPECTED_0011_TABLES = {"capture_processing_jobs"}
 
+EXPECTED_0014_TABLES = {"mfa_factors", "mfa_recovery_codes"}
+
+EXPECTED_MFA_FACTOR_COLUMNS = {
+    "id",
+    "user_id",
+    "secret_encrypted",
+    "confirmed_at",
+    "pending_secret_encrypted",
+    "pending_setup_started_at",
+    "pending_setup_expires_at",
+    "last_accepted_timestep",
+    "pending_last_accepted_timestep",
+    "failed_attempts",
+    "locked_until",
+    "created_at",
+    "updated_at",
+}
+
+EXPECTED_MFA_RECOVERY_CODE_COLUMNS = {
+    "id",
+    "factor_id",
+    "code_hash",
+    "created_at",
+    "used_at",
+}
+
 EXPECTED_CAPTURE_PROCESSING_JOB_COLUMNS = {
     "id",
     "household_id",
@@ -338,6 +364,7 @@ def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Co
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("SECRET_KEY", "migration-test-secret-that-is-long-enough")
     monkeypatch.setenv("FILE_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+    monkeypatch.setenv("MFA_ENCRYPTION_KEY", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
     get_settings.cache_clear()
     config = Config(str(ROOT / "alembic.ini"), output_buffer=output_buffer)
     config.set_main_option("script_location", str(ROOT / "alembic"))
@@ -381,6 +408,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0007_TABLES,
             *EXPECTED_0009_TABLES,
             *EXPECTED_0011_TABLES,
+            *EXPECTED_0014_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -483,6 +511,20 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_capture_jobs_household_status",
         "ix_capture_jobs_status_created",
     }
+    assert "session_version" in {column["name"] for column in inspector.get_columns("users")}
+    assert {column["name"] for column in inspector.get_columns("mfa_factors")} == (
+        EXPECTED_MFA_FACTOR_COLUMNS
+    )
+    assert {index["name"] for index in inspector.get_indexes("mfa_factors")} == {
+        "ix_mfa_factors_user_id"
+    }
+    assert {column["name"] for column in inspector.get_columns("mfa_recovery_codes")} == (
+        EXPECTED_MFA_RECOVERY_CODE_COLUMNS
+    )
+    assert {index["name"] for index in inspector.get_indexes("mfa_recovery_codes")} == {
+        "ix_mfa_recovery_codes_factor_id",
+        "ix_mfa_recovery_codes_code_hash",
+    }
     engine.dispose()
 
     command.downgrade(config, "0001")
@@ -523,6 +565,9 @@ def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     assert "ALTER TABLE integrity_findings ADD COLUMN acknowledgement_reason TEXT" in sql
     assert "ALTER TABLE audit_events ADD COLUMN before_state JSONB" in sql
     assert "CREATE TABLE transactions" in sql
+    assert "ALTER TABLE users ADD COLUMN session_version" in sql
+    assert "CREATE TABLE mfa_factors" in sql
+    assert "CREATE TABLE mfa_recovery_codes" in sql
     assert "INSERT INTO alembic_version" in sql
     get_settings.cache_clear()
 
@@ -570,7 +615,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0013"
+        ).scalar_one() == "0014"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -596,6 +641,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0013"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0014"
     engine.dispose()
     get_settings.cache_clear()
