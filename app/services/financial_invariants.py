@@ -365,8 +365,21 @@ def validate_confirmed_balance_sovereignty(
     divergence = _decimal(context, "reconciliation_divergence")
     synthetic_adjustment = _boolean(context, "synthetic_adjustment_created")
     disclosed = _boolean(context, "divergence_disclosed")
+    anchor_present = _boolean(context, "confirmed_anchor_present")
+    anchor_matches = _boolean(context, "closing_matches_confirmed_anchor")
+    anchor_gap = _decimal(context, "closing_vs_confirmed_anchor_gap")
     has_divergence = divergence != 0
-    matches = not synthetic_adjustment and (not has_divergence or disclosed)
+    # Disclosure alone is not enough: when an intra-period confirmed balance
+    # exists, the *published* closing position (`closing_liquidity_balance`)
+    # must itself be the confirmed anchor plus evidenced movement after it --
+    # never the from-opening reconstruction left standing. Otherwise a
+    # snapshot could disclose the correct divergence while still publishing
+    # the wrong canonical number (rebaseline §5.1/§5.2).
+    matches = (
+        not synthetic_adjustment
+        and (not has_divergence or disclosed)
+        and (not anchor_present or anchor_matches)
+    )
     return _result(
         definition,
         context,
@@ -375,16 +388,29 @@ def validate_confirmed_balance_sovereignty(
             "O saldo confirmado permaneceu soberano; nenhuma divergência foi mascarada e "
             "nenhum ajuste sintético foi criado."
             if matches
-            else "Uma divergência de reconciliação foi mascarada ou um ajuste sintético foi "
-            "criado em vez de expor a divergência para revisão."
+            else "Uma divergência de reconciliação foi mascarada, um ajuste sintético foi "
+            "criado, ou o saldo corrente publicado diverge da âncora confirmada mais os "
+            "movimentos posteriores a ela."
         ),
-        expected={"synthetic_adjustment_created": False, "divergence_disclosed": True},
+        expected={
+            "synthetic_adjustment_created": False,
+            "divergence_disclosed": True,
+            "closing_matches_confirmed_anchor": True,
+        },
         actual={
             "synthetic_adjustment_created": synthetic_adjustment,
             "divergence_disclosed": disclosed,
             "reconciliation_divergence": divergence,
+            "confirmed_anchor_present": anchor_present,
+            "closing_vs_confirmed_anchor_gap": anchor_gap,
         },
-        difference=abs(divergence) if not matches else Decimal("0.00"),
+        difference=(
+            Decimal("0.00")
+            if matches
+            else abs(anchor_gap)
+            if anchor_present and not anchor_matches
+            else abs(divergence)
+        ),
     )
 
 

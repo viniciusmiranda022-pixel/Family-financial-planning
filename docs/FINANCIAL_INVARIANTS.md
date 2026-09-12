@@ -373,16 +373,30 @@ esconde a diferença entre resultado econômico e movimento real de caixa.
 **Descrição:** Quando existe observação de saldo confirmada (`AccountBalanceObservation` confiável),
 ela prevalece sobre a reconstrução derivada no instante observado. Qualquer divergência entre o
 saldo confirmado e a reconstrução baseada em evidência é exposta para investigação — nunca mascarada
-— e o sistema nunca fabrica uma transação de ajuste para zerá-la.
+— e o sistema nunca fabrica uma transação de ajuste para zerá-la. Disclosure isolado não basta: o
+`closing_liquidity_balance` publicado pelo snapshot precisa, ele mesmo, ser a âncora confirmada mais
+o movimento evidenciado posterior a ela (`derived_balance_since_observation`) sempre que existir uma
+observação confiável intra-período — nunca a reconstrução aditiva desde a abertura, mesmo que a
+divergência entre as duas apareça corretamente exposta em `reconciliation`. A busca por essa
+observação intra-período tampouco pode depender de a abertura do período já ser confiável: uma
+observação confirmada no meio do período torna-se a âncora soberana a partir de sua própria data
+mesmo quando a abertura caiu no fallback legado não confiável.
 **Motivação:** Rebaseline §5.1/§5.2 — hipótese não vira fato; saldo confirmado é soberano no instante
-observado.
-**Entradas:** `reconciliation_divergence`, `divergence_disclosed`, `synthetic_adjustment_created`.
-**Resultado esperado:** `synthetic_adjustment_created` é sempre falso; quando `reconciliation_divergence
-!= 0`, `divergence_disclosed` é verdadeiro.
+observado. (Correção pós-review de engenharia na PR #89, 2026-09-12: a versão anterior permitia que
+`closing_liquidity_balance` continuasse na reconstrução aditiva mesmo com divergência divulgada, e
+ignorava uma observação confiável intra-período sempre que a abertura do período não fosse, ela
+mesma, confiável.)
+**Entradas:** `reconciliation_divergence`, `divergence_disclosed`, `synthetic_adjustment_created`,
+`confirmed_anchor_present`, `closing_matches_confirmed_anchor`.
+**Resultado esperado:** `synthetic_adjustment_created` é sempre falso; quando
+`reconciliation_divergence != 0`, `divergence_disclosed` é verdadeiro; quando
+`confirmed_anchor_present` é verdadeiro, `closing_matches_confirmed_anchor` também é.
 **Severidade se violado:** `CRITICAL`.
 **Teste automatizado associado:**
 `tests/test_financial_snapshots.py::test_intra_period_balance_observation_is_reflected_without_rewriting_it`,
-`tests/test_financial_snapshots.py::test_intra_period_balance_observation_divergence_is_disclosed_not_masked`.
+`tests/test_financial_snapshots.py::test_intra_period_balance_observation_divergence_is_disclosed_not_masked`,
+`tests/test_financial_snapshots.py::test_intra_period_observation_becomes_sovereign_anchor_without_opening_evidence`,
+`tests/test_financial_snapshots.py::test_point_in_time_balance_becomes_next_period_opening_evidence`.
 
 ## Controle de mudança
 

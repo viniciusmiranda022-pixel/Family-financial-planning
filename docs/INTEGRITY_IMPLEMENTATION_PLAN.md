@@ -556,20 +556,28 @@ O valor atual de `FinancialProfile.investment_balance` não possui data efetiva 
 
 **October Go-Live Slice 1 (P0 #87):** uma observação de saldo confirmada *dentro* do período corrente
 (não apenas no limite entre períodos) passa a ser refletida imediatamente, em vez de esperar a
-abertura do período seguinte. `_collect`/`build_snapshot` calculam, quando essa observação existir:
+abertura do período seguinte. Essa busca não depende de a abertura do período já ser confiável: se
+`_opening_balance` caiu no fallback legado (nenhuma observação confiável até o início do período),
+uma observação confiável que aparece no meio do período ainda se torna a âncora soberana a partir de
+sua própria data — nunca é ignorada só porque nada ancorou o início do período.
+`_collect`/`build_snapshot` calculam, quando essa observação existir:
 
-- `reconstructed_balance_at_observation` — saldo de abertura do período mais os movimentos
-  evidenciados ("Transferência patrimonial") até a data da observação;
+- `reconstructed_balance_at_observation` — saldo de abertura do período (ou o *floor* de busca, na
+  ausência de abertura confiável) mais os movimentos evidenciados ("Transferência patrimonial") até
+  a data da observação;
 - `reconciliation_divergence` — a diferença entre o saldo confirmado e essa reconstrução, exposta
   sempre, nunca corrigida por um ajuste sintético;
 - `derived_balance_since_observation` — o saldo confirmado mais os movimentos evidenciados
   *depois* da observação, isto é, a melhor estimativa do saldo agora.
 
-A observação em si nunca é reescrita ou substituída por essa reconstrução. O
-`closing_liquidity_balance` canônico do período continua sendo a reconstrução aditiva de todo o
-período (saldo de abertura + evidência do período inteiro) — a mesma fonte única para
-Dashboard/relatórios/projeção — enquanto `reconciliation` é uma camada de transparência adicional,
-não um segundo cálculo de patrimônio.
+A observação em si nunca é reescrita ou substituída por essa reconstrução. **Correção pós-review de
+engenharia (PR #89, 2026-09-12):** o `closing_liquidity_balance` canônico do período — a mesma fonte
+única para Dashboard/relatórios/projeção — deixa de ser a reconstrução aditiva desde a abertura
+sempre que essa observação intra-período existir; ele passa a ser `derived_balance_since_observation`
+(a âncora confirmada mais o movimento evidenciado posterior a ela). A reconstrução aditiva e a
+divergência continuam expostas em `reconciliation` como camada de transparência/auditoria — nunca um
+segundo cálculo de patrimônio — mas não são mais o que é publicado como posição corrente quando uma
+âncora mais recente e confirmada existe.
 
 ### 7.5 Separação obrigatória de conceitos
 

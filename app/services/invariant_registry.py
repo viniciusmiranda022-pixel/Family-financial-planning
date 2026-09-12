@@ -339,13 +339,18 @@ _DEFINITIONS = (
             "October Go-Live Slice 1: quando existe observação de saldo confirmada, ela prevalece "
             "sobre a reconstrução derivada no instante observado; qualquer divergência é exposta "
             "para investigação, nunca mascarada, e o sistema nunca fabrica um ajuste sintético "
-            "para zerá-la."
+            "para zerá-la. Quando a observação for intra-período, o `closing_liquidity_balance` "
+            "publicado também deve ser a âncora confirmada mais o movimento evidenciado posterior "
+            "a ela -- divulgar a divergência não basta se o número canônico publicado ainda "
+            "discorda dela."
         ),
         severity=IntegritySeverity.CRITICAL,
         required_facts=(
             "reconciliation_divergence",
             "synthetic_adjustment_created",
             "divergence_disclosed",
+            "confirmed_anchor_present",
+            "closing_matches_confirmed_anchor",
         ),
         validator=validate_confirmed_balance_sovereignty,
     ),

@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 from calendar import monthrange
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -299,7 +299,7 @@ def _intra_period_reconciliation(
     eligible_accounts: tuple[Account, ...],
     opening_amount: Decimal,
     opening_as_of: date | None,
-    observed_balance: bool,
+    period_start: date,
     period_end: date,
     rows: list[tuple[Transaction, str]],
 ) -> dict[str, Any] | None:
@@ -313,10 +313,18 @@ def _intra_period_reconciliation(
     real evidenced "Transferência patrimonial" movement, and (b) the gap
     between what evidence implied and what the bank actually confirmed --
     exposed for investigation, never silently corrected or hidden.
+
+    This search must not depend on the period's *opening* balance already
+    being trusted (`_opening_balance` may have fallen back to the untrusted
+    legacy profile figure with `opening_as_of is None`). A confirmed
+    observation that appears mid-period becomes the sovereign anchor from
+    its own date forward regardless -- it is never dropped just because
+    nothing anchored the period's start.
     """
 
-    if not eligible_accounts or not observed_balance or opening_as_of is None:
+    if not eligible_accounts:
         return None
+    search_floor = opening_as_of if opening_as_of is not None else period_start
     account_ids = [item.id for item in eligible_accounts]
     candidates = tuple(
         db.scalars(
@@ -326,7 +334,7 @@ def _intra_period_reconciliation(
                 AccountBalanceObservation.account_id.in_(account_ids),
                 AccountBalanceObservation.invalidated_at.is_(None),
                 AccountBalanceObservation.superseded_by_id.is_(None),
-                AccountBalanceObservation.as_of_date > opening_as_of,
+                AccountBalanceObservation.as_of_date > search_floor,
                 AccountBalanceObservation.as_of_date < period_end,
             )
             .order_by(
@@ -338,7 +346,7 @@ def _intra_period_reconciliation(
     latest = next((item for item in candidates if _observation_is_trusted(db, item)), None)
     if latest is None:
         return None
-    movement_before = _patrimonial_net_movement(rows, opening_as_of, latest.as_of_date)
+    movement_before = _patrimonial_net_movement(rows, search_floor, latest.as_of_date)
     reconstructed_at_observation = money(opening_amount + movement_before)
     divergence = money(money(latest.amount) - reconstructed_at_observation)
     movement_after = _patrimonial_net_movement(rows, latest.as_of_date, period_end)
@@ -591,7 +599,7 @@ def _collect(
         _eligible_liquidity_accounts(db, household_id, profile),
         opening,
         opening_as_of,
-        observed_balance,
+        start,
         end,
         rows,
     )
@@ -617,6 +625,30 @@ def _collect(
             source_count=len(rows),
         )
     )
+    # Rebaseline §5.1/§5.2: a confirmed balance observed *inside* the period
+    # is sovereign from its own date forward. `calculate_actual_snapshot`
+    # only ever anchors on the period's *opening* evidence, so when a later,
+    # more current confirmation exists, the published closing position must
+    # be re-anchored on it (`observed + movements after it`) instead of
+    # leaving the from-opening reconstruction standing as the canonical
+    # figure. The reconstruction itself, and the gap between it and the
+    # confirmation, remain untouched in `reconciliation` for audit -- only
+    # the canonical closing/derived fields are replaced here.
+    closing_balance_trusted = observed_balance
+    if intra_period is not None:
+        anchored_raw = Decimal(str(intra_period["derived_balance_since_observation"]))
+        anchored_closing = money(max(Decimal("0"), anchored_raw))
+        anchored_deficit = money(max(Decimal("0"), -anchored_raw))
+        floor_value = money(max(Decimal("0"), profile.emergency_floor))
+        result = replace(
+            result,
+            closing_liquidity_balance=anchored_closing,
+            closing_uncovered_deficit=anchored_deficit,
+            distance_to_floor=money(anchored_closing - floor_value),
+            floor_breached=anchored_closing < floor_value,
+            projected_balance=anchored_closing,
+        )
+        closing_balance_trusted = True
     integrity = consolidated_integrity_status(db, household_id=household_id, period=period)
     payload = result.canonical_payload()
     payload.update(
@@ -629,7 +661,7 @@ def _collect(
                 if opening_source.entity_type == "financial_snapshot"
                 else "legacy_profile"
             ),
-            "balance_evidence_trusted": observed_balance,
+            "balance_evidence_trusted": closing_balance_trusted,
             "duplicates_ignored": len(ignored) + pending_duplicates,
             "category_spending": [
                 {"category": key, "amount": float(money(value))}
@@ -681,7 +713,7 @@ def _collect(
         {
             "checksum": checksum,
             "integrity": integrity,
-            "observed_balance": observed_balance,
+            "observed_balance": closing_balance_trusted,
         },
     )
 
@@ -858,17 +890,38 @@ def realized_balance_sovereignty_facts(snapshot: FinancialSnapshot) -> dict[str,
     any divergence between it and the evidence-derived reconstruction is
     disclosed on the snapshot, never silently corrected or hidden (rebaseline
     §5.1/§5.2).
+
+    Disclosure alone is not sufficient: when an intra-period confirmed
+    observation exists, the snapshot's own published
+    `closing_liquidity_balance` must equal that confirmed anchor plus
+    evidenced movement after it (`derived_balance_since_observation`) --
+    otherwise the snapshot could disclose the right divergence while still
+    publishing the wrong canonical figure downstream.
     """
 
     reconciliation = snapshot.payload.get("reconciliation") or {}
     divergence = money(Decimal(str(reconciliation.get("reconciliation_divergence", 0) or 0)))
+    observed_as_of = reconciliation.get("observed_balance_as_of")
+    derived_since_observation = reconciliation.get("derived_balance_since_observation")
+    anchor_present = observed_as_of is not None and derived_since_observation is not None
+    anchor_gap = (
+        money(
+            money(Decimal(str(snapshot.closing_liquidity_balance)))
+            - money(Decimal(str(derived_since_observation)))
+        )
+        if anchor_present
+        else Decimal("0.00")
+    )
     return {
         "reconciliation_divergence": divergence,
         # `build_snapshot` is the only way a `FinancialSnapshot` is persisted,
         # and it never creates a transaction to zero out a divergence -- this
         # is a structural guarantee of the build path, not an unchecked claim.
         "synthetic_adjustment_created": False,
-        "divergence_disclosed": reconciliation.get("observed_balance_as_of") is not None,
+        "divergence_disclosed": observed_as_of is not None,
+        "confirmed_anchor_present": anchor_present,
+        "closing_matches_confirmed_anchor": anchor_gap == 0,
+        "closing_vs_confirmed_anchor_gap": anchor_gap,
     }
 
 
