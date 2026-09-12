@@ -122,9 +122,13 @@
 ## Em andamento — Financial Integrity Engine
 
 - discovery técnico e matriz de fontes de verdade documentados;
-- contrato formal `INV-001` a `INV-022` na versão `2026.09.1`;
+- contrato formal `INV-001` a `INV-024` na versão `2026.10.1` (INV-005/006/007 rescopadas para
+  PROJEÇÃO apenas; INV-023/024 cobrindo a liquidez REALIZADO baseada em evidência — October Go-Live
+  Slice 1, P0 #87);
 - registry executável com resultado estruturado e `unknown` para fatos insuficientes;
-- regra canônica do Privilège DI coberta por testes de propriedades e cenários de borda;
+- regra canônica do Privilège DI (projeção) e regra de reconciliação de liquidez REALIZADO
+  (evidência real, saldo confirmado soberano) cobertas por testes de propriedades e cenários de
+  borda;
 - migração inicial congelada, sem dependência dos modelos ORM futuros;
 - runs e findings persistentes com fingerprint, score explicado, status, gates específicos e
   trilha before/after/reason/trace;
