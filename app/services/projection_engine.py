@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.services.finance import ForecastInput, add_months, money, month_key
-from app.services.financial_engine import settle_liquidity
+from app.services.financial_engine import settle_liquidity_projection
 
 PROJECTION_CALCULATION_VERSION = "2026.09.2"
 SCENARIOS = ("no_commission", "delayed", "expected")
@@ -65,7 +65,7 @@ def build_projection(data: ForecastInput) -> list[dict[str, Decimal | str]]:
             income = money(salary + extras + commission)
             expenses = money(obligations + installments + cash_cap)
             result = money(income - expenses)
-            transition = settle_liquidity(
+            transition = settle_liquidity_projection(
                 opening_balance=opening,
                 opening_uncovered_deficit=opening_debt,
                 operating_result=result,
@@ -100,4 +100,45 @@ def flatten_projection(rows: list[dict[str, Decimal | str]]) -> dict[str, Decima
         for row in rows
         for key, value in row.items()
         if key != "month" and isinstance(value, Decimal)
+    }
+
+
+def projection_liquidity_facts(
+    row: dict[str, Decimal | str], scenario: str = "expected"
+) -> dict[str, Decimal]:
+    """Derive INV-005/INV-006 facts from one row of `build_projection`'s output.
+
+    October Go-Live Slice 1: INV-005/INV-006 govern the PROJECTION engine's
+    hypothetical liquidity formula only (`settle_liquidity_projection`) -- a
+    REALIZADO snapshot's liquidity is evidence-based
+    (`app.services.financial_engine.reconcile_actual_liquidity`) and is
+    checked by INV-023/INV-024 instead, never by these two. This function
+    replaces the pre-Slice-1 `liquidity_transition_facts`, which fed these
+    same two invariants from a *closed snapshot's own* fields -- a check that
+    only made sense while snapshots were themselves built by this same
+    formula. See `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §8 (Technical
+    Challenge #1).
+
+    `calculate_liquidity_transition` (the invariants' own independent
+    formula) has no parameter for prior uncovered debt, so a carried debt is
+    folded into a single-step transition exactly as the retired
+    `liquidity_transition_facts` did: a period that starts with
+    `opening_uncovered_deficit_{scenario} > 0` always closes with
+    `opening_balance_{scenario} == 0` (the engine forces it), and the
+    two-step "pay debt, then deposit the remainder" transition is
+    algebraically identical to a single step of
+    `calculate_liquidity_transition(0, result + investment_return - debt)`.
+    """
+
+    debt = money(row[f"opening_uncovered_deficit_{scenario}"])
+    opening = Decimal("0.00") if debt > 0 else money(row[f"opening_balance_{scenario}"])
+    monthly_result = money(
+        money(row[f"result_{scenario}"]) + money(row[f"investment_return_{scenario}"]) - debt
+    )
+    return {
+        "opening_liquidity_balance": opening,
+        "monthly_operating_result": monthly_result,
+        "closing_liquidity_balance": money(row[f"balance_{scenario}"]),
+        "uncovered_deficit": money(row[f"uncovered_deficit_{scenario}"]),
+        "liquidity_used": money(row[f"liquidity_used_{scenario}"]),
     }

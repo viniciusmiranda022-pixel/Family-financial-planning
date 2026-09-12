@@ -23,7 +23,8 @@ from app.services.financial_snapshots import (
     _observation_is_trusted,
     build_snapshot,
     dashboard_and_report_consistency_facts,
-    liquidity_transition_facts,
+    realized_balance_sovereignty_facts,
+    realized_liquidity_evidence_facts,
     snapshot_lineage_facts,
 )
 from app.services.invariant_registry import evaluate_invariant
@@ -71,6 +72,21 @@ def test_only_confirmed_or_reconciled_balance_evidence_is_trusted() -> None:
 
 
 def test_point_in_time_balance_becomes_next_period_opening_evidence() -> None:
+    """A confirmed observation dated *inside* the current period is reflected
+    in that same period's snapshot, not deferred until it becomes next
+    period's opening evidence.
+
+    This test used to assert the opposite -- `not
+    september.payload["balance_evidence_trusted"]` -- and was cited verbatim
+    in `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §2 item 3 as "prova viva do
+    gap": a real Slice 0 conflict between that assertion and rebaseline
+    §5.1/§5.2, which require distinguishing "saldo observado", "movimentos
+    posteriores" and "saldo corrente derivado" continuously, not only at a
+    period boundary. Slice 1 closes that gap
+    (`_intra_period_reconciliation`), so the September confirmation now
+    anchors September's own closing balance immediately; it is not a change
+    to what October derives from it."""
+
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -106,7 +122,12 @@ def test_point_in_time_balance_becomes_next_period_opening_evidence() -> None:
         september = build_snapshot(db, household_id=household.id, period="2026-09")
         october = build_snapshot(db, household_id=household.id, period="2026-10")
 
-        assert not september.payload["balance_evidence_trusted"]
+        # September opened on the untrusted legacy profile balance (999,
+        # `investment_balance`) -- no observation dated on/before Sept 1
+        # exists -- but the Sept 2 confirmation is still inside September
+        # and becomes the sovereign anchor for the rest of the period.
+        assert september.payload["balance_evidence_trusted"]
+        assert september.closing_liquidity_balance == Decimal("321.45")
         assert october.payload["balance_evidence_trusted"]
         assert october.opening_liquidity_balance == Decimal("321.45")
 
@@ -276,8 +297,15 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
         assert august.card_payments == Decimal("100.00")
         assert august.redemptions == Decimal("25.00")
         assert august.operating_income == Decimal("0.00")
-        assert august.closing_liquidity_balance == Decimal("0.00")
-        assert august.closing_uncovered_deficit == Decimal("50.00")
+        # October Go-Live Slice 1: the R$ 100 operating deficit has no bearing
+        # on the Privilège closing balance -- only the real, evidenced R$ 25
+        # "Transferência patrimonial" redemption does (opening 50 - 25 = 25).
+        # The pre-Slice-1 engine used to fabricate a R$ 50 withdrawal (all of
+        # `opening`) purely from the deficit's size, ignoring this evidence.
+        assert august.liquidity_used == Decimal("25.00")
+        assert august.closing_liquidity_balance == Decimal("25.00")
+        assert august.closing_uncovered_deficit == Decimal("0.00")
+        assert august.payload["has_transfer_evidence"] is True
         assert august.payload["opening_balance_source"] == "observation"
         assert august.payload["duplicates_ignored"] == 1
         duplicate_lineage = db.scalar(
@@ -301,15 +329,24 @@ def test_snapshots_separate_economic_cash_card_and_patrimonial_flows() -> None:
 
         same = build_snapshot(db, household_id=household.id, period="2026-08")
         assert same.id == august.id
-        assert september.opening_uncovered_deficit == Decimal("50.00")
+        # No uncovered deficit is carried into September: August's own
+        # evidenced redemption already covered its deficit, so there is no
+        # fabricated debt left to carry (see the August assertions above).
+        assert september.opening_uncovered_deficit == Decimal("0.00")
         assert september.closing_uncovered_deficit == Decimal("0.00")
+        # September has no evidenced "Transferência patrimonial" movement of
+        # its own, so its closing balance is simply August's real closing
+        # balance carried forward, untouched by September's own (unrelated,
+        # unexplained) operating surplus.
         assert september.closing_liquidity_balance == Decimal("25.00")
+        assert september.payload["has_transfer_evidence"] is False
+        assert Decimal(str(september.payload["unexplained_operating_result"])) == Decimal("75.00")
         lineage = tuple(
             db.scalars(
                 select(FinancialSnapshotLineage).where(FinancialSnapshotLineage.snapshot_id == september.id)
             ).all()
         )
-        assert any(item.rule_id == "PRIOR-UNCOVERED-DEFICIT-CARRY" for item in lineage)
+        assert not any(item.rule_id == "PRIOR-UNCOVERED-DEFICIT-CARRY" for item in lineage)
 
         rebuilt = build_snapshot(db, household_id=household.id, period="2026-08", force=True)
         db.commit()
@@ -413,7 +450,12 @@ def test_report_aggregates_snapshot_refunds_and_latest_balance_observation() -> 
         ]
         assert result["summary"]["liquidity_starting_balance"] == 100.0
         assert result["summary"]["liquidity_balance"] == 1000.0
-        assert result["summary"]["liquidity_withdrawal"] == 80.0
+        # October Go-Live Slice 1: no "Transferência patrimonial" movement was
+        # ever evidenced in either month -- only a card expense and its
+        # refund, both purely economic -- so no Privilège withdrawal is
+        # reported. The pre-Slice-1 engine used to fabricate an R$ 80
+        # withdrawal from the net operating deficit alone.
+        assert result["summary"]["liquidity_withdrawal"] == 0.0
         assert result["monthly"][-1]["snapshot_id"]
 
 
@@ -1668,29 +1710,39 @@ def _evaluate_projection_gate_check(invariant_id: str, facts: dict[str, object])
     )
 
 
-def test_liquidity_transition_facts_prove_a_debt_carrying_snapshot() -> None:
-    """INV-005/INV-006 must evaluate PASS on a real, debt-carrying snapshot.
+def _evaluate_period_check(invariant_id: str, facts: dict[str, object]):
+    return evaluate_invariant(
+        invariant_id,
+        InvariantContext(
+            facts=facts,
+            scope=InvariantScope.PERIOD,
+            entity_type="financial_snapshot",
+            entity_id="financial-snapshot-gate-test",
+            period="2026-09",
+            trace_id="trace-realized-liquidity-gate-test",
+        ),
+    )
 
-    `calculate_liquidity_transition` (the invariants' own independent
-    formula) has no parameter for prior uncovered debt, so
-    `liquidity_transition_facts` must fold it into a single-step transition
-    before calling it. This proves that fold reproduces the engine's own
-    numbers for a snapshot that actually carries debt into the period being
-    checked -- the exact shape of PR 34's regression scenario -- not just the
-    debt-free case already covered by `tests/test_financial_invariants.py`.
+
+def test_account_balance_observation_alone_never_materializes_liquidity_transfer() -> None:
+    """October Go-Live Slice 1 (rebaseline §4.3/§5.1): an
+    `AccountBalanceObservation` proves a position, never a transfer. A
+    household with only an opening observation and ordinary expenses -- no
+    "Transferência patrimonial" transaction at all -- must close the period
+    with `liquidity_used == liquidity_deposit == 0` and its Privilège balance
+    completely untouched by the operating deficit, and INV-023 must PASS.
     """
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        household = Household(name="Família Liquidez")
+        household = Household(name="Família Evidência")
         db.add(household)
         db.flush()
         investment = Account(household_id=household.id, name="Reserva DI", account_type="investment")
         card = Account(household_id=household.id, name="Cartão", account_type="credit_card")
         expense = Category(household_id=household.id, name="Compras")
-        income = Category(household_id=household.id, name="Receitas")
-        db.add_all([investment, card, expense, income])
+        db.add_all([investment, card, expense])
         db.flush()
         db.add_all(
             [
@@ -1698,8 +1750,8 @@ def test_liquidity_transition_facts_prove_a_debt_carrying_snapshot() -> None:
                 AccountBalanceObservation(
                     household_id=household.id,
                     account_id=investment.id,
-                    amount=Decimal("50"),
-                    as_of_date=date(2026, 8, 1),
+                    amount=Decimal("1000"),
+                    as_of_date=date(2026, 9, 1),
                     observation_type="opening",
                     source="manual_confirmed",
                     confidence=Decimal("1"),
@@ -1709,64 +1761,297 @@ def test_liquidity_transition_facts_prove_a_debt_carrying_snapshot() -> None:
                     household,
                     card,
                     expense,
-                    booked_at=date(2026, 8, 5),
-                    amount="-100",
+                    booked_at=date(2026, 9, 5),
+                    amount="-5000",
                     transaction_type="expense",
                     suffix="1",
-                ),
-                _transaction(
-                    household,
-                    investment,
-                    income,
-                    booked_at=date(2026, 9, 2),
-                    amount="75",
-                    transaction_type="income",
-                    suffix="2",
                 ),
             ]
         )
         db.commit()
 
         september = build_snapshot(db, household_id=household.id, period="2026-09")
-        assert september.opening_uncovered_deficit == Decimal("50.00")
-        assert september.closing_uncovered_deficit == Decimal("0.00")
-        assert september.closing_liquidity_balance == Decimal("25.00")
 
-        facts = liquidity_transition_facts(september)
-        assert facts["opening_liquidity_balance"] == Decimal("0.00")
-        assert facts["monthly_operating_result"] == Decimal("25.00")
-        non_negative_balance = _evaluate_projection_gate_check("INV-005", facts)
-        deficit_consumes_liquidity = _evaluate_projection_gate_check("INV-006", facts)
-        assert non_negative_balance.status is InvariantStatus.PASS
-        assert deficit_consumes_liquidity.status is InvariantStatus.PASS
+        assert september.liquidity_used == Decimal("0.00")
+        assert Decimal(str(september.payload["liquidity_deposit"])) == Decimal("0.00")
+        assert september.payload["has_transfer_evidence"] is False
+        assert september.closing_liquidity_balance == september.opening_liquidity_balance == Decimal("1000.00")
+        assert Decimal(str(september.payload["unexplained_operating_result"])) == Decimal("-5000.00")
+
+        result = _evaluate_period_check("INV-023", realized_liquidity_evidence_facts(september))
+        assert result.status is InvariantStatus.PASS
 
 
-def test_liquidity_transition_facts_catch_a_broken_engine_result() -> None:
-    """A snapshot that misreports its own closing figures must FAIL.
-
-    This is the fold's contrapositive to the previous test: if `settle_liquidity`
-    ever mis-happens to publish a closing balance that doesn't match the
-    single-step transition implied by the snapshot's own opening/result/debt
-    fields, `liquidity_transition_facts` + INV-005 must catch it instead of
-    trusting the engine's own arithmetic -- proving the check is a real
-    second opinion, not a tautology that always agrees with the engine.
-    """
+def test_realized_liquidity_evidence_facts_catch_a_snapshot_that_fabricated_movement_without_evidence() -> (
+    None
+):
+    """Contrapositive of the previous test: if a snapshot ever reports a
+    nonzero `liquidity_used`/`liquidity_deposit` while its own persisted
+    `has_transfer_evidence` flag says no real movement was found, INV-023
+    must FAIL -- a real second opinion, not a tautology."""
 
     from types import SimpleNamespace
 
     broken_snapshot = SimpleNamespace(
-        opening_liquidity_balance=Decimal("0.00"),
-        operating_result=Decimal("75.00"),
-        investment_yield=Decimal("0.00"),
-        opening_uncovered_deficit=Decimal("50.00"),
-        # Correct closing balance would be 25.00 (75 - 50 of debt paid down).
-        closing_liquidity_balance=Decimal("30.00"),
-        closing_uncovered_deficit=Decimal("0.00"),
-        liquidity_used=Decimal("0.00"),
+        liquidity_used=Decimal("50.00"),
+        payload={"liquidity_deposit": Decimal("0.00"), "has_transfer_evidence": False},
     )
-    facts = liquidity_transition_facts(broken_snapshot)
-    result = _evaluate_projection_gate_check("INV-005", facts)
+    result = _evaluate_period_check("INV-023", realized_liquidity_evidence_facts(broken_snapshot))
     assert result.status is InvariantStatus.FAIL
+
+
+def test_intra_period_balance_observation_is_reflected_without_rewriting_it() -> None:
+    """Rebaseline §5.1/§5.2: a balance confirmed *inside* the current period
+    (not just at its boundary) is reflected immediately as the derived
+    current position, while the observation itself is never rewritten and
+    the period's canonical closing balance keeps converging with it when the
+    evidence agrees."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família Intra-Período")
+        db.add(household)
+        db.flush()
+        investment = Account(household_id=household.id, name="Reserva DI", account_type="investment")
+        checking = Account(household_id=household.id, name="Conta Corrente", account_type="checking")
+        patrimonial = Category(household_id=household.id, name="Transferência patrimonial")
+        db.add_all([investment, checking, patrimonial])
+        db.flush()
+        opening_observation = AccountBalanceObservation(
+            household_id=household.id,
+            account_id=investment.id,
+            amount=Decimal("1000"),
+            as_of_date=date(2026, 8, 1),
+            observation_type="opening",
+            source="manual_confirmed",
+            confidence=Decimal("1"),
+            trace_id="opening-observation",
+        )
+        mid_period_observation = AccountBalanceObservation(
+            household_id=household.id,
+            account_id=investment.id,
+            amount=Decimal("1200"),
+            as_of_date=date(2026, 9, 20),
+            observation_type="confirmation",
+            source="manual_confirmed",
+            confidence=Decimal("1"),
+            trace_id="mid-period-observation",
+        )
+        db.add_all(
+            [
+                FinancialProfile(household_id=household.id, investment_name="Reserva DI"),
+                opening_observation,
+                mid_period_observation,
+                # A real, evidenced application into Privilège -- money leaving
+                # Conta Corrente -- booked mid-period, before the confirmation.
+                _transaction(
+                    household,
+                    checking,
+                    patrimonial,
+                    booked_at=date(2026, 9, 5),
+                    amount="-200",
+                    transaction_type="transfer",
+                    suffix="1",
+                ),
+            ]
+        )
+        db.commit()
+
+        september = build_snapshot(db, household_id=household.id, period="2026-09")
+
+        reconciliation = september.payload["reconciliation"]
+        assert reconciliation["observed_balance"] == 1200.0
+        assert reconciliation["observed_balance_as_of"] == "2026-09-20"
+        assert reconciliation["reconciliation_divergence"] == 0.0
+        assert reconciliation["derived_balance_since_observation"] == 1200.0
+        # The whole-period additive reconstruction converges with the
+        # observation-anchored figure when the evidence agrees.
+        assert september.closing_liquidity_balance == Decimal("1200.00")
+        assert Decimal(str(september.payload["liquidity_deposit"])) == Decimal("200.00")
+        assert september.payload["has_transfer_evidence"] is True
+
+        # The confirmed observation itself is never rewritten.
+        db.expire_all()
+        stored = db.get(AccountBalanceObservation, mid_period_observation.id)
+        assert stored is not None
+        assert stored.amount == Decimal("1200.00")
+        assert stored.invalidated_at is None
+        assert stored.superseded_by_id is None
+
+        sovereignty = _evaluate_period_check(
+            "INV-024", realized_balance_sovereignty_facts(september)
+        )
+        assert sovereignty.status is InvariantStatus.PASS
+
+
+def test_intra_period_balance_observation_divergence_is_disclosed_not_masked() -> None:
+    """When the confirmed balance disagrees with what evidenced transfers
+    alone would reconstruct, the gap is surfaced -- never silently adjusted
+    away, and the observation is never overwritten to match the
+    reconstruction (rebaseline §5.1). The *published* canonical closing
+    balance is anchored on the confirmed observation itself (plus any
+    evidenced movement after it), never left as the from-opening
+    reconstruction that disagrees with the bank -- engineering review on
+    PR #89 (2026-09-12): a stale `closing_liquidity_balance == 1200` here
+    contradicted the confirmed 1250 in the same instant it was supposedly
+    already disclosing."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família Divergência")
+        db.add(household)
+        db.flush()
+        investment = Account(household_id=household.id, name="Reserva DI", account_type="investment")
+        checking = Account(household_id=household.id, name="Conta Corrente", account_type="checking")
+        patrimonial = Category(household_id=household.id, name="Transferência patrimonial")
+        db.add_all([investment, checking, patrimonial])
+        db.flush()
+        db.add_all(
+            [
+                FinancialProfile(household_id=household.id, investment_name="Reserva DI"),
+                AccountBalanceObservation(
+                    household_id=household.id,
+                    account_id=investment.id,
+                    amount=Decimal("1000"),
+                    as_of_date=date(2026, 8, 1),
+                    observation_type="opening",
+                    source="manual_confirmed",
+                    confidence=Decimal("1"),
+                    trace_id="opening-observation",
+                ),
+                AccountBalanceObservation(
+                    household_id=household.id,
+                    account_id=investment.id,
+                    # Evidence alone (opening 1000 + 200 deposit) reconstructs
+                    # 1200, but the bank actually confirms 1250 -- a real,
+                    # unexplained R$ 50 gap (e.g. uncaptured yield).
+                    amount=Decimal("1250"),
+                    as_of_date=date(2026, 9, 20),
+                    observation_type="confirmation",
+                    source="manual_confirmed",
+                    confidence=Decimal("1"),
+                    trace_id="mid-period-observation-divergent",
+                ),
+                _transaction(
+                    household,
+                    checking,
+                    patrimonial,
+                    booked_at=date(2026, 9, 5),
+                    amount="-200",
+                    transaction_type="transfer",
+                    suffix="1",
+                ),
+            ]
+        )
+        db.commit()
+
+        september = build_snapshot(db, household_id=household.id, period="2026-09")
+
+        reconciliation = september.payload["reconciliation"]
+        assert reconciliation["observed_balance"] == 1250.0
+        assert reconciliation["reconstructed_balance_at_observation"] == 1200.0
+        assert reconciliation["reconciliation_divergence"] == 50.0
+        assert reconciliation["derived_balance_since_observation"] == 1250.0
+        # The canonical closing balance is anchored on the confirmed
+        # observation (no movement occurred after it in this period), never
+        # left at the from-opening reconstruction that disagrees with the
+        # bank. The reconstruction and the 50.00 gap remain visible above,
+        # in `reconciliation`, for investigation -- disclosed, not hidden,
+        # and not used to synthesize an adjusting transaction.
+        assert september.closing_liquidity_balance == Decimal("1250.00")
+
+        db.expire_all()
+        stored = db.scalars(
+            select(AccountBalanceObservation).where(
+                AccountBalanceObservation.household_id == household.id,
+                AccountBalanceObservation.as_of_date == date(2026, 9, 20),
+            )
+        ).one()
+        assert stored.amount == Decimal("1250.00")
+
+        sovereignty = _evaluate_period_check(
+            "INV-024", realized_balance_sovereignty_facts(september)
+        )
+        assert sovereignty.status is InvariantStatus.PASS
+
+
+def test_intra_period_observation_becomes_sovereign_anchor_without_opening_evidence() -> None:
+    """Rebaseline §5.1: the search for a trusted intra-period observation
+    must not depend on the period's *opening* balance already being trusted.
+    When no observation anchors the period's start (`_opening_balance` falls
+    back to the untrusted legacy profile figure, `opening_as_of is None`), a
+    confirmed observation that appears mid-period must still become the
+    sovereign anchor from its own date forward -- never ignored, and never
+    papered over by fabricating a transfer to explain the earlier gap.
+
+    Engineering review on PR #89 (2026-09-12), blocker #2: previously
+    `_intra_period_reconciliation` returned `None` whenever `observed_balance`
+    (the *opening* trust flag) was falsy, so this exact scenario silently
+    dropped a real, trusted mid-period confirmation."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família Sem Abertura Confiável")
+        db.add(household)
+        db.flush()
+        investment = Account(household_id=household.id, name="Reserva DI", account_type="investment")
+        checking = Account(household_id=household.id, name="Conta Corrente", account_type="checking")
+        patrimonial = Category(household_id=household.id, name="Transferência patrimonial")
+        db.add_all([investment, checking, patrimonial])
+        db.flush()
+        db.add_all(
+            [
+                # No opening observation exists at all -- `_opening_balance`
+                # falls back to `FinancialProfile.investment_balance` (0,
+                # untrusted) as the period's opening.
+                FinancialProfile(household_id=household.id, investment_name="Reserva DI"),
+                AccountBalanceObservation(
+                    household_id=household.id,
+                    account_id=investment.id,
+                    amount=Decimal("900"),
+                    as_of_date=date(2026, 9, 10),
+                    observation_type="confirmation",
+                    source="manual_confirmed",
+                    confidence=Decimal("1"),
+                    trace_id="mid-period-only-observation",
+                ),
+                # A real, evidenced application into Privilège booked after
+                # the confirmation.
+                _transaction(
+                    household,
+                    checking,
+                    patrimonial,
+                    booked_at=date(2026, 9, 20),
+                    amount="-100",
+                    transaction_type="transfer",
+                    suffix="1",
+                ),
+            ]
+        )
+        db.commit()
+
+        september = build_snapshot(db, household_id=household.id, period="2026-09")
+
+        reconciliation = september.payload["reconciliation"]
+        assert reconciliation["observed_balance"] == 900.0
+        assert reconciliation["observed_balance_as_of"] == "2026-09-10"
+        assert reconciliation["movements_since_observation"] == 100.0
+        assert reconciliation["derived_balance_since_observation"] == 1000.0
+        # The canonical closing balance derives from the mid-period
+        # confirmation plus the evidenced movement after it -- 900 + 100 --
+        # never a fabricated transfer synthesized to explain the gap between
+        # the untrusted legacy opening (0) and the confirmed 900.
+        assert september.closing_liquidity_balance == Decimal("1000.00")
+        assert september.payload["balance_evidence_trusted"] is True
+        assert september.payload["has_transfer_evidence"] is True
+
+        sovereignty = _evaluate_period_check(
+            "INV-024", realized_balance_sovereignty_facts(september)
+        )
+        assert sovereignty.status is InvariantStatus.PASS
 
 
 def test_snapshot_lineage_facts_require_transactions_accounts_and_categories() -> None:

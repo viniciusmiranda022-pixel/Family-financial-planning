@@ -41,9 +41,9 @@ ZERO_OPERATING_EFFECTS = {
 
 
 def test_registry_contains_all_permanent_invariants_once() -> None:
-    assert FINANCIAL_RULES_VERSION == "2026.09.1"
-    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 23))
-    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 22
+    assert FINANCIAL_RULES_VERSION == "2026.10.1"
+    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 25))
+    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 24
     assert all(item.required_facts for item in INVARIANT_REGISTRY.values())
 
 

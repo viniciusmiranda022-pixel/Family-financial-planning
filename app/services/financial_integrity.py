@@ -92,6 +92,13 @@ PROJECTION_INVARIANTS = frozenset(
         "INV-012",
         "INV-018",
         "INV-022",
+        # October Go-Live Slice 1: a realized snapshot's evidence-based
+        # liquidity (INV-023/024) must also hold before it is trusted as a
+        # projection seed -- INV-005/006 alone only cover the projection
+        # engine's own hypothetical math (see
+        # docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md §8).
+        "INV-023",
+        "INV-024",
     }
 )
 REPORT_INVARIANTS = frozenset(
@@ -111,7 +118,7 @@ REPORT_INVARIANTS = frozenset(
     }
 )
 PROJECTION_REQUIRED_INVARIANTS = frozenset(
-    {"INV-005", "INV-006", "INV-018", "INV-022"}
+    {"INV-005", "INV-006", "INV-018", "INV-022", "INV-023", "INV-024"}
 )
 REPORT_REQUIRED_INVARIANTS = frozenset({"INV-019", "INV-020", "INV-022"})
 

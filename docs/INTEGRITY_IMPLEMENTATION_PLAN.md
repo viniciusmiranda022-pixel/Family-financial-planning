@@ -454,6 +454,8 @@ budget_remaining
 commitments
 projected_balance
 source_count
+has_transfer_evidence
+unexplained_operating_result
 calculation_version
 financial_rules_version
 generated_at
@@ -461,11 +463,28 @@ trace_id
 integrity_status
 ```
 
+`has_transfer_evidence`/`unexplained_operating_result` foram adicionados no October Go-Live Slice 1
+(P0 #87) e vivem apenas no `payload` JSON (sem coluna própria em `financial_snapshots`) — ver §7.3.1.
+O `payload` também ganhou, no mesmo Slice, um objeto `reconciliation` computado
+(`observed_balance`, `observed_balance_as_of`, `observed_balance_source`,
+`reconstructed_balance_at_observation`, `reconciliation_divergence`, `movements_since_observation`,
+`derived_balance_since_observation`) quando uma observação de saldo intra-período existir — ver §7.4.
+
 Os valores monetários permanecem `Decimal/Numeric(14,2)` no núcleo. Conversão para JSON ocorre apenas na borda. O Advisor não passa a ser fonte de nenhum campo.
 
 ### 7.3 Regra canônica do Privilège DI
 
-Para um déficit mensal `D > 0` e saldo disponível `S >= 0`:
+**Reescopado pelo October Go-Live Rebaseline, Slice 1 (P0 #87, 2026-10):** a
+fórmula abaixo (`min(S, D)` derivado do déficit mensal) é a matemática do
+**motor de projeção** (`settle_liquidity_projection`/`build_projection`),
+usada exclusivamente para simular cenários hipotéticos de 30/60/90 dias.
+Ela **não** é mais a regra de fechamento de um período REALIZADO — ver
+`docs/OCTOBER_GO_LIVE_REBASELINE.md` §4.3 e
+`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §8 (Technical Challenge #1), que
+documentam por que essa liquidação automática, aplicada a um fato fechado,
+fabricava resgate/aplicação sem evidência real.
+
+Para um déficit projetado `D > 0` e saldo disponível `S >= 0`:
 
 ```text
 liquidity_used = min(S, D)
@@ -473,7 +492,7 @@ closing_liquidity_balance = S - liquidity_used
 closing_uncovered_deficit = D - liquidity_used
 ```
 
-Exemplo obrigatório de regressão:
+Exemplo obrigatório de regressão (projeção):
 
 ```text
 resultado do mês            = -270.014,03
@@ -490,7 +509,35 @@ distance_to_floor = closing_liquidity_balance - safety_floor
 floor_breached = closing_liquidity_balance < safety_floor
 ```
 
-Se houver déficit sem cobertura no início do mês seguinte, superávits futuros primeiro reduzem esse déficit. O sistema não pode apresentar simultaneamente liquidez positiva e dívida anterior não coberta sem uma regra explícita que justifique essa coexistência.
+Se houver déficit sem cobertura no início do mês seguinte, superávits futuros projetados primeiro
+reduzem esse déficit. O sistema não pode apresentar simultaneamente liquidez positiva e dívida
+anterior não coberta sem uma regra explícita que justifique essa coexistência.
+
+#### 7.3.1 Regra canônica do Privilège DI — REALIZADO
+
+Para um período REALIZADO (já fechado), a regra é evidence-based
+(`app.services.financial_engine.reconcile_actual_liquidity`), nunca derivada
+do resultado operacional:
+
+```text
+liquidity_deposit = aplicação evidenciada (transação real "Transferência
+                     patrimonial", importada/observada ou confirmada)
+liquidity_used     = resgate evidenciado (idem)
+closing_liquidity_balance = saldo_inicial + liquidity_deposit
+                            - liquidity_used + rendimento_evidenciado
+unexplained_operating_result = resultado_operacional quando nenhuma
+                                evidência de movimento existir no período
+                                (nunca mascarado, nunca fabrica movimento)
+```
+
+Uma dívida legada (`opening_uncovered_deficit` herdada de um período fechado
+antes desta regra existir) só diminui por um depósito evidenciado — nunca
+por um superávit operacional inferido. Um resgate evidenciado maior do que o
+disponível não é silenciosamente zerado: vira `closing_uncovered_deficit`
+para investigação, exatamente como qualquer outra divergência deste
+rebaseline. Invariantes: INV-023 (evidência obrigatória) e INV-024 (saldo
+confirmado soberano; divergência sinalizada, nunca corrigida por ajuste
+sintético) — ver `docs/FINANCIAL_INVARIANTS.md`.
 
 ### 7.4 Saldo confirmado versus calculado
 
@@ -506,6 +553,31 @@ Todo saldo informado deve ter:
 - confiança.
 
 O valor atual de `FinancialProfile.investment_balance` não possui data efetiva confiável. No backfill ele deve virar uma observação `legacy_profile` com finding `REVIEW`, até o usuário confirmar a data. Não se deve subtrair despesas históricas de um saldo atual sem saber se elas já estão refletidas nele.
+
+**October Go-Live Slice 1 (P0 #87):** uma observação de saldo confirmada *dentro* do período corrente
+(não apenas no limite entre períodos) passa a ser refletida imediatamente, em vez de esperar a
+abertura do período seguinte. Essa busca não depende de a abertura do período já ser confiável: se
+`_opening_balance` caiu no fallback legado (nenhuma observação confiável até o início do período),
+uma observação confiável que aparece no meio do período ainda se torna a âncora soberana a partir de
+sua própria data — nunca é ignorada só porque nada ancorou o início do período.
+`_collect`/`build_snapshot` calculam, quando essa observação existir:
+
+- `reconstructed_balance_at_observation` — saldo de abertura do período (ou o *floor* de busca, na
+  ausência de abertura confiável) mais os movimentos evidenciados ("Transferência patrimonial") até
+  a data da observação;
+- `reconciliation_divergence` — a diferença entre o saldo confirmado e essa reconstrução, exposta
+  sempre, nunca corrigida por um ajuste sintético;
+- `derived_balance_since_observation` — o saldo confirmado mais os movimentos evidenciados
+  *depois* da observação, isto é, a melhor estimativa do saldo agora.
+
+A observação em si nunca é reescrita ou substituída por essa reconstrução. **Correção pós-review de
+engenharia (PR #89, 2026-09-12):** o `closing_liquidity_balance` canônico do período — a mesma fonte
+única para Dashboard/relatórios/projeção — deixa de ser a reconstrução aditiva desde a abertura
+sempre que essa observação intra-período existir; ele passa a ser `derived_balance_since_observation`
+(a âncora confirmada mais o movimento evidenciado posterior a ela). A reconstrução aditiva e a
+divergência continuam expostas em `reconciliation` como camada de transparência/auditoria — nunca um
+segundo cálculo de patrimônio — mas não são mais o que é publicado como posição corrente quando uma
+âncora mais recente e confirmada existe.
 
 ### 7.5 Separação obrigatória de conceitos
 

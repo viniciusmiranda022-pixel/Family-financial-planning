@@ -1,7 +1,21 @@
 # Contrato de invariantes financeiros
 
-**Versão das regras:** `2026.09.1`
+**Versão das regras:** `2026.10.1`
 **Status:** normativo
+
+**Controle de mudança (2026-10, October Go-Live Slice 1, P0 #87):** INV-005,
+INV-006 e INV-007 foram rescopadas de "fato realizado" para "PROJEÇÃO/cenário
+hipotético apenas" — `docs/OCTOBER_GO_LIVE_REBASELINE.md` §4.3 proíbe inferir
+resgate/aplicação REALIZADO do Privilège a partir do sinal do resultado
+operacional, e a liquidação automática que essas três regras validavam
+(`settle_liquidity`/`calculate_liquidity_transition`) permanece correta
+apenas como matemática de projeção hipotética. INV-023 e INV-024 foram
+adicionadas para cobrir a semântica REALIZADO equivalente: resgate/aplicação
+só é reconhecido com evidência de movimento real, e saldo confirmado é
+soberano com divergência sinalizada. Nenhum snapshot histórico é reescrito;
+cada um mantém seu próprio `calculation_version`. Ver
+`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §8 (Technical Challenge #1) e
+`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_1.md`.
 **Implementação executável:** `app/services/invariant_registry.py`
 
 Este documento define as condições que precisam permanecer verdadeiras em importações,
@@ -100,12 +114,15 @@ posição.
 **Teste automatizado associado:**
 `tests/test_financial_invariants.py::test_redemption_is_not_operating_income`.
 
-## INV-005 — Privilège não negativo
+## INV-005 — Privilège não negativo (PROJEÇÃO)
 
+**Escopo:** PROJEÇÃO/cenário hipotético apenas (`settle_liquidity_projection`/
+`build_projection`). Nunca se aplica a um período REALIZADO — ver INV-023/INV-024.
 **Título:** Saldo de liquidez nunca negativo
-**Descrição:** Se o déficit exceder o saldo disponível, o saldo final é zero e a diferença é déficit
-sem cobertura.
-**Motivação:** Um saldo patrimonial negativo fictício esconde dívida ou falta de recursos.
+**Descrição:** Se o déficit projetado exceder o saldo disponível, o saldo final é zero e a diferença
+é déficit sem cobertura.
+**Motivação:** Um saldo patrimonial negativo fictício esconde dívida ou falta de recursos, mesmo em
+projeção.
 **Entradas:** saldo inicial, resultado mensal, saldo final, liquidez utilizada e déficit sem cobertura.
 **Resultado esperado:**
 `saldo_final = max(0, saldo_inicial + resultado_mensal)` e
@@ -114,12 +131,15 @@ sem cobertura.
 **Teste automatizado associado:**
 `tests/test_financial_invariants.py::test_liquidity_transition_never_produces_negative_balance`.
 
-## INV-006 — Déficit consome liquidez
+## INV-006 — Déficit consome liquidez (PROJEÇÃO)
 
+**Escopo:** PROJEÇÃO/cenário hipotético apenas. Nunca se aplica a um período REALIZADO — ver
+INV-023/INV-024.
 **Título:** Resultado negativo usa a conta central
-**Descrição:** Resultado mensal negativo consome o Privilège DI disponível antes de produzir déficit
-sem cobertura, inclusive quando rompe o piso.
-**Motivação:** O Privilège DI é o caixa operacional real e diariamente movimentado pela família.
+**Descrição:** Resultado mensal projetado negativo consome o Privilège DI disponível antes de
+produzir déficit sem cobertura, inclusive quando rompe o piso.
+**Motivação:** O Privilège DI é o caixa operacional real e diariamente movimentado pela família, e a
+projeção precisa modelar esse comportamento hipoteticamente.
 **Entradas:** saldo inicial, resultado mensal, retirada utilizada, saldo final e déficit sem cobertura.
 **Resultado esperado:**
 `retirada = min(saldo_inicial, abs(min(resultado_mensal, 0)))`.
@@ -127,11 +147,12 @@ sem cobertura, inclusive quando rompe o piso.
 **Teste automatizado associado:**
 `tests/test_financial_invariants.py::test_deficit_uses_all_available_liquidity_before_becoming_uncovered`.
 
-## INV-007 — Piso não é dinheiro bloqueado
+## INV-007 — Piso não é dinheiro bloqueado (PROJEÇÃO)
 
+**Escopo:** PROJEÇÃO/cenário hipotético apenas.
 **Título:** Piso de segurança é referência
-**Descrição:** O piso gera indicador e alerta, mas não impede resgate necessário para cobrir déficit
-real.
+**Descrição:** O piso gera indicador e alerta, mas não impede resgate projetado necessário para
+cobrir déficit hipotético.
 **Motivação:** Não exibir simultaneamente um saldo “protegido” e uma dívida que esse próprio saldo
 deveria ter reduzido.
 **Entradas:** saldo inicial, resultado mensal, piso, retirada utilizada, saldo final e déficit sem
@@ -323,6 +344,59 @@ versão do cálculo.
 **Severidade se violado:** `CRITICAL`.
 **Teste automatizado associado:**
 `tests/test_financial_invariants.py::test_aggregate_requires_complete_lineage`.
+
+## INV-023 — Resgate/aplicação REALIZADO exige evidência
+
+**Escopo:** REALIZADO (`reconcile_actual_liquidity`/`calculate_actual_snapshot`).
+**Título:** Liquidez realizada não é inferida do resultado operacional
+**Descrição:** Um período REALIZADO só pode reportar `liquidity_used`/`liquidity_deposit` do
+Privilège quando há evidência de um movimento real de "Transferência patrimonial" (transação
+importada/observada do extrato bancário, ou ação explicitamente confirmada pelo usuário/Assistente —
+por exemplo `funding_source="privilege"`). Nunca é inferido do sinal do resultado operacional, e uma
+`AccountBalanceObservation` isolada nunca basta como evidência: ela prova posição, não causa.
+**Motivação:** Rebaseline §4.2/§4.3 — resultado operacional negativo não prova resgate; resultado
+positivo não prova aplicação. A fabricação automática (`resultado_operacional < 0 -> liquidity_used`)
+esconde a diferença entre resultado econômico e movimento real de caixa.
+**Entradas:** `liquidity_used`, `liquidity_deposit`, `has_transfer_evidence`.
+**Resultado esperado:** `has_transfer_evidence` é verdadeiro sempre que `liquidity_used > 0` ou
+`liquidity_deposit > 0`; caso contrário ambos são zero.
+**Severidade se violado:** `BLOCK`.
+**Teste automatizado associado:**
+`tests/test_financial_snapshots.py::test_account_balance_observation_alone_never_materializes_liquidity_transfer`,
+`tests/test_financial_snapshots.py::test_realized_liquidity_evidence_facts_catch_a_snapshot_that_fabricated_movement_without_evidence`,
+`tests/test_financial_engine.py::test_actual_snapshot_never_fabricates_liquidity_withdrawal_without_transfer_movement_or_confirmed_action`.
+
+## INV-024 — Saldo confirmado soberano; divergência sinalizada
+
+**Escopo:** REALIZADO.
+**Título:** Observação de saldo confirmada é soberana; nenhum ajuste sintético
+**Descrição:** Quando existe observação de saldo confirmada (`AccountBalanceObservation` confiável),
+ela prevalece sobre a reconstrução derivada no instante observado. Qualquer divergência entre o
+saldo confirmado e a reconstrução baseada em evidência é exposta para investigação — nunca mascarada
+— e o sistema nunca fabrica uma transação de ajuste para zerá-la. Disclosure isolado não basta: o
+`closing_liquidity_balance` publicado pelo snapshot precisa, ele mesmo, ser a âncora confirmada mais
+o movimento evidenciado posterior a ela (`derived_balance_since_observation`) sempre que existir uma
+observação confiável intra-período — nunca a reconstrução aditiva desde a abertura, mesmo que a
+divergência entre as duas apareça corretamente exposta em `reconciliation`. A busca por essa
+observação intra-período tampouco pode depender de a abertura do período já ser confiável: uma
+observação confirmada no meio do período torna-se a âncora soberana a partir de sua própria data
+mesmo quando a abertura caiu no fallback legado não confiável.
+**Motivação:** Rebaseline §5.1/§5.2 — hipótese não vira fato; saldo confirmado é soberano no instante
+observado. (Correção pós-review de engenharia na PR #89, 2026-09-12: a versão anterior permitia que
+`closing_liquidity_balance` continuasse na reconstrução aditiva mesmo com divergência divulgada, e
+ignorava uma observação confiável intra-período sempre que a abertura do período não fosse, ela
+mesma, confiável.)
+**Entradas:** `reconciliation_divergence`, `divergence_disclosed`, `synthetic_adjustment_created`,
+`confirmed_anchor_present`, `closing_matches_confirmed_anchor`.
+**Resultado esperado:** `synthetic_adjustment_created` é sempre falso; quando
+`reconciliation_divergence != 0`, `divergence_disclosed` é verdadeiro; quando
+`confirmed_anchor_present` é verdadeiro, `closing_matches_confirmed_anchor` também é.
+**Severidade se violado:** `CRITICAL`.
+**Teste automatizado associado:**
+`tests/test_financial_snapshots.py::test_intra_period_balance_observation_is_reflected_without_rewriting_it`,
+`tests/test_financial_snapshots.py::test_intra_period_balance_observation_divergence_is_disclosed_not_masked`,
+`tests/test_financial_snapshots.py::test_intra_period_observation_becomes_sovereign_anchor_without_opening_evidence`,
+`tests/test_financial_snapshots.py::test_point_in_time_balance_becomes_next_period_opening_evidence`.
 
 ## Controle de mudança
 

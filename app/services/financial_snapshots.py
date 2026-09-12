@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 from calendar import monthrange
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -150,13 +150,13 @@ def _obligation_occurs_in(item: Obligation, start: date, end: date) -> bool:
     return False
 
 
-def _opening_balance(
-    db: Session,
-    household_id: str,
-    profile: FinancialProfile,
-    period_start: date,
-    previous_snapshot: FinancialSnapshot | None,
-) -> tuple[Decimal, SnapshotSource, bool]:
+def _eligible_liquidity_accounts(
+    db: Session, household_id: str, profile: FinancialProfile
+) -> tuple[Account, ...]:
+    """Same Privilège-account matching used by `_opening_balance` and reused,
+    rather than re-derived, by the intra-period reconciliation below -- one
+    account-selection rule, not two."""
+
     investment_accounts = tuple(
         db.scalars(
             select(Account).where(
@@ -172,7 +172,17 @@ def _opening_balance(
         for account in investment_accounts
         if profile_name and profile_name in normalize_description(f"{account.institution} {account.name}")
     )
-    eligible = matching or (investment_accounts if len(investment_accounts) == 1 else ())
+    return matching or (investment_accounts if len(investment_accounts) == 1 else ())
+
+
+def _opening_balance(
+    db: Session,
+    household_id: str,
+    profile: FinancialProfile,
+    period_start: date,
+    previous_snapshot: FinancialSnapshot | None,
+) -> tuple[Decimal, SnapshotSource, bool, date | None]:
+    eligible = _eligible_liquidity_accounts(db, household_id, profile)
     observation = None
     if eligible:
         statement = select(AccountBalanceObservation).where(
@@ -214,6 +224,7 @@ def _opening_balance(
                 money(observation.amount),
             ),
             True,
+            observation.as_of_date,
         )
     if previous_snapshot is not None and previous_snapshot.payload.get("balance_evidence_trusted", False):
         return (
@@ -228,6 +239,7 @@ def _opening_balance(
                 money(previous_snapshot.closing_liquidity_balance),
             ),
             True,
+            period_start,
         )
     return (
         money(profile.investment_balance),
@@ -241,6 +253,7 @@ def _opening_balance(
             money(profile.investment_balance),
         ),
         False,
+        None,
     )
 
 
@@ -258,6 +271,96 @@ def _observation_is_trusted(db: Session, observation: AccountBalanceObservation)
             )
         )
     )
+
+
+def _patrimonial_net_movement(
+    rows: list[tuple[Transaction, str]], start: date, end: date
+) -> Decimal:
+    """Net evidenced Privilège movement (deposit positive, redemption
+    negative) for the already-selected "Transferência patrimonial" rows
+    booked in `(start, end]`. Reuses `_collect`'s own canonical transaction
+    selection and sign convention (negative amount = money left an account
+    into Privilège; positive = money arrived from a redemption) instead of a
+    second query or a second engine."""
+
+    net = Decimal("0")
+    for transaction, category_name in rows:
+        if category_name != "Transferência patrimonial":
+            continue
+        if not (start < transaction.booked_at <= end):
+            continue
+        net += -money(transaction.amount)
+    return net
+
+
+def _intra_period_reconciliation(
+    db: Session,
+    household_id: str,
+    eligible_accounts: tuple[Account, ...],
+    opening_amount: Decimal,
+    opening_as_of: date | None,
+    period_start: date,
+    period_end: date,
+    rows: list[tuple[Transaction, str]],
+) -> dict[str, Any] | None:
+    """Rebaseline §5.1/§5.2: a balance confirmed *inside* the current period
+    must be reflected as soon as it exists, not silently deferred to next
+    period's opening (`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §2 item 3).
+
+    The confirmed observation is never rewritten and never superseded by a
+    reconstruction: it stays the sovereign fact for its own instant. What
+    this adds is (a) the derived position *since* that instant, using only
+    real evidenced "Transferência patrimonial" movement, and (b) the gap
+    between what evidence implied and what the bank actually confirmed --
+    exposed for investigation, never silently corrected or hidden.
+
+    This search must not depend on the period's *opening* balance already
+    being trusted (`_opening_balance` may have fallen back to the untrusted
+    legacy profile figure with `opening_as_of is None`). A confirmed
+    observation that appears mid-period becomes the sovereign anchor from
+    its own date forward regardless -- it is never dropped just because
+    nothing anchored the period's start.
+    """
+
+    if not eligible_accounts:
+        return None
+    search_floor = opening_as_of if opening_as_of is not None else period_start
+    account_ids = [item.id for item in eligible_accounts]
+    candidates = tuple(
+        db.scalars(
+            select(AccountBalanceObservation)
+            .where(
+                AccountBalanceObservation.household_id == household_id,
+                AccountBalanceObservation.account_id.in_(account_ids),
+                AccountBalanceObservation.invalidated_at.is_(None),
+                AccountBalanceObservation.superseded_by_id.is_(None),
+                AccountBalanceObservation.as_of_date > search_floor,
+                AccountBalanceObservation.as_of_date < period_end,
+            )
+            .order_by(
+                AccountBalanceObservation.as_of_date.desc(),
+                AccountBalanceObservation.created_at.desc(),
+            )
+        ).all()
+    )
+    latest = next((item for item in candidates if _observation_is_trusted(db, item)), None)
+    if latest is None:
+        return None
+    movement_before = _patrimonial_net_movement(rows, search_floor, latest.as_of_date)
+    reconstructed_at_observation = money(opening_amount + movement_before)
+    divergence = money(money(latest.amount) - reconstructed_at_observation)
+    movement_after = _patrimonial_net_movement(rows, latest.as_of_date, period_end)
+    derived_since_observation = money(money(latest.amount) + movement_after)
+    return {
+        "observed_balance": money(latest.amount),
+        "observed_balance_as_of": latest.as_of_date.isoformat(),
+        "observed_balance_source": latest.source,
+        "observed_balance_document_id": latest.document_id,
+        "reconstructed_balance_at_observation": reconstructed_at_observation,
+        "reconciliation_divergence": divergence,
+        "movements_since_observation": movement_after,
+        "derived_balance_since_observation": derived_since_observation,
+    }
 
 
 def _source_hash(sources: list[SnapshotSource], profile: FinancialProfile) -> str:
@@ -316,7 +419,7 @@ def _collect(
         .limit(1)
     )
     rows, ignored = consolidated_transactions(db, household_id, start, end)
-    opening, opening_source, observed_balance = _opening_balance(
+    opening, opening_source, observed_balance, opening_as_of = _opening_balance(
         db, household_id, profile, start, previous_snapshot
     )
     sources = [opening_source]
@@ -490,6 +593,17 @@ def _collect(
                 )
             )
 
+    intra_period = _intra_period_reconciliation(
+        db,
+        household_id,
+        _eligible_liquidity_accounts(db, household_id, profile),
+        opening,
+        opening_as_of,
+        start,
+        end,
+        rows,
+    )
+
     result = calculate_actual_snapshot(
         FinancialEngineInput(
             period=period,
@@ -511,6 +625,30 @@ def _collect(
             source_count=len(rows),
         )
     )
+    # Rebaseline §5.1/§5.2: a confirmed balance observed *inside* the period
+    # is sovereign from its own date forward. `calculate_actual_snapshot`
+    # only ever anchors on the period's *opening* evidence, so when a later,
+    # more current confirmation exists, the published closing position must
+    # be re-anchored on it (`observed + movements after it`) instead of
+    # leaving the from-opening reconstruction standing as the canonical
+    # figure. The reconstruction itself, and the gap between it and the
+    # confirmation, remain untouched in `reconciliation` for audit -- only
+    # the canonical closing/derived fields are replaced here.
+    closing_balance_trusted = observed_balance
+    if intra_period is not None:
+        anchored_raw = Decimal(str(intra_period["derived_balance_since_observation"]))
+        anchored_closing = money(max(Decimal("0"), anchored_raw))
+        anchored_deficit = money(max(Decimal("0"), -anchored_raw))
+        floor_value = money(max(Decimal("0"), profile.emergency_floor))
+        result = replace(
+            result,
+            closing_liquidity_balance=anchored_closing,
+            closing_uncovered_deficit=anchored_deficit,
+            distance_to_floor=money(anchored_closing - floor_value),
+            floor_breached=anchored_closing < floor_value,
+            projected_balance=anchored_closing,
+        )
+        closing_balance_trusted = True
     integrity = consolidated_integrity_status(db, household_id=household_id, period=period)
     payload = result.canonical_payload()
     payload.update(
@@ -523,7 +661,7 @@ def _collect(
                 if opening_source.entity_type == "financial_snapshot"
                 else "legacy_profile"
             ),
-            "balance_evidence_trusted": observed_balance,
+            "balance_evidence_trusted": closing_balance_trusted,
             "duplicates_ignored": len(ignored) + pending_duplicates,
             "category_spending": [
                 {"category": key, "amount": float(money(value))}
@@ -531,6 +669,33 @@ def _collect(
                 if value > 0
             ],
             "cash_flow_by_account": _serialize_accounts(accounts),
+            "reconciliation": (
+                {
+                    "observed_balance": float(intra_period["observed_balance"]),
+                    "observed_balance_as_of": intra_period["observed_balance_as_of"],
+                    "observed_balance_source": intra_period["observed_balance_source"],
+                    "observed_balance_document_id": intra_period["observed_balance_document_id"],
+                    "reconstructed_balance_at_observation": float(
+                        intra_period["reconstructed_balance_at_observation"]
+                    ),
+                    "reconciliation_divergence": float(intra_period["reconciliation_divergence"]),
+                    "movements_since_observation": float(intra_period["movements_since_observation"]),
+                    "derived_balance_since_observation": float(
+                        intra_period["derived_balance_since_observation"]
+                    ),
+                }
+                if intra_period is not None
+                else {
+                    "observed_balance": None,
+                    "observed_balance_as_of": None,
+                    "observed_balance_source": None,
+                    "observed_balance_document_id": None,
+                    "reconstructed_balance_at_observation": None,
+                    "reconciliation_divergence": 0.0,
+                    "movements_since_observation": 0.0,
+                    "derived_balance_since_observation": None,
+                }
+            ),
         }
     )
     payload["integrity"] = {
@@ -548,7 +713,7 @@ def _collect(
         {
             "checksum": checksum,
             "integrity": integrity,
-            "observed_balance": observed_balance,
+            "observed_balance": closing_balance_trusted,
         },
     )
 
@@ -696,38 +861,67 @@ def build_snapshot(
     return snapshot
 
 
-def liquidity_transition_facts(snapshot: FinancialSnapshot) -> dict[str, Decimal]:
-    """Derive INV-005/INV-006 facts for an already-built snapshot.
+def realized_liquidity_evidence_facts(snapshot: FinancialSnapshot) -> dict[str, object]:
+    """Derive INV-023 facts for an already-built REALIZADO snapshot.
 
-    `settle_liquidity` (the engine) zeroes the opening balance and pays down any
-    prior uncovered deficit before a positive result can rebuild liquidity, so a
-    period that carries debt cannot be replayed through the invariants' own
-    independent `calculate_liquidity_transition(opening, monthly_result)` -- that
-    function has no debt parameter at all.
-
-    A period that starts with `opening_uncovered_deficit > 0` always closes with
-    `opening_liquidity_balance == 0` (the engine forces it), and the two-step
-    "pay debt, then deposit the remainder" transition is algebraically identical
-    to a single step of `calculate_liquidity_transition(0, operating_result +
-    investment_yield - opening_uncovered_deficit)`: whatever is left over after
-    netting the period's result and yield against the carried debt is exactly
-    what either formula clamps at zero. Folding debt into the result this way
-    reproduces the engine's own closing/uncovered/liquidity_used figures only
-    when every max/min clamp in `settle_liquidity` was applied correctly, so a
-    regression in its debt-priority branch still surfaces as a mismatch here.
-    A period with no carried debt is unaffected: the fold is a no-op because
-    `opening_uncovered_deficit` is zero.
+    October Go-Live Slice 1 retires `liquidity_transition_facts`, which used
+    to replay a closed snapshot's own closing figures through the
+    projection-only `calculate_liquidity_transition` formula -- a check that
+    only made sense while snapshots were themselves built by that same
+    formula (see `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §8, Technical
+    Challenge #1). A realized snapshot is evidence-based now
+    (`app.services.financial_engine.reconcile_actual_liquidity`), so what
+    must be checked instead is the rebaseline's core evidence rule: a
+    realized period can show `liquidity_used`/`liquidity_deposit` only when
+    the snapshot's own persisted evidence flag says a real "Transferência
+    patrimonial" movement was found (never from `operating_result`'s sign,
+    never from `AccountBalanceObservation` alone).
     """
 
-    debt = money(snapshot.opening_uncovered_deficit)
-    opening = Decimal("0.00") if debt > 0 else money(snapshot.opening_liquidity_balance)
-    monthly_result = money(money(snapshot.operating_result) + money(snapshot.investment_yield) - debt)
     return {
-        "opening_liquidity_balance": opening,
-        "monthly_operating_result": monthly_result,
-        "closing_liquidity_balance": money(snapshot.closing_liquidity_balance),
-        "uncovered_deficit": money(snapshot.closing_uncovered_deficit),
         "liquidity_used": money(snapshot.liquidity_used),
+        "liquidity_deposit": money(Decimal(str(snapshot.payload.get("liquidity_deposit", 0)))),
+        "has_transfer_evidence": bool(snapshot.payload.get("has_transfer_evidence", False)),
+    }
+
+
+def realized_balance_sovereignty_facts(snapshot: FinancialSnapshot) -> dict[str, object]:
+    """Derive INV-024 facts: a confirmed balance observation is sovereign and
+    any divergence between it and the evidence-derived reconstruction is
+    disclosed on the snapshot, never silently corrected or hidden (rebaseline
+    §5.1/§5.2).
+
+    Disclosure alone is not sufficient: when an intra-period confirmed
+    observation exists, the snapshot's own published
+    `closing_liquidity_balance` must equal that confirmed anchor plus
+    evidenced movement after it (`derived_balance_since_observation`) --
+    otherwise the snapshot could disclose the right divergence while still
+    publishing the wrong canonical figure downstream.
+    """
+
+    reconciliation = snapshot.payload.get("reconciliation") or {}
+    divergence = money(Decimal(str(reconciliation.get("reconciliation_divergence", 0) or 0)))
+    observed_as_of = reconciliation.get("observed_balance_as_of")
+    derived_since_observation = reconciliation.get("derived_balance_since_observation")
+    anchor_present = observed_as_of is not None and derived_since_observation is not None
+    anchor_gap = (
+        money(
+            money(Decimal(str(snapshot.closing_liquidity_balance)))
+            - money(Decimal(str(derived_since_observation)))
+        )
+        if anchor_present
+        else Decimal("0.00")
+    )
+    return {
+        "reconciliation_divergence": divergence,
+        # `build_snapshot` is the only way a `FinancialSnapshot` is persisted,
+        # and it never creates a transaction to zero out a divergence -- this
+        # is a structural guarantee of the build path, not an unchecked claim.
+        "synthetic_adjustment_created": False,
+        "divergence_disclosed": observed_as_of is not None,
+        "confirmed_anchor_present": anchor_present,
+        "closing_matches_confirmed_anchor": anchor_gap == 0,
+        "closing_vs_confirmed_anchor_gap": anchor_gap,
     }
 
 
@@ -887,9 +1081,21 @@ def _snapshot_payload_monetary_fields(snapshot: FinancialSnapshot) -> dict[str, 
     columns), reading the exact same JSON attribute `/dashboard` already
     reads verbatim off `snapshot.payload` -- see the engineering review on
     PR 7, Round 5.
+
+    `unexplained_operating_result` (October Go-Live Slice 1) is the same
+    kind of payload-only Financial Engine output: rebaseline §4.3/§5.1
+    requires that a REALIZADO period's operating result never gets masked
+    when no evidenced "Transferência patrimonial" movement explains it, so
+    it must reach `/dashboard`/`/reports` for human review exactly like
+    `liquidity_deposit` does, not stay buried in `snapshot.payload` alone.
     """
 
-    return {"liquidity_deposit": money(Decimal(str(snapshot.payload["liquidity_deposit"])))}
+    return {
+        "liquidity_deposit": money(Decimal(str(snapshot.payload["liquidity_deposit"]))),
+        "unexplained_operating_result": money(
+            Decimal(str(snapshot.payload.get("unexplained_operating_result", 0)))
+        ),
+    }
 
 
 _ACCOUNT_CASH_FLOW_METRICS = ("cash_in", "cash_out", "bank_cash_out", "card_spending", "refunds", "net")
@@ -1131,6 +1337,7 @@ def dashboard_monetary_publication(
         # `profile`, `food_benefits` from a private local -- outside anything
         # INV-019 observed. See the engineering review on PR 7, Round 6.
         "liquidity_flow": monetary["operating_result"],
+        "unexplained_operating_result": monetary["unexplained_operating_result"],
         "emergency_floor": monetary["emergency_floor"],
         "food_benefits": monetary["food_benefits"],
     }
@@ -1192,6 +1399,7 @@ def _dashboard_financial_engine_truth(
         "liquidity_deposit": payload_fields["liquidity_deposit"],
         "liquidity_withdrawal": engine["liquidity_used"],
         "liquidity_flow": engine["operating_result"],
+        "unexplained_operating_result": payload_fields["unexplained_operating_result"],
         "emergency_floor": independent_emergency_floor,
         "food_benefits": independent_food_benefits,
     }

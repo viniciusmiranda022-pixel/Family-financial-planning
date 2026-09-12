@@ -187,7 +187,8 @@ from app.services.financial_snapshots import (
     category_spending_rows,
     dashboard_and_report_consistency_facts,
     dashboard_monetary_publication,
-    liquidity_transition_facts,
+    realized_balance_sovereignty_facts,
+    realized_liquidity_evidence_facts,
     report_month_monetary_publication,
     report_summary_monetary_publication,
     serialize_snapshot,
@@ -212,7 +213,7 @@ from app.services.monthly_close import (
     trust_monthly_close,
     upsert_monthly_close_after_run,
 )
-from app.services.projection_engine import PROJECTION_CALCULATION_VERSION
+from app.services.projection_engine import PROJECTION_CALCULATION_VERSION, projection_liquidity_facts
 from app.services.projection_validator import PROJECTION_TOLERANCE, validate_projection
 from app.services.reconciliation import (
     persist_reconciliation,
@@ -7275,7 +7276,7 @@ def _build_projection_gate_checks(
     """Run the canonical Projection Engine + independent Validator over
     `[start_month, end_month]` starting from `snapshot`'s closing position and
     derive the deterministic checks that gate `trusted_for_projection`
-    (INV-005, INV-006, INV-018, INV-022).
+    (INV-005, INV-006, INV-018, INV-022, INV-023, INV-024).
 
     Shared by `GET /forecast` (full display horizon) and
     `POST /monthly-closes/{period}/run` (a minimal one-month check proving
@@ -7284,6 +7285,15 @@ def _build_projection_gate_checks(
     engineering review on PR 7 that blocked `run -> trust` from ever reaching
     a real `trusted` state because the monthly close never ran this coverage
     at all.
+
+    October Go-Live Slice 1: INV-005/INV-006 check the PROJECTION engine's
+    own hypothetical math (`rows[0]`, the first projected month seeded from
+    `snapshot`'s REALIZADO closing balance) -- never `snapshot`'s own closing
+    figures, which are evidence-based and not produced by that formula (see
+    `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §8, Technical Challenge #1).
+    INV-023/INV-024 check `snapshot` itself: that its realized liquidity
+    movement is evidence-backed and that any confirmed-balance divergence was
+    disclosed, never masked.
 
     `extra_installments` (`month -> amount`, added on top of the household's
     already-persisted `_future_installments`) is the one seam
@@ -7336,8 +7346,15 @@ def _build_projection_gate_checks(
     )
     rows = build_forecast(projection_input)
     validation = validate_projection(projection_input, rows)
-    liquidity_facts = liquidity_transition_facts(snapshot)
+    # `rows[0]` is the first projected month, seeded from `snapshot`'s
+    # REALIZADO closing balance -- INV-005/006 must always have at least one
+    # row here because `start_month <= end_month` by construction at every
+    # call site, but an empty projection_input.commissions/obligations never
+    # skips a month, so this stays a defensive guard, not a real gap.
+    liquidity_facts = projection_liquidity_facts(rows[0]) if rows else {}
     lineage_facts = snapshot_lineage_facts(db, snapshot)
+    realized_liquidity_facts = realized_liquidity_evidence_facts(snapshot)
+    realized_sovereignty_facts = realized_balance_sovereignty_facts(snapshot)
     checks = (
         IntegrityCheck(
             "INV-018",
@@ -7378,6 +7395,26 @@ def _build_projection_gate_checks(
             InvariantContext(
                 facts=lineage_facts,
                 scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-023",
+            InvariantContext(
+                facts=realized_liquidity_facts,
+                scope=InvariantScope.PERIOD,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-024",
+            InvariantContext(
+                facts=realized_sovereignty_facts,
+                scope=InvariantScope.PERIOD,
                 entity_type=entity_type,
                 entity_id=entity_id,
                 period=check_period,
@@ -8303,11 +8340,17 @@ def dashboard(
         # inline) keeps the same verbatim-publication guarantee.
         "cash_flow_by_account": account_cash_flow_rows(snapshot),
         "liquidity_name": profile.investment_name,
+        # October Go-Live Slice 1: driven by the real, evidenced
+        # deposit/withdrawal (`liquidity_deposit`/`liquidity_withdrawal`,
+        # themselves evidence-based since `reconcile_actual_liquidity`) --
+        # never by `liquidity_flow` (the operating result's sign). A negative
+        # operating result with no evidenced Privilège movement must render
+        # as "balanced" here, not "withdrawal": nothing real moved.
         "liquidity_direction": (
             "deposit"
-            if publication["liquidity_flow"] > 0
+            if publication["liquidity_deposit"] > 0
             else "withdrawal"
-            if publication["liquidity_flow"] < 0
+            if publication["liquidity_withdrawal"] > 0
             else "balanced"
         ),
         "review_count": int(review_count or 0),
@@ -8604,11 +8647,18 @@ def _build_report_payload(db: Session, user: User, *, end_month: str | None, mon
         "duplicates_ignored": duplicates_ignored,
         "summary": {
             "liquidity_name": profile.investment_name,
+            # October Go-Live Slice 1: aligned with `/dashboard`'s
+            # `liquidity_direction` fix -- driven by the real, evidenced
+            # Privilège deposit/withdrawal (`total_liquidity_deposit`/
+            # `total_liquidity_used`), never by aggregate bank cash in/out
+            # (a different question -- see rebaseline §17 -- that this label
+            # used to answer instead, alongside Privilège-specific figures in
+            # the same `summary` object).
             "liquidity_direction": (
                 "deposit"
-                if total_cash_in > total_cash_out
+                if total_liquidity_deposit > 0
                 else "withdrawal"
-                if total_cash_out > total_cash_in
+                if total_liquidity_used > 0
                 else "balanced"
             ),
             **{key: decimal_value(value) for key, value in summary_publication.items()},

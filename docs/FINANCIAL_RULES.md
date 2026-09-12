@@ -56,18 +56,53 @@
 
 ## Conta central de liquidez — Privilège DI
 
+**Reescopado pelo October Go-Live Rebaseline, Slice 1 (P0 #87, 2026-10):** as
+regras abaixo marcadas "PROJEÇÃO" descrevem apenas a matemática hipotética de
+projeção/simulação (30/60/90 dias, comparação de cenário de compra). Elas
+**não** descrevem mais o fechamento de um período REALIZADO — ver a seção
+"Liquidez REALIZADO" logo abaixo. Ver `docs/OCTOBER_GO_LIVE_REBASELINE.md`
+§4 e `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §8 (Technical Challenge #1).
+
 - O Privilège DI funciona como o caixa central da família, embora tecnicamente seja uma aplicação.
-- A sobra operacional do mês é destinada a essa conta; quando as receitas não cobrem as saídas, o déficit é retirado dela.
-- Aplicações e resgates são movimentos patrimoniais e não viram receita, despesa ou consumo do teto.
+- Aplicações e resgates são movimentos patrimoniais e não viram receita, despesa ou consumo do teto,
+  seja em projeção ou em fato realizado.
 - Todo o saldo permanece em uma única conta de liquidez.
 - O saldo mínimo é uma meta de segurança e um alerta, não uma separação bancária nem dinheiro bloqueado.
-- Um resultado negativo consome o saldo do Privilège DI até zerá-lo, mesmo que isso rompa o piso.
-- Se o déficit for maior que o saldo informado, o sistema mostra saldo final zero e o valor restante como déficit sem cobertura.
-- Um resultado positivo é somado ao saldo do Privilège DI como sobra destinada à liquidez.
-- A distância do piso é calculada sobre o saldo depois do fechamento; se for negativa, o sistema mostra quanto falta recompor.
+- **PROJEÇÃO:** a sobra operacional projetada é modelada como se fosse destinada a essa conta; quando
+  as receitas projetadas não cobrem as saídas projetadas, o déficit hipotético é modelado como
+  retirado dela. Esta é uma simulação de cenário, nunca um fato.
+- **PROJEÇÃO:** um resultado negativo projetado consome o saldo projetado do Privilège DI até
+  zerá-lo, mesmo que isso rompa o piso; se o déficit projetado for maior que o saldo, o sistema
+  mostra saldo final zero e o valor restante como déficit sem cobertura projetado.
+- **PROJEÇÃO:** um resultado positivo projetado é somado ao saldo projetado do Privilège DI como
+  sobra destinada à liquidez hipotética.
+- A distância do piso é calculada sobre o saldo depois do fechamento/projeção; se for negativa, o
+  sistema mostra quanto falta recompor.
 - A taxa líquida mensal estimada é calculada a partir do retorno bruto anual e do IR conservador.
 - O rendimento mensal incide sobre o saldo inicial positivo do mês.
 - Entradas do mês começam a influenciar o rendimento no mês seguinte.
+
+### Liquidez REALIZADO (fato fechado)
+
+- Um resultado operacional REALIZADO negativo **nunca** prova ou fabrica um resgate do Privilège; um
+  resultado positivo **nunca** prova ou fabrica uma aplicação. Rebaseline §4.3: é proibido o
+  comportamento `resultado_operacional < 0 -> fabricar liquidity_withdrawal` (e o espelho para
+  sobra/aplicação) como fato.
+- O saldo REALIZADO de fechamento do Privilège é `saldo_inicial + aplicação_evidenciada -
+  resgate_evidenciado + rendimento_evidenciado` — nunca uma função do resultado operacional.
+  "Evidenciado" significa uma transação real categorizada "Transferência patrimonial", criada a
+  partir de um movimento bancário importado/observado ou de uma ação explicitamente confirmada pelo
+  usuário/Assistente (ex.: `funding_source="privilege"`).
+- Uma `AccountBalanceObservation` isolada nunca é evidência suficiente para fabricar um
+  resgate/aplicação: ela prova a posição soberana naquele instante, não a causa do delta. Na
+  ausência de qualquer movimento evidenciado, o saldo de fechamento é simplesmente o saldo de
+  abertura, e o resultado operacional do período é exposto como `unexplained_operating_result` para
+  revisão humana — nunca mascarado, nunca usado para fabricar o movimento.
+- Quando existe observação de saldo confirmada, ela é soberana no instante observado. Qualquer
+  divergência entre o saldo confirmado e a reconstrução baseada em evidência é exposta para
+  investigação — nunca corrigida silenciosamente por uma transação de ajuste sintética.
+- Implementação: `app.services.financial_engine.reconcile_actual_liquidity`. Invariantes:
+  INV-023/INV-024 (`docs/FINANCIAL_INVARIANTS.md`).
 
 ## Integridade persistente
 

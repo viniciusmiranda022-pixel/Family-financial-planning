@@ -151,7 +151,7 @@ sh ./scripts/setup-codex.sh
 
 Para acesso privado fora de casa, siga [docs/TAILSCALE.md](docs/TAILSCALE.md), que automatiza e verifica a publicação via `scripts/setup-tailscale.ps1`. Não abra a porta `8080` no roteador e não habilite o Tailscale Funnel.
 
-Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo do Privilège DI, mas não entram nas receitas ou saídas operacionais. A visão geral mostra a sobra que deve ir para essa conta ou o déficit que precisa ser coberto por ela. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
+Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo do Privilège DI, mas não entram nas receitas ou saídas operacionais. A visão geral mostra o saldo confirmado/atual do Privilège DI e uma projeção hipotética de sobra ou déficit para os próximos meses — mas um resultado do mês fechado, positivo ou negativo, nunca vira sozinho um resgate ou aplicação real: isso só acontece quando existe evidência de movimento real (extrato importado/observado) ou uma ação explicitamente confirmada. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
 
 O **Consultor** calcula localmente o veredito com regras financeiras auditáveis. Se o Codex estiver autenticado, recebe apenas pergunta, totais agregados, projeções e o veredito para produzir uma explicação; não recebe documentos, credenciais ou conexão com o banco. Para compras, informe pagamento à vista ou quantidade de parcelas e juros. Sem Codex, o consultor continua operando localmente.
 

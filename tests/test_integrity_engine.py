@@ -127,15 +127,20 @@ def test_non_pass_block_finding_blocks_the_affected_trust_gate() -> None:
 
 
 def test_projection_gate_requires_complete_deterministic_coverage() -> None:
+    # October Go-Live Slice 1: INV-023/INV-024 (the REALIZADO snapshot's
+    # evidence-based liquidity/sovereignty checks) joined INV-005/006/018/022
+    # in `PROJECTION_REQUIRED_INVARIANTS` -- trusting a snapshot as a
+    # projection seed now also requires its own realized liquidity to be
+    # evidence-backed, not just the projection engine's internal math.
     assessment = assess_integrity(
         [
             _result(
                 invariant_id,
                 InvariantStatus.PASS,
-                IntegritySeverity.BLOCK if invariant_id == "INV-018" else IntegritySeverity.CRITICAL,
+                IntegritySeverity.BLOCK if invariant_id in ("INV-018", "INV-023") else IntegritySeverity.CRITICAL,
                 scope=InvariantScope.PROJECTION,
             )
-            for invariant_id in ("INV-005", "INV-006", "INV-018", "INV-022")
+            for invariant_id in ("INV-005", "INV-006", "INV-018", "INV-022", "INV-023", "INV-024")
         ]
     )
     assert assessment.trusted_for_projection is True

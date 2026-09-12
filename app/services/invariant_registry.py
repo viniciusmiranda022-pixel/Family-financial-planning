@@ -14,6 +14,7 @@ from app.services.financial_invariants import (
     validate_card_competence,
     validate_card_payment,
     validate_commission_competence,
+    validate_confirmed_balance_sovereignty,
     validate_conservative_delay,
     validate_dashboard_consistency,
     validate_deficit_consumes_liquidity,
@@ -26,6 +27,7 @@ from app.services.financial_invariants import (
     validate_payroll_loan,
     validate_probable_duplicate,
     validate_projection_consistency,
+    validate_realized_liquidity_requires_evidence,
     validate_refund,
     validate_report_consistency,
     validate_safety_floor_is_reference,
@@ -95,8 +97,12 @@ _DEFINITIONS = (
     InvariantDefinition(
         id="INV-005",
         name="liquidity_balance_never_negative",
-        title="Privilège não negativo",
-        description="Liquidez final nunca fica negativa; excedente vira déficit sem cobertura.",
+        title="Privilège não negativo (projeção)",
+        description=(
+            "PROJEÇÃO/cenário hipotético apenas (October Go-Live Slice 1): liquidez projetada "
+            "nunca fica negativa; excedente vira déficit sem cobertura. Um período REALIZADO usa "
+            "INV-023/INV-024 em vez desta regra -- ver docs/OCTOBER_GO_LIVE_REBASELINE.md §4.3."
+        ),
         severity=IntegritySeverity.BLOCK,
         required_facts=(
             "opening_liquidity_balance",
@@ -110,8 +116,12 @@ _DEFINITIONS = (
     InvariantDefinition(
         id="INV-006",
         name="deficit_consumes_liquidity",
-        title="Déficit consome liquidez",
-        description="Resultado negativo usa a liquidez disponível antes de virar déficit sem cobertura.",
+        title="Déficit consome liquidez (projeção)",
+        description=(
+            "PROJEÇÃO/cenário hipotético apenas (October Go-Live Slice 1): resultado projetado "
+            "negativo usa a liquidez disponível antes de virar déficit sem cobertura. Nunca se "
+            "aplica a um fato REALIZADO -- ver INV-023/INV-024."
+        ),
         severity=IntegritySeverity.BLOCK,
         required_facts=(
             "opening_liquidity_balance",
@@ -125,8 +135,11 @@ _DEFINITIONS = (
     InvariantDefinition(
         id="INV-007",
         name="safety_floor_is_reference",
-        title="Piso não é dinheiro bloqueado",
-        description="O piso de segurança gera alerta, mas não impede cobertura de déficit real.",
+        title="Piso não é dinheiro bloqueado (projeção)",
+        description=(
+            "PROJEÇÃO/cenário hipotético apenas (October Go-Live Slice 1): o piso de segurança "
+            "gera alerta, mas não impede cobertura de déficit projetado."
+        ),
         severity=IntegritySeverity.CRITICAL,
         required_facts=(
             "opening_liquidity_balance",
@@ -302,6 +315,44 @@ _DEFINITIONS = (
             "lineage_period",
         ),
         validator=validate_lineage,
+    ),
+    InvariantDefinition(
+        id="INV-023",
+        name="realized_liquidity_requires_evidence",
+        title="Resgate/aplicação REALIZADO exige evidência",
+        description=(
+            "October Go-Live Slice 1: um período REALIZADO só pode mostrar "
+            "liquidity_used/liquidity_deposit do Privilège quando há evidência de movimento real "
+            "(transação de 'Transferência patrimonial' importada/observada ou ação confirmada). "
+            "Nunca inferido do sinal do resultado operacional; uma AccountBalanceObservation "
+            "isolada nunca basta como evidência."
+        ),
+        severity=IntegritySeverity.BLOCK,
+        required_facts=("liquidity_used", "liquidity_deposit", "has_transfer_evidence"),
+        validator=validate_realized_liquidity_requires_evidence,
+    ),
+    InvariantDefinition(
+        id="INV-024",
+        name="confirmed_balance_sovereignty",
+        title="Saldo confirmado soberano; divergência sinalizada",
+        description=(
+            "October Go-Live Slice 1: quando existe observação de saldo confirmada, ela prevalece "
+            "sobre a reconstrução derivada no instante observado; qualquer divergência é exposta "
+            "para investigação, nunca mascarada, e o sistema nunca fabrica um ajuste sintético "
+            "para zerá-la. Quando a observação for intra-período, o `closing_liquidity_balance` "
+            "publicado também deve ser a âncora confirmada mais o movimento evidenciado posterior "
+            "a ela -- divulgar a divergência não basta se o número canônico publicado ainda "
+            "discorda dela."
+        ),
+        severity=IntegritySeverity.CRITICAL,
+        required_facts=(
+            "reconciliation_divergence",
+            "synthetic_adjustment_created",
+            "divergence_disclosed",
+            "confirmed_anchor_present",
+            "closing_matches_confirmed_anchor",
+        ),
+        validator=validate_confirmed_balance_sovereignty,
     ),
 )
 
