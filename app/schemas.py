@@ -372,6 +372,61 @@ class CardInvoicePaymentRequest(BaseModel):
         return self
 
 
+class CardInvoiceSyncRequest(BaseModel):
+    """`POST /card-invoices/sync` -- October Go-Live Slice 2.
+
+    The project's "leitura preguiçosa no primeiro acesso" trigger
+    (`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §4): idempotent get-or-create
+    plus deterministic resync of the `CardInvoice` for
+    `(account_id, competence)`. `competence` defaults to the account's
+    current billing cycle when omitted.
+    """
+
+    account_id: str = Field(min_length=1, max_length=36)
+    competence: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+class CardInvoiceCloseRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class CardInvoicePayRequest(BaseModel):
+    """Manual payment of a `CardInvoice` -- superset of
+    `CardInvoicePaymentRequest`/`pay_card_invoice`: `amount` may be any
+    value up to the invoice's outstanding balance, including a partial
+    amount (rebaseline §6.5). Mirrors the same five minimum inputs and
+    explicit `confirmed` assent every other manual command in this project
+    requires (`CardInvoicePaymentRequest`, `MonthlyCloseReopenRequest`).
+    """
+
+    paying_account_id: str = Field(min_length=1, max_length=36)
+    amount: Decimal = Field(gt=0)
+    booked_at: date
+    description: str = Field(min_length=2, max_length=500)
+    confirmed: bool
+    confirmed_large_amount: bool = False
+
+    @model_validator(mode="after")
+    def validate_confirmation(self) -> "CardInvoicePayRequest":
+        if not self.confirmed:
+            raise ValueError("Confirme explicitamente que este pagamento aconteceu")
+        return self
+
+
+class RefundLinkRequest(BaseModel):
+    """Explicit, human-confirmed link from a `refund` transaction to the
+    original `expense` it neutralizes -- rebaseline §6.6; never inferred."""
+
+    refund_transaction_id: str = Field(min_length=1, max_length=36)
+    original_transaction_id: str = Field(min_length=1, max_length=36)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class RefundUnlinkRequest(BaseModel):
+    refund_transaction_id: str = Field(min_length=1, max_length=36)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
 class ClassificationRuleEditRequest(BaseModel):
     """Admin-only edit of an eligible local merchant rule's category.
 

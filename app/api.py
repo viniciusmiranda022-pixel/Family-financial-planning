@@ -62,7 +62,10 @@ from app.schemas import (
     CaptureConfirmRequest,
     CardCompetenceRepairApplyRequest,
     CardCompetenceRepairRollbackRequest,
+    CardInvoiceCloseRequest,
     CardInvoicePaymentRequest,
+    CardInvoicePayRequest,
+    CardInvoiceSyncRequest,
     CardPaymentLinkRequest,
     CardPaymentUnlinkRequest,
     ClassificationRuleDeactivateRequest,
@@ -84,6 +87,8 @@ from app.schemas import (
     ProfileRequest,
     PurchaseScenarioAlternativeRequest,
     PurchaseScenarioComparisonRequest,
+    RefundLinkRequest,
+    RefundUnlinkRequest,
     SemanticAuditRequest,
     SetupRequest,
     TransactionUpdate,
@@ -120,6 +125,20 @@ from app.services.card_competence_repair import (
     preview_card_competence_repair,
     rollback_card_competence_repair,
     serialize_candidate,
+)
+from app.services.card_invoice_lifecycle import (
+    CardInvoiceError,
+    close_invoice,
+    get_or_sync_invoice,
+    invoice_divergence,
+    link_refund,
+    pay_invoice,
+    serialize_card_invoice,
+    serialize_invoice_divergence,
+    unlink_refund,
+)
+from app.services.card_invoice_lifecycle import (
+    list_invoices as list_card_invoices,
 )
 from app.services.card_payment_reconciliation import (
     CardPaymentLinkError,
@@ -5897,6 +5916,258 @@ def pay_card_invoice_reconciliation(
         "card_transaction_id": card.id,
         "review_items": 1 if review_created else 0,
     }
+
+
+@router.get("/card-invoices")
+def card_invoices(
+    account_id: str | None = None,
+    period: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """`CardInvoice` lifecycle read model -- October Go-Live Slice 2.
+
+    Pure read of already-persisted rows, except the one narrow exception
+    `list_invoices` documents (the household's *current* billing cycle for
+    `account_id` is synced on first access when it has no row yet).
+    """
+
+    invoices = list_card_invoices(db, household_id=user.household_id, account_id=account_id, period=period)
+    if account_id and not period:
+        db.commit()
+    return [serialize_card_invoice(invoice) for invoice in invoices]
+
+
+@router.post("/card-invoices/sync", status_code=status.HTTP_201_CREATED)
+def sync_card_invoice(
+    payload: CardInvoiceSyncRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    account = db.scalar(
+        select(Account).where(Account.id == payload.account_id, Account.household_id == user.household_id)
+    )
+    if account is None:
+        raise HTTPException(status_code=404, detail="Cartão não encontrado")
+    competence = payload.competence or card_invoice_competence(account, date.today())
+    invoice = get_or_sync_invoice(db, household_id=user.household_id, account=account, competence=competence)
+    db.commit()
+    return serialize_card_invoice(invoice)
+
+
+@router.post("/card-invoices/{invoice_id}/close")
+def close_card_invoice(
+    invoice_id: str,
+    payload: CardInvoiceCloseRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        invoice = close_invoice(db, household_id=user.household_id, invoice_id=invoice_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada") from exc
+    except CardInvoiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "card_invoice.close",
+        "card_invoice",
+        invoice.id,
+        {"competence": invoice.competence, "status": invoice.status},
+        reason=payload.reason,
+        source="card_invoice_lifecycle",
+        trace_id=invoice.trace_id,
+    )
+    db.commit()
+    return serialize_card_invoice(invoice)
+
+
+@router.get("/card-invoices/{invoice_id}/divergence")
+def card_invoice_divergence(
+    invoice_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Rebaseline §6.4 -- never adjusts silently. `status ==
+    "unreconciled_unexplained"` surfaces `FATURA NÃO RECONCILIADA` for
+    human review instead of being masked."""
+
+    try:
+        divergence = invoice_divergence(db, household_id=user.household_id, invoice_id=invoice_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada") from exc
+    db.commit()
+    return serialize_invoice_divergence(divergence)
+
+
+@router.post("/card-invoices/{invoice_id}/pay", status_code=status.HTTP_201_CREATED)
+def pay_card_invoice_lifecycle(
+    invoice_id: str,
+    payload: CardInvoicePayRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Manual payment of a `CardInvoice` -- superset of
+    `pay_card_invoice_reconciliation`: accepts a partial amount up to the
+    invoice's outstanding balance (rebaseline §6.5). See
+    `app.services.card_invoice_lifecycle.pay_invoice`.
+    """
+
+    _require_admin(user)
+    paying_account = db.scalar(
+        select(Account).where(
+            Account.id == payload.paying_account_id,
+            Account.household_id == user.household_id,
+            Account.active.is_(True),
+        )
+    )
+    if not paying_account:
+        raise HTTPException(status_code=404, detail="Conta pagadora não encontrada")
+
+    profile = profile_for(db, user.household_id)
+    large_threshold = _large_entry_threshold(profile)
+    if payload.amount >= large_threshold and not payload.confirmed_large_amount:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Este valor exige confirmação adicional. Confirme apenas se o pagamento "
+                f"aconteceu de verdade; use o Consultor para simulações. Limite de confirmação: "
+                f"R$ {large_threshold:,.2f}."
+            ),
+        )
+
+    category = category_for(db, user.household_id, "Conciliação")
+    try:
+        checking_leg, invoice, duplicate_assessment = pay_invoice(
+            db,
+            household_id=user.household_id,
+            invoice_id=invoice_id,
+            paying_account=paying_account,
+            category=category,
+            amount=payload.amount,
+            booked_at=payload.booked_at,
+            description=payload.description,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada") from exc
+    except CardInvoiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    review_created = False
+    if duplicate_assessment is not None:
+        review_created = True
+        db.add(
+            ReviewItem(
+                household_id=user.household_id,
+                transaction_id=checking_leg.id,
+                reason="possible_duplicate",
+                details=(
+                    "Pagamento de fatura (CardInvoice) agrupado como possível repetição "
+                    f"({duplicate_assessment.band}, confiança {duplicate_assessment.confidence})"
+                ),
+            )
+        )
+
+    audit(
+        db,
+        user,
+        "card_invoice.pay",
+        "card_invoice",
+        invoice.id,
+        {
+            "checking_transaction_id": checking_leg.id,
+            "paying_account_id": paying_account.id,
+            "amount": str(checking_leg.amount),
+            "status": invoice.status,
+            "outstanding_balance": serialize_card_invoice(invoice)["outstanding_balance"],
+        },
+        trace_id=checking_leg.trace_id,
+        source="card_invoice_lifecycle",
+    )
+    db.commit()
+    return {
+        "checking_transaction_id": checking_leg.id,
+        "invoice": serialize_card_invoice(invoice),
+        "review_items": 1 if review_created else 0,
+    }
+
+
+@router.post("/transactions/{transaction_id}/link-refund", status_code=status.HTTP_201_CREATED)
+def link_refund_transaction(
+    transaction_id: str,
+    payload: RefundLinkRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Explicit, human-confirmed refund lineage -- rebaseline §6.6.
+    `transaction_id` (path) must equal `payload.refund_transaction_id`;
+    the body keeps the field name explicit for clarity in the audit log.
+    """
+
+    _require_admin(user)
+    if transaction_id != payload.refund_transaction_id:
+        raise HTTPException(status_code=422, detail="O identificador da rota não corresponde ao do corpo")
+    try:
+        refund, original = link_refund(
+            db,
+            household_id=user.household_id,
+            refund_transaction_id=payload.refund_transaction_id,
+            original_transaction_id=payload.original_transaction_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Lançamento não encontrado") from exc
+    except CardInvoiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "refund.link",
+        "transaction",
+        refund.id,
+        {"original_transaction_id": original.id},
+        before_state={"refund_of_transaction_id": None},
+        after_state={"refund_of_transaction_id": original.id},
+        reason=payload.reason,
+        source="card_invoice_lifecycle",
+    )
+    db.commit()
+    return {"refund_transaction_id": refund.id, "original_transaction_id": original.id}
+
+
+@router.post("/transactions/{transaction_id}/unlink-refund")
+def unlink_refund_transaction(
+    transaction_id: str,
+    payload: RefundUnlinkRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    if transaction_id != payload.refund_transaction_id:
+        raise HTTPException(status_code=422, detail="O identificador da rota não corresponde ao do corpo")
+    try:
+        refund, previous_original_id = unlink_refund(
+            db, household_id=user.household_id, refund_transaction_id=payload.refund_transaction_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Lançamento não encontrado") from exc
+    except CardInvoiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "refund.unlink",
+        "transaction",
+        refund.id,
+        {},
+        before_state={"refund_of_transaction_id": previous_original_id},
+        after_state={"refund_of_transaction_id": None},
+        reason=payload.reason,
+        source="card_invoice_lifecycle",
+    )
+    db.commit()
+    return {"refund_transaction_id": refund.id}
 
 
 @router.get("/classification-rules")

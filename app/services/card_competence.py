@@ -29,7 +29,8 @@ historical repair detector -- resolves competence through this one function.
 
 from __future__ import annotations
 
-from datetime import date
+from calendar import monthrange
+from datetime import date, timedelta
 
 from fastapi import HTTPException
 
@@ -125,4 +126,64 @@ def resolve_expense_competence(
     return booked_month
 
 
-__all__ = ["card_invoice_competence", "resolve_expense_competence"]
+def _clip_day(year: int, month: int, day: int) -> int:
+    return min(day, monthrange(year, month)[1])
+
+
+def card_invoice_window(account: Account, competence: str) -> tuple[date, date, date]:
+    """Inverse of `card_invoice_competence`: the `(opens_at, closes_at,
+    due_date)` window of the invoice identified by `competence` for
+    `account` -- October Go-Live Slice 2
+    (`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.1).
+
+    Pure function, deterministic from the exact same two persisted fields
+    `card_invoice_competence` reads (`card_closing_day`/`card_due_day`), so
+    a purchase on any date in `[opens_at, closes_at]` always resolves back
+    to this same `competence` through the forward function -- proven by
+    `tests/test_card_invoice_lifecycle.py`'s round-trip property test. Day
+    clipping mirrors the forward function's own implicit behaviour: a
+    closing/due day beyond a short month's length (e.g. 31 in February)
+    never advances past that month, exactly like `card_invoice_competence`
+    never lets `booked_at.day > closing_day` become true for a short month.
+
+    Raises `HTTPException` (422) for a card without a fully configured
+    cycle -- never invents a window for it, matching
+    `card_invoice_competence`'s own fail-closed contract.
+    """
+
+    if account.account_type != "credit_card":
+        raise HTTPException(
+            status_code=422,
+            detail=f"A conta {account.name} não é um cartão de crédito.",
+        )
+    closing_day = account.card_closing_day
+    due_day = account.card_due_day
+    if not closing_day or not due_day:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"O cartão {account.name} não tem fechamento/vencimento configurados. "
+                "Configure o ciclo antes de consultar a fatura."
+            ),
+        )
+
+    due_year, due_month_num = (int(part) for part in competence.split("-"))
+    due_month = date(due_year, due_month_num, 1)
+    closing_month = add_months(due_month, -1) if due_day < closing_day else due_month
+
+    closes_at = date(
+        closing_month.year, closing_month.month, _clip_day(closing_month.year, closing_month.month, closing_day)
+    )
+    due_date = date(due_month.year, due_month.month, _clip_day(due_month.year, due_month.month, due_day))
+
+    previous_closing_month = add_months(closing_month, -1)
+    previous_closes_at = date(
+        previous_closing_month.year,
+        previous_closing_month.month,
+        _clip_day(previous_closing_month.year, previous_closing_month.month, closing_day),
+    )
+    opens_at = previous_closes_at + timedelta(days=1)
+    return opens_at, closes_at, due_date
+
+
+__all__ = ["card_invoice_competence", "card_invoice_window", "resolve_expense_competence"]

@@ -16,7 +16,21 @@ soberano com divergência sinalizada. Nenhum snapshot histórico é reescrito;
 cada um mantém seu próprio `calculation_version`. Ver
 `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §8 (Technical Challenge #1) e
 `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_1.md`.
-**Implementação executável:** `app/services/invariant_registry.py`
+
+**Controle de mudança (2026-10, October Go-Live Slice 2, P0 #87):** INV-025 a
+INV-028 foram adicionadas para o ciclo de vida de fatura de cartão
+(`CardInvoice` — `app/services/card_invoice_lifecycle.py`, migração `0015`):
+pagamento parcial/integral nunca duplica gasto, principal carregado nunca é
+uma nova despesa, estorno neutraliza sem apagar histórico (inclusive quando
+cai em ciclo posterior a uma fatura já paga) e divergência de fatura nunca é
+ajustada silenciosamente. Nenhuma calcula um valor de snapshot/projeção
+existente nem altera `INVARIANT_REGISTRY` (`app/services/invariant_
+registry.py` permanece em INV-001..INV-024) ou o `FINANCIAL_RULES_VERSION`
+de cálculo — cada uma documenta explicitamente que ainda não está integrada
+ao Financial Integrity Engine e aponta para o teste dedicado que a cobre
+nesta fase. Ver `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_2.md`.
+**Implementação executável:** `app/services/invariant_registry.py` (INV-001
+a INV-024; INV-025 a INV-028 ainda pendentes de integração -- ver acima).
 
 Este documento define as condições que precisam permanecer verdadeiras em importações,
 fechamentos, projeções, snapshots, dashboards, relatórios e contextos enviados ao Advisor.
@@ -397,6 +411,94 @@ mesma, confiável.)
 `tests/test_financial_snapshots.py::test_intra_period_balance_observation_divergence_is_disclosed_not_masked`,
 `tests/test_financial_snapshots.py::test_intra_period_observation_becomes_sovereign_anchor_without_opening_evidence`,
 `tests/test_financial_snapshots.py::test_point_in_time_balance_becomes_next_period_opening_evidence`.
+
+## INV-025 — Pagamento de fatura nunca duplica gasto (parcial ou integral)
+
+**Escopo:** REALIZADO (`CardInvoice`, `app.services.card_invoice_lifecycle.pay_invoice`).
+**Título:** Pagamento de fatura é liquidação, nunca despesa nova
+**Descrição:** Qualquer pagamento de fatura de cartão — integral ou parcial, em um ou mais
+pagamentos ao longo do tempo — cria apenas um lançamento de conciliação
+(`transaction_type="reconciliation"`, `excluded=True`) na conta pagadora; nunca cria ou duplica um
+lançamento de despesa. O número de lançamentos `expense` do ciclo permanece igual ao das compras
+originais, independentemente de quantos pagamentos parciais liquidam a fatura.
+**Motivação:** Rebaseline §6.3/§6.5 — "Pagamento de fatura nunca é novo gasto."
+**Entradas:** contagem de lançamentos `expense` do ciclo antes e depois de cada pagamento;
+`CardInvoice.paid_total`/`status`.
+**Resultado esperado:** a contagem de lançamentos `expense` do ciclo é idêntica antes e depois de
+qualquer pagamento (parcial ou integral).
+**Severidade se violado:** `BLOCK`.
+**Implementação executável:** ainda não integrada ao Financial Integrity Engine
+(`app/services/invariant_registry.py`) — coberta nesta fase apenas pelo teste dedicado abaixo; ver
+riscos residuais do PR do Slice 2.
+**Teste automatizado associado:**
+`tests/test_card_invoice_lifecycle.py::test_pay_invoice_partial_then_remainder_reaches_paid_without_double_counting`.
+
+## INV-026 — Principal carregado não é gasto novo
+
+**Escopo:** REALIZADO (`CardInvoice`).
+**Título:** Saldo não pago transportado é campo, não transação
+**Descrição:** O saldo não pago de uma fatura fechada é transportado para o ciclo seguinte apenas
+como `CardInvoice.principal_carried_in`/`principal_carried_out` — nunca como uma nova `Transaction`
+de compra ou despesa no ciclo seguinte.
+**Motivação:** Rebaseline §6.5 — "não é nova compra e não como novo gasto."
+**Entradas:** `principal_carried_in` do ciclo seguinte; contagem de lançamentos `expense` criados
+nesse ciclo.
+**Resultado esperado:** `principal_carried_in` reflete exatamente o saldo em aberto do ciclo
+anterior no momento da sincronização; nenhuma `Transaction` nova é criada apenas para representá-lo.
+**Severidade se violado:** `BLOCK`.
+**Implementação executável:** ainda não integrada ao Financial Integrity Engine — mesma ressalva da
+INV-025.
+**Teste automatizado associado:**
+`tests/test_card_invoice_lifecycle.py::test_principal_carried_forward_without_creating_new_expense`.
+
+## INV-027 — Estorno neutraliza sem apagar histórico (cartão)
+
+**Escopo:** REALIZADO (`Transaction.refund_of_transaction_id`).
+**Título:** Vínculo explícito de estorno preserva a compra original
+**Descrição:** Um estorno só neutraliza o valor da compra original depois de vinculado
+explicitamente (`link_refund`) — nunca inferido por valor/data/descrição. O vínculo neutraliza
+apenas o valor efetivamente somado dos estornos vinculados àquela compra (nunca mais do que o valor
+original) e nunca apaga a compra original. Quando o estorno cai em um ciclo posterior ao da compra —
+inclusive depois de a fatura original já ter sido paga — o crédito reduz o total do ciclo em que o
+próprio estorno foi lançado, nunca reescrevendo o ciclo/fatura original já liquidado.
+**Motivação:** Rebaseline §6.6.
+**Entradas:** `Transaction.refund_of_transaction_id`, soma dos estornos vinculados a uma compra,
+`CardInvoice.computed_total`/`paid_total`/`status` do ciclo original e do ciclo em que o estorno foi
+lançado.
+**Resultado esperado:** a compra original nunca é apagada; a soma dos estornos vinculados a uma
+compra nunca excede o valor original; um ciclo já `paid` mantém `computed_total`/`paid_total`/`status`
+inalterados quando um estorno da compra que o compõe é lançado em um ciclo posterior.
+**Severidade se violado:** `BLOCK`.
+**Implementação executável:** ainda não integrada ao Financial Integrity Engine — mesma ressalva da
+INV-025.
+**Teste automatizado associado:**
+`tests/test_card_invoice_lifecycle.py::test_refund_integral_neutralizes_purchase_without_deleting_it`,
+`tests/test_card_invoice_lifecycle.py::test_refund_partial_neutralizes_only_the_linked_amount_and_rejects_overshoot`,
+`tests/test_card_invoice_lifecycle.py::test_refund_after_invoice_already_paid_credits_later_cycle_without_rewriting_it`.
+
+## INV-028 — Divergência de fatura nunca é ajustada silenciosamente
+
+**Escopo:** REALIZADO (`CardInvoice`, `app.services.card_invoice_lifecycle.invoice_divergence`).
+**Título:** Diferença entre total do sistema e total declarado é sinalizada, nunca corrigida
+sozinha
+**Descrição:** Quando `declared_total` (evidência de fatura/extrato já importado) diverge de
+`computed_total + principal_carried_in` além da tolerância monetária padrão, o sistema procura uma
+causa determinística e não contada ainda (estorno não vinculado, encargo Juros/IOF/tarifa ainda não
+reclamado por nenhuma fatura) e a reporta; se nenhuma causa for encontrada, o resultado é
+`unreconciled_unexplained`. Em nenhum dos dois casos o sistema fabrica um ajuste sintético para
+zerar a diferença.
+**Motivação:** Rebaseline §6.4.
+**Entradas:** `declared_total`, `computed_total + principal_carried_in`, diferença, lista de
+`explanations`.
+**Resultado esperado:** `status in {reconciled, unreconciled_explained, unreconciled_unexplained,
+not_applicable}`; nenhum campo de valor é reescrito para forçar `reconciled`.
+**Severidade se violado:** `CRITICAL`.
+**Implementação executável:** ainda não integrada ao Financial Integrity Engine — mesma ressalva da
+INV-025.
+**Teste automatizado associado:**
+`tests/test_card_invoice_lifecycle.py::test_divergence_reconciled_when_declared_matches_computed`,
+`tests/test_card_invoice_lifecycle.py::test_divergence_unreconciled_unexplained_without_any_candidate_cause`,
+`tests/test_card_invoice_lifecycle.py::test_divergence_explained_by_unlinked_refund_in_cycle`.
 
 ## Controle de mudança
 
