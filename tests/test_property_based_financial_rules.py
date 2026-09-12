@@ -41,9 +41,13 @@ CENTS = Decimal("0.01")
 
 
 def _context(**facts: object) -> InvariantContext:
+    # October Go-Live Slice 1: INV-005/INV-006/INV-007 govern the projection
+    # engine's hypothetical liquidity formula only (never a REALIZADO
+    # snapshot -- see docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md §8), so these
+    # property tests exercise them under `InvariantScope.PROJECTION`.
     return InvariantContext(
         facts=facts,
-        scope=InvariantScope.PERIOD,
+        scope=InvariantScope.PROJECTION,
         entity_type="financial_snapshot",
         entity_id="property-test",
         period="2026-06",

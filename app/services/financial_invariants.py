@@ -14,7 +14,11 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 
-FINANCIAL_RULES_VERSION = "2026.09.1"
+# October Go-Live Rebaseline, Slice 1 (P0 #87): INV-005/INV-006/INV-007 are
+# rescoped to the projection engine's hypothetical liquidity formula only,
+# and INV-023/INV-024 are added for a REALIZADO period's evidence-based
+# liquidity reconciliation. See docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md §5.
+FINANCIAL_RULES_VERSION = "2026.10.1"
 MONEY_TOLERANCE = Decimal("0.01")
 PROBABLE_DUPLICATE_THRESHOLD = Decimal("0.60")
 STRONG_DUPLICATE_THRESHOLD = Decimal("0.85")
@@ -326,6 +330,61 @@ def validate_safety_floor_is_reference(
         expected={"liquidity_used": transition.liquidity_used, "safety_floor_role": "alert"},
         actual={"liquidity_used": used, "safety_floor": floor},
         difference=_money(used - transition.liquidity_used),
+    )
+
+
+def validate_realized_liquidity_requires_evidence(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    used = _decimal(context, "liquidity_used")
+    deposit = _decimal(context, "liquidity_deposit")
+    has_evidence = _boolean(context, "has_transfer_evidence")
+    matches = has_evidence or (used == 0 and deposit == 0)
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            "Nenhum resgate/aplicação do Privilège foi registrado como fato sem evidência de "
+            "movimento real."
+            if matches
+            else "O fechamento registrou resgate/aplicação do Privilège como fato realizado sem "
+            "nenhuma evidência de movimento real (importado/observado ou ação confirmada)."
+        ),
+        expected={"liquidity_used": Decimal("0.00"), "liquidity_deposit": Decimal("0.00")}
+        if not has_evidence
+        else None,
+        actual={"liquidity_used": used, "liquidity_deposit": deposit, "has_transfer_evidence": has_evidence},
+        difference=_money(used + deposit) if not has_evidence else Decimal("0.00"),
+    )
+
+
+def validate_confirmed_balance_sovereignty(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    divergence = _decimal(context, "reconciliation_divergence")
+    synthetic_adjustment = _boolean(context, "synthetic_adjustment_created")
+    disclosed = _boolean(context, "divergence_disclosed")
+    has_divergence = divergence != 0
+    matches = not synthetic_adjustment and (not has_divergence or disclosed)
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            "O saldo confirmado permaneceu soberano; nenhuma divergência foi mascarada e "
+            "nenhum ajuste sintético foi criado."
+            if matches
+            else "Uma divergência de reconciliação foi mascarada ou um ajuste sintético foi "
+            "criado em vez de expor a divergência para revisão."
+        ),
+        expected={"synthetic_adjustment_created": False, "divergence_disclosed": True},
+        actual={
+            "synthetic_adjustment_created": synthetic_adjustment,
+            "divergence_disclosed": disclosed,
+            "reconciliation_divergence": divergence,
+        },
+        difference=abs(divergence) if not matches else Decimal("0.00"),
     )
 
 

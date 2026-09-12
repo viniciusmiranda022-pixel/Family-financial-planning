@@ -45,7 +45,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
     with TestClient(app) as client:
         health = client.get("/health")
         assert health.status_code == 200
-        assert health.json()["financial_rules_version"] == "2026.09.1"
+        assert health.json()["financial_rules_version"] == "2026.10.1"
 
         setup = client.post(
             "/api/auth/setup",
@@ -520,13 +520,20 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert dashboard["spending"] == 76.78
         assert dashboard["food_benefits"] == 1630.0
         assert dashboard["liquidity_name"] == "Privilege DI"
+        # October Go-Live Slice 1: no "Transferência patrimonial" transaction
+        # exists yet in this household -- only card expenses -- so the
+        # Privilège balance is untouched by the operating deficit. The
+        # pre-Slice-1 engine used to fabricate a R$ 76.78 withdrawal from the
+        # deficit's size alone; `liquidity_flow` (the operating result) is
+        # still -76.78, but it no longer drives the Privilège balance.
         assert dashboard["liquidity_starting_balance"] == 20000
-        assert dashboard["liquidity_balance"] == 19923.22
-        assert dashboard["liquidity_available"] == 9923.22
-        assert dashboard["liquidity_withdrawal"] == 76.78
+        assert dashboard["liquidity_balance"] == 20000
+        assert dashboard["liquidity_available"] == 10000
+        assert dashboard["liquidity_withdrawal"] == 0
         assert dashboard["liquidity_uncovered_deficit"] == 0
         assert dashboard["liquidity_flow"] == -76.78
-        assert dashboard["liquidity_direction"] == "withdrawal"
+        assert dashboard["unexplained_operating_result"] == -76.78
+        assert dashboard["liquidity_direction"] == "balanced"
         assert dashboard["bank_cash_out"] == 0
         assert dashboard["card_spending"] == 76.78
         assert dashboard["duplicates_ignored"] == 1
@@ -601,14 +608,18 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert report_data["monthly"][1]["bank_cash_out"] == 0
         assert report_data["monthly"][1]["card_spending"] == 76.78
         assert report_data["summary"]["highest_month"] == "2026-08"
+        # October Go-Live Slice 1: same evidence-based reasoning as the
+        # `/dashboard` assertions above -- no "Transferência patrimonial"
+        # movement exists across July/August, so the Privilège balance is
+        # untouched by the operating deficit.
         assert report_data["summary"]["liquidity_name"] == "Privilege DI"
         assert report_data["summary"]["liquidity_starting_balance"] == 20000
-        assert report_data["summary"]["liquidity_balance"] == 19923.22
-        assert report_data["summary"]["liquidity_available"] == 9923.22
-        assert report_data["summary"]["liquidity_withdrawal"] == 110.18
+        assert report_data["summary"]["liquidity_balance"] == 20000
+        assert report_data["summary"]["liquidity_available"] == 10000
+        assert report_data["summary"]["liquidity_withdrawal"] == 0
         assert report_data["summary"]["liquidity_uncovered_deficit"] == 0
         assert report_data["summary"]["liquidity_flow"] == -110.18
-        assert report_data["summary"]["liquidity_direction"] == "withdrawal"
+        assert report_data["summary"]["liquidity_direction"] == "balanced"
         assert report_data["categories"][0]["amount"] > 0
         assert client.get("/api/reports?months=13").status_code == 422
         july_cuts = client.get("/api/cut-plan?month=2026-07").json()
@@ -729,11 +740,22 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         # `liquidity_deposit`/`liquidity_flow` are this period's operating
         # result and do not depend on the opening balance, so they are
         # unchanged.
+        # October Go-Live Slice 1: `liquidity_balance` now reflects only the
+        # real, evidenced "Transferência patrimonial" movement -- the R$ 500
+        # manual investment and R$ 200 manual redemption below (opening
+        # 20000 + 500 - 200 = 20300) -- never the period's unrelated
+        # operating surplus. `liquidity_deposit` is the real R$ 500
+        # application, not the (larger, coincidental) operating result the
+        # pre-Slice-1 engine used to substitute for it; `liquidity_flow`
+        # (the operating result itself) is unaffected by this Slice and
+        # stays the same as before.
         assert dashboard_with_manual["liquidity_starting_balance"] == 20000
-        assert dashboard_with_manual["liquidity_balance"] == 20823.22
-        assert dashboard_with_manual["liquidity_available"] == 10823.22
-        assert dashboard_with_manual["liquidity_deposit"] == 823.22
+        assert dashboard_with_manual["liquidity_balance"] == 20300.0
+        assert dashboard_with_manual["liquidity_available"] == 10300.0
+        assert dashboard_with_manual["liquidity_deposit"] == 500.0
+        assert dashboard_with_manual["liquidity_withdrawal"] == 200.0
         assert dashboard_with_manual["liquidity_flow"] == 823.22
+        assert dashboard_with_manual["unexplained_operating_result"] == 0
         assert dashboard_with_manual["liquidity_direction"] == "deposit"
         nubank_flow = next(
             item
@@ -789,8 +811,8 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         # mutated by the investment/redemption create above, so there is
         # nothing for delete to "revert".
         assert dashboard_after_delete["investment_balance"] == 20000
-        assert dashboard_after_delete["liquidity_balance"] == 19923.22
-        assert dashboard_after_delete["liquidity_available"] == 9923.22
+        assert dashboard_after_delete["liquidity_balance"] == 20000
+        assert dashboard_after_delete["liquidity_available"] == 10000
 
         uncovered_expense = client.post(
             "/api/transactions",
@@ -807,12 +829,22 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
         assert uncovered_expense.status_code == 201
         exhausted = client.get("/api/dashboard?month=2026-08").json()
+        # This is the exact scenario October Go-Live Rebaseline §4.3 forbids:
+        # a deficit (R$ 25.076,78, here larger than the whole Privilège
+        # balance) with no evidenced "Transferência patrimonial" transaction
+        # and no confirmed action. The pre-Slice-1 engine used to fabricate
+        # `liquidity_withdrawal = 20000` (draining all of Privilège) and
+        # `liquidity_uncovered_deficit = 5076.78` purely from the deficit's
+        # size. Now nothing about the Privilège balance changes -- it is
+        # simply untouched -- and the deficit is surfaced as
+        # `unexplained_operating_result` for human review instead.
         assert exhausted["liquidity_starting_balance"] == 20000
         assert exhausted["liquidity_flow"] == -25076.78
-        assert exhausted["liquidity_withdrawal"] == 20000
-        assert exhausted["liquidity_balance"] == 0
-        assert exhausted["liquidity_available"] == -10000
-        assert exhausted["liquidity_uncovered_deficit"] == 5076.78
+        assert exhausted["unexplained_operating_result"] == -25076.78
+        assert exhausted["liquidity_withdrawal"] == 0
+        assert exhausted["liquidity_balance"] == 20000
+        assert exhausted["liquidity_available"] == 10000
+        assert exhausted["liquidity_uncovered_deficit"] == 0
         assert client.delete(f"/api/transactions/{uncovered_expense.json()['id']}").status_code == 200
         restored_dashboard = client.get("/api/dashboard?month=2026-08").json()
 
@@ -829,8 +861,8 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         )
         assert liquidity_data["intent"] == "liquidity"
         assert liquidity_data["metrics"]["liquidity_starting_balance"] == 20000
-        assert liquidity_data["metrics"]["liquidity_balance"] == 19923.22
-        assert liquidity_data["metrics"]["liquidity_available"] == 9923.22
+        assert liquidity_data["metrics"]["liquidity_balance"] == 20000
+        assert liquidity_data["metrics"]["liquidity_available"] == 10000
         assert "conta" in liquidity_data["answer"].lower()
         assert "renda ou gasto" in liquidity_data["answer"]
 
