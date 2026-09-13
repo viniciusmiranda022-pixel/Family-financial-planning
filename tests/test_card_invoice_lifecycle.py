@@ -46,9 +46,11 @@ from app.services.card_invoice_lifecycle import (  # noqa: E402
     close_invoice,
     get_or_sync_invoice,
     invoice_divergence,
+    invoice_purchase_lines,
     link_refund,
     outstanding_balance,
     pay_invoice,
+    serialize_invoice_purchase_line,
 )
 from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
@@ -166,6 +168,8 @@ def _purchase(
     category_id: str,
     transaction_type: str = "expense",
     description: str = "Compra",
+    installment_current: int | None = None,
+    installment_total: int | None = None,
 ) -> str:
     with session_factory() as db:
         signed_amount = Decimal(amount) if transaction_type == "refund" else -abs(Decimal(amount))
@@ -184,6 +188,8 @@ def _purchase(
             source_priority=50,
             confidence=Decimal("1"),
             reviewed=True,
+            installment_current=installment_current,
+            installment_total=installment_total,
         )
         db.add(txn)
         db.commit()
@@ -281,6 +287,59 @@ def test_get_or_sync_invoice_closes_on_closing_day_and_never_reopens() -> None:
         assert invoice.status == "closed"
 
 
+def test_invoice_purchase_lines_expose_contracted_impact_and_future_installments() -> None:
+    """Work Order Slice 2, "parcelamento": rebaseline §6.7's three
+    mandatory figures -- compra contratada / impacto no mês / parcelas
+    futuras -- for a purchase split into installments, plus a plain
+    (non-installment) purchase's line, from `GET /card-invoices/{id}/lines`.
+    """
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    card_id = _account(session_factory, household_id=household_id, name="Cartão", account_type="credit_card", closing_day=10, due_day=17)
+    category_id = _category(session_factory, household_id=household_id)
+    # A R$5.000 purchase split 10x, now on its 1st installment (R$500/month).
+    installment_id = _purchase(
+        session_factory, household_id=household_id, account_id=card_id, amount="500.00",
+        booked_at=date(2026, 9, 3), competence="2026-09", category_id=category_id,
+        description="Televisor 10x", installment_current=1, installment_total=10,
+    )
+    plain_id = _purchase(
+        session_factory, household_id=household_id, account_id=card_id, amount="80.00",
+        booked_at=date(2026, 9, 4), competence="2026-09", category_id=category_id, description="Farmácia",
+    )
+
+    with session_factory() as db:
+        account = db.get(Account, card_id)
+        invoice = get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-09", as_of=date(2026, 9, 5))
+        db.commit()
+        invoice_id = invoice.id
+        # `computed_total` never double counts: only this month's R$500
+        # installment slice, plus the R$80 plain purchase -- never the full
+        # R$5.000 contracted amount.
+        assert invoice.computed_total == Decimal("580.00")
+
+    with session_factory() as db:
+        lines = {
+            line.id: serialize_invoice_purchase_line(line)
+            for line in invoice_purchase_lines(db, household_id=household_id, invoice_id=invoice_id)
+        }
+
+    installment_line = lines[installment_id]
+    assert installment_line["is_installment"] is True
+    assert installment_line["installment_current"] == 1
+    assert installment_line["installment_total"] == 10
+    assert installment_line["monthly_impact"] == "500.00"
+    assert installment_line["contracted_total"] == "5000.00"
+    assert installment_line["future_installments_total"] == "4500.00"
+
+    plain_line = lines[plain_id]
+    assert plain_line["is_installment"] is False
+    assert plain_line["monthly_impact"] == "80.00"
+    assert plain_line["contracted_total"] == "80.00"
+    assert plain_line["future_installments_total"] == "0"
+
+
 def test_close_invoice_fails_closed_before_closing_date() -> None:
     session_factory = _session_factory()
     household_id = _household(session_factory)
@@ -346,7 +405,7 @@ def test_pay_invoice_partial_then_remainder_reaches_paid_without_double_counting
     with session_factory() as db:
         paying_account = db.get(Account, checking_id)
         category = db.get(Category, category_id)
-        checking_leg, invoice, duplicate_assessment = pay_invoice(
+        checking_leg, invoice, duplicate_assessment, is_idempotent_replay = pay_invoice(
             db,
             household_id=household_id,
             invoice_id=invoice_id,
@@ -377,7 +436,7 @@ def test_pay_invoice_partial_then_remainder_reaches_paid_without_double_counting
     with session_factory() as db:
         paying_account = db.get(Account, checking_id)
         category = db.get(Category, category_id)
-        checking_leg_2, invoice, _ = pay_invoice(
+        checking_leg_2, invoice, _, _ = pay_invoice(
             db,
             household_id=household_id,
             invoice_id=invoice_id,
@@ -461,7 +520,7 @@ def test_principal_carried_forward_without_creating_new_expense() -> None:
     with session_factory() as db:
         paying_account = db.get(Account, checking_id)
         category = db.get(Category, category_id)
-        _, invoice, _ = pay_invoice(
+        _, invoice, _, _ = pay_invoice(
             db, household_id=household_id, invoice_id=invoice_id, paying_account=paying_account,
             category=category, amount=Decimal("400.00"), booked_at=date(2026, 9, 15), description="Pagamento parcial",
         )
@@ -490,6 +549,85 @@ def test_principal_carried_forward_without_creating_new_expense() -> None:
     with session_factory() as db:
         expenses = db.scalars(select(Transaction).where(Transaction.transaction_type == "expense")).all()
         assert len(expenses) == 2  # the original 1000 purchase + the 80 charge -- never a third for the 600 carry.
+
+
+def test_principal_carried_in_does_not_oscillate_after_invoice_already_paid() -> None:
+    """Engineering review round (2026-09-12, `BLOQUEIO DE MERGE`): a late
+    payment against the *previous* cycle must never retroactively change
+    `principal_carried_in`/`status`/`outstanding_balance` of a cycle that
+    has already itself received a payment -- see `get_or_sync_invoice`'s
+    `invoice.paid_total <= 0` guard."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    card_id = _account(session_factory, household_id=household_id, name="Cartão", account_type="credit_card", closing_day=10, due_day=17)
+    checking_id = _account(session_factory, household_id=household_id, name="Conta Corrente")
+    category_id = _category(session_factory, household_id=household_id)
+    _purchase(session_factory, household_id=household_id, account_id=card_id, amount="1000.00", booked_at=date(2026, 9, 3), competence="2026-09", category_id=category_id)
+
+    with session_factory() as db:
+        account = db.get(Account, card_id)
+        september = get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-09", as_of=date(2026, 9, 10))
+        db.commit()
+        september_id = september.id
+
+    with session_factory() as db:
+        paying_account = db.get(Account, checking_id)
+        category = db.get(Category, category_id)
+        _, september, _, _ = pay_invoice(
+            db, household_id=household_id, invoice_id=september_id, paying_account=paying_account,
+            category=category, amount=Decimal("400.00"), booked_at=date(2026, 9, 15), description="Pagamento parcial de setembro",
+        )
+        db.commit()
+        assert outstanding_balance(september) == Decimal("600.00")
+
+    # October has no purchases of its own -- it only inherits September's
+    # unpaid 600 as `principal_carried_in` -- and is paid in full using
+    # exactly that total.
+    with session_factory() as db:
+        account = db.get(Account, card_id)
+        october = get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-10", as_of=date(2026, 10, 11))
+        db.commit()
+        october_id = october.id
+        assert october.principal_carried_in == Decimal("600.00")
+        assert outstanding_balance(october) == Decimal("600.00")
+
+    with session_factory() as db:
+        paying_account = db.get(Account, checking_id)
+        category = db.get(Category, category_id)
+        _, october, _, _ = pay_invoice(
+            db, household_id=household_id, invoice_id=october_id, paying_account=paying_account,
+            category=category, amount=Decimal("600.00"), booked_at=date(2026, 10, 6), description="Pagamento integral de outubro",
+        )
+        db.commit()
+        assert october.status == "paid"
+        assert outstanding_balance(october) == Decimal("0")
+
+    # A late payment settles the *original* September balance weeks later
+    # (a real, legitimate fact -- September's own contract never rejects a
+    # payment just because a later cycle already inherited its old
+    # outstanding balance).
+    with session_factory() as db:
+        paying_account = db.get(Account, checking_id)
+        category = db.get(Category, category_id)
+        _, september, _, _ = pay_invoice(
+            db, household_id=household_id, invoice_id=september_id, paying_account=paying_account,
+            category=category, amount=Decimal("600.00"), booked_at=date(2026, 11, 1), description="Pagamento tardio do saldo restante de setembro",
+        )
+        db.commit()
+        assert september.status == "paid"
+        assert outstanding_balance(september) == Decimal("0")
+
+    # Resyncing October *after* that late September payment must not make
+    # October's already-paid total oscillate: `principal_carried_in` stays
+    # frozen at the 600 it was actually paid against.
+    with session_factory() as db:
+        account = db.get(Account, card_id)
+        october_resynced = get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-10", as_of=date(2026, 11, 2))
+        db.commit()
+        assert october_resynced.principal_carried_in == Decimal("600.00")
+        assert october_resynced.status == "paid"
+        assert outstanding_balance(october_resynced) == Decimal("0")
 
 
 def test_refund_integral_neutralizes_purchase_without_deleting_it() -> None:
@@ -568,7 +706,7 @@ def test_refund_after_invoice_already_paid_credits_later_cycle_without_rewriting
     with session_factory() as db:
         paying_account = db.get(Account, checking_id)
         category = db.get(Category, category_id)
-        _, invoice, _ = pay_invoice(
+        _, invoice, _, _ = pay_invoice(
             db, household_id=household_id, invoice_id=invoice_id, paying_account=paying_account,
             category=category, amount=Decimal("300.00"), booked_at=date(2026, 9, 15), description="Pagamento integral",
         )
@@ -806,3 +944,179 @@ def test_pay_card_invoice_lifecycle_endpoint_rejects_still_open_invoice() -> Non
         )
         assert pay.status_code == 409
         assert "não fechou" in pay.json()["detail"]
+
+
+def test_pay_card_invoice_lifecycle_endpoint_retry_is_idempotent() -> None:
+    """Work Order Slice 2, "idempotência de pagamento": an exact retry of
+    the same payment request (same paying account, amount, description and
+    date, against the same invoice -- e.g. a client timeout retry) never
+    creates a second `reconciliation` leg nor increments `paid_total`
+    twice."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        card_id = _create_account(client, name="Cartão Idempotência", account_type="credit_card", card_closing_day=10, card_due_day=17)
+        checking_id = _create_account(client, name="Conta Idempotência")
+
+        with session_factory() as db:
+            household_id = db.scalar(select(Household)).id
+            category_id = _category(session_factory, household_id=household_id)
+        _purchase(session_factory, household_id=household_id, account_id=card_id, amount="1000.00", booked_at=date(2026, 9, 3), competence="2026-09", category_id=category_id)
+
+        with session_factory() as db:
+            account = db.get(Account, card_id)
+            get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-09", as_of=date(2026, 9, 11))
+            db.commit()
+
+        invoice_id = client.get("/api/card-invoices", params={"account_id": card_id, "period": "2026-09"}).json()[0]["id"]
+
+        payment_payload = {
+            "paying_account_id": checking_id,
+            "amount": "400.00",
+            "booked_at": "2026-09-15",
+            "description": "Pagamento parcial",
+            "confirmed": True,
+        }
+        first = client.post(f"/api/card-invoices/{invoice_id}/pay", json=payment_payload)
+        assert first.status_code == 201, first.text
+        assert first.json()["idempotent_replay"] is False
+        assert first.json()["invoice"]["paid_total"] == "400.00"
+
+        retry = client.post(f"/api/card-invoices/{invoice_id}/pay", json=payment_payload)
+        assert retry.status_code == 201, retry.text
+        assert retry.json()["idempotent_replay"] is True
+        # Same leg, same invoice total -- never doubled.
+        assert retry.json()["checking_transaction_id"] == first.json()["checking_transaction_id"]
+        assert retry.json()["invoice"]["paid_total"] == "400.00"
+
+        with session_factory() as db:
+            legs = db.scalars(
+                select(Transaction).where(Transaction.transaction_type == "reconciliation")
+            ).all()
+            assert len(legs) == 1
+
+        # A genuinely distinct second partial payment (different amount) is
+        # not blocked by the idempotency guard.
+        remainder = client.post(
+            f"/api/card-invoices/{invoice_id}/pay",
+            json={**payment_payload, "amount": "600.00", "description": "Pagamento restante"},
+        )
+        assert remainder.status_code == 201, remainder.text
+        assert remainder.json()["idempotent_replay"] is False
+        assert remainder.json()["invoice"]["status"] == "paid"
+        assert remainder.json()["invoice"]["paid_total"] == "1000.00"
+
+
+def test_close_pay_and_divergence_endpoints_run_financial_integrity_checks() -> None:
+    """HTTP-level wiring smoke test for `INV-026`/`INV-028`: the sync/close/
+    pay/divergence endpoints must keep working end-to-end now that they
+    each also evaluate the Financial Integrity Engine, and must never
+    persist a non-`pass` finding for a correct, ordinary payment flow."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        card_id = _create_account(client, name="Cartão Integridade", account_type="credit_card", card_closing_day=10, card_due_day=17)
+        checking_id = _create_account(client, name="Conta Integridade")
+
+        with session_factory() as db:
+            household_id = db.scalar(select(Household)).id
+            category_id = _category(session_factory, household_id=household_id)
+        _purchase(session_factory, household_id=household_id, account_id=card_id, amount="500.00", booked_at=date(2026, 9, 3), competence="2026-09", category_id=category_id)
+
+        with session_factory() as db:
+            account = db.get(Account, card_id)
+            get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-09", as_of=date(2026, 9, 11))
+            db.commit()
+
+        invoice_id = client.get("/api/card-invoices", params={"account_id": card_id, "period": "2026-09"}).json()[0]["id"]
+
+        close = client.post(f"/api/card-invoices/{invoice_id}/close", json={"reason": "Fechamento do ciclo"})
+        assert close.status_code == 200, close.text
+
+        divergence = client.get(f"/api/card-invoices/{invoice_id}/divergence")
+        assert divergence.status_code == 200, divergence.text
+        assert divergence.json()["status"] == "not_applicable"
+
+        pay = client.post(
+            f"/api/card-invoices/{invoice_id}/pay",
+            json={
+                "paying_account_id": checking_id,
+                "amount": "500.00",
+                "booked_at": "2026-09-15",
+                "description": "Pagamento integral",
+                "confirmed": True,
+            },
+        )
+        assert pay.status_code == 201, pay.text
+        assert pay.json()["invoice"]["status"] == "paid"
+
+        with session_factory() as db:
+            from app.models import IntegrityFinding
+
+            findings = db.scalars(
+                select(IntegrityFinding).where(IntegrityFinding.invariant_id.in_(("INV-025", "INV-026", "INV-028")))
+            ).all()
+            assert findings == []
+
+
+def test_card_invoice_lines_endpoint_returns_installment_breakdown() -> None:
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        card_id = _create_account(client, name="Cartão Parcelado", account_type="credit_card", card_closing_day=10, card_due_day=17)
+
+        with session_factory() as db:
+            household_id = db.scalar(select(Household)).id
+            category_id = _category(session_factory, household_id=household_id)
+        _purchase(
+            session_factory, household_id=household_id, account_id=card_id, amount="500.00",
+            booked_at=date(2026, 9, 3), competence="2026-09", category_id=category_id,
+            description="Televisor 10x", installment_current=1, installment_total=10,
+        )
+
+        with session_factory() as db:
+            account = db.get(Account, card_id)
+            invoice = get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-09", as_of=date(2026, 9, 5))
+            db.commit()
+            invoice_id = invoice.id
+
+        response = client.get(f"/api/card-invoices/{invoice_id}/lines")
+        assert response.status_code == 200, response.text
+        lines = response.json()
+        assert len(lines) == 1
+        assert lines[0]["contracted_total"] == "5000.00"
+        assert lines[0]["future_installments_total"] == "4500.00"
+
+        missing = client.get("/api/card-invoices/does-not-exist/lines")
+        assert missing.status_code == 404
+
+
+def test_link_refund_endpoint_runs_financial_integrity_check() -> None:
+    """HTTP-level wiring smoke test for `INV-027`."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        card_id = _create_account(client, name="Cartão Estorno", account_type="credit_card", card_closing_day=10, card_due_day=17)
+
+        with session_factory() as db:
+            household_id = db.scalar(select(Household)).id
+            category_id = _category(session_factory, household_id=household_id)
+        purchase_id = _purchase(session_factory, household_id=household_id, account_id=card_id, amount="200.00", booked_at=date(2026, 9, 3), competence="2026-09", category_id=category_id)
+        refund_id = _purchase(session_factory, household_id=household_id, account_id=card_id, amount="200.00", booked_at=date(2026, 9, 8), competence="2026-09", category_id=category_id, transaction_type="refund")
+
+        link = client.post(
+            f"/api/transactions/{refund_id}/link-refund",
+            json={"refund_transaction_id": refund_id, "original_transaction_id": purchase_id, "reason": "Estorno integral"},
+        )
+        assert link.status_code == 201, link.text
+
+        with session_factory() as db:
+            from app.models import IntegrityFinding
+
+            findings = db.scalars(
+                select(IntegrityFinding).where(IntegrityFinding.invariant_id == "INV-027")
+            ).all()
+            assert findings == []
