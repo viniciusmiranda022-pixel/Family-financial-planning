@@ -1346,6 +1346,7 @@ async function loadPayables() {
     api("/obligations"),
     api(`/card-payment-reconciliations/invoices${month ? `?period=${month}` : ""}`),
   ]);
+  await loadCardInvoices();
 
   state.obligations = obligations;
   document.querySelector("#payables-obligations-table").innerHTML = obligations.length
@@ -1380,6 +1381,216 @@ async function loadPayables() {
       <td>${item.paid_date ? dateFormat.format(new Date(`${item.paid_date}T00:00:00Z`)) : ""}</td>
     </tr>
   `).join("") : emptyRow(4, "Nenhuma fatura paga neste período");
+}
+
+const cardInvoiceStatusLabels = {
+  open: '<span class="status-chip">Em aberto</span>',
+  closed: '<span class="status-chip warn">Fechada — aguardando pagamento</span>',
+  partially_paid: '<span class="status-chip warn">Parcialmente paga</span>',
+  paid: '<span class="status-chip ok">Paga</span>',
+};
+
+let cardInvoicePaymentContext = null;
+
+function cardInvoiceCheckingAccounts() {
+  return state.accounts.filter((account) => account.account_type === "checking" && account.active !== false);
+}
+
+async function loadCardInvoices() {
+  // October Go-Live Slice 2: `CardInvoice` lifecycle
+  // (`GET/POST /card-invoices*`) -- a distinct, newer contract from the
+  // legacy `/card-payment-reconciliations/invoices` table above
+  // (exact-match-only, no partial payment, no principal carry-forward).
+  // Both stay visible side by side; nothing here recalculates anything the
+  // backend has not already computed. `account_id` on `GET /card-invoices`
+  // lazily syncs that card's current cycle (documented backend behavior),
+  // so this always shows the open cycle even before its first sync.
+  const cardAccounts = state.accounts.filter((account) => account.account_type === "credit_card");
+  const invoicesByAccount = await Promise.all(
+    cardAccounts.map((account) => api(`/card-invoices?account_id=${account.id}`))
+  );
+  const invoices = invoicesByAccount.flat().sort((a, b) => b.competence.localeCompare(a.competence));
+  state.cardInvoices = invoices;
+
+  document.querySelector("#card-invoices-table").innerHTML = invoices.length ? invoices.map((item) => {
+    const account = state.accounts.find((row) => row.id === item.account_id);
+    const total = Number(item.computed_total) + Number(item.principal_carried_in);
+    const canPay = isAdmin() && (item.status === "closed" || item.status === "partially_paid");
+    const action = canPay
+      ? `<button class="text-action pay-card-invoice" data-id="${escapeHtml(item.id)}">Conferir e pagar</button>`
+      : "";
+    return `
+      <tr>
+        <td>${escapeHtml(account ? (account.institution ? `${account.institution} • ${account.name}` : account.name) : "")}</td>
+        <td>${escapeHtml(item.competence)}</td>
+        <td>${cardInvoiceStatusLabels[item.status] || escapeHtml(item.status)}</td>
+        <td class="right">${money.format(total)}</td>
+        <td class="right">${money.format(Number(item.outstanding_balance))}</td>
+        <td>${item.due_date ? dateFormat.format(new Date(`${item.due_date}T00:00:00Z`)) : ""}</td>
+        <td class="right">${action}</td>
+      </tr>
+    `;
+  }).join("") : emptyRow(7, "Nenhuma fatura de cartão sincronizada ainda");
+
+  document.querySelectorAll(".pay-card-invoice").forEach((button) => {
+    button.addEventListener("click", () => openCardInvoicePayment(button.dataset.id));
+  });
+}
+
+function ensureCardInvoicePaymentDialog() {
+  let dialog = document.querySelector("#card-invoice-payment-dialog");
+  if (dialog) return dialog;
+
+  dialog = document.createElement("dialog");
+  dialog.id = "card-invoice-payment-dialog";
+  dialog.className = "obligation-payment-dialog";
+  dialog.innerHTML = `
+    <form id="card-invoice-payment-form">
+      <div class="obligation-payment-heading">
+        <div><span class="step-label">CONFERIR E PAGAR</span><h2 id="card-invoice-payment-title">Fatura de cartão</h2></div>
+        <button type="button" class="text-button card-invoice-payment-close">Fechar</button>
+      </div>
+      <div class="obligation-payment-summary" id="card-invoice-payment-summary"></div>
+      <div id="card-invoice-payment-divergence" class="capture-notes full hidden"></div>
+      <div id="card-invoice-payment-lines" class="capture-notes full hidden"></div>
+      <div class="obligation-payment-fields">
+        <label>Conta de origem<select id="card-invoice-payment-account" required></select></label>
+        <label>Valor a pagar<input type="number" id="card-invoice-payment-amount" step="0.01" min="0.01" required></label>
+        <label>Data do pagamento<input type="date" id="card-invoice-payment-date" required></label>
+        <label class="full">Observação (opcional)<input id="card-invoice-payment-description" maxlength="500"></label>
+        <label class="full"><input type="checkbox" id="card-invoice-payment-confirmed" required> Confirmo que este pagamento realmente aconteceu</label>
+      </div>
+      <div class="obligation-payment-actions">
+        <button type="button" class="secondary card-invoice-payment-close">Cancelar</button>
+        <button type="submit" class="primary">Registrar pagamento</button>
+      </div>
+    </form>
+  `;
+  document.body.appendChild(dialog);
+
+  dialog.querySelectorAll(".card-invoice-payment-close").forEach((button) => {
+    button.addEventListener("click", () => dialog.close());
+  });
+  dialog.querySelector("#card-invoice-payment-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!cardInvoicePaymentContext) return;
+    const invoice = cardInvoicePaymentContext;
+    const accountId = dialog.querySelector("#card-invoice-payment-account").value;
+    const amount = dialog.querySelector("#card-invoice-payment-amount").value;
+    const bookedAt = dialog.querySelector("#card-invoice-payment-date").value;
+    const description = dialog.querySelector("#card-invoice-payment-description").value.trim()
+      || `Pagamento fatura ${invoice.competence}`;
+    const confirmed = dialog.querySelector("#card-invoice-payment-confirmed").checked;
+    if (!accountId || !amount || !bookedAt || !confirmed) {
+      toast("Informe conta, valor, data e confirme o pagamento", true);
+      return;
+    }
+    if (!window.confirm(`Confirmar pagamento de ${money.format(Number(amount))} desta fatura?`)) return;
+
+    try {
+      const result = await api(`/card-invoices/${invoice.id}/pay`, {
+        method: "POST",
+        body: JSON.stringify({
+          paying_account_id: accountId,
+          amount: Number(amount),
+          booked_at: bookedAt,
+          description,
+          confirmed: true,
+        }),
+      });
+      dialog.close();
+      cardInvoicePaymentContext = null;
+      toast(
+        result.idempotent_replay
+          ? "Este pagamento já havia sido registrado; nada foi duplicado"
+          : `Pagamento registrado; fatura ${result.invoice.status === "paid" ? "totalmente paga" : "parcialmente paga"}`
+      );
+      await refreshObligationPaymentViews();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+
+  return dialog;
+}
+
+async function openCardInvoicePayment(invoiceId) {
+  const item = (state.cardInvoices || []).find((row) => row.id === invoiceId);
+  if (!item) {
+    toast("Fatura não encontrada na tela atual", true);
+    return;
+  }
+  const accounts = cardInvoiceCheckingAccounts();
+  if (!accounts.length) {
+    toast("Cadastre uma conta corrente antes de registrar o pagamento", true);
+    return;
+  }
+
+  try {
+    const [divergence, lines] = await Promise.all([
+      api(`/card-invoices/${invoiceId}/divergence`),
+      api(`/card-invoices/${invoiceId}/lines`),
+    ]);
+
+    const dialog = ensureCardInvoicePaymentDialog();
+    cardInvoicePaymentContext = item;
+    const account = state.accounts.find((row) => row.id === item.account_id);
+
+    dialog.querySelector("#card-invoice-payment-title").textContent =
+      `${account ? account.name : "Cartão"} • ${item.competence}`;
+    const carriedNote = Number(item.principal_carried_in) > 0
+      ? ` (inclui ${money.format(Number(item.principal_carried_in))} de principal transportado)`
+      : "";
+    dialog.querySelector("#card-invoice-payment-summary").innerHTML = `
+      <strong>${money.format(Number(item.outstanding_balance))}</strong>
+      <span>Total calculado pelo sistema: ${money.format(Number(item.computed_total) + Number(item.principal_carried_in))}${carriedNote}</span>
+    `;
+
+    const divergenceBox = dialog.querySelector("#card-invoice-payment-divergence");
+    if (divergence.status === "unreconciled_unexplained" || divergence.status === "unreconciled_explained") {
+      divergenceBox.classList.remove("hidden");
+      const causesLine = divergence.explanations.length
+        ? `<br>Possíveis causas: ${divergence.explanations.map((cause) => escapeHtml(cause.cause)).join(", ")}`
+        : "";
+      divergenceBox.innerHTML = `
+        <strong>${divergence.status === "unreconciled_unexplained" ? "FATURA NÃO RECONCILIADA" : "Divergência de fatura (causa encontrada)"}</strong><br>
+        Total banco: ${money.format(Number(divergence.declared_total))} •
+        Total sistema: ${money.format(Number(divergence.expected_total))} •
+        Diferença: ${money.format(Number(divergence.difference))}${causesLine}
+      `;
+    } else {
+      divergenceBox.classList.add("hidden");
+      divergenceBox.innerHTML = "";
+    }
+
+    const linesBox = dialog.querySelector("#card-invoice-payment-lines");
+    if (lines.length) {
+      linesBox.classList.remove("hidden");
+      linesBox.innerHTML = `<strong>Compras desta fatura</strong><br>${lines.map((line) => (
+        line.is_installment
+          ? `${escapeHtml(line.description)} — parcela ${line.installment_current}/${line.installment_total} de `
+            + `${money.format(Number(line.monthly_impact))} (contratado ${money.format(Number(line.contracted_total))}, `
+            + `parcelas futuras ${money.format(Number(line.future_installments_total))})`
+          : `${escapeHtml(line.description)} — ${money.format(Number(line.monthly_impact))}`
+      )).join("<br>")}`;
+    } else {
+      linesBox.classList.add("hidden");
+      linesBox.innerHTML = "";
+    }
+
+    const accountSelect = dialog.querySelector("#card-invoice-payment-account");
+    accountSelect.innerHTML = accounts.map((row) =>
+      `<option value="${escapeHtml(row.id)}">${escapeHtml(row.institution ? `${row.institution} • ${row.name}` : row.name)}</option>`
+    ).join("");
+    dialog.querySelector("#card-invoice-payment-amount").value = item.outstanding_balance;
+    dialog.querySelector("#card-invoice-payment-date").value = obligationPaymentLocalToday();
+    dialog.querySelector("#card-invoice-payment-description").value = "";
+    dialog.querySelector("#card-invoice-payment-confirmed").checked = false;
+
+    dialog.showModal();
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 async function loadTransferencias() {
