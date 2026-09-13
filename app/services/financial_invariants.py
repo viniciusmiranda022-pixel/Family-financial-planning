@@ -18,7 +18,11 @@ from typing import Any
 # rescoped to the projection engine's hypothetical liquidity formula only,
 # and INV-023/INV-024 are added for a REALIZADO period's evidence-based
 # liquidity reconciliation. See docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md §5.
-FINANCIAL_RULES_VERSION = "2026.10.1"
+# October Go-Live Rebaseline, Slice 3 (P0 #87): INV-029/INV-030 are added so
+# a received Commission and a reconciled recurring income never re-enter the
+# forward projection as a second, duplicated income fact. See
+# docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md.
+FINANCIAL_RULES_VERSION = "2026.10.2"
 MONEY_TOLERANCE = Decimal("0.01")
 PROBABLE_DUPLICATE_THRESHOLD = Decimal("0.60")
 STRONG_DUPLICATE_THRESHOLD = Decimal("0.85")
@@ -864,6 +868,66 @@ def validate_card_invoice_divergence_not_silently_adjusted(
         ),
         expected={"divergence_status": sorted(allowed_statuses), "synthetic_adjustment_created": False},
         actual={"divergence_status": status, "synthetic_adjustment_created": synthetic_adjustment_created},
+    )
+
+
+def validate_received_commission_excluded_from_projection(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-029 (October Go-Live Slice 3): a `Commission` already marked
+    received (`received_date` set) is never fed into the forecast's income
+    lines again -- the real credit already exists as a fact; projecting the
+    same commission a second time would duplicate income
+    (`docs/OCTOBER_GO_LIVE_REBASELINE.md` §8.3,
+    `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §2.4/§4)."""
+
+    received_ids = set(_text_sequence(context, "received_commission_ids"))
+    projected_ids = set(_text_sequence(context, "projected_commission_ids"))
+    overlap = sorted(received_ids & projected_ids)
+    matches = not overlap
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            "Nenhuma comissão já recebida foi incluída na projeção futura."
+            if matches
+            else "Uma comissão já marcada como recebida ainda está incluída na projeção -- risco de renda duplicada."
+        ),
+        expected={"received_commissions_in_projection": []},
+        actual={"received_commissions_in_projection": overlap},
+        difference=Decimal(len(overlap)),
+    )
+
+
+def validate_recurring_income_no_duplicate(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-030 (October Go-Live Slice 3): when
+    `app.services.recurring_income.reconcile_recurring_income` finds a real
+    credit for the household's configured recurring salary in a period, the
+    projection for that period uses *only* the confirmed amount -- never the
+    confirmed amount plus the flat PREVISTO estimate
+    (`docs/OCTOBER_GO_LIVE_REBASELINE.md` §8.4)."""
+
+    has_evidence = _boolean(context, "has_recurring_income_evidence")
+    expected_amount = _decimal(context, "expected_amount")
+    reconciled_amount = _decimal(context, "reconciled_amount")
+    projected_amount = _decimal(context, "projected_amount")
+    expected_projected = reconciled_amount if has_evidence else expected_amount
+    matches = projected_amount == expected_projected
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            "A renda recorrente do período usa exatamente um valor, sem somar previsto e realizado."
+            if matches
+            else "A renda recorrente do período somou o valor previsto ao valor real -- risco de renda duplicada."
+        ),
+        expected=expected_projected,
+        actual=projected_amount,
+        difference=_money(projected_amount - expected_projected),
     )
 
 

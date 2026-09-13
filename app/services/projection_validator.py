@@ -49,10 +49,11 @@ def independently_calculate(data: ForecastInput) -> dict[str, Decimal]:
     cursor = data.start_month.replace(day=1)
     while cursor <= data.end_month.replace(day=1):
         period = month_key(cursor)
-        salary = money(data.monthly_salary)
+        salary = money(data.monthly_salary_overrides.get(period, data.monthly_salary))
         extras = money(data.payroll_extras.get(period, 0))
         obligations = money(data.obligations.get(period, 0))
         installments = money(data.installments.get(period, 0))
+        card_invoices = money(data.card_invoices.get(period, 0))
         cash_cap = money(data.monthly_cash_cap)
         expected = money(expected_commissions.get(period, 0))
         delayed = money(delayed_commissions.get(period, 0))
@@ -63,6 +64,7 @@ def independently_calculate(data: ForecastInput) -> dict[str, Decimal]:
             "commission_delayed": delayed,
             "obligations": obligations,
             "installments": installments,
+            "card_invoices": card_invoices,
             "cash_cap": cash_cap,
         }
         values.update({f"{period}.{key}": value for key, value in common.items()})
@@ -77,7 +79,7 @@ def independently_calculate(data: ForecastInput) -> dict[str, Decimal]:
                 opening * data.monthly_investment_rate if opening_debt == 0 else 0
             )
             income = money(salary + extras + commission)
-            expenses = money(obligations + installments + cash_cap)
+            expenses = money(obligations + installments + card_invoices + cash_cap)
             result = money(income - expenses)
             available_result = money(result + investment_return)
             used = Decimal("0.00")

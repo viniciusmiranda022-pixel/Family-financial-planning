@@ -48,6 +48,7 @@ from sqlalchemy.orm import Session
 
 from app.services.card_competence import card_invoice_window
 from app.services.finance import add_months, money, month_key
+from app.services.financial_state import COMPROMETIDO, REALIZADO
 from app.services.reconciliation import RECONCILIATION_TOLERANCE
 
 # Same category name every card-payment leg in this project already uses
@@ -750,6 +751,19 @@ def serialize_invoice_purchase_line(transaction: Any) -> dict[str, Any]:
     }
 
 
+def invoice_financial_state(invoice: Any) -> str:
+    """October Go-Live Slice 3: an invoice `closed`/`partially_paid` is a
+    real, contracted-but-unliquidated payable -- COMPROMETIDO (rebaseline
+    §3/§6.2, "fatura fechada ainda não paga"). `open` (still accruing -- its
+    purchases already are individually REALIZADO, rebaseline §6.1) and
+    `paid` (liquidated) both describe a state with nothing left owed, so
+    neither is a pending commitment; label the invoice-as-payable itself
+    REALIZADO in both cases rather than inventing a fourth bucket outside
+    the rebaseline's three."""
+
+    return COMPROMETIDO if invoice.status in ("closed", "partially_paid") else REALIZADO
+
+
 def serialize_card_invoice(invoice: Any) -> dict[str, Any]:
     return {
         "id": invoice.id,
@@ -759,6 +773,7 @@ def serialize_card_invoice(invoice: Any) -> dict[str, Any]:
         "closes_at": invoice.closes_at.isoformat() if invoice.closes_at else None,
         "due_date": invoice.due_date.isoformat() if invoice.due_date else None,
         "status": invoice.status,
+        "financial_state": invoice_financial_state(invoice),
         "declared_total": str(invoice.declared_total) if invoice.declared_total is not None else None,
         "computed_total": str(invoice.computed_total),
         "principal_carried_in": str(invoice.principal_carried_in),

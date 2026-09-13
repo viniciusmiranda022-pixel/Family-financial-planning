@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -76,6 +76,22 @@ class ForecastInput:
     commissions: tuple[ForecastCommission, ...]
     starting_uncovered_deficit: Decimal = Decimal("0")
     safety_floor: Decimal = Decimal("0")
+    # October Go-Live Slice 3 (P0 #87): committed `CardInvoice` balances
+    # already closed/partially paid (rebaseline §6.2/§7) -- a real
+    # COMPROMETIDO commitment distinct from `installments` (still-future,
+    # not-yet-closed parcelamento) and from `obligations` (the `Obligation`
+    # model). Kept as its own field, never merged into `obligations`, so a
+    # consumer can always tell the two sources apart instead of only seeing
+    # one combined number.
+    card_invoices: dict[str, Decimal] = field(default_factory=dict)
+    # October Go-Live Slice 3: period -> confirmed amount, used *instead of*
+    # `monthly_salary` for that one period when
+    # `app.services.recurring_income.reconcile_recurring_income` already
+    # found a real income `Transaction` for it (rebaseline §8.4 -- "a
+    # conciliação não pode criar uma segunda receita"). Never additive with
+    # `monthly_salary`; an empty dict reproduces the previous flat-salary
+    # behaviour exactly.
+    monthly_salary_overrides: dict[str, Decimal] = field(default_factory=dict)
 
 
 def build_forecast(data: ForecastInput) -> list[dict[str, Decimal | str]]:
