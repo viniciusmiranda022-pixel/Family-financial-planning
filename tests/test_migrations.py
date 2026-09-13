@@ -1,6 +1,7 @@
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, select
 
@@ -359,6 +360,28 @@ EXPECTED_CAPTURE_PROCESSING_JOB_COLUMNS = {
     "updated_at",
 }
 
+EXPECTED_0015_TABLES = {"card_invoices"}
+
+EXPECTED_CARD_INVOICE_COLUMNS = {
+    "id",
+    "household_id",
+    "account_id",
+    "competence",
+    "opens_at",
+    "closes_at",
+    "due_date",
+    "status",
+    "declared_total",
+    "computed_total",
+    "principal_carried_in",
+    "principal_carried_out",
+    "paid_total",
+    "closed_at",
+    "trace_id",
+    "created_at",
+    "updated_at",
+}
+
 
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
@@ -409,6 +432,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0009_TABLES,
             *EXPECTED_0011_TABLES,
             *EXPECTED_0014_TABLES,
+            *EXPECTED_0015_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -525,6 +549,21 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_mfa_recovery_codes_factor_id",
         "ix_mfa_recovery_codes_code_hash",
     }
+    assert {column["name"] for column in inspector.get_columns("card_invoices")} == (
+        EXPECTED_CARD_INVOICE_COLUMNS
+    )
+    assert {index["name"] for index in inspector.get_indexes("card_invoices")} == {
+        "ix_card_invoice_household_id",
+        "ix_card_invoice_account_id",
+        "ix_card_invoice_household_competence",
+        "ix_card_invoice_trace_id",
+    }
+    assert {"card_invoice_id", "refund_of_transaction_id"}.issubset(
+        {column["name"] for column in inspector.get_columns("transactions")}
+    )
+    assert "ix_transaction_card_invoice_id" in {
+        index["name"] for index in inspector.get_indexes("transactions")
+    }
     engine.dispose()
 
     command.downgrade(config, "0001")
@@ -535,6 +574,101 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
     command.downgrade(config, "base")
     engine, inspector = _inspect(database_url)
     assert inspector.get_table_names() == ["alembic_version"]
+    engine.dispose()
+    get_settings.cache_clear()
+
+
+def test_downgrade_from_0015_refuses_to_discard_confirmed_refund_lineage(monkeypatch, tmp_path) -> None:
+    """Engineering review round (2026-09-12, `BLOQUEIO DE MERGE` #5): a
+    confirmed `refund_of_transaction_id` link is a human/Assistant-approved
+    fact, not derived cache -- `downgrade()` must refuse instead of
+    silently discarding it, and must still succeed once no link remains."""
+
+    from datetime import date
+    from decimal import Decimal
+
+    from sqlalchemy.orm import sessionmaker
+
+    from app.models import Account, Category, Household, Transaction
+
+    database_url = f"sqlite:///{tmp_path / 'migrations-refund-guard.sqlite'}"
+    config = _alembic_config(monkeypatch, database_url)
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        household = Household(name="Família Downgrade")
+        db.add(household)
+        db.flush()
+        account = Account(household_id=household.id, name="Cartão", account_type="credit_card")
+        category = Category(household_id=household.id, name="Compras")
+        db.add_all([account, category])
+        db.flush()
+        purchase = Transaction(
+            household_id=household.id,
+            account_id=account.id,
+            category_id=category.id,
+            booked_at=date(2026, 9, 3),
+            occurred_at=date(2026, 9, 3),
+            competence="2026-09",
+            description="Compra",
+            normalized_description="COMPRA",
+            amount=Decimal("-100.00"),
+            transaction_type="expense",
+            fingerprint="f" * 64,
+            source_priority=50,
+            confidence=Decimal("1"),
+            reviewed=True,
+        )
+        db.add(purchase)
+        db.flush()
+        refund = Transaction(
+            household_id=household.id,
+            account_id=account.id,
+            category_id=category.id,
+            booked_at=date(2026, 9, 8),
+            occurred_at=date(2026, 9, 8),
+            competence="2026-09",
+            description="Estorno",
+            normalized_description="ESTORNO",
+            amount=Decimal("100.00"),
+            transaction_type="refund",
+            fingerprint="g" * 64,
+            source_priority=50,
+            confidence=Decimal("1"),
+            reviewed=True,
+            refund_of_transaction_id=purchase.id,
+        )
+        db.add(refund)
+        db.commit()
+        purchase_id, refund_id = purchase.id, refund.id
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="vínculo"):
+        command.downgrade(config, "0014")
+
+    # Refused: schema (and the confirmed link itself) is left untouched.
+    engine, inspector = _inspect(database_url)
+    assert "card_invoices" in inspector.get_table_names()
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        assert db.get(Transaction, refund_id).refund_of_transaction_id == purchase_id
+    engine.dispose()
+
+    # The documented export-then-clear path: once no link remains, the
+    # exact same downgrade proceeds like before this guard existed.
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("UPDATE transactions SET refund_of_transaction_id = NULL")
+    engine.dispose()
+
+    command.downgrade(config, "0014")
+    engine, inspector = _inspect(database_url)
+    assert "card_invoices" not in inspector.get_table_names()
+    assert "refund_of_transaction_id" not in {
+        column["name"] for column in inspector.get_columns("transactions")
+    }
     engine.dispose()
     get_settings.cache_clear()
 
@@ -615,7 +749,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0014"
+        ).scalar_one() == "0015"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -641,6 +775,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0014"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0015"
     engine.dispose()
     get_settings.cache_clear()

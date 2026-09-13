@@ -259,6 +259,76 @@ snapshot/relatório/projeção. Dashboard, relatórios, projeção e Monthly Clo
 exatamente as mesmas linhas `Transaction`/`DocumentReconciliation` de sempre; esta tela não introduz
 uma segunda fonte de verdade.
 
+## Ciclo de vida de fatura de cartão (October Go-Live Slice 2, P0 #87)
+
+`CardInvoice` (migração `0015`, `app/services/card_invoice_lifecycle.py`) é a entidade canônica do
+ciclo `open -> closed -> partially_paid -> paid`, complementar às fontes já existentes -- nunca um
+segundo motor de competência ou de conciliação:
+
+- competência/janela do ciclo: `app.services.card_competence.card_invoice_window`, a função inversa
+  de `card_invoice_competence` (mesmos `card_closing_day`/`card_due_day`, nunca uma segunda regra);
+- quais compras pertencem ao ciclo: soma de `Transaction.amount` já persistido
+  (`transaction_type="expense"`, mesma `competence` já resolvida por `resolve_expense_competence`) --
+  nenhuma segunda classificação;
+- o leg bancário de um pagamento (`pay_invoice`) reaproveita a mesma construção de `Transaction`
+  (`ParsedTransaction`/`transaction_fingerprint`, categoria "Conciliação", `excluded=True`) e a mesma
+  detecção de duplicidade (`register_transaction_duplicates`) que
+  `card_payment_reconciliation.pay_card_invoice` já usa -- não é uma segunda política de
+  reconciliação, é uma extensão que aceita valor parcial (`GET/POST /card-invoices/...`, superset do
+  contrato acima, que continua existindo e sem alteração de comportamento).
+
+`Transaction.card_invoice_id` (FK aditiva, mesmo padrão de `linked_transaction_id`) associa cada
+compra/pagamento à fatura -- atribuída apenas quando `get_or_sync_invoice` sincroniza aquele
+`(account, competence)`, nunca em uma leitura pura (`GET /card-invoices` só sincroniza a exceção
+estrita e documentada do ciclo *atual* de um cartão sem nenhuma fatura ainda; qualquer outra
+competência exige um `POST /card-invoices/sync`/`.../close`/`.../pay`/`.../divergence` explícito).
+`Transaction.refund_of_transaction_id` (FK aditiva autorreferente) é o vínculo explícito e nunca
+inferido de um estorno à compra original (`link_refund`/`POST /transactions/{id}/link-refund`);
+apenas um estorno *vinculado* reduz `CardInvoice.computed_total` do ciclo em que o próprio estorno
+foi lançado -- nunca o ciclo da compra original quando os dois divergem, preservando uma fatura já
+paga sem reescrevê-la.
+
+`principal_carried_in`/`principal_carried_out` são o único par de campos com estado genuíno além de
+`paid_total`/`status`/`closed_at`: o saldo em aberto de um ciclo fechado é transportado ao próximo
+apenas como esse campo numérico, nunca como uma nova `Transaction`. `computed_total`/`declared_total`
+são recalculados a cada sincronização a partir de `Transaction`/`CardInvoice` já persistidos -- nunca
+uma fonte independente. `invoice_divergence` nunca ajusta silenciosamente uma diferença entre o total
+declarado (evidência de fatura/extrato já importado) e o total calculado: procura causa
+determinística ainda não contada (estorno não vinculado, encargo ainda não reclamado por nenhuma
+fatura) e, sem uma, publica `unreconciled_unexplained` para revisão humana.
+
+**Revisão de engenharia (2026-09-12, `BLOQUEIO DE MERGE`), corrigida neste PR:**
+
+- **Idempotência de pagamento.** `pay_invoice` computa o mesmo `transaction_fingerprint`
+  determinístico que uma nova `Transaction` de conciliação receberia e, antes de criar qualquer
+  coisa, procura um pagamento já persistido nesta exata fatura com esse fingerprint -- mesma
+  filosofia de "idempotência documental" já usada pelos parsers de importação deste projeto, não um
+  conceito novo. Uma repetição exata da mesma requisição (mesma conta/valor/descrição/data) devolve o
+  lançamento existente sem incrementar `paid_total`/criar um segundo leg
+  (`tests/test_card_invoice_lifecycle.py::test_pay_card_invoice_lifecycle_endpoint_retry_is_idempotent`).
+- **INV-025..INV-028 integradas ao Financial Integrity Engine.** `app.api._run_card_invoice_integrity_checks`
+  chama `execute_integrity_run` (scope `ENTITY`, trigger `TRANSACTION`) a partir de
+  `sync`/`close`/`pay`/`divergence`/`link-refund`, usando fatos observados em runtime (contagem de
+  `expense` antes/depois, `db.new` para provar que nenhuma `Transaction` nova foi criada onde não
+  deveria, snapshot da fatura original antes/depois de um vínculo de estorno) -- nunca uma segunda
+  fórmula, apenas evidência direta do que a própria chamada acabou de fazer. Um resultado `fail`
+  reverte a transação e aborta a requisição.
+- **`principal_carried_in` não oscila retroativamente.** `get_or_sync_invoice` só recomputa
+  `principal_carried_in`/`principal_carried_out` a partir do ciclo anterior enquanto a própria fatura
+  ainda não recebeu nenhum pagamento (`paid_total <= 0`); uma vez paga (total ou parcialmente), o
+  valor fica congelado, mesmo que um pagamento tardio no ciclo anterior mude o outstanding daquele
+  ciclo depois.
+- **Parcelamento exposto (`GET /card-invoices/{id}/lines`).** Reaproveita apenas
+  `Transaction.amount`/`installment_current`/`installment_total` já confirmados -- nunca o motor de
+  projeção mês-a-mês de `_project_installments`/`_future_installments` (que resolve "em quais meses
+  futuros", não usado aqui) -- para expor compra contratada, impacto no mês e parcelas futuras por
+  compra da fatura.
+- **UI "Conferir e pagar".** `app/templates/index.html`/`app/static/app.js` (tela Contas a pagar,
+  painel "Faturas de cartão") ganharam o modal do rebaseline §6.2/§6.3, ao lado (não em substituição)
+  da UI já existente do contrato legado `/card-payment-reconciliations/*`.
+- **Downgrade de `0015` deixa de ser destrutivo silencioso.** Recusa (levanta `RuntimeError`) quando
+  existe algum `refund_of_transaction_id` confirmado -- ver `alembic/versions/0015_card_invoice_lifecycle.py`.
+
 ## Comparação visual de cenários de compra (Fase 3)
 
 `POST /api/purchases/scenario-comparison` (`app/api.py::compare_purchase_scenarios`) compara duas a

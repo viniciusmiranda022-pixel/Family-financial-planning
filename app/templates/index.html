@@ -442,6 +442,10 @@
           <div class="table-wrap"><table><thead><tr><th>Data de referência</th><th>Cartão</th><th>Descrição</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="payables-pending-invoices-table"></tbody></table></div>
         </article>
         <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">CICLO COMPLETO</span><h2>Faturas de cartão</h2><small>Ciclo aberta → fechada → parcialmente paga → paga (October Go-Live Slice 2). "Conferir e pagar" aparece assim que a fatura fecha; pagamento parcial é aceito e o saldo restante é transportado como principal, nunca como novo gasto.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Cartão</th><th>Competência</th><th>Status</th><th class="right">Total da fatura</th><th class="right">Saldo em aberto</th><th>Vencimento</th><th class="right">Ações</th></tr></thead><tbody id="card-invoices-table"></tbody></table></div>
+        </article>
+        <article class="panel">
           <div class="panel-heading"><div><span class="step-label">PAGAMENTO DE FATURA</span><h2>Registrar pagamento manual</h2><small>Pagamento de fatura é conciliação, nunca uma nova despesa (INV-002); as compras da fatura continuam sendo os fatos de despesa. Origem dos recursos, conta pagadora e fatura são sempre confirmadas por você.</small></div></div>
           <form id="pay-invoice-form" class="form-grid three admin-only">
             <input type="hidden" name="card_transaction_id">

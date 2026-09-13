@@ -15,6 +15,50 @@
 - Parcelas futuras são projetadas pelo valor observado e pelas marcações `atual/total`.
 - Mudança de valor ou antecipação exige revisão manual.
 
+### Ciclo de vida da fatura (October Go-Live Slice 2, P0 #87)
+
+`CardInvoice` (`app/services/card_invoice_lifecycle.py`, migração `0015`) é a entidade canônica do
+ciclo de fatura, complementar às regras acima (nunca um segundo motor de competência ou de
+conciliação):
+
+- estados `open -> closed -> partially_paid -> paid`; a transição para `closed` só ocorre na (ou
+  após a) própria data de fechamento do cartão, nunca antecipada por uma chamada de API;
+- pagamento (`POST /card-invoices/{id}/pay`) aceita qualquer valor até o saldo em aberto, inclusive
+  parcial; cada pagamento cria apenas um lançamento de conciliação, nunca uma despesa nova;
+- o saldo não pago de uma fatura fechada é transportado ao ciclo seguinte apenas como
+  `principal_carried_in`/`principal_carried_out` — nunca como uma nova compra ou despesa;
+- juros/IOF/tarifas cobrados depois de um pagamento parcial são despesas novas e separadas do
+  principal transportado, lançadas apenas quando efetivamente informadas;
+- estorno só neutraliza uma compra depois de vinculado explicitamente
+  (`Transaction.refund_of_transaction_id`, `POST /transactions/{id}/link-refund`) — nunca inferido;
+  um estorno lançado em ciclo posterior credita esse ciclo, sem reescrever uma fatura já paga;
+- divergência entre o total declarado (fatura/extrato já importado) e o total calculado nunca é
+  ajustada silenciosamente (`GET /card-invoices/{id}/divergence`): o sistema procura causa
+  determinística (estorno não vinculado, encargo ainda não reclamado) e, se não encontrar, marca a
+  divergência como não resolvida para revisão humana;
+- `POST /card-invoices/{id}/pay` é idempotente: uma repetição exata da mesma requisição (mesma conta
+  pagadora, valor, descrição e data, contra a mesma fatura — ex.: retry de rede ou duplo clique)
+  devolve o lançamento já persistido em vez de criar um segundo (`is_idempotent_replay`/
+  `idempotent_replay` na resposta); duas compras genuinamente distintas não colidem a menos que
+  também compartilhem valor/descrição/data;
+- `principal_carried_in` é congelado assim que a própria fatura já recebeu algum pagamento
+  (`paid_total > 0`): uma repetição/atraso de pagamento em um ciclo anterior nunca faz o total já
+  usado para pagar um ciclo posterior oscilar retroativamente;
+- `GET /card-invoices/{id}/lines` expõe, por compra, os três valores obrigatórios de parcelamento
+  (rebaseline §6.7): compra contratada, impacto no mês e parcelas futuras (COMPROMETIDO) — derivados
+  apenas de `Transaction.amount`/`installment_current`/`installment_total` já confirmados, nunca uma
+  segunda fonte de verdade em relação ao motor de parcelas de `/forecast`;
+- INV-025 a INV-028 (`docs/FINANCIAL_INVARIANTS.md`) são avaliadas em tempo real pelo Financial
+  Integrity Engine a cada `sync`/`close`/`pay`/`link-refund`/`divergence`
+  (`app.api._run_card_invoice_integrity_checks`); um resultado `fail` aborta a requisição;
+- a UI "Conferir e pagar" (tela Contas a pagar, rebaseline §6.2/§6.3) mostra cartão/fatura/
+  competência, total calculado pelo sistema, valor editável, conta de origem, data, observação
+  opcional, divergência (quando houver) e a lista de compras/parcelamento da fatura; só aparece para
+  faturas `closed`/`partially_paid`;
+- downgrade da migração `0015` recusa (levanta erro, não altera nada) quando existe algum
+  `Transaction.refund_of_transaction_id` confirmado — esse vínculo é fato humano/Assistente
+  confirmado (rebaseline §6.6), não cache derivável; a lineage deve ser exportada antes de reverter.
+
 ## Documentos sobrepostos
 
 - Reimportação exata é bloqueada pelo hash do arquivo.

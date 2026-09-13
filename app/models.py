@@ -171,6 +171,50 @@ class Account(Base, TimestampMixin):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class CardInvoice(Base, TimestampMixin):
+    """One card's billing cycle -- P0 #87, October Go-Live Slice 2
+    (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_2.md`,
+    `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.1).
+
+    `status` lifecycle: `open -> closed -> partially_paid/paid`, driven only
+    by `app.services.card_invoice_lifecycle` (never edited directly). Every
+    figure here is either a deterministic aggregate of already-persisted
+    `Transaction` rows (`computed_total`, `declared_total`,
+    `principal_carried_in`/`principal_carried_out`) or a genuine stateful
+    fact this project's own payment action writes (`paid_total`,
+    `closed_at`) -- never a second, independently editable financial
+    engine. `declared_total` is only ever populated from an already-
+    imported bank/card-statement "payment received" line (evidence), never
+    typed by a human as a bare correction.
+
+    Unique on `(account_id, competence)`: exactly one invoice per card per
+    billing cycle, matching `card_invoice_competence`'s own canonical
+    "YYYY-MM" identity for that cycle.
+    """
+
+    __tablename__ = "card_invoices"
+    __table_args__ = (
+        UniqueConstraint("account_id", "competence", name="uq_card_invoice_account_competence"),
+        Index("ix_card_invoice_household_competence", "household_id", "competence"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(ForeignKey("households.id", ondelete="CASCADE"), index=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), index=True)
+    competence: Mapped[str] = mapped_column(String(7))
+    opens_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    closes_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    declared_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    computed_total: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    principal_carried_in: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    principal_carried_out: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    paid_total: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+
+
 class Category(Base, TimestampMixin):
     __tablename__ = "categories"
     __table_args__ = (UniqueConstraint("household_id", "name", name="uq_category_household_name"),)
@@ -241,6 +285,20 @@ class Transaction(Base, TimestampMixin):
         ForeignKey("duplicate_groups.id", ondelete="SET NULL"), nullable=True, index=True
     )
     linked_transaction_id: Mapped[str | None] = mapped_column(
+        ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True
+    )
+    # October Go-Live Slice 2 (`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md`
+    # §3.1/§3.2). `card_invoice_id` associates a purchase or payment leg to
+    # the `CardInvoice` it belongs to -- set only by
+    # `app.services.card_invoice_lifecycle`, never by a parser or a plain
+    # column edit. `refund_of_transaction_id` is the explicit, human/
+    # Assistant-confirmed link from a refund to the original purchase it
+    # neutralizes (rebaseline §6.6) -- never inferred from amount/date/
+    # description alone.
+    card_invoice_id: Mapped[str | None] = mapped_column(
+        ForeignKey("card_invoices.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    refund_of_transaction_id: Mapped[str | None] = mapped_column(
         ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True
     )
     transfer_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

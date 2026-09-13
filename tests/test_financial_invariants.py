@@ -42,8 +42,11 @@ ZERO_OPERATING_EFFECTS = {
 
 def test_registry_contains_all_permanent_invariants_once() -> None:
     assert FINANCIAL_RULES_VERSION == "2026.10.1"
-    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 25))
-    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 24
+    # October Go-Live Slice 2 (P0 #87): INV-025..INV-028 join the registry,
+    # integrating the CardInvoice lifecycle into the Financial Integrity
+    # Engine (docs/FINANCIAL_INVARIANTS.md).
+    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 29))
+    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 28
     assert all(item.required_facts for item in INVARIANT_REGISTRY.values())
 
 
@@ -583,3 +586,88 @@ def test_projection_validator_divergence_is_blocking() -> None:
     )
     assert result.status is InvariantStatus.FAIL
     assert result.severity.value == "block"
+
+
+# ---------------------------------------------------------------------------
+# October Go-Live Slice 2 (P0 #87): INV-025..INV-028, the `CardInvoice`
+# lifecycle's own contribution to the Financial Integrity Engine
+# (`docs/FINANCIAL_INVARIANTS.md`, `app/services/card_invoice_lifecycle.py`).
+# ---------------------------------------------------------------------------
+
+
+def test_card_invoice_payment_never_duplicates_expense() -> None:
+    valid = _evaluate("INV-025", expense_count_before=3, expense_count_after=3)
+    regressed = _evaluate("INV-025", expense_count_before=3, expense_count_after=4)
+    assert valid.status is InvariantStatus.PASS
+    assert regressed.status is InvariantStatus.FAIL
+    assert regressed.difference == Decimal("1")
+    assert regressed.severity.value == "block"
+
+
+def test_card_invoice_principal_carry_never_becomes_new_expense() -> None:
+    valid = _evaluate(
+        "INV-026", principal_carried_in=Decimal("600.00"), new_expense_transactions_for_carry=0
+    )
+    fabricated = _evaluate(
+        "INV-026", principal_carried_in=Decimal("600.00"), new_expense_transactions_for_carry=1
+    )
+    negative = _evaluate(
+        "INV-026", principal_carried_in=Decimal("-1.00"), new_expense_transactions_for_carry=0
+    )
+    assert valid.status is InvariantStatus.PASS
+    assert fabricated.status is InvariantStatus.FAIL
+    assert negative.status is InvariantStatus.FAIL
+
+
+def test_card_invoice_refund_preserves_history() -> None:
+    valid = _evaluate(
+        "INV-027",
+        original_transaction_exists=True,
+        linked_refund_total=Decimal("200.00"),
+        original_amount=Decimal("200.00"),
+        original_invoice_already_paid=True,
+        original_invoice_state_unchanged=True,
+    )
+    deleted = _evaluate(
+        "INV-027",
+        original_transaction_exists=False,
+        linked_refund_total=Decimal("200.00"),
+        original_amount=Decimal("200.00"),
+        original_invoice_already_paid=False,
+        original_invoice_state_unchanged=True,
+    )
+    overshoot = _evaluate(
+        "INV-027",
+        original_transaction_exists=True,
+        linked_refund_total=Decimal("250.00"),
+        original_amount=Decimal("200.00"),
+        original_invoice_already_paid=False,
+        original_invoice_state_unchanged=True,
+    )
+    rewritten = _evaluate(
+        "INV-027",
+        original_transaction_exists=True,
+        linked_refund_total=Decimal("200.00"),
+        original_amount=Decimal("200.00"),
+        original_invoice_already_paid=True,
+        original_invoice_state_unchanged=False,
+    )
+    assert valid.status is InvariantStatus.PASS
+    assert deleted.status is InvariantStatus.FAIL
+    assert overshoot.status is InvariantStatus.FAIL
+    assert overshoot.difference == Decimal("50.00")
+    assert rewritten.status is InvariantStatus.FAIL
+
+
+def test_card_invoice_divergence_never_silently_adjusted() -> None:
+    for status in ("reconciled", "unreconciled_explained", "unreconciled_unexplained", "not_applicable"):
+        result = _evaluate("INV-028", divergence_status=status, synthetic_adjustment_created=False)
+        assert result.status is InvariantStatus.PASS
+    invalid_status = _evaluate(
+        "INV-028", divergence_status="auto_adjusted", synthetic_adjustment_created=False
+    )
+    synthetic = _evaluate(
+        "INV-028", divergence_status="reconciled", synthetic_adjustment_created=True
+    )
+    assert invalid_status.status is InvariantStatus.FAIL
+    assert synthetic.status is InvariantStatus.FAIL

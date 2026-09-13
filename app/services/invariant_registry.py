@@ -12,6 +12,10 @@ from app.services.financial_invariants import (
     validate_benefits_not_cash,
     validate_canonical_historical_source,
     validate_card_competence,
+    validate_card_invoice_divergence_not_silently_adjusted,
+    validate_card_invoice_payment_no_duplicate_expense,
+    validate_card_invoice_principal_not_new_expense,
+    validate_card_invoice_refund_preserves_history,
     validate_card_payment,
     validate_commission_competence,
     validate_confirmed_balance_sovereignty,
@@ -353,6 +357,65 @@ _DEFINITIONS = (
             "closing_matches_confirmed_anchor",
         ),
         validator=validate_confirmed_balance_sovereignty,
+    ),
+    InvariantDefinition(
+        id="INV-025",
+        name="card_invoice_payment_no_duplicate_expense",
+        title="Pagamento de fatura nunca duplica gasto",
+        description=(
+            "October Go-Live Slice 2: qualquer pagamento de `CardInvoice` -- integral ou parcial, "
+            "em um ou mais pagamentos ao longo do tempo -- cria apenas um lançamento de conciliação "
+            "na conta pagadora; a contagem de despesas do ciclo permanece idêntica antes e depois."
+        ),
+        severity=IntegritySeverity.BLOCK,
+        required_facts=("expense_count_before", "expense_count_after"),
+        validator=validate_card_invoice_payment_no_duplicate_expense,
+    ),
+    InvariantDefinition(
+        id="INV-026",
+        name="card_invoice_principal_not_new_expense",
+        title="Principal carregado não é gasto novo",
+        description=(
+            "October Go-Live Slice 2: o saldo não pago de uma fatura fechada é transportado para o "
+            "ciclo seguinte apenas como `principal_carried_in`/`principal_carried_out` -- nunca uma "
+            "nova despesa -- e nunca fica negativo."
+        ),
+        severity=IntegritySeverity.BLOCK,
+        required_facts=("principal_carried_in", "new_expense_transactions_for_carry"),
+        validator=validate_card_invoice_principal_not_new_expense,
+    ),
+    InvariantDefinition(
+        id="INV-027",
+        name="card_invoice_refund_preserves_history",
+        title="Estorno neutraliza sem apagar histórico",
+        description=(
+            "October Go-Live Slice 2: um estorno vinculado explicitamente a uma compra de cartão "
+            "nunca apaga a compra original, nunca neutraliza mais do que o valor efetivamente "
+            "gasto, e nunca reescreve `computed_total`/`paid_total`/`status` de um ciclo já pago "
+            "quando o próprio estorno é lançado em um ciclo posterior."
+        ),
+        severity=IntegritySeverity.BLOCK,
+        required_facts=(
+            "original_transaction_exists",
+            "linked_refund_total",
+            "original_amount",
+            "original_invoice_already_paid",
+            "original_invoice_state_unchanged",
+        ),
+        validator=validate_card_invoice_refund_preserves_history,
+    ),
+    InvariantDefinition(
+        id="INV-028",
+        name="card_invoice_divergence_not_silently_adjusted",
+        title="Divergência de fatura nunca é ajustada silenciosamente",
+        description=(
+            "October Go-Live Slice 2: quando `declared_total` diverge de `computed_total + "
+            "principal_carried_in` além da tolerância padrão, o sistema reporta um dos quatro "
+            "status documentados e nunca fabrica um ajuste sintético para forçar `reconciled`."
+        ),
+        severity=IntegritySeverity.CRITICAL,
+        required_facts=("divergence_status", "synthetic_adjustment_created"),
+        validator=validate_card_invoice_divergence_not_silently_adjusted,
     ),
 )
 

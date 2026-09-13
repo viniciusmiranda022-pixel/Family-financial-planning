@@ -34,6 +34,7 @@ from app.models import (
     AuditEvent,
     CaptureDraft,
     CaptureProcessingJob,
+    CardInvoice,
     Category,
     ClassificationRule,
     Commission,
@@ -62,7 +63,10 @@ from app.schemas import (
     CaptureConfirmRequest,
     CardCompetenceRepairApplyRequest,
     CardCompetenceRepairRollbackRequest,
+    CardInvoiceCloseRequest,
     CardInvoicePaymentRequest,
+    CardInvoicePayRequest,
+    CardInvoiceSyncRequest,
     CardPaymentLinkRequest,
     CardPaymentUnlinkRequest,
     ClassificationRuleDeactivateRequest,
@@ -84,6 +88,8 @@ from app.schemas import (
     ProfileRequest,
     PurchaseScenarioAlternativeRequest,
     PurchaseScenarioComparisonRequest,
+    RefundLinkRequest,
+    RefundUnlinkRequest,
     SemanticAuditRequest,
     SetupRequest,
     TransactionUpdate,
@@ -120,6 +126,23 @@ from app.services.card_competence_repair import (
     preview_card_competence_repair,
     rollback_card_competence_repair,
     serialize_candidate,
+)
+from app.services.card_invoice_lifecycle import (
+    CardInvoiceError,
+    close_invoice,
+    get_or_sync_invoice,
+    invoice_divergence,
+    invoice_purchase_lines,
+    link_refund,
+    linked_refund_total_for,
+    pay_invoice,
+    serialize_card_invoice,
+    serialize_invoice_divergence,
+    serialize_invoice_purchase_line,
+    unlink_refund,
+)
+from app.services.card_invoice_lifecycle import (
+    list_invoices as list_card_invoices,
 )
 from app.services.card_payment_reconciliation import (
     CardPaymentLinkError,
@@ -178,7 +201,7 @@ from app.services.financial_integrity import (
     serialize_finding,
     serialize_run,
 )
-from app.services.financial_invariants import InvariantContext, InvariantScope
+from app.services.financial_invariants import InvariantContext, InvariantScope, InvariantStatus
 from app.services.financial_revision import current_household_financial_revision
 from app.services.financial_snapshots import (
     account_cash_flow_rows,
@@ -5897,6 +5920,541 @@ def pay_card_invoice_reconciliation(
         "card_transaction_id": card.id,
         "review_items": 1 if review_created else 0,
     }
+
+
+def _expense_count(db: Session, *, household_id: str, account_id: str, competence: str) -> int:
+    """Deterministic count reused by every `CardInvoice` integrity check
+    below (`INV-025`/`INV-026`) instead of a second counting policy."""
+
+    return int(
+        db.scalar(
+            select(func.count(Transaction.id)).where(
+                Transaction.household_id == household_id,
+                Transaction.account_id == account_id,
+                Transaction.competence == competence,
+                Transaction.transaction_type == "expense",
+            )
+        )
+        or 0
+    )
+
+
+def _pending_expense_transactions(db: Session) -> int:
+    """Counts not-yet-flushed `Transaction(transaction_type="expense")`
+    objects already added to `db` in the current unit of work -- a direct,
+    runtime-observed witness (not a hardcoded assumption) that a given
+    lifecycle call created no new economic expense, used by the `CardInvoice`
+    integrity checks below (`INV-025`/`INV-026`/`INV-028`)."""
+
+    return sum(
+        1
+        for obj in db.new
+        if isinstance(obj, Transaction) and obj.transaction_type == "expense"
+    )
+
+
+def _inv026_check(db: Session, invoice: CardInvoice) -> IntegrityCheck:
+    """`INV-026` context for a `CardInvoice` that was just synced/closed/paid
+    -- `card_invoice_lifecycle.get_or_sync_invoice`/`close_invoice`/
+    `pay_invoice` never create an `expense` `Transaction`, so
+    `_pending_expense_transactions` witnesses that directly instead of
+    assuming it."""
+
+    return IntegrityCheck(
+        "INV-026",
+        InvariantContext(
+            facts={
+                "principal_carried_in": str(invoice.principal_carried_in),
+                "new_expense_transactions_for_carry": _pending_expense_transactions(db),
+            },
+            scope=InvariantScope.ENTITY,
+            entity_type="card_invoice",
+            entity_id=invoice.id,
+            period=invoice.competence,
+        ),
+    )
+
+
+def _run_card_invoice_integrity_checks(
+    db: Session,
+    *,
+    user: User,
+    invoice_id: str,
+    checks: tuple[IntegrityCheck, ...],
+    period: str | None = None,
+    scope_entity_type: str = "card_invoice",
+) -> None:
+    """October Go-Live Slice 2: evaluates INV-025..INV-028 against the
+    `Financial Integrity Engine` (`app.services.invariant_registry`) right
+    after a `CardInvoice` lifecycle mutation, instead of leaving these
+    BLOCK/CRITICAL invariants documented-only. A non-`pass` result is
+    persisted as an `IntegrityFinding` like any other invariant
+    (`execute_integrity_run`); a `fail` additionally aborts the request
+    instead of silently committing a state the engine itself proved
+    violates a BLOCK/CRITICAL rule -- these are self-consistency proofs over
+    code that is deterministic by construction, so a `fail` here means a
+    genuine regression, never an expected outcome to tolerate.
+    """
+
+    if not checks:
+        return
+    _run, results = execute_integrity_run(
+        db,
+        household_id=user.household_id,
+        scope=IntegrityRunScope.ENTITY,
+        trigger=IntegrityRunTrigger.TRANSACTION,
+        checks=checks,
+        created_by=user.id,
+        period=period,
+        scope_entity_type=scope_entity_type,
+        scope_entity_id=invoice_id,
+    )
+    failed = [result for result in results if result.status == InvariantStatus.FAIL]
+    if failed:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Falha de integridade financeira detectada "
+                f"({', '.join(result.invariant_id for result in failed)}); operação abortada, "
+                "nada foi salvo."
+            ),
+        )
+
+
+@router.get("/card-invoices")
+def card_invoices(
+    account_id: str | None = None,
+    period: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """`CardInvoice` lifecycle read model -- October Go-Live Slice 2.
+
+    Pure read of already-persisted rows, except the one narrow exception
+    `list_invoices` documents (the household's *current* billing cycle for
+    `account_id` is synced on first access when it has no row yet).
+    """
+
+    invoices = list_card_invoices(db, household_id=user.household_id, account_id=account_id, period=period)
+    if account_id and not period:
+        db.commit()
+    return [serialize_card_invoice(invoice) for invoice in invoices]
+
+
+@router.get("/card-invoices/{invoice_id}/lines")
+def card_invoice_lines(
+    invoice_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Rebaseline §6.7 ("compra parcelada"): every purchase already claimed
+    by this invoice, each with `compra contratada`/`impacto no mês`/
+    `parcelas futuras` -- never fabricating a future `Transaction`, only
+    the total still COMPROMETIDO on an already-confirmed installment row.
+    """
+
+    try:
+        lines = invoice_purchase_lines(db, household_id=user.household_id, invoice_id=invoice_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada") from exc
+    return [serialize_invoice_purchase_line(line) for line in lines]
+
+
+@router.post("/card-invoices/sync", status_code=status.HTTP_201_CREATED)
+def sync_card_invoice(
+    payload: CardInvoiceSyncRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    account = db.scalar(
+        select(Account).where(Account.id == payload.account_id, Account.household_id == user.household_id)
+    )
+    if account is None:
+        raise HTTPException(status_code=404, detail="Cartão não encontrado")
+    competence = payload.competence or card_invoice_competence(account, date.today())
+    invoice = get_or_sync_invoice(db, household_id=user.household_id, account=account, competence=competence)
+    _run_card_invoice_integrity_checks(
+        db,
+        user=user,
+        invoice_id=invoice.id,
+        period=invoice.competence,
+        checks=(_inv026_check(db, invoice),),
+    )
+    db.commit()
+    return serialize_card_invoice(invoice)
+
+
+@router.post("/card-invoices/{invoice_id}/close")
+def close_card_invoice(
+    invoice_id: str,
+    payload: CardInvoiceCloseRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        invoice = close_invoice(db, household_id=user.household_id, invoice_id=invoice_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada") from exc
+    except CardInvoiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _run_card_invoice_integrity_checks(
+        db,
+        user=user,
+        invoice_id=invoice.id,
+        period=invoice.competence,
+        checks=(_inv026_check(db, invoice),),
+    )
+    audit(
+        db,
+        user,
+        "card_invoice.close",
+        "card_invoice",
+        invoice.id,
+        {"competence": invoice.competence, "status": invoice.status},
+        reason=payload.reason,
+        source="card_invoice_lifecycle",
+        trace_id=invoice.trace_id,
+    )
+    db.commit()
+    return serialize_card_invoice(invoice)
+
+
+@router.get("/card-invoices/{invoice_id}/divergence")
+def card_invoice_divergence(
+    invoice_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Rebaseline §6.4 -- never adjusts silently. `status ==
+    "unreconciled_unexplained"` surfaces `FATURA NÃO RECONCILIADA` for
+    human review instead of being masked. `INV-028` (Financial Integrity
+    Engine) confirms at runtime that this call itself created no
+    `Transaction` -- a synthetic adjustment would be exactly that."""
+
+    try:
+        divergence = invoice_divergence(db, household_id=user.household_id, invoice_id=invoice_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada") from exc
+    _run_card_invoice_integrity_checks(
+        db,
+        user=user,
+        invoice_id=invoice_id,
+        checks=(
+            IntegrityCheck(
+                "INV-028",
+                InvariantContext(
+                    facts={
+                        "divergence_status": divergence.status,
+                        "synthetic_adjustment_created": any(isinstance(obj, Transaction) for obj in db.new),
+                    },
+                    scope=InvariantScope.ENTITY,
+                    entity_type="card_invoice",
+                    entity_id=invoice_id,
+                ),
+            ),
+        ),
+    )
+    db.commit()
+    return serialize_invoice_divergence(divergence)
+
+
+@router.post("/card-invoices/{invoice_id}/pay", status_code=status.HTTP_201_CREATED)
+def pay_card_invoice_lifecycle(
+    invoice_id: str,
+    payload: CardInvoicePayRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Manual payment of a `CardInvoice` -- superset of
+    `pay_card_invoice_reconciliation`: accepts a partial amount up to the
+    invoice's outstanding balance (rebaseline §6.5). See
+    `app.services.card_invoice_lifecycle.pay_invoice`.
+    """
+
+    _require_admin(user)
+    paying_account = db.scalar(
+        select(Account).where(
+            Account.id == payload.paying_account_id,
+            Account.household_id == user.household_id,
+            Account.active.is_(True),
+        )
+    )
+    if not paying_account:
+        raise HTTPException(status_code=404, detail="Conta pagadora não encontrada")
+
+    profile = profile_for(db, user.household_id)
+    large_threshold = _large_entry_threshold(profile)
+    if payload.amount >= large_threshold and not payload.confirmed_large_amount:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Este valor exige confirmação adicional. Confirme apenas se o pagamento "
+                f"aconteceu de verdade; use o Consultor para simulações. Limite de confirmação: "
+                f"R$ {large_threshold:,.2f}."
+            ),
+        )
+
+    invoice_before = db.get(CardInvoice, invoice_id)
+    if invoice_before is None or invoice_before.household_id != user.household_id:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada")
+    expense_count_before = _expense_count(
+        db,
+        household_id=user.household_id,
+        account_id=invoice_before.account_id,
+        competence=invoice_before.competence,
+    )
+
+    category = category_for(db, user.household_id, "Conciliação")
+    try:
+        checking_leg, invoice, duplicate_assessment, is_idempotent_replay = pay_invoice(
+            db,
+            household_id=user.household_id,
+            invoice_id=invoice_id,
+            paying_account=paying_account,
+            category=category,
+            amount=payload.amount,
+            booked_at=payload.booked_at,
+            description=payload.description,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada") from exc
+    except CardInvoiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    review_created = False
+    if is_idempotent_replay:
+        # Same paying account/amount/description/date already persisted as a
+        # `reconciliation` leg on this exact invoice -- retry of the exact
+        # same request (Work Order "idempotência de pagamento"). Nothing new
+        # is created and `paid_total`/`status` are not touched again; audit
+        # records the replay itself so it is never silently invisible.
+        audit(
+            db,
+            user,
+            "card_invoice.pay.idempotent_replay",
+            "card_invoice",
+            invoice.id,
+            {
+                "checking_transaction_id": checking_leg.id,
+                "paying_account_id": paying_account.id,
+                "amount": str(checking_leg.amount),
+            },
+            trace_id=checking_leg.trace_id,
+            source="card_invoice_lifecycle",
+        )
+        db.commit()
+        return {
+            "checking_transaction_id": checking_leg.id,
+            "invoice": serialize_card_invoice(invoice),
+            "review_items": 0,
+            "idempotent_replay": True,
+        }
+
+    if duplicate_assessment is not None:
+        review_created = True
+        db.add(
+            ReviewItem(
+                household_id=user.household_id,
+                transaction_id=checking_leg.id,
+                reason="possible_duplicate",
+                details=(
+                    "Pagamento de fatura (CardInvoice) agrupado como possível repetição "
+                    f"({duplicate_assessment.band}, confiança {duplicate_assessment.confidence})"
+                ),
+            )
+        )
+
+    expense_count_after = _expense_count(
+        db,
+        household_id=user.household_id,
+        account_id=invoice.account_id,
+        competence=invoice.competence,
+    )
+    _run_card_invoice_integrity_checks(
+        db,
+        user=user,
+        invoice_id=invoice.id,
+        period=invoice.competence,
+        checks=(
+            IntegrityCheck(
+                "INV-025",
+                InvariantContext(
+                    facts={
+                        "expense_count_before": expense_count_before,
+                        "expense_count_after": expense_count_after,
+                    },
+                    scope=InvariantScope.ENTITY,
+                    entity_type="card_invoice",
+                    entity_id=invoice.id,
+                    period=invoice.competence,
+                ),
+            ),
+            _inv026_check(db, invoice),
+        ),
+    )
+
+    audit(
+        db,
+        user,
+        "card_invoice.pay",
+        "card_invoice",
+        invoice.id,
+        {
+            "checking_transaction_id": checking_leg.id,
+            "paying_account_id": paying_account.id,
+            "amount": str(checking_leg.amount),
+            "status": invoice.status,
+            "outstanding_balance": serialize_card_invoice(invoice)["outstanding_balance"],
+        },
+        trace_id=checking_leg.trace_id,
+        source="card_invoice_lifecycle",
+    )
+    db.commit()
+    return {
+        "checking_transaction_id": checking_leg.id,
+        "invoice": serialize_card_invoice(invoice),
+        "review_items": 1 if review_created else 0,
+        "idempotent_replay": False,
+    }
+
+
+@router.post("/transactions/{transaction_id}/link-refund", status_code=status.HTTP_201_CREATED)
+def link_refund_transaction(
+    transaction_id: str,
+    payload: RefundLinkRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Explicit, human-confirmed refund lineage -- rebaseline §6.6.
+    `transaction_id` (path) must equal `payload.refund_transaction_id`;
+    the body keeps the field name explicit for clarity in the audit log.
+    """
+
+    _require_admin(user)
+    if transaction_id != payload.refund_transaction_id:
+        raise HTTPException(status_code=422, detail="O identificador da rota não corresponde ao do corpo")
+
+    original_before = db.get(Transaction, payload.original_transaction_id)
+    original_invoice_before = (
+        db.get(CardInvoice, original_before.card_invoice_id)
+        if original_before is not None and original_before.card_invoice_id
+        else None
+    )
+    original_invoice_was_paid = (
+        original_invoice_before is not None and original_invoice_before.status == "paid"
+    )
+    original_invoice_snapshot_before = (
+        (
+            original_invoice_before.computed_total,
+            original_invoice_before.paid_total,
+            original_invoice_before.status,
+        )
+        if original_invoice_before is not None
+        else None
+    )
+
+    try:
+        refund, original = link_refund(
+            db,
+            household_id=user.household_id,
+            refund_transaction_id=payload.refund_transaction_id,
+            original_transaction_id=payload.original_transaction_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Lançamento não encontrado") from exc
+    except CardInvoiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    original_still_exists = db.get(Transaction, original.id) is not None
+    original_invoice_snapshot_after = (
+        (
+            original_invoice_before.computed_total,
+            original_invoice_before.paid_total,
+            original_invoice_before.status,
+        )
+        if original_invoice_before is not None
+        else None
+    )
+    _run_card_invoice_integrity_checks(
+        db,
+        user=user,
+        invoice_id=original.id,
+        scope_entity_type="transaction",
+        checks=(
+            IntegrityCheck(
+                "INV-027",
+                InvariantContext(
+                    facts={
+                        "original_transaction_exists": original_still_exists,
+                        "linked_refund_total": str(
+                            linked_refund_total_for(
+                                db, household_id=user.household_id, original_transaction_id=original.id
+                            )
+                        ),
+                        "original_amount": str(money(abs(original.amount))),
+                        "original_invoice_already_paid": original_invoice_was_paid,
+                        "original_invoice_state_unchanged": (
+                            original_invoice_snapshot_before == original_invoice_snapshot_after
+                        ),
+                    },
+                    scope=InvariantScope.ENTITY,
+                    entity_type="transaction",
+                    entity_id=original.id,
+                ),
+            ),
+        ),
+    )
+
+    audit(
+        db,
+        user,
+        "refund.link",
+        "transaction",
+        refund.id,
+        {"original_transaction_id": original.id},
+        before_state={"refund_of_transaction_id": None},
+        after_state={"refund_of_transaction_id": original.id},
+        reason=payload.reason,
+        source="card_invoice_lifecycle",
+    )
+    db.commit()
+    return {"refund_transaction_id": refund.id, "original_transaction_id": original.id}
+
+
+@router.post("/transactions/{transaction_id}/unlink-refund")
+def unlink_refund_transaction(
+    transaction_id: str,
+    payload: RefundUnlinkRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    if transaction_id != payload.refund_transaction_id:
+        raise HTTPException(status_code=422, detail="O identificador da rota não corresponde ao do corpo")
+    try:
+        refund, previous_original_id = unlink_refund(
+            db, household_id=user.household_id, refund_transaction_id=payload.refund_transaction_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Lançamento não encontrado") from exc
+    except CardInvoiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "refund.unlink",
+        "transaction",
+        refund.id,
+        {},
+        before_state={"refund_of_transaction_id": previous_original_id},
+        after_state={"refund_of_transaction_id": None},
+        reason=payload.reason,
+        source="card_invoice_lifecycle",
+    )
+    db.commit()
+    return {"refund_transaction_id": refund.id}
 
 
 @router.get("/classification-rules")
