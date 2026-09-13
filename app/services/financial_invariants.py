@@ -734,6 +734,139 @@ def validate_lineage(definition: InvariantDefinition, context: InvariantContext)
     )
 
 
+def validate_card_invoice_payment_no_duplicate_expense(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-025 (October Go-Live Slice 2): a `CardInvoice` payment -- partial
+    or full, in one or more calls over time -- never creates or duplicates
+    an `expense` `Transaction`. The cycle's own `expense` count must be
+    identical immediately before and immediately after the payment call
+    that produced this context (`app.services.card_invoice_lifecycle.
+    pay_invoice` always creates a `reconciliation` leg, never a new
+    `expense`)."""
+
+    before = _integer(context, "expense_count_before")
+    after = _integer(context, "expense_count_after")
+    matches = before == after
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            "O pagamento da fatura não alterou a contagem de despesas do ciclo."
+            if matches
+            else "O pagamento da fatura alterou a contagem de despesas do ciclo -- possível gasto duplicado."
+        ),
+        expected={"expense_count": before},
+        actual={"expense_count": after},
+        difference=Decimal(after - before),
+    )
+
+
+def validate_card_invoice_principal_not_new_expense(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-026: the unpaid balance a closed `CardInvoice` carries into the
+    next cycle (`principal_carried_in`) is only ever the cache field itself
+    -- never materialized as a new `expense`/purchase `Transaction` in the
+    cycle that inherits it. `principal_carried_in` is also never negative
+    (this slice never models a card credit balance -- see
+    `card_invoice_lifecycle.outstanding_balance`)."""
+
+    principal_carried_in = _decimal(context, "principal_carried_in")
+    new_expense_transactions_for_carry = _integer(context, "new_expense_transactions_for_carry")
+    matches = principal_carried_in >= 0 and new_expense_transactions_for_carry == 0
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            "O saldo transportado permanece apenas como campo de fatura, sem nova despesa."
+            if matches
+            else "O saldo transportado é negativo ou foi materializado como uma nova despesa."
+        ),
+        expected={"new_expense_transactions_for_carry": 0, "principal_carried_in_negative": False},
+        actual={
+            "new_expense_transactions_for_carry": new_expense_transactions_for_carry,
+            "principal_carried_in_negative": principal_carried_in < 0,
+        },
+        metadata={"principal_carried_in": str(principal_carried_in)},
+    )
+
+
+def validate_card_invoice_refund_preserves_history(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-027: linking a refund to the card purchase it neutralizes
+    (`card_invoice_lifecycle.link_refund`) never deletes the original
+    purchase, never lets the sum of linked refunds exceed what was actually
+    spent, and -- when the refund lands in a later cycle than an original
+    invoice that has *already been paid* -- never rewrites that already-
+    settled invoice's `computed_total`/`paid_total`/`status`."""
+
+    original_exists = _boolean(context, "original_transaction_exists")
+    linked_refund_total = _decimal(context, "linked_refund_total")
+    original_amount = _decimal(context, "original_amount")
+    original_invoice_already_paid = _boolean(context, "original_invoice_already_paid")
+    original_invoice_state_unchanged = _boolean(context, "original_invoice_state_unchanged")
+
+    within_original_amount = linked_refund_total <= original_amount + MONEY_TOLERANCE
+    settled_invoice_untouched = (not original_invoice_already_paid) or original_invoice_state_unchanged
+    matches = original_exists and within_original_amount and settled_invoice_untouched
+    failures = {
+        "original_transaction_deleted": not original_exists,
+        "linked_refund_exceeds_original_amount": not within_original_amount,
+        "already_paid_invoice_rewritten": original_invoice_already_paid and not original_invoice_state_unchanged,
+    }
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            "O estorno neutralizou apenas o valor vinculado sem apagar ou reescrever histórico."
+            if matches
+            else "O estorno apagou a compra original, excedeu o valor gasto ou reescreveu fatura já paga."
+        ),
+        expected={
+            "original_transaction_exists": True,
+            "linked_refund_total_within_original_amount": True,
+            "already_paid_invoice_rewritten": False,
+        },
+        actual={
+            "original_transaction_exists": original_exists,
+            "linked_refund_total": str(linked_refund_total),
+            "original_amount": str(original_amount),
+            **failures,
+        },
+        difference=_money(max(Decimal("0"), linked_refund_total - original_amount)),
+    )
+
+
+def validate_card_invoice_divergence_not_silently_adjusted(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-028: `card_invoice_lifecycle.invoice_divergence` only ever
+    reports one of the four documented statuses and never fabricates a
+    synthetic adjustment to force `reconciled` -- rebaseline §6.4."""
+
+    status = _text(context, "divergence_status")
+    synthetic_adjustment_created = _boolean(context, "synthetic_adjustment_created")
+    allowed_statuses = {"reconciled", "unreconciled_explained", "unreconciled_unexplained", "not_applicable"}
+    matches = status in allowed_statuses and not synthetic_adjustment_created
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            "A divergência de fatura foi sinalizada sem ajuste sintético."
+            if matches
+            else "A divergência de fatura foi resolvida com um status inválido ou um ajuste sintético."
+        ),
+        expected={"divergence_status": sorted(allowed_statuses), "synthetic_adjustment_created": False},
+        actual={"divergence_status": status, "synthetic_adjustment_created": synthetic_adjustment_created},
+    )
+
+
 def duplicate_confidence_band(confidence: Decimal | int | float | str) -> str:
     value = Decimal(str(confidence))
     if value < 0 or value > 1:
