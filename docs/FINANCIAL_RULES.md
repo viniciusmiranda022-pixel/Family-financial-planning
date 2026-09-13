@@ -73,6 +73,13 @@ conciliação):
 - O imposto é arredondado por recebível, e não apenas sobre o total agregado.
 - Uma comissão cadastrada em 2027 não pode aparecer em 2026.
 - O cenário conservador desloca o mês; não muda o ano de origem nem antecipa receita.
+- Uma comissão só entra na visão financeira quando efetivamente registrada; nunca é criada
+  automaticamente por importação ou classificação (rebaseline §8.3).
+- **October Go-Live Slice 3 (P0 #87):** `POST /commissions/{id}/receive` marca explicitamente uma
+  comissão como recebida (`status="received"`, `received_date`) sem criar/editar/apagar nenhuma
+  `Transaction` -- o crédito real é esperado já existir pelo fluxo normal de renda. A partir desse
+  momento, a comissão sai da projeção futura (`GET /forecast`) em todos os cenários -- nunca soma o
+  valor previsto ao valor real do mesmo evento (INV-029, `docs/FINANCIAL_INVARIANTS.md`).
 
 ## Holerites
 
@@ -81,6 +88,12 @@ conciliação):
 - 13º e férias são eventos separados.
 - Adiantamento salarial de férias não é renda extra.
 - Apenas o adicional líquido real deve ser cadastrado como `vacation_extra`.
+- **October Go-Live Slice 3 (P0 #87):** o salário-base configurado
+  (`FinancialProfile.monthly_salary_net`) é aplicado como PREVISTO em todo mês futuro da projeção.
+  Quando já existe um lançamento real de renda para a mesma competência dentro da tolerância
+  monetária padrão, esse mês passa a usar o valor real em vez do valor previsto -- nunca a soma dos
+  dois (`app.services.recurring_income.reconcile_recurring_income`, INV-030). "PREVISTO -> REALIZADO"
+  nunca cria uma segunda renda.
 
 ## Benefícios
 
@@ -322,6 +335,20 @@ projeção/simulação (30/60/90 dias, comparação de cenário de compra). Elas
 - Codex/Advisor não calcula reconciliação, confiança de duplicidade, baseline, status canônico ou
   decisão de exclusão; esses resultados permanecem determinísticos e auditáveis.
 
+## Obrigações e estados financeiros (October Go-Live Slice 3, P0 #87)
+
+- Todo fato/compromisso/hipótese é rotulado com exatamente um dos três estados do rebaseline §3:
+  REALIZADO, COMPROMETIDO ou PREVISTO. Nunca somados nem tratados como o mesmo conceito.
+- O rótulo é sempre computado (`app.services.financial_state`), nunca uma coluna persistida
+  independente: uma `Obligation` paga é REALIZADO, pendente é COMPROMETIDO -- inclusive vencida; uma
+  `CardInvoice` fechada/parcialmente paga é COMPROMETIDO; toda linha de projeção é PREVISTO.
+- Uma obrigação vencida e não paga permanece COMPROMETIDA e visível; atraso nunca a remove da lista
+  nem da projeção.
+- Uma fatura de cartão já fechada e ainda não paga é um compromisso real, com o mesmo direito de
+  aparecer na projeção que uma `Obligation` -- nunca invisível só porque nasceu de outra entidade.
+- Pagar uma obrigação vincula a transação real, remove o valor da projeção futura e nunca duplica a
+  despesa já reconhecida por compra/fatura/transação (`pay_obligation`/`unpay_obligation`).
+
 ## Projeções
 
 O sistema produz três cenários:
@@ -335,13 +362,19 @@ Cada linha mensal considera:
 ```text
 saldo anterior
 + rendimento estimado
-+ salário líquido
++ salário líquido (real, quando reconciliado; previsto, caso contrário)
 + eventos adicionais da folha
-+ comissão líquida do cenário
++ comissão líquida do cenário (nunca uma comissão já marcada como recebida)
 - compromissos
+- faturas de cartão já fechadas e ainda não pagas
 - parcelas futuras
 - teto de gastos em dinheiro
 ```
+
+**October Go-Live Slice 3 (P0 #87):** um compromisso (`Obligation` vencida ou `CardInvoice`
+fechada/parcialmente paga) cujo vencimento já passou nunca desaparece da projeção só porque seu
+próprio mês ficou no passado -- ele é somado ao primeiro mês que a projeção efetivamente exibe. Ver
+`docs/ARCHITECTURE.md` ("Obrigações e projeção REALIZADO/COMPROMETIDO/PREVISTO").
 
 O fechamento canônico aplica:
 

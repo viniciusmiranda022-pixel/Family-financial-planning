@@ -583,3 +583,73 @@ entrega, sem reabrir o plano acima:**
 6. Regressão adicional corrigida: `principal_carried_in` deixou de oscilar retroativamente depois
    que a própria fatura já recebeu um pagamento (`get_or_sync_invoice`'s `paid_total <= 0` guard) —
    ver `tests/test_card_invoice_lifecycle.py::test_principal_carried_in_does_not_oscillate_after_invoice_already_paid`.
+
+## 11. Status pós-implementação — Slice 3 (2026-09-13)
+
+**Slice 3** (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md`) implementou o plano do §3.3/§4
+essencialmente como proposto, sem coluna persistida nova para `financial_state` — computado na
+camada de serialização, exatamente como recomendado:
+
+- `app/services/financial_state.py` (constantes `REALIZADO`/`COMPROMETIDO`/`PREVISTO`) e
+  `app/services/recurring_income.py` (`reconcile_recurring_income`) — módulos novos, ambos puros ou
+  quase puros (o segundo só lê `Transaction`, nunca escreve).
+- `_obligation_rows` ganhou `financial_state` computado (§4 do plano). **Desvio deliberado do §4
+  (refinamento de implementação, não Technical Challenge):** o plano original sugeria mesclar
+  `CardInvoice` e `_future_installments` na mesma resposta de `GET /obligations`. Investigação do
+  frontend (`app/static/app.js`, tela "Contas a pagar") mostrou que essa tela **já** chama
+  `GET /obligations` e `GET /card-invoices` em paralelo e renderiza cada um em sua própria tabela
+  (comentário existente em `app/static/app.js`: "`GET /obligations` (unchanged, slice-1-era) e
+  `GET /card-invoices`"). Mesclar `CardInvoice` na resposta de `/obligations` duplicaria essas faturas
+  nas duas tabelas simultaneamente e exigiria retrabalho de frontend fora do escopo deste slice (que é
+  UX/navegação, reservado ao Slice 5). Em vez de mesclar payloads HTTP, cada superfície ganhou seu
+  próprio `financial_state` computado de forma independente e consistente:
+  `serialize_card_invoice` (`app/services/card_invoice_lifecycle.py::invoice_financial_state`) e
+  `GET /commissions`. Nenhuma tabela soma duas vezes a mesma linha porque nenhuma união de payload
+  foi criada.
+- **Achado adicional durante a implementação, corrigido no mesmo PR (não estava listado
+  explicitamente no plano do Slice 0, mas está diretamente coberto pelo Work Order do Slice 3 e pelo
+  rebaseline §7 — "atraso não vira gasto duplicado nem desaparece da projeção"):**
+  `_forecast_obligations` bucketava cada ocorrência pela própria data de vencimento; uma obrigação
+  vencida cujo mês já ficou no passado nunca era revisitada pelo cursor somente-para-frente de
+  `build_projection` (que começa em `start_month`, sempre o próximo mês a partir de hoje) — o valor
+  simplesmente nunca aparecia em nenhuma linha da projeção, uma forma de desaparecimento silencioso
+  de dinheiro comprometido. O mesmo problema existia de forma mais grave para `CardInvoice`: uma
+  fatura `closed`/`partially_paid` nunca entrava em `ForecastInput` de forma alguma — `/forecast`
+  simplesmente não sabia que ela existia. Corrigido com `start_month` opcional em
+  `_forecast_obligations` (compatibilidade total com quem não o passa — `tests/test_plan_workbook.py`
+  continua com o mesmo resultado) e a nova `_forecast_card_invoices`, ambas dobrando (`clamp`) um
+  vencimento já passado para dentro do próprio `start_month` em vez de deixá-lo em um mês que o
+  cursor nunca visita.
+- `ForecastInput` ganhou `card_invoices`/`monthly_salary_overrides` (ambos com default vazio — zero
+  regressão para quem já constrói `ForecastInput` sem eles: `tests/test_finance.py`,
+  `tests/test_purchase_scenario_comparison.py`, `tests/test_financial_invariants.py` continuam
+  passando sem alteração). `app.services.projection_engine`/`projection_validator` replicam a mesma
+  fórmula estendida em paralelo, preservando a garantia de INV-018 (motor e validador concordam).
+  `PROJECTION_CALCULATION_VERSION` avançou de `2026.09.2` para `2026.10.1`.
+- `reconcile_recurring_income` liga o crédito real ao `monthly_salary_net` PREVISTO do mês exatamente
+  como especificado no §4, sem hardcodar nenhum nome de pessoa — `owner_label` é um filtro opcional.
+- `Commission.received_date` passou a ser lido: `POST /commissions/{id}/receive` (novo, admin-only)
+  marca a comissão como recebida; `_build_projection_gate_checks` a partir de então a exclui de
+  `ForecastInput.commissions`. Fecha o Technical Challenge #2 do Slice 0 (§8 acima) — a lacuna era
+  real e pré-existente, não introduzida por este slice.
+- INV-029/INV-030 registradas em `app/services/invariant_registry.py` e avaliadas em tempo real por
+  `GET /forecast`/`POST /monthly-closes/{period}/run` (`app.api._build_projection_gate_checks`), o
+  mesmo ponto único que já avalia INV-005/006/018/022/023/024 — nunca um segundo mecanismo de
+  avaliação.
+- Nenhuma migration foi necessária: `Commission.received_date` já existe desde a migração `0001`;
+  nenhuma coluna nova foi criada para `financial_state`.
+- Testes novos: `tests/test_recurring_income_reconciliation.py` (unitário, puro),
+  `tests/test_obligation_lifecycle_slice3.py` (unitário + HTTP, inclui a suíte funcional completa de
+  `pay_obligation`/`unpay_obligation` que faltava — plano §6 item 11),
+  `tests/test_commission_lifecycle_slice3.py` (HTTP), mais casos novos em
+  `tests/test_financial_invariants.py` e uma propriedade nova em
+  `tests/test_property_based_financial_rules.py`. Suíte completa (727 testes, incluindo
+  `tests/test_postgresql_integration.py`), `ruff check` e migrations Alembic (SQLite e PostgreSQL 16
+  reais) verificados verdes localmente antes da entrega.
+- **Pendência/decisão consciente fora de escopo:** a restrição de `pay_obligation` a
+  `recurrence_months == 0`/`occurrence_count == 1` (linha 70 do §1.2 acima, "decisão de design em
+  aberto") não foi alterada. O Work Order do Slice 3 não exige pagar uma ocorrência específica de uma
+  obrigação recorrente diretamente; o contorno documentado (cadastrar cada parcela como obrigação
+  individual) continua funcionando e já é coberto pela nova suíte funcional. Mudar esse contrato
+  criaria uma decisão de design nova (qual ocorrência? como marcar as demais?) fora do escopo restrito
+  deste slice — registrado aqui para o Slice 4/5 avaliar se necessário.

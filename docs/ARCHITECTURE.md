@@ -329,6 +329,85 @@ fatura) e, sem uma, publica `unreconciled_unexplained` para revisão humana.
 - **Downgrade de `0015` deixa de ser destrutivo silencioso.** Recusa (levanta `RuntimeError`) quando
   existe algum `refund_of_transaction_id` confirmado -- ver `alembic/versions/0015_card_invoice_lifecycle.py`.
 
+## Obrigações e projeção REALIZADO/COMPROMETIDO/PREVISTO (October Go-Live Slice 3, P0 #87)
+
+`app.services.financial_state` (`REALIZADO`/`COMPROMETIDO`/`PREVISTO`) é o único vocabulário que
+qualquer superfície pode usar para rotular um fato/compromisso/hipótese financeira -- rebaseline §3.
+Nenhuma coluna nova é persistida: seguindo a recomendação de
+`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.3, o rótulo é sempre computado na camada de
+serialização a partir de um dado que já é autoritativo por si só -- nunca um segundo classificador
+que poderia divergir da fonte:
+
+- `Obligation.status == "paid"` -> REALIZADO; `"pending"` -> COMPROMETIDO, inclusive vencida
+  (`app.api._obligation_rows`);
+- `CardInvoice.status in (closed, partially_paid)` -> COMPROMETIDO; `open`/`paid` -> REALIZADO
+  (`app.services.card_invoice_lifecycle.invoice_financial_state`, usado por `serialize_card_invoice`)
+  -- uma fatura `closed`/`partially_paid` é um compromisso contratado ainda não liquidado
+  (rebaseline §6.2); `open` (ainda acumulando -- suas compras já são individualmente REALIZADO,
+  rebaseline §6.1) e `paid` (liquidada) não têm nada em aberto, então nenhuma das duas é um
+  compromisso pendente;
+- `Commission.received_date` preenchido -> REALIZADO; ausente -> PREVISTO
+  (`GET /commissions`, `app.api._build_projection_gate_checks`);
+- toda linha de `GET /forecast` -> PREVISTO (a projeção inteira é hipótese, rebaseline §3/§13.1),
+  com `salary_financial_state`/`salary_reconciled_transaction_id` isolando o único componente que
+  este slice promove a REALIZADO quando há evidência (ver reconciliação abaixo).
+
+**Sem desaparecimento silencioso da projeção (rebaseline §7, "atraso não vira gasto duplicado nem
+desaparece da projeção").** Antes deste slice, `_forecast_obligations` bucketava cada ocorrência
+pela sua própria data de vencimento; uma obrigação vencida cujo mês já ficou no passado nunca era
+revisitada pelo cursor somente-para-frente de `build_projection` (que começa em `start_month`,
+sempre o próximo mês) -- o valor simplesmente nunca aparecia em nenhuma linha da projeção. Faturas de
+cartão fechadas/parcialmente pagas (`CardInvoice`) tinham o mesmo problema, mas de outra forma: nunca
+entravam em `ForecastInput` de forma alguma. Ambas as funções agora recebem `start_month` e dobram
+(`clamp`) qualquer vencimento anterior a ele para dentro do próprio `start_month` -- o compromisso
+aparece exatamente uma vez, no mês mais próximo que a projeção realmente exibe, nunca em um mês que o
+cursor não visita:
+
+- `app.api._forecast_obligations(items, start_month=None)` -- `start_month` opcional preserva o
+  comportamento anterior byte a byte para quem não o passa (ex.: `tests/test_plan_workbook.py`);
+- `app.api._forecast_card_invoices(db, household_id, start_month)` -- soma `outstanding_balance` de
+  toda `CardInvoice` `closed`/`partially_paid` da família, nunca `open`/`paid`.
+
+`ForecastInput` (`app.services.finance.py`) ganhou dois campos aditivos, ambos com default vazio
+(zero regressão para todo chamador existente):
+
+- `card_invoices: dict[str, Decimal]` -- soma-se a `obligations`/`installments` na fórmula de
+  despesas de `build_projection`/`independently_calculate` (INV-018 continua provando que motor e
+  validador concordam com a fórmula estendida); `PROJECTION_CALCULATION_VERSION` avançou de
+  `2026.09.2` para `2026.10.1`;
+- `monthly_salary_overrides: dict[str, Decimal]` -- ver reconciliação de renda recorrente abaixo.
+
+**Reconciliação de renda recorrente (`app.services.recurring_income.reconcile_recurring_income`,
+rebaseline §8.4).** O salário recorrente configurado (`FinancialProfile.monthly_salary_net`) é
+aplicado linearmente em todo mês futuro como PREVISTO. Quando já existe uma `Transaction` real de
+renda para a mesma competência dentro da tolerância monetária padrão (`MONEY_TOLERANCE`), essa
+competência passa a usar o valor real em vez do valor previsto -- nunca a soma dos dois ("PREVISTO ->
+REALIZADO... a conciliação não pode criar uma segunda receita"). A função nunca cria, edita ou apaga
+`Transaction`; uma competência sem correspondência simplesmente permanece PREVISTO. Não fixa nenhum
+nome de pessoa no código -- `owner_label` é um filtro opcional, o salário recorrente pertence a quem
+quer que o perfil tenha configurado. `app.api._build_projection_gate_checks` chama essa função uma
+vez por mês do horizonte de projeção e monta `monthly_salary_overrides`; o mesmo mapa alimenta os
+campos informativos `salary_financial_state`/`salary_reconciled_transaction_id` de cada linha de
+`/forecast`.
+
+**Comissão recebida sai da projeção (`POST /commissions/{id}/receive`, rebaseline §8.3).** Ato
+explícito e humano-confirmado que marca `Commission.status = "received"` e
+`Commission.received_date`; nunca cria, edita ou apaga nenhuma `Transaction` -- o crédito real é
+esperado já existir pelo fluxo normal de renda. Fecha a lacuna que
+`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §2.4 documentava desde o Slice 0:
+`Commission.received_date` existia no modelo desde a migração original mas nunca era lido em lugar
+algum; uma comissão já recebida continuava sendo projetada como futura indefinidamente. A partir
+deste slice, `_build_projection_gate_checks` filtra `Commission.received_date.is_(None)` ao montar
+`ForecastInput.commissions`.
+
+**INV-029/INV-030 (`app/services/invariant_registry.py`).** Ambas avaliadas em tempo real por
+`GET /forecast` e `POST /monthly-closes/{period}/run`
+(`app.api._build_projection_gate_checks`), o mesmo ponto único que já avalia
+INV-005/006/018/022/023/024: INV-029 prova que nenhuma comissão já recebida está entre as
+efetivamente projetadas; INV-030 prova que o primeiro mês exibido pela projeção usa exclusivamente
+um valor para o salário recorrente -- o real quando há evidência, o previsto caso contrário -- nunca
+a soma dos dois.
+
 ## Comparação visual de cenários de compra (Fase 3)
 
 `POST /api/purchases/scenario-comparison` (`app/api.py::compare_purchase_scenarios`) compara duas a

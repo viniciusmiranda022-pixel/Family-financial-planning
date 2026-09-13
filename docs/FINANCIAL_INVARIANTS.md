@@ -1,6 +1,6 @@
 # Contrato de invariantes financeiros
 
-**Versão das regras:** `2026.10.1`
+**Versão das regras:** `2026.10.2`
 **Status:** normativo
 
 **Controle de mudança (2026-10, October Go-Live Slice 1, P0 #87):** INV-005,
@@ -33,8 +33,37 @@ integrar `INVARIANT_REGISTRY` (`app/services/invariant_registry.py`,
 — um resultado `fail` aborta a requisição em vez de persistir silenciosamente
 um estado que o próprio motor provou violar uma regra `BLOCK`/`CRITICAL`.
 Ver `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_2.md`.
+
+**Controle de mudança (2026-10, October Go-Live Slice 3, P0 #87):** INV-029 e
+INV-030 foram adicionadas para a separação REALIZADO/COMPROMETIDO/PREVISTO de
+obrigações e projeção (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md`): uma
+`Commission` já marcada como recebida (`received_date` preenchido via
+`POST /commissions/{id}/receive`) nunca volta a ser projetada como PREVISTO,
+e o salário recorrente configurado (`FinancialProfile.monthly_salary_net`)
+usa o valor de um crédito real já reconciliado
+(`app.services.recurring_income.reconcile_recurring_income`) em vez de somar
+o valor previsto ao valor real do mesmo período. Nenhuma coluna nova foi
+persistida para `financial_state`: o rótulo REALIZADO/COMPROMETIDO/PREVISTO é
+sempre computado na camada de serialização (`app.services.financial_state`)
+a partir de um fato que já é autoritativo por si só (`Obligation.status`,
+`CardInvoice.status`, a origem `Transaction`/projeção) — ver
+`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.3. Ambas são avaliadas em tempo
+real por `GET /forecast` e `POST /monthly-closes/{period}/run`
+(`app.api._build_projection_gate_checks`), o mesmo ponto único que já avalia
+INV-005/006/018/022/023/024. `_forecast_obligations` e a nova
+`_forecast_card_invoices` também passaram a receber o `start_month` da
+projeção: uma `Obligation` vencida e ainda não paga, ou uma `CardInvoice`
+`closed`/`partially_paid` cujo vencimento já passou, deixam de desaparecer
+silenciosamente da projeção (rebaseline §7, "atraso não vira gasto duplicado
+nem desaparece da projeção") — ambas passam a ser somadas ao primeiro mês
+que a projeção efetivamente exibe, nunca em um mês que o cursor da projeção
+não visita. `app.services.projection_engine`/`projection_validator` ganharam
+o termo `card_invoices` e a resolução de `monthly_salary_overrides` em
+paralelo (INV-018 continua provando que engine e validador concordam com a
+nova fórmula); `PROJECTION_CALCULATION_VERSION` avançou de `2026.09.2` para
+`2026.10.1`. Ver `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md`.
 **Implementação executável:** `app/services/invariant_registry.py` (INV-001
-a INV-028).
+a INV-030).
 
 Este documento define as condições que precisam permanecer verdadeiras em importações,
 fechamentos, projeções, snapshots, dashboards, relatórios e contextos enviados ao Advisor.
@@ -516,6 +545,50 @@ que também confirma em runtime que a própria chamada não criou nenhuma `Trans
 `tests/test_card_invoice_lifecycle.py::test_divergence_explained_by_unlinked_refund_in_cycle`,
 `tests/test_financial_invariants.py::test_card_invoice_divergence_never_silently_adjusted`,
 `tests/test_card_invoice_lifecycle.py::test_close_pay_and_divergence_endpoints_run_financial_integrity_checks`.
+
+## INV-029 — Comissão recebida sai da projeção
+
+**Escopo:** PREVISTO (`Commission`, `app.api._build_projection_gate_checks`).
+**Título:** Comissão recebida sai da projeção
+**Descrição:** Uma `Commission` já marcada como recebida (`received_date` preenchido via
+`POST /commissions/{id}/receive`) nunca é incluída novamente como PREVISTO em nenhum cenário de
+projeção. O crédito real já existe como fato (registrado pelo fluxo normal de renda); projetar a
+mesma comissão de novo duplicaria renda.
+**Motivação:** Rebaseline §8.3; `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §2.4/§4.
+**Entradas:** `received_commission_ids` (todas as comissões da família com `received_date`
+preenchido), `projected_commission_ids` (as efetivamente incluídas em `ForecastInput.commissions`).
+**Resultado esperado:** interseção vazia entre `received_commission_ids` e `projected_commission_ids`.
+**Severidade se violado:** `CRITICAL`.
+**Implementação executável:** `app/services/invariant_registry.py`
+(`validate_received_commission_excluded_from_projection`). Avaliada em tempo real por
+`GET /forecast` e `POST /monthly-closes/{period}/run` (`app.api._build_projection_gate_checks`).
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_received_commission_excluded_from_projection_pass_and_fail`,
+`tests/test_commission_lifecycle_slice3.py::test_received_commission_excluded_from_forecast_projection`,
+`tests/test_commission_lifecycle_slice3.py::test_commission_receive_endpoint_marks_received_and_sets_date`.
+
+## INV-030 — Renda recorrente reconciliada não duplica
+
+**Escopo:** PREVISTO/REALIZADO (`FinancialProfile.monthly_salary_net`,
+`app.services.recurring_income.reconcile_recurring_income`).
+**Título:** Renda recorrente reconciliada não duplica
+**Descrição:** Quando existe evidência de um crédito real (`Transaction` de renda) para o salário
+recorrente configurado em um período, a projeção desse período usa exclusivamente o valor do
+crédito real -- nunca soma o valor real ao valor previsto do mesmo período.
+**Motivação:** Rebaseline §8.4 -- "Quando o crédito real chegar: PREVISTO -> REALIZADO. A
+conciliação não pode criar uma segunda receita."
+**Entradas:** `has_recurring_income_evidence`, `expected_amount`, `reconciled_amount`,
+`projected_amount` (todos referentes ao primeiro mês que a projeção exibe).
+**Resultado esperado:** `projected_amount` igual a `reconciled_amount` quando há evidência, ou a
+`expected_amount` caso contrário -- nunca a soma dos dois.
+**Severidade se violado:** `CRITICAL`.
+**Implementação executável:** `app/services/invariant_registry.py`
+(`validate_recurring_income_no_duplicate`). Avaliada em tempo real por `GET /forecast` e
+`POST /monthly-closes/{period}/run` (`app.api._build_projection_gate_checks`).
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_recurring_income_no_duplicate_pass_and_fail`,
+`tests/test_recurring_income_reconciliation.py`,
+`tests/test_commission_lifecycle_slice3.py::test_forecast_uses_realized_salary_amount_when_reconciled`.
 
 ## Controle de mudança
 
