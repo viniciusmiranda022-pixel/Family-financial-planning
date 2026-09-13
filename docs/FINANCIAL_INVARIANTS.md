@@ -24,13 +24,17 @@ pagamento parcial/integral nunca duplica gasto, principal carregado nunca é
 uma nova despesa, estorno neutraliza sem apagar histórico (inclusive quando
 cai em ciclo posterior a uma fatura já paga) e divergência de fatura nunca é
 ajustada silenciosamente. Nenhuma calcula um valor de snapshot/projeção
-existente nem altera `INVARIANT_REGISTRY` (`app/services/invariant_
-registry.py` permanece em INV-001..INV-024) ou o `FINANCIAL_RULES_VERSION`
-de cálculo — cada uma documenta explicitamente que ainda não está integrada
-ao Financial Integrity Engine e aponta para o teste dedicado que a cobre
-nesta fase. Ver `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_2.md`.
+existente nem altera o `FINANCIAL_RULES_VERSION` de cálculo. Revisão de
+engenharia (2026-09-12, `BLOQUEIO DE MERGE` #4): as quatro passaram a
+integrar `INVARIANT_REGISTRY` (`app/services/invariant_registry.py`,
+`app/services/financial_invariants.py`) e são avaliadas em tempo real pelo
+`Financial Integrity Engine` a cada `sync`/`close`/`pay`/`link-refund`/
+`divergence` de `CardInvoice` (`app.api._run_card_invoice_integrity_checks`)
+— um resultado `fail` aborta a requisição em vez de persistir silenciosamente
+um estado que o próprio motor provou violar uma regra `BLOCK`/`CRITICAL`.
+Ver `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_2.md`.
 **Implementação executável:** `app/services/invariant_registry.py` (INV-001
-a INV-024; INV-025 a INV-028 ainda pendentes de integração -- ver acima).
+a INV-028).
 
 Este documento define as condições que precisam permanecer verdadeiras em importações,
 fechamentos, projeções, snapshots, dashboards, relatórios e contextos enviados ao Advisor.
@@ -427,11 +431,14 @@ originais, independentemente de quantos pagamentos parciais liquidam a fatura.
 **Resultado esperado:** a contagem de lançamentos `expense` do ciclo é idêntica antes e depois de
 qualquer pagamento (parcial ou integral).
 **Severidade se violado:** `BLOCK`.
-**Implementação executável:** ainda não integrada ao Financial Integrity Engine
-(`app/services/invariant_registry.py`) — coberta nesta fase apenas pelo teste dedicado abaixo; ver
-riscos residuais do PR do Slice 2.
+**Implementação executável:** `app/services/invariant_registry.py` (`validate_card_invoice_payment_no_duplicate_expense`).
+Avaliada em tempo real por `POST /card-invoices/{id}/pay`
+(`app.api._run_card_invoice_integrity_checks`), comparando a contagem de `expense` do ciclo antes e
+depois de cada chamada.
 **Teste automatizado associado:**
-`tests/test_card_invoice_lifecycle.py::test_pay_invoice_partial_then_remainder_reaches_paid_without_double_counting`.
+`tests/test_card_invoice_lifecycle.py::test_pay_invoice_partial_then_remainder_reaches_paid_without_double_counting`,
+`tests/test_financial_invariants.py::test_card_invoice_payment_never_duplicates_expense`,
+`tests/test_card_invoice_lifecycle.py::test_close_pay_and_divergence_endpoints_run_financial_integrity_checks`.
 
 ## INV-026 — Principal carregado não é gasto novo
 
@@ -446,10 +453,14 @@ nesse ciclo.
 **Resultado esperado:** `principal_carried_in` reflete exatamente o saldo em aberto do ciclo
 anterior no momento da sincronização; nenhuma `Transaction` nova é criada apenas para representá-lo.
 **Severidade se violado:** `BLOCK`.
-**Implementação executável:** ainda não integrada ao Financial Integrity Engine — mesma ressalva da
-INV-025.
+**Implementação executável:** `app/services/invariant_registry.py` (`validate_card_invoice_principal_not_new_expense`).
+Avaliada em tempo real por `POST /card-invoices/sync`, `.../close` e `.../pay`
+(`app.api._inv026_check`), lendo diretamente as `Transaction`/`expense` recém-adicionadas à sessão
+em vez de presumir que nenhuma foi criada.
 **Teste automatizado associado:**
-`tests/test_card_invoice_lifecycle.py::test_principal_carried_forward_without_creating_new_expense`.
+`tests/test_card_invoice_lifecycle.py::test_principal_carried_forward_without_creating_new_expense`,
+`tests/test_card_invoice_lifecycle.py::test_principal_carried_in_does_not_oscillate_after_invoice_already_paid`,
+`tests/test_financial_invariants.py::test_card_invoice_principal_carry_never_becomes_new_expense`.
 
 ## INV-027 — Estorno neutraliza sem apagar histórico (cartão)
 
@@ -469,12 +480,15 @@ lançado.
 compra nunca excede o valor original; um ciclo já `paid` mantém `computed_total`/`paid_total`/`status`
 inalterados quando um estorno da compra que o compõe é lançado em um ciclo posterior.
 **Severidade se violado:** `BLOCK`.
-**Implementação executável:** ainda não integrada ao Financial Integrity Engine — mesma ressalva da
-INV-025.
+**Implementação executável:** `app/services/invariant_registry.py` (`validate_card_invoice_refund_preserves_history`).
+Avaliada em tempo real por `POST /transactions/{id}/link-refund` (`app.api.link_refund_transaction`),
+comparando o estado da fatura original antes/depois do vínculo.
 **Teste automatizado associado:**
 `tests/test_card_invoice_lifecycle.py::test_refund_integral_neutralizes_purchase_without_deleting_it`,
 `tests/test_card_invoice_lifecycle.py::test_refund_partial_neutralizes_only_the_linked_amount_and_rejects_overshoot`,
-`tests/test_card_invoice_lifecycle.py::test_refund_after_invoice_already_paid_credits_later_cycle_without_rewriting_it`.
+`tests/test_card_invoice_lifecycle.py::test_refund_after_invoice_already_paid_credits_later_cycle_without_rewriting_it`,
+`tests/test_financial_invariants.py::test_card_invoice_refund_preserves_history`,
+`tests/test_card_invoice_lifecycle.py::test_link_refund_endpoint_runs_financial_integrity_check`.
 
 ## INV-028 — Divergência de fatura nunca é ajustada silenciosamente
 
@@ -493,12 +507,15 @@ zerar a diferença.
 **Resultado esperado:** `status in {reconciled, unreconciled_explained, unreconciled_unexplained,
 not_applicable}`; nenhum campo de valor é reescrito para forçar `reconciled`.
 **Severidade se violado:** `CRITICAL`.
-**Implementação executável:** ainda não integrada ao Financial Integrity Engine — mesma ressalva da
-INV-025.
+**Implementação executável:** `app/services/invariant_registry.py` (`validate_card_invoice_divergence_not_silently_adjusted`).
+Avaliada em tempo real por `GET /card-invoices/{id}/divergence` (`app.api.card_invoice_divergence`),
+que também confirma em runtime que a própria chamada não criou nenhuma `Transaction`.
 **Teste automatizado associado:**
 `tests/test_card_invoice_lifecycle.py::test_divergence_reconciled_when_declared_matches_computed`,
 `tests/test_card_invoice_lifecycle.py::test_divergence_unreconciled_unexplained_without_any_candidate_cause`,
-`tests/test_card_invoice_lifecycle.py::test_divergence_explained_by_unlinked_refund_in_cycle`.
+`tests/test_card_invoice_lifecycle.py::test_divergence_explained_by_unlinked_refund_in_cycle`,
+`tests/test_financial_invariants.py::test_card_invoice_divergence_never_silently_adjusted`,
+`tests/test_card_invoice_lifecycle.py::test_close_pay_and_divergence_endpoints_run_financial_integrity_checks`.
 
 ## Controle de mudança
 

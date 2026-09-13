@@ -557,8 +557,29 @@ essencialmente como proposto, com um desvio deliberado registrado abaixo:
   política de correspondência banco↔fatura (reaproveita `register_transaction_duplicates`, a mesma
   construção de `ParsedTransaction`/`transaction_fingerprint`, e a mesma categoria/`excluded=True`).
   Nenhum teste existente foi alterado para este PR passar; a suíte legada permanece 100% verde.
-- **Risco residual explícito:** INV-025 a INV-028 (`docs/FINANCIAL_INVARIANTS.md`) documentam as
-  novas regras e apontam testes dedicados, mas ainda não estão integradas ao Financial Integrity
-  Engine (`app/services/invariant_registry.py`) — nenhuma execução de `POST /integrity/runs` avalia
-  essas quatro regras automaticamente ainda. Recomendado para um follow-up antes do go-live real de
-  outubro, não necessariamente bloqueante para o merge deste Slice.
+- **Risco residual explícito (resolvido na rodada de revisão de engenharia de 2026-09-12,
+  `BLOQUEIO DE MERGE`):** a entrega inicial deste Slice registrava INV-025 a INV-028
+  (`docs/FINANCIAL_INVARIANTS.md`) como documentadas e testadas, mas ainda fora do
+  `INVARIANT_REGISTRY`/Financial Integrity Engine. O engenheiro responsável bloqueou o merge exigindo
+  a integração antes de aceitar o Slice como concluído. Corrigido: as quatro passaram a integrar
+  `app/services/invariant_registry.py` e são avaliadas em tempo real por
+  `app.api._run_card_invoice_integrity_checks` a cada `sync`/`close`/`pay`/`divergence`/
+  `link-refund`, com `fail` abortando a requisição — ver `docs/FINANCIAL_INVARIANTS.md` e
+  `docs/ARCHITECTURE.md` para o mecanismo completo.
+
+**Rodada de revisão de engenharia (2026-09-12, `BLOQUEIO DE MERGE`) — demais itens corrigidos nesta
+entrega, sem reabrir o plano acima:**
+
+1. UI normativa "Conferir e pagar" (rebaseline §6.2/§6.3) implementada em
+   `app/templates/index.html`/`app/static/app.js`, ao lado da UI legada existente.
+2. Parcelamento (rebaseline §6.7) exposto por `GET /card-invoices/{id}/lines`, reaproveitando apenas
+   `Transaction.amount`/`installment_current`/`installment_total` já confirmados.
+3. Idempotência de pagamento: `pay_invoice` reconhece um retry exato da mesma requisição pelo mesmo
+   `transaction_fingerprint` já usado pelo leg de conciliação, e devolve o lançamento existente em
+   vez de duplicá-lo.
+4. INV-025..INV-028 integradas ao Financial Integrity Engine (ver acima).
+5. Rollback de `0015` deixou de ser destrutivo silencioso para `refund_of_transaction_id` — a
+   migração agora recusa o downgrade quando existe algum vínculo de estorno confirmado.
+6. Regressão adicional corrigida: `principal_carried_in` deixou de oscilar retroativamente depois
+   que a própria fatura já recebeu um pagamento (`get_or_sync_invoice`'s `paid_total <= 0` guard) —
+   ver `tests/test_card_invoice_lifecycle.py::test_principal_carried_in_does_not_oscillate_after_invoice_already_paid`.

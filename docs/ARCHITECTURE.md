@@ -297,6 +297,38 @@ declarado (evidência de fatura/extrato já importado) e o total calculado: proc
 determinística ainda não contada (estorno não vinculado, encargo ainda não reclamado por nenhuma
 fatura) e, sem uma, publica `unreconciled_unexplained` para revisão humana.
 
+**Revisão de engenharia (2026-09-12, `BLOQUEIO DE MERGE`), corrigida neste PR:**
+
+- **Idempotência de pagamento.** `pay_invoice` computa o mesmo `transaction_fingerprint`
+  determinístico que uma nova `Transaction` de conciliação receberia e, antes de criar qualquer
+  coisa, procura um pagamento já persistido nesta exata fatura com esse fingerprint -- mesma
+  filosofia de "idempotência documental" já usada pelos parsers de importação deste projeto, não um
+  conceito novo. Uma repetição exata da mesma requisição (mesma conta/valor/descrição/data) devolve o
+  lançamento existente sem incrementar `paid_total`/criar um segundo leg
+  (`tests/test_card_invoice_lifecycle.py::test_pay_card_invoice_lifecycle_endpoint_retry_is_idempotent`).
+- **INV-025..INV-028 integradas ao Financial Integrity Engine.** `app.api._run_card_invoice_integrity_checks`
+  chama `execute_integrity_run` (scope `ENTITY`, trigger `TRANSACTION`) a partir de
+  `sync`/`close`/`pay`/`divergence`/`link-refund`, usando fatos observados em runtime (contagem de
+  `expense` antes/depois, `db.new` para provar que nenhuma `Transaction` nova foi criada onde não
+  deveria, snapshot da fatura original antes/depois de um vínculo de estorno) -- nunca uma segunda
+  fórmula, apenas evidência direta do que a própria chamada acabou de fazer. Um resultado `fail`
+  reverte a transação e aborta a requisição.
+- **`principal_carried_in` não oscila retroativamente.** `get_or_sync_invoice` só recomputa
+  `principal_carried_in`/`principal_carried_out` a partir do ciclo anterior enquanto a própria fatura
+  ainda não recebeu nenhum pagamento (`paid_total <= 0`); uma vez paga (total ou parcialmente), o
+  valor fica congelado, mesmo que um pagamento tardio no ciclo anterior mude o outstanding daquele
+  ciclo depois.
+- **Parcelamento exposto (`GET /card-invoices/{id}/lines`).** Reaproveita apenas
+  `Transaction.amount`/`installment_current`/`installment_total` já confirmados -- nunca o motor de
+  projeção mês-a-mês de `_project_installments`/`_future_installments` (que resolve "em quais meses
+  futuros", não usado aqui) -- para expor compra contratada, impacto no mês e parcelas futuras por
+  compra da fatura.
+- **UI "Conferir e pagar".** `app/templates/index.html`/`app/static/app.js` (tela Contas a pagar,
+  painel "Faturas de cartão") ganharam o modal do rebaseline §6.2/§6.3, ao lado (não em substituição)
+  da UI já existente do contrato legado `/card-payment-reconciliations/*`.
+- **Downgrade de `0015` deixa de ser destrutivo silencioso.** Recusa (levanta `RuntimeError`) quando
+  existe algum `refund_of_transaction_id` confirmado -- ver `alembic/versions/0015_card_invoice_lifecycle.py`.
+
 ## Comparação visual de cenários de compra (Fase 3)
 
 `POST /api/purchases/scenario-comparison` (`app/api.py::compare_purchase_scenarios`) compara duas a
