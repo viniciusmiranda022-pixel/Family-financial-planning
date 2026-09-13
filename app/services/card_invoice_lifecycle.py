@@ -210,6 +210,22 @@ def get_or_sync_invoice(
     )
     invoice.declared_total = money(abs(declared_row.amount)) if declared_row is not None else None
 
+    # Engineering review round (2026-09-12, `BLOQUEIO DE MERGE`): once this
+    # exact invoice has already had a real payment applied to it
+    # (`paid_total > 0`), `principal_carried_in` is frozen instead of kept
+    # live-recomputed from the previous cycle's *current* outstanding
+    # balance. Without this guard, a late/retry payment against the
+    # *previous* cycle (still legitimately allowed after this one already
+    # closed/paid) would silently change this invoice's own total the next
+    # time it is resynced -- `outstanding_balance`/`status` would then
+    # disagree with the payment(s) that already happened against the
+    # now-stale total, which is exactly the "fatura já fechada sendo
+    # reescrita" this project forbids (rebaseline §6.6 applies the same
+    # principle to refunds; this is the equivalent guard for principal
+    # carry-forward). `principal_carried_out` on the *previous* invoice is
+    # only ever mirrored alongside a live `principal_carried_in` update for
+    # the same reason -- it must never disagree with what this invoice
+    # actually carried in when it was paid.
     previous_invoice = db.scalar(
         select(CardInvoice).where(
             CardInvoice.household_id == household_id,
@@ -217,12 +233,13 @@ def get_or_sync_invoice(
             CardInvoice.competence == _previous_competence(competence),
         )
     )
-    if previous_invoice is not None:
-        previous_outstanding = outstanding_balance(previous_invoice)
-        invoice.principal_carried_in = previous_outstanding
-        previous_invoice.principal_carried_out = previous_outstanding
-    else:
-        invoice.principal_carried_in = Decimal("0")
+    if invoice.paid_total <= 0:
+        if previous_invoice is not None:
+            previous_outstanding = outstanding_balance(previous_invoice)
+            invoice.principal_carried_in = previous_outstanding
+            previous_invoice.principal_carried_out = previous_outstanding
+        else:
+            invoice.principal_carried_in = Decimal("0")
 
     if invoice.status == "open" and as_of >= invoice.closes_at:
         invoice.status = "closed"
@@ -273,7 +290,7 @@ def pay_invoice(
     amount: Decimal,
     booked_at: date,
     description: str,
-) -> tuple[Any, Any, Any]:
+) -> tuple[Any, Any, Any, bool]:
     """Manual payment of a `CardInvoice` -- superset of
     `card_payment_reconciliation.pay_card_invoice`: accepts any amount up
     to the invoice's current `outstanding_balance`, not only an exact
@@ -288,6 +305,22 @@ def pay_invoice(
     new compra/expense -- it only ever changes `principal_carried_in` of
     the *next* cycle's invoice, the next time that cycle is synced.
 
+    Idempotência documental (Work Order Slice 2, "idempotência de
+    pagamento"): before creating anything, this computes the exact same
+    `fingerprint` a genuinely new payment would get and looks for an
+    existing `reconciliation` leg already claimed by this invoice with that
+    exact fingerprint. `register_transaction_duplicates` below only *flags*
+    a possible duplicate for human review -- it never stops a second
+    insert -- so this is a separate, deterministic guard: a retry of the
+    exact same request (same paying account, amount, description and date,
+    against the exact same invoice -- e.g. a client timeout retry or a
+    double click) returns the already-persisted leg unchanged instead of
+    incrementing `paid_total`/creating a second leg. Two genuinely distinct
+    partial payments happen to collide only if they also share amount,
+    description and date; give the second one a distinguishing
+    `description`/`observação` (rebaseline §6.3 already exposes that field)
+    to record it as a separate fact.
+
     Never accepts more than `outstanding_balance` (+ the standard R$ 0.01
     tolerance): this slice does not model a card credit balance, so an
     attempted overpayment fails closed instead of fabricating one.
@@ -299,6 +332,8 @@ def pay_invoice(
     Atomicity: like `pay_card_invoice`, nothing here calls `db.commit()` --
     the caller commits once after this call (and its duplicate-detection
     pass) succeeds.
+
+    Returns `(checking_leg, invoice, duplicate_assessment, is_idempotent_replay)`.
     """
 
     import uuid as uuid_module
@@ -357,6 +392,19 @@ def pay_invoice(
         source_line=1,
         card_last_four=paying_account.last_four,
     )
+    fingerprint = transaction_fingerprint(paying_account.id, parsed, paying_account.owner_label)
+
+    existing_payment = db.scalar(
+        select(Transaction).where(
+            Transaction.household_id == household_id,
+            Transaction.card_invoice_id == invoice.id,
+            Transaction.transaction_type == "reconciliation",
+            Transaction.fingerprint == fingerprint,
+        )
+    )
+    if existing_payment is not None:
+        return existing_payment, invoice, None, True
+
     checking_leg = Transaction(
         household_id=household_id,
         account_id=paying_account.id,
@@ -368,7 +416,7 @@ def pay_invoice(
         transaction_type="reconciliation",
         owner_label=paying_account.owner_label,
         card_last_four=paying_account.last_four,
-        fingerprint=transaction_fingerprint(paying_account.id, parsed, paying_account.owner_label),
+        fingerprint=fingerprint,
         occurred_at=booked_at,
         competence=booked_at.strftime("%Y-%m"),
         classification_source="manual_confirmed",
@@ -395,7 +443,7 @@ def pay_invoice(
     new_outstanding = outstanding_balance(invoice)
     invoice.status = "paid" if new_outstanding <= RECONCILIATION_TOLERANCE else "partially_paid"
 
-    return checking_leg, invoice, duplicate_assessment
+    return checking_leg, invoice, duplicate_assessment, False
 
 
 def invoice_divergence(db: Session, *, household_id: str, invoice_id: str) -> InvoiceDivergence:
@@ -510,6 +558,24 @@ def invoice_divergence(db: Session, *, household_id: str, invoice_id: str) -> In
     )
 
 
+def linked_refund_total_for(db: Session, *, household_id: str, original_transaction_id: str) -> Decimal:
+    """Sum of every `refund` `Transaction` already linked to
+    `original_transaction_id` -- the single formula `link_refund` (its own
+    overshoot guard) and `INV-027`'s Financial Integrity Engine context
+    (`app.api.link_refund_transaction`) both read, so neither can drift on
+    "how much of this purchase has already been neutralized"."""
+
+    from app.models import Transaction
+
+    total = db.scalar(
+        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+            Transaction.household_id == household_id,
+            Transaction.refund_of_transaction_id == original_transaction_id,
+        )
+    )
+    return money(Decimal(total or 0))
+
+
 def link_refund(
     db: Session,
     *,
@@ -551,13 +617,10 @@ def link_refund(
             "Este estorno já está vinculado a uma compra; desvincule antes de vincular a outra"
         )
 
-    already_linked_total = db.scalar(
-        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
-            Transaction.household_id == household_id,
-            Transaction.refund_of_transaction_id == original.id,
-        )
+    already_linked_total = linked_refund_total_for(
+        db, household_id=household_id, original_transaction_id=original.id
     )
-    prospective_total = money(Decimal(already_linked_total or 0) + refund.amount)
+    prospective_total = money(already_linked_total + refund.amount)
     if prospective_total > money(abs(original.amount)) + RECONCILIATION_TOLERANCE:
         raise CardInvoiceError(
             "A soma dos estornos vinculados a esta compra excederia o valor original gasto"
@@ -631,6 +694,62 @@ def list_invoices(
     return invoices
 
 
+def invoice_purchase_lines(db: Session, *, household_id: str, invoice_id: str) -> list[Any]:
+    """Read model for `GET /card-invoices/{id}/lines` -- rebaseline §6.7,
+    "compra parcelada" display. Pure read of every `expense` `Transaction`
+    already claimed by this invoice (`Transaction.card_invoice_id`),
+    oldest first. The installment breakdown itself
+    (`serialize_invoice_purchase_line`) is a direct function of three
+    already-confirmed fields on each row -- `amount`/`installment_current`/
+    `installment_total` -- never a second projection engine: unlike
+    `app.api._future_installments` (which schedules *which future months*
+    a commitment lands in, for `/forecast`), this only needs the single
+    total a purchase still owes as of *now*, so it never needs that
+    calendar anchoring at all.
+    """
+
+    from app.models import CardInvoice, Transaction
+
+    invoice = db.get(CardInvoice, invoice_id)
+    if invoice is None or invoice.household_id != household_id:
+        raise LookupError("invoice not found")
+
+    return list(
+        db.scalars(
+            select(Transaction)
+            .where(
+                Transaction.household_id == household_id,
+                Transaction.card_invoice_id == invoice_id,
+                Transaction.transaction_type == "expense",
+            )
+            .order_by(Transaction.booked_at, Transaction.id)
+        )
+    )
+
+
+def serialize_invoice_purchase_line(transaction: Any) -> dict[str, Any]:
+    installment_current = transaction.installment_current
+    installment_total = transaction.installment_total
+    monthly_impact = money(abs(transaction.amount))
+    is_installment = installment_current is not None and installment_total is not None
+    return {
+        "transaction_id": transaction.id,
+        "description": transaction.description,
+        "booked_at": transaction.booked_at.isoformat(),
+        "is_installment": is_installment,
+        "installment_current": installment_current,
+        "installment_total": installment_total,
+        # Rebaseline §6.7's three figures -- for a purchase that was never
+        # installments, the whole amount already *is* the month's impact,
+        # nothing is contracted beyond it and nothing remains COMPROMETIDO.
+        "monthly_impact": str(monthly_impact),
+        "contracted_total": str(money(monthly_impact * installment_total) if is_installment else monthly_impact),
+        "future_installments_total": str(
+            money(monthly_impact * (installment_total - installment_current)) if is_installment else Decimal("0")
+        ),
+    }
+
+
 def serialize_card_invoice(invoice: Any) -> dict[str, Any]:
     return {
         "id": invoice.id,
@@ -666,11 +785,14 @@ __all__ = [
     "close_invoice",
     "get_or_sync_invoice",
     "invoice_divergence",
+    "invoice_purchase_lines",
     "link_refund",
+    "linked_refund_total_for",
     "list_invoices",
     "outstanding_balance",
     "pay_invoice",
     "serialize_card_invoice",
     "serialize_invoice_divergence",
+    "serialize_invoice_purchase_line",
     "unlink_refund",
 ]
