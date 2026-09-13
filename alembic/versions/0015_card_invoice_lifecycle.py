@@ -29,13 +29,24 @@ lineage.
   link from a refund transaction to the original purchase it neutralizes
   (rebaseline §6.6) -- never inferred, never written by this migration.
 
-Downgrade drops both new columns and the new table. Safe only under the
-same rule every other migration in this project follows: it discards rows
-that only ever exist as `card_invoices`/`refund_of_transaction_id`
-bookkeeping (derived lifecycle cache + refund lineage), never a financial
-fact recorded anywhere else (`Transaction.amount`/`transaction_type`/
-`competence`/`excluded` are all untouched by this migration in either
-direction).
+Downgrade drops both new columns and the new table -- safe for
+`card_invoices`/`card_invoice_id` under the same rule every other
+migration in this project follows: both are pure derived cache, always
+reconstructible by resyncing from already-existing `Transaction` history
+(`Transaction.amount`/`transaction_type`/`competence`/`excluded` are never
+touched by this migration in either direction).
+
+`refund_of_transaction_id` is different -- engineering review round
+(2026-09-12, `BLOQUEIO DE MERGE` #5): it is an explicit, human/Assistant-
+*confirmed* fact (rebaseline §6.6's estorno lineage), not a value this
+project could recompute from anything else if lost. Downgrading with any
+row already linked would silently discard that confirmed lineage, which
+this project's migration discipline (`docs/OCTOBER_GO_LIVE_REBASELINE.md`
+§52/§75: "nunca... transformação destrutiva silenciosa") forbids just as
+much as deleting a `Transaction`. `downgrade()` therefore refuses (raises,
+does not proceed) when any `refund_of_transaction_id` is still set --
+export the lineage first (see the query in `downgrade()`'s docstring
+below), then retry.
 """
 
 import sqlalchemy as sa
@@ -153,6 +164,40 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Refuses (raises `RuntimeError`, changes nothing) when any
+    `transactions.refund_of_transaction_id` is still set -- that column is
+    a confirmed fact (rebaseline §6.6), never mere derived cache; see the
+    module docstring. Export the lineage first:
+
+        SELECT id, refund_of_transaction_id FROM transactions
+        WHERE refund_of_transaction_id IS NOT NULL;
+
+    keep that result outside the database, then retry the downgrade once it
+    is safe to lose the column; reapply the links from the export after
+    restoring 0015 (or an equivalent future migration). No other financial
+    fact (`Transaction.amount`/`transaction_type`/`competence`/`excluded`,
+    or any row's existence) is ever at risk from this downgrade either way
+    -- only this explicit refund lineage, and only when at least one link
+    has actually been confirmed.
+
+    Offline SQL generation (`alembic downgrade --sql`) has no live
+    connection to check against -- matches this migration's own `upgrade()`
+    pattern (`_live_tables`/`_live_columns`) of never guessing in that mode.
+    """
+
+    if not op.get_context().as_sql:
+        linked_refund_count = op.get_bind().execute(
+            sa.text("SELECT COUNT(*) FROM transactions WHERE refund_of_transaction_id IS NOT NULL")
+        ).scalar()
+        if linked_refund_count:
+            raise RuntimeError(
+                f"Downgrade de 0015 abortado: {linked_refund_count} vínculo(s) confirmado(s) de "
+                "estorno (transactions.refund_of_transaction_id) seriam perdidos silenciosamente. "
+                "Exporte a lineage primeiro com "
+                "`SELECT id, refund_of_transaction_id FROM transactions WHERE "
+                "refund_of_transaction_id IS NOT NULL`, preserve o resultado fora do banco, e só "
+                "então repita o downgrade."
+            )
     with op.batch_alter_table("transactions") as batch_op:
         batch_op.drop_constraint(
             "fk_transactions_refund_of_transaction_id_transactions", type_="foreignkey"
