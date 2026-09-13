@@ -41,12 +41,12 @@ ZERO_OPERATING_EFFECTS = {
 
 
 def test_registry_contains_all_permanent_invariants_once() -> None:
-    assert FINANCIAL_RULES_VERSION == "2026.10.1"
-    # October Go-Live Slice 2 (P0 #87): INV-025..INV-028 join the registry,
-    # integrating the CardInvoice lifecycle into the Financial Integrity
-    # Engine (docs/FINANCIAL_INVARIANTS.md).
-    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 29))
-    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 28
+    assert FINANCIAL_RULES_VERSION == "2026.10.2"
+    # October Go-Live Slice 3 (P0 #87): INV-029/INV-030 join the registry,
+    # guarding the forecast against a received Commission or a reconciled
+    # recurring income being counted twice (docs/FINANCIAL_INVARIANTS.md).
+    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 31))
+    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 30
     assert all(item.required_facts for item in INVARIANT_REGISTRY.values())
 
 
@@ -671,3 +671,58 @@ def test_card_invoice_divergence_never_silently_adjusted() -> None:
     )
     assert invalid_status.status is InvariantStatus.FAIL
     assert synthetic.status is InvariantStatus.FAIL
+
+
+def test_received_commission_excluded_from_projection_pass_and_fail() -> None:
+    clean = _evaluate(
+        "INV-029",
+        received_commission_ids=["c1", "c2"],
+        projected_commission_ids=["c3", "c4"],
+    )
+    empty = _evaluate("INV-029", received_commission_ids=[], projected_commission_ids=[])
+    leaked = _evaluate(
+        "INV-029",
+        received_commission_ids=["c1", "c2"],
+        projected_commission_ids=["c2", "c3"],
+    )
+    assert clean.status is InvariantStatus.PASS
+    assert empty.status is InvariantStatus.PASS
+    assert leaked.status is InvariantStatus.FAIL
+    assert leaked.actual["received_commissions_in_projection"] == ["c2"]
+    assert leaked.severity.value == "critical"
+
+
+def test_recurring_income_no_duplicate_pass_and_fail() -> None:
+    no_evidence_uses_estimate = _evaluate(
+        "INV-030",
+        has_recurring_income_evidence=False,
+        expected_amount=Decimal("5000.00"),
+        reconciled_amount=Decimal("0"),
+        projected_amount=Decimal("5000.00"),
+    )
+    evidence_uses_real_amount = _evaluate(
+        "INV-030",
+        has_recurring_income_evidence=True,
+        expected_amount=Decimal("5000.00"),
+        reconciled_amount=Decimal("5000.01"),
+        projected_amount=Decimal("5000.01"),
+    )
+    double_counted = _evaluate(
+        "INV-030",
+        has_recurring_income_evidence=True,
+        expected_amount=Decimal("5000.00"),
+        reconciled_amount=Decimal("5000.01"),
+        projected_amount=Decimal("10000.01"),
+    )
+    stale_estimate_kept_despite_evidence = _evaluate(
+        "INV-030",
+        has_recurring_income_evidence=True,
+        expected_amount=Decimal("5000.00"),
+        reconciled_amount=Decimal("5000.01"),
+        projected_amount=Decimal("5000.00"),
+    )
+    assert no_evidence_uses_estimate.status is InvariantStatus.PASS
+    assert evidence_uses_real_amount.status is InvariantStatus.PASS
+    assert double_counted.status is InvariantStatus.FAIL
+    assert double_counted.difference == Decimal("5000.00")
+    assert stale_estimate_kept_despite_evidence.status is InvariantStatus.FAIL

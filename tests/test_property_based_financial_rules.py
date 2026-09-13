@@ -379,3 +379,55 @@ def test_backfill_reaches_the_same_steady_state_regardless_of_amounts(
         after_second = _counts()
 
         assert after_first == after_second
+
+
+# ---------------------------------------------------------------------------
+# October Go-Live Slice 3 (P0 #87): recurring income never counted twice.
+# ---------------------------------------------------------------------------
+
+
+@given(
+    expected_amount=st.decimals(min_value=Decimal("0.01"), max_value=Decimal("50000.00"), places=2),
+    reconciled_amount=st.decimals(min_value=Decimal("0.00"), max_value=Decimal("50000.00"), places=2),
+    has_evidence=st.booleans(),
+)
+@settings(max_examples=100, deadline=None)
+def test_recurring_income_projection_never_sums_estimate_and_real_credit(
+    expected_amount: Decimal, reconciled_amount: Decimal, has_evidence: bool
+) -> None:
+    """INV-030, as a property rather than a handful of fixed examples: for
+    any generated combination of the flat PREVISTO estimate and a
+    reconciled real credit, using *exactly one* of the two always passes,
+    and using their sum (the double-counting bug rebaseline §8.4 forbids)
+    always fails -- regardless of which amount happens to be larger, zero,
+    or equal to the other."""
+
+    correct_projected = reconciled_amount if has_evidence else expected_amount
+    correct = evaluate_invariant(
+        "INV-030",
+        _context(
+            has_recurring_income_evidence=has_evidence,
+            expected_amount=expected_amount,
+            reconciled_amount=reconciled_amount,
+            projected_amount=correct_projected,
+        ),
+    )
+    assert correct.status is InvariantStatus.PASS
+
+    doubled_projected = money(expected_amount + reconciled_amount)
+    if doubled_projected == correct_projected:
+        # Only possible when reconciled_amount == 0 and no evidence, or the
+        # generated amounts happen to coincide -- the "doubled" figure is
+        # then indistinguishable from the correct one, so there is nothing
+        # to assert as a failure for this particular example.
+        return
+    doubled = evaluate_invariant(
+        "INV-030",
+        _context(
+            has_recurring_income_evidence=has_evidence,
+            expected_amount=expected_amount,
+            reconciled_amount=reconciled_amount,
+            projected_amount=doubled_projected,
+        ),
+    )
+    assert doubled.status is InvariantStatus.FAIL

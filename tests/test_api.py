@@ -45,7 +45,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
     with TestClient(app) as client:
         health = client.get("/health")
         assert health.status_code == 200
-        assert health.json()["financial_rules_version"] == "2026.10.1"
+        assert health.json()["financial_rules_version"] == "2026.10.2"
 
         setup = client.post(
             "/api/auth/setup",
