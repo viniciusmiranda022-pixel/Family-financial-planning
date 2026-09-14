@@ -628,6 +628,37 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             "/api/entry-type-templates/missing/deactivate",
             {"json": reason},
         ),
+        (
+            "investment create",
+            "post",
+            "/api/investments",
+            {
+                "json": {
+                    "name": "Studio",
+                    "historical_cost": "1000.00",
+                    "current_value": "1000.00",
+                    "valuation_date": "2026-08-01",
+                }
+            },
+        ),
+        (
+            "investment update value",
+            "post",
+            "/api/investments/missing/valuations",
+            {"json": {"current_value": "1000.00", "valuation_date": "2026-08-01"}},
+        ),
+        (
+            "investment register contribution",
+            "post",
+            "/api/investments/missing/contributions",
+            {"json": {"contribution_amount": "500.00", "valuation_date": "2026-08-01"}},
+        ),
+        (
+            "investment undo valuation",
+            "post",
+            "/api/investments/missing/valuations/missing/undo",
+            {"json": reason},
+        ),
     ]
 
 
