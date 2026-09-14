@@ -608,6 +608,22 @@ implementado. O Dashboard ganhou um card de projeção compacto (`renderDashboar
 reusa a mesma resposta de `GET /forecast` (nenhuma segunda chamada com lógica própria) para
 satisfazer "projeção no Dashboard" sem recortar a tela cheia.
 
+**Risco de concorrência encontrado e corrigido durante este slice (verificação end-to-end com
+Playwright real, não só a suíte estática):** tornar `GET /forecast` incondicional em
+`loadDashboard()` o colocou no mesmo `Promise.all` de `GET /dashboard` -- as duas rotas chamam
+`build_snapshot()` (`app/services/financial_snapshots.py`) como get-or-create para o mesmo
+household/período, e a concorrência abria uma janela TOCTOU (as duas veem "sem snapshot ainda" e
+as duas tentam inserir; a segunda viola a constraint UNIQUE de `financial_snapshots` e retorna
+500). Essa mesma race já existia antes deste slice para visualizações de mês futuro (`/forecast`
+já rodava dentro do mesmo `Promise.all` quando `isFutureMonth` era verdadeiro) -- tornar a chamada
+incondicional só tornou a exposição praticamente garantida em vez de rara. Corrigido sequenciando
+`/dashboard` sozinho primeiro em `loadDashboard()`, sem tocar `build_snapshot()`: por escopo, este
+slice é puramente frontend e o Work Order pede para não desviar para hardening do Financial
+Integrity Engine. **Risco residual registrado para hardening futuro:** `build_snapshot()` em si
+ainda não tem nenhum lock (nada equivalente ao `SELECT ... FOR UPDATE` que `execute_typed_action`
+já usa para o INV-032), então dois clientes genuinamente concorrentes (dois membros da família
+abrindo o Dashboard no mesmo instante) ainda podem colidir.
+
 **Decisão de design em aberto para revisão:** a absorção de `Transferências`/`Importações`/
 `Lançamentos`/`Revisar` usa links contextuais (`data-go`) para a view legada, que continua roteável
 e com seu HTML intacto, em vez de recortar o HTML dessas views para dentro de abas aninhadas nas
