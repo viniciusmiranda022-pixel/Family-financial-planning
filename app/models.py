@@ -857,6 +857,112 @@ class AccountBalanceObservation(Base):
     )
 
 
+class Investment(Base, TimestampMixin):
+    """A patrimonial asset/investment (P0 #87, October Go-Live Slice 6 --
+    `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md`,
+    `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.4). The Studio is one row
+    here, not a special-cased model of its own.
+
+    Three fields are semantically distinct and must never be summed
+    (rebaseline §16.2): `historical_cost` ("Valor investido") is the
+    accumulated cost basis/contributions; `current_value` ("Valor de hoje")
+    is the sole field `app.services.investments.net_worth_summary` reads
+    into patrimony; `expected_receivable_value` ("Valor previsto a
+    receber") is a future projection that never contributes to current net
+    worth. This row always holds the *current* state; every mutation
+    (`app.services.investments.update_investment_value`/
+    `register_investment_contribution`) also appends an immutable
+    `InvestmentValuation` snapshot row -- never rewritten, only
+    superseded/invalidated, exactly like `AccountBalanceObservation`."""
+
+    __tablename__ = "investments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(120))
+    historical_cost: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    current_value: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    expected_receivable_value: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    last_updated_at: Mapped[date] = mapped_column(Date)
+    expected_receipt_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class InvestmentValuation(Base):
+    """One immutable, point-in-time snapshot of an `Investment`'s state
+    (P0 #87, October Go-Live Slice 6). Every valuation update and every
+    contribution appends exactly one row here -- never updates or deletes a
+    prior row, mirroring `AccountBalanceObservation`'s "a correction
+    creates a new row" contract (conflict matrix §3.4). Each row snapshots
+    the *entire* post-event state (`historical_cost`/`current_value`/
+    `expected_receivable_value`), not just the field the triggering event
+    changed, so history alone can always reconstruct what the parent
+    `Investment` looked like at any point in time -- a deliberate extension
+    of the conflict matrix's illustrative sketch, which listed only
+    `current_value`/`expected_receivable_value`.
+
+    `contribution_amount`/`funding_transaction_id` are populated only when
+    this row represents a contribution (aporte) event -- `null` for a pure
+    valuation-update event. `funding_transaction_id` only ever *links* to
+    an already-existing `Transaction` (created the same way any
+    `movement_type="investment"` manual entry already is, or imported) --
+    this table is never the write path that creates that cash-movement
+    fact, exactly like `register_refund` only links an already-existing
+    refund transaction (see `app.services.assistant_actions`).
+
+    `invalidated_at`/`invalidated_by`/`invalidation_reason` support undo
+    (rebaseline §11.3, Work Order item "pode ser desfeita quando
+    reversível") without ever deleting a row: undoing a valuation/
+    contribution invalidates this row and restores the parent `Investment`
+    to the exact prior state recorded in the pairing
+    `AssistantActionEvent.before_state` -- the history itself is never
+    erased, only marked no-longer-current, exactly like
+    `AccountBalanceObservation.invalidated_at`."""
+
+    __tablename__ = "investment_valuations"
+    __table_args__ = (
+        Index(
+            "ix_investment_valuations_investment_date",
+            "household_id",
+            "investment_id",
+            "valuation_date",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    investment_id: Mapped[str] = mapped_column(
+        ForeignKey("investments.id", ondelete="CASCADE"), index=True
+    )
+    valuation_date: Mapped[date] = mapped_column(Date)
+    historical_cost: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    current_value: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    expected_receivable_value: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    contribution_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    funding_transaction_id: Mapped[str | None] = mapped_column(
+        ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True
+    )
+    source: Mapped[str] = mapped_column(String(30))
+    recorded_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    invalidation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class DuplicateGroup(Base, TimestampMixin):
     __tablename__ = "duplicate_groups"
     __table_args__ = (
@@ -1314,6 +1420,17 @@ class BackfillRun(Base):
 # ("Fresh evidence in the Round 8 barrier is that this model list omits
 # IntegrityRun and IntegrityFinding ... and also omits Commission and
 # PayrollRecord").
+#
+# Deliberately excludes `Investment`/`InvestmentValuation` (October Go-Live
+# Slice 6, P0 #87): `HouseholdFinancialRevision` guards the point-in-time
+# consistency of `FinancialSnapshot`/monthly close, which cover period
+# income/expense/cash-flow facts only -- patrimony/net worth is not a
+# `FinancialSnapshot` input in this slice (rebaseline §16, Work Order
+# "Relatórios/integração": Slice 6 prepares the contract, it does not fold
+# patrimony into the monthly-close-gated snapshot). If a future slice ties
+# net worth into a revision-gated computation, add both models here then --
+# not preemptively now, which would only widen every existing snapshot
+# consumer's lock scope for no present benefit.
 FINANCIAL_REVISION_MODELS: tuple[type, ...] = (
     Transaction,
     Account,

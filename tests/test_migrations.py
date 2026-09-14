@@ -440,6 +440,43 @@ EXPECTED_ASSISTANT_ACTION_PROPOSAL_COLUMNS = {
     "consumed_action_event_id",
 }
 
+EXPECTED_0019_TABLES = {"investments", "investment_valuations"}
+
+EXPECTED_INVESTMENT_COLUMNS = {
+    "id",
+    "household_id",
+    "name",
+    "historical_cost",
+    "current_value",
+    "expected_receivable_value",
+    "last_updated_at",
+    "expected_receipt_date",
+    "notes",
+    "active",
+    "created_at",
+    "updated_at",
+}
+
+EXPECTED_INVESTMENT_VALUATION_COLUMNS = {
+    "id",
+    "household_id",
+    "investment_id",
+    "valuation_date",
+    "historical_cost",
+    "current_value",
+    "expected_receivable_value",
+    "contribution_amount",
+    "funding_transaction_id",
+    "source",
+    "recorded_by",
+    "note",
+    "invalidated_at",
+    "invalidated_by",
+    "invalidation_reason",
+    "trace_id",
+    "created_at",
+}
+
 
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
@@ -494,6 +531,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0016_TABLES,
             *EXPECTED_0017_TABLES,
             *EXPECTED_0018_TABLES,
+            *EXPECTED_0019_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -829,6 +867,84 @@ def test_downgrade_from_0016_refuses_to_discard_assistant_action_events(monkeypa
     get_settings.cache_clear()
 
 
+def test_downgrade_from_0019_refuses_to_discard_investment_valuations(monkeypatch, tmp_path) -> None:
+    """October Go-Live Slice 6: `investment_valuations` is the only durable
+    record of every valuation/contribution event -- `investments` itself
+    only ever holds the *current* state. Same guarded-downgrade pattern as
+    0016/0015."""
+
+    from datetime import date
+    from decimal import Decimal
+
+    from sqlalchemy.orm import sessionmaker
+
+    database_url = f"sqlite:///{tmp_path / 'migrations-investment-guard.sqlite'}"
+    config = _alembic_config(monkeypatch, database_url)
+
+    from app.models import Household, Investment, InvestmentValuation
+
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        household = Household(name="Família Downgrade Investimento")
+        db.add(household)
+        db.flush()
+        investment = Investment(
+            household_id=household.id,
+            name="Studio",
+            historical_cost=Decimal("30000.00"),
+            current_value=Decimal("35000.00"),
+            last_updated_at=date(2026, 9, 1),
+        )
+        db.add(investment)
+        db.flush()
+        valuation = InvestmentValuation(
+            household_id=household.id,
+            investment_id=investment.id,
+            valuation_date=date(2026, 9, 1),
+            historical_cost=Decimal("30000.00"),
+            current_value=Decimal("35000.00"),
+            source="manual_confirmed",
+            trace_id="trace-investment-guard",
+        )
+        db.add(valuation)
+        db.commit()
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="investment_valuations"):
+        command.downgrade(config, "0018")
+
+    engine, inspector = _inspect(database_url)
+    assert "investment_valuations" in inspector.get_table_names()
+    assert "investments" in inspector.get_table_names()
+    engine.dispose()
+
+    # Clearing the valuation history alone still leaves a real `investments`
+    # row behind -- the downgrade must refuse a second time, now naming
+    # `investments` instead.
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM investment_valuations")
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="investments"):
+        command.downgrade(config, "0018")
+
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM investments")
+    engine.dispose()
+
+    command.downgrade(config, "0018")
+    engine, inspector = _inspect(database_url)
+    assert "investments" not in inspector.get_table_names()
+    assert "investment_valuations" not in inspector.get_table_names()
+    engine.dispose()
+    get_settings.cache_clear()
+
+
 def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     output = StringIO()
     config = _alembic_config(
@@ -909,7 +1025,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0018"
+        ).scalar_one() == "0019"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -935,6 +1051,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0018"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0019"
     engine.dispose()
     get_settings.cache_clear()
