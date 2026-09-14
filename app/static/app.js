@@ -847,7 +847,117 @@ async function loadDashboard() {
   `).join("") : emptyRow(5);
   await applyCurrentMonthConfirmedLiquidity(selectedMonth);
   await applyFutureMonthDashboardSemantics(summary, selectedMonth, selectedLabel);
+  renderInvestments(summary);
 }
+
+// October Go-Live Slice 6: reads noncanonical.net_worth/noncanonical.investments
+// verbatim from GET /dashboard -- app.services.investments.net_worth_summary
+// is the one function that computed both; nothing here sums, derives a
+// gain/return, or re-decides which field counts as patrimony a second time.
+function renderInvestments(summary) {
+  const netWorth = summary.noncanonical?.net_worth?.value;
+  document.querySelector("#net-worth-total").textContent = money.format(netWorth || 0);
+  const rows = summary.noncanonical?.investments || [];
+  document.querySelector("#investments-table").innerHTML = rows.length
+    ? rows.map((item) => {
+      const returnPct = item.return_current_pct === null || item.return_current_pct === undefined
+        ? "—"
+        : `${(item.return_current_pct * 100).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%`;
+      return `<tr>
+        <td><strong>${escapeHtml(item.name)}</strong>${item.notes ? `<br><small>${escapeHtml(item.notes)}</small>` : ""}</td>
+        <td class="right">${money.format(item.historical_cost)}</td>
+        <td class="right">${money.format(item.current_value)}</td>
+        <td class="right">${item.expected_receivable_value === null || item.expected_receivable_value === undefined ? "—" : money.format(item.expected_receivable_value)}</td>
+        <td class="right ${item.gain_current < 0 ? "amount-expense" : "amount-income"}">${money.format(item.gain_current)}</td>
+        <td class="right">${returnPct}</td>
+        <td class="right">
+          <button type="button" class="secondary investment-update-value" data-id="${item.id}" data-name="${escapeHtml(item.name)}">Valor de hoje</button>
+          <button type="button" class="secondary investment-update-projection" data-id="${item.id}" data-name="${escapeHtml(item.name)}">Valor previsto</button>
+          <button type="button" class="secondary investment-contribute" data-id="${item.id}" data-name="${escapeHtml(item.name)}">Aporte</button>
+        </td>
+      </tr>`;
+    }).join("")
+    : emptyRow(7, "Nenhum investimento cadastrado ainda");
+}
+
+document.querySelector("#new-investment-button").addEventListener("click", async () => {
+  const name = window.prompt("Nome do ativo/investimento (ex.: Studio):");
+  if (!name) return;
+  const historicalCostText = window.prompt("Valor investido até hoje (custo histórico), em R$:", "0");
+  if (historicalCostText === null) return;
+  const currentValueText = window.prompt("Valor de hoje (patrimônio atual deste ativo), em R$:");
+  if (currentValueText === null) return;
+  try {
+    await api("/investments", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        historical_cost: Number(historicalCostText.replace(",", ".")) || 0,
+        current_value: Number(currentValueText.replace(",", ".")) || 0,
+        valuation_date: currentDateKey(),
+      }),
+    });
+    toast("Investimento cadastrado");
+    await loadDashboard();
+  } catch (error) {
+    toast(error.message, true);
+  }
+});
+
+document.querySelector("#investments-table").addEventListener("click", async (event) => {
+  const updateValueButton = event.target.closest(".investment-update-value");
+  const updateProjectionButton = event.target.closest(".investment-update-projection");
+  const contributeButton = event.target.closest(".investment-contribute");
+  if (updateValueButton) {
+    const amountText = window.prompt(`Novo valor de hoje para "${updateValueButton.dataset.name}", em R$:`);
+    if (amountText === null) return;
+    try {
+      await api(`/investments/${updateValueButton.dataset.id}/valuations`, {
+        method: "POST",
+        body: JSON.stringify({
+          current_value: Number(amountText.replace(",", ".")) || 0,
+          valuation_date: currentDateKey(),
+        }),
+      });
+      toast("Valor de hoje atualizado");
+      await loadDashboard();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  } else if (updateProjectionButton) {
+    const amountText = window.prompt(`Novo valor previsto a receber para "${updateProjectionButton.dataset.name}", em R$:`);
+    if (amountText === null) return;
+    try {
+      await api(`/investments/${updateProjectionButton.dataset.id}/valuations`, {
+        method: "POST",
+        body: JSON.stringify({
+          expected_receivable_value: Number(amountText.replace(",", ".")) || 0,
+          valuation_date: currentDateKey(),
+        }),
+      });
+      toast("Valor previsto atualizado");
+      await loadDashboard();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  } else if (contributeButton) {
+    const amountText = window.prompt(`Valor do aporte em "${contributeButton.dataset.name}", em R$:`);
+    if (amountText === null) return;
+    try {
+      await api(`/investments/${contributeButton.dataset.id}/contributions`, {
+        method: "POST",
+        body: JSON.stringify({
+          contribution_amount: Number(amountText.replace(",", ".")) || 0,
+          valuation_date: currentDateKey(),
+        }),
+      });
+      toast("Aporte registrado");
+      await loadDashboard();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }
+});
 
 function reportInsight(icon, label, value, detail, tone = "") {
   return `<div class="report-insight ${tone}"><span class="report-insight-icon">${escapeHtml(icon)}</span><div><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong><p>${escapeHtml(detail)}</p></div></div>`;

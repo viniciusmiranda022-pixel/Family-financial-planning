@@ -689,3 +689,28 @@ tr:last-child td { border-bottom: 0; }
 @media (max-width: 760px) {
   .credit-card-summary-totals { grid-template-columns: 1fr; }
 }
+
+/* October Go-Live Slice 6: patrimônio/investimentos */
+.net-worth-total {
+  padding: 15px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f8fafc;
+  margin: 4px 0 18px;
+  max-width: 320px;
+}
+.net-worth-total small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .07em;
+}
+.net-worth-total strong {
+  display: block;
+  margin-top: 7px;
+  color: var(--navy);
+  font-size: 21px;
+  letter-spacing: -.03em;
+}
+#investments-table button + button { margin-left: 6px; }
