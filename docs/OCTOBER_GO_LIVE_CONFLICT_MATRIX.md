@@ -805,3 +805,95 @@ imagem de produção -- corrigido neste PR. O build real das imagens Docker (`do
 (daemon Docker indisponível na sandbox); `node --check`/`npm test` no sidecar e a suíte Python
 completa foram verificados como proxy, mas o engenheiro responsável deve confirmar os gates Docker
 no CI real antes do merge.
+
+## 13. Status pós-implementação — Slice 6 (2026-09-14)
+
+**Slice 6** (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md`) implementou o plano do §3.4
+essencialmente como proposto, com duas extensões deliberadas sobre o esboço original:
+
+- **Inventário confirmado greenfield.** Busca completa por "Studio"/`Investment`/`Asset`/`NetWorth`
+  no repositório antes de qualquer alteração: zero ocorrências fora de `docs/` (todas em planejamento
+  normativo). Nenhum modelo, migration, endpoint ou dado legado de patrimônio/investimentos existia
+  -- confirmado também pelas notas já existentes em `app/services/assistant_actions.py:89-92` e
+  `docs/ARCHITECTURE.md` ("o modelo `Investment` ainda não existe"). Não há, portanto, migração de
+  dados reais a fazer para o Studio especificamente; a migração `0019` é puramente aditiva.
+- **Modelo:** `Investment` (`app/models.py`) -- estado atual (`historical_cost`/`current_value`/
+  `expected_receivable_value`/`last_updated_at`/`expected_receipt_date`/`notes`/`active`) --
+  e `InvestmentValuation` -- histórico imutável, mesmo padrão de `AccountBalanceObservation`.
+  **Extensão deliberada #1:** cada linha de `investment_valuations` grava o snapshot *completo*
+  pós-evento (`historical_cost`/`current_value`/`expected_receivable_value`), não somente os campos
+  que mudaram -- o esboço do §3.4 listava só `current_value`/`expected_receivable_value`; a extensão
+  garante que o histórico sozinho reconstrua o estado do ativo em qualquer ponto no tempo.
+  **Extensão deliberada #2:** `invalidated_at`/`invalidated_by`/`invalidation_reason` (ausentes no
+  esboço original) foram adicionados para suportar undo sem nunca apagar uma linha -- exigido pelo
+  próprio Work Order ("não apagar histórico") e pelo mesmo padrão que `AccountBalanceObservation` já
+  usa para invalidar uma observação superada.
+- **Migração `0019`**, puramente aditiva (`investments`, `investment_valuations`). Downgrade
+  guardado como o de `0016`: recusa (levanta `RuntimeError`, não altera nada) quando qualquer uma das
+  duas tabelas tem ao menos uma linha -- `investment_valuations` é o único registro durável de cada
+  evento de avaliação/aporte, e mesmo um `investments` isolado sem histórico ainda é um fato
+  financeiro real.
+- **Invariante central estrutural por construção.** `app.services.investments.net_worth_summary` é a
+  única função que soma `current_value` de ativos ativos de um household -- `historical_cost`/
+  `expected_receivable_value` nunca entram na soma, porque não há nenhuma outra função que calcule
+  esse total. `GET /investments` e `GET /dashboard` (`noncanonical.net_worth`/
+  `noncanonical.investments`) chamam exatamente essa função, provado por
+  `test_dashboard_regression_never_sums_historical_or_projected_into_net_worth`. INV-034
+  (`app/services/invariant_registry.py`/`docs/FINANCIAL_INVARIANTS.md`) formaliza o mesmo contrato
+  como invariante executável para uma futura validação independente do Codex/Financial Integrity
+  Engine -- `FINANCIAL_RULES_VERSION` avançou de `2026.10.4` para `2026.10.5` (nenhuma regra anterior
+  foi alterada; o conjunto de invariantes mudou).
+- **Endpoints novos:** `POST /investments`, `GET /investments`, `GET /investments/{id}/valuations`,
+  `POST /investments/{id}/valuations`, `POST /investments/{id}/contributions`,
+  `POST /investments/{id}/valuations/{valuation_id}/undo`. Todos admin-only
+  (`_require_admin`), todos household-scoped por filtro explícito de query, seguindo exatamente a
+  convenção já usada em `Account`/`Obligation`.
+- **Aportes nunca fabricam origem de caixa.** `_register_investment_contribution_impl` só aumenta
+  `historical_cost`; `funding_transaction_id`, quando informado, apenas vincula uma
+  `Transaction` `movement_type="investment"`/"Transferência patrimonial" já existente (criada pelo
+  fluxo manual já suportado desde o Slice 1) -- nunca a cria. Mesmo padrão "vincular, nunca criar e
+  vincular numa ação composta" que `register_refund` já estabeleceu no Slice 4.
+- **Assistente Financeiro:** `update_asset_value`/`register_asset_contribution` entram em
+  `TYPED_ACTIONS`, despachando para os mesmos `_update_investment_value_impl`/
+  `_register_investment_contribution_impl` que os endpoints manuais chamam, com o mesmo contrato de
+  atomicidade (`commit=False` + `domain_audit_sink`) de `pay_obligation`. Novo campo extraído
+  `asset_value_kind_hint` (`current_value`/`expected_receivable_value`/`unspecified`) desambigua qual
+  valor um "Hoje acho que o Studio vale 35 mil" está atualizando -- um hint ausente/`unspecified`
+  sempre pergunta, nunca assume. `register_asset_contribution` exige exatamente uma transação de
+  financiamento "Transferência patrimonial" ainda não vinculada e compatível em valor para resolver
+  sem pergunta -- zero ou múltiplas candidatas devolvem a pergunta obrigatória do Work Order ("De onde
+  saiu esse aporte?"), nunca uma inferência.
+- **Undo sem apagar histórico.** `_undo_investment_valuation_impl` invalida (nunca apaga) a
+  `InvestmentValuation` alvo e restaura o `Investment` ao estado exato anterior; recusa (409) quando
+  já existe uma avaliação mais recente ainda válida -- mesma guarda que
+  `_undo_obligation_privilege_funding` já aplica a um pagamento de obrigação financiado pelo
+  Privilège. `target_entity_ids` do `AssistantActionEvent` grava `[investment_id, valuation_id]` (não
+  só o id do investimento), então o undo sempre reverte o evento exato que a ação registrou, nunca "a
+  avaliação mais recente" no momento do undo.
+- **Dashboard/UX:** painel "Patrimônio" dentro de `#view-dashboard` (`app/templates/index.html`/
+  `app/static/app.js`), sem item novo no menu principal -- consome
+  `noncanonical.net_worth`/`noncanonical.investments` de `GET /dashboard` verbatim, sem segundo
+  cálculo no frontend. Ações de edição via `window.prompt`, mesmo padrão já usado para "motivo do
+  undo" em outras telas -- UI mínima suficiente para o slice, não uma tela dedicada.
+
+**Desvios deliberados (refinamento de implementação, não Technical Challenge):** ver as duas
+extensões acima (snapshot completo + invalidação); nenhum endpoint de exclusão/desativação de
+investimento foi adicionado (não exigido pelo Work Order); `Investment`/`InvestmentValuation` foram
+deliberadamente excluídos de `FINANCIAL_REVISION_MODELS` (patrimônio não é entrada do
+`FinancialSnapshot`/fechamento mensal neste slice -- ver o comentário em `app/models.py`).
+
+**Testes:** `tests/test_investments_slice6.py` (20 testes -- cálculos derivados, `net_worth_summary`,
+suíte funcional HTTP de criação/valuation/aporte/undo/isolamento de household, proposta determinística
+do Assistente para os dois novos typed actions, execução/undo/idempotência via
+`/assistant/execute`/`/assistant/actions/{id}/undo`, regressão de Dashboard), `tests/test_migrations.py`
+(guarda de downgrade da migração `0019`, tabelas/cabeça de revisão atualizadas), 4 novos casos em
+`tests/test_role_based_authorization.py` (as quatro rotas mutantes de investimento rejeitadas para o
+perfil consulta), 1 novo caso em `tests/test_financial_invariants.py` (INV-034, pass/fail/zero-cost).
+Suíte completa verificada localmente: **834 testes** (822 SQLite + 12 PostgreSQL 16 real via
+`tests/test_postgresql_integration.py`, incluindo os dois testes de migração que verificam a cabeça
+`0019` upgrade/downgrade contra PostgreSQL de verdade), `ruff check .` limpo, `node --check` nos
+arquivos do sidecar e em `app/static/app.js`, e `node --test test/*.test.mjs` do advisor (37 testes)
+todos verdes. Build das imagens Docker (`docker-build`, `advisor` Docker build, Docker Compose
+validation) não pôde ser executado até o fim neste ambiente de execução (rede da sandbox bloqueia
+`docker.io` para baixar a imagem base `python:3.12-slim`, mesma limitação de rede já registrada no
+Slice 4) -- o engenheiro responsável deve confirmar esses três gates no CI real antes do merge.

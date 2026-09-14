@@ -1,7 +1,13 @@
 # Contrato de invariantes financeiros
 
-**Versão das regras:** `2026.10.4`
+**Versão das regras:** `2026.10.5`
 **Status:** normativo
+
+**Controle de mudança (2026-09-14, October Go-Live Slice 6, P0 #87):**
+INV-034 adicionada — patrimônio de um investimento/ativo (incluindo o
+Studio) usa somente o valor de hoje (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md`).
+Nenhuma regra anterior foi alterada; a versão avança porque o conjunto de
+invariantes deste contrato mudou.
 
 **Controle de mudança (2026-09-14, October Go-Live Slice 4, P0 #87):**
 INV-032/INV-033 adicionadas — auditoria e undo do Assistente Financeiro
@@ -734,6 +740,29 @@ nunca chama `db.delete` sobre `AssistantActionEvent`, apenas marca campos e adic
 `tests/test_financial_invariants.py::test_assistant_undo_preserves_history_pass_and_fail`,
 `tests/test_assistant_slice4.py::test_execute_pay_obligation_via_assistant_matches_manual_contract_no_double_count`,
 `tests/test_assistant_slice4.py::test_undo_pay_card_invoice_is_refused_as_non_reversible_with_explicit_reason`.
+
+## INV-034 — Patrimônio do ativo
+
+**Escopo:** `Investment` (`app.services.investments.net_worth_summary`).
+**Título:** Patrimônio do ativo
+**Descrição:** O patrimônio de um investimento/ativo, incluindo o Studio, usa somente o valor de
+hoje (`current_value`) -- nunca a soma de custo histórico (`historical_cost`) e/ou valor previsto a
+receber (`expected_receivable_value`) com o valor de hoje do mesmo ativo.
+**Motivação:** Rebaseline §16.2 -- "Valor investido = custo histórico; Valor de hoje = patrimônio
+atual; Valor previsto a receber = projeção futura", e a proibição explícita de somar os três.
+**Entradas:** `historical_cost`, `current_value`, `expected_receivable_value`,
+`net_worth_contribution`.
+**Resultado esperado:** `net_worth_contribution == current_value` dentro da tolerância monetária.
+**Severidade se violado:** `CRITICAL`.
+**Implementação executável:** `app/services/invariant_registry.py`
+(`validate_net_worth_current_value_only`). `app.services.investments.net_worth_summary` já garante
+esta propriedade por construção (soma somente `current_value` dos ativos ativos); esta invariante
+formaliza o contrato para o Financial Integrity Engine/validação independente do Codex também
+poderem recomputar e conferir o mesmo fato de forma determinística.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_net_worth_uses_current_value_only_pass_and_fail`,
+`tests/test_investments_slice6.py::test_net_worth_summary_sums_current_value_only_never_historical_or_projected`,
+`tests/test_investments_slice6.py::test_updating_expected_receivable_value_never_changes_net_worth`.
 
 ## Controle de mudança
 
