@@ -606,8 +606,13 @@ em uma única tabela em vez de duas divergentes). `Gastos & Economia` (renomeaç
 `pageNames.planning`, mesma `id="view-planning"`/`loadForecast()`) ficou só com o que é
 projeção/economia de fato: cenário conservador, calendário consolidado e comparação de cenários de
 compra -- a análise mais profunda (tendências, categorias, anomalias --
-rebaseline §"Slice 7 -- Gastos & Economia + Relatórios") é escopo do **Slice 7**, ainda não
-implementado. O Dashboard ganhou um card de projeção compacto (`renderDashboardProjection`) que
+rebaseline §"Slice 7 -- Gastos & Economia + Relatórios") passou a ser servida pelo mesmo
+`#view-planning`, acima do painel de projeção: `loadSpendingEconomy()` (chamada por
+`loadPlanningView()`, o novo loader dessa view) lê `GET /spending-economy` -- que por sua vez
+constrói sobre `_build_report_payload` (`GET /reports`), nunca uma segunda soma/classificação --
+para exibir tendências por categoria, oportunidades de economia e a análise Codex separada em
+"Seus dados / Referências externas / Análise / Recomendação" (rebaseline §14). O Dashboard ganhou
+um card de projeção compacto (`renderDashboardProjection`) que
 reusa a mesma resposta de `GET /forecast` (nenhuma segunda chamada com lógica própria) para
 satisfazer "projeção no Dashboard" sem recortar a tela cheia.
 
@@ -871,6 +876,76 @@ normativos; os quatro foram corrigidos no mesmo PR, sem migration destrutiva e s
    em branco virava `0` e era enviado como fato financeiro confirmado. Novo `parseMoneyPromptInput`
    (`app/static/app.js`) rejeita entrada inválida em vez de normalizá-la; `promptMoney` repete o
    prompt até um valor válido ou cancelamento explícito -- nunca deixa `0` passar por coincidência.
+
+## Gastos & Economia e Relatórios (October Go-Live Slice 7, P0 #87)
+
+Work Order: `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md`. Rebaseline §§14, 15, 16, 17, 21.
+
+**Sem segundo motor: tudo compõe sobre `_build_report_payload`.** `GET /reports`
+(`app.api._build_report_payload`) já era a única fonte de `spending`/`categories`/`accounts`/
+`monthly` publicada tanto pela tela quanto pela exportação Excel/PDF (INV-020). Este slice estende
+a mesma função com seis seções novas -- `patrimony`, `investments`, `card_invoices`, `obligations`,
+`financial_states`, `ledger` -- e uma granularidade nova (`monthly_categories`, a mesma
+`category_spending_rows(snapshot)` já somada em `categories`, mas preservada por mês em vez de
+descartada) em vez de criar um segundo endpoint/serviço de agregação. Cada seção nova chama
+exatamente a função canônica que `/dashboard`/`/investments`/`/obligations`/`/card-invoices` já
+usam:
+
+- `patrimony`/`investments`: `app.services.investments.household_patrimony_summary`/
+  `investments_summary` -- as mesmas duas funções `/dashboard` chama, fechando a lacuna que
+  `docs/ARCHITECTURE.md` (seção do Slice 6, acima) já registrava como pendente ("o Work Order pede
+  o contrato para os Relatórios do Slice 7"). O componente de caixa do patrimônio usa a mesma
+  resolução "saldo confirmado soberano no instante observado, senão o saldo de liquidez calculado"
+  que `/dashboard` já fazia inline -- extraída para `app.api._current_liquidity_observation` e
+  chamada por ambos os endpoints (nunca duas implementações da mesma consulta).
+- `card_invoices`: `app.services.card_invoice_lifecycle.list_invoices`/`serialize_card_invoice`
+  (o mesmo par `GET /card-invoices` usa; `serialize_card_invoice` já inclui `financial_state`).
+- `obligations`: `app.api._obligation_rows` (o mesmo `GET /obligations`/`/dashboard` usam; já
+  retorna `financial_state` REALIZADO/COMPROMETIDO por linha).
+- `financial_states.comprometido`: soma de `report_obligations_pending_total` +
+  `outstanding_balance()` sobre as mesmas faturas fechadas/parcialmente pagas -- os mesmos dois
+  totais que `/dashboard`'s `noncanonical.commitments` já publica.
+- `financial_states.previsto`: **deliberadamente restrito** ao salário recorrente configurado do
+  período seguinte ao relatório, via `app.services.recurring_income.reconcile_recurring_income` (a
+  mesma função `GET /forecast` usa) -- nunca uma comissão (rebaseline §8.3/INV-031) e nunca uma
+  segunda chamada à projeção completa (`_build_projection_gate_checks`, que também persiste um
+  `IntegrityRun`): rodar o motor de projeção inteiro a cada `GET /reports` só para popular um
+  resumo teria efeito colateral desproporcional ao valor exibido. A projeção completa (30/60/90
+  dias) continua exclusivamente em `GET /forecast`; `financial_states.previsto.note` aponta para lá.
+- `ledger`: os mesmos `movement_rows` que `_build_report_payload` já buscava para os totais mensais
+  (`_consolidated_transactions`) -- nenhuma query nova, só serialização dos fatos já carregados.
+
+**`GET /spending-economy` (novo) não recalcula nada -- ele lê `_build_report_payload`.** A tela
+"Gastos & Economia" precisava de comparação histórica/tendências/oportunidades por categoria, que
+exigem a série mensal por categoria (não só o total do período). Em vez de duplicar o laço de
+`_build_report_payload`, o próprio laço passou a acumular `monthly_categories` (a mesma
+`category_spending_rows(snapshot)` já chamada para `categories`, só que preservada por mês);
+`GET /spending-economy` chama `_build_report_payload` uma vez e deriva `tendencias`/
+`oportunidades_economia` com aritmética pura (variação percentual mês a mês e contra a própria
+média histórica -- `app.api._category_trends`/`_spending_opportunities`) sobre esses números já
+canônicos.
+
+**Separação "Seus dados / Referências externas / Análise / Recomendação" (rebaseline §14).** O
+Advisor sidecar (`advisor/server.mjs`) não tem acesso à internet nem provedor de busca externa
+(`advisor/providers/` só tem `fakeProvider.mjs`) -- então `referencias_externas` fica
+estruturalmente presente e vazia por padrão, nunca inventada, em vez deste slice simular uma busca
+que não existe de fato. `analise`/`recomendacao` reaproveitam a rota `/v1/analyze` já existente
+(schema `advisor-schema.json`, o mesmo `POST /advisor/question` já usa) com a mesma regra de
+autoridade do INV-021: um veredito determinístico é calculado primeiro
+(`app.api._spending_economy_codex_analysis`); o Codex só substitui o texto quando devolve
+exatamente esse veredito, nunca um mais/menos conservador. Uma divergência de veredito nunca é
+aplicada silenciosamente -- fica em `divergencia_codex` para o usuário/engenheiro revisar
+(diferente de `POST /advisor/question`, que hoje só descarta a resposta divergente sem sinalizar;
+este endpoint melhora esse ponto porque o Work Order deste slice pede explicitamente
+"divergência... deve ser sinalizada, nunca sobrescrita silenciosamente" -- um Technical Challenge
+futuro pode avaliar levar o mesmo campo `divergence` para `POST /advisor/question`).
+
+**Frontend.** `renderReport`/`renderReportSlice7Sections` (`app/static/app.js`) só formatam os
+campos novos de `GET /reports` (nunca somam nada); a nova tabela "Cartões" reaproveita
+`cardInvoiceStatusLabels` e a de "Obrigações" reaproveita `payableInvoiceStatusLabels` -- os mesmos
+dois mapas de rótulo que `Contas a pagar` já usa, não uma terceira cópia. `#view-planning` ganhou
+`loadSpendingEconomy()` (chamada por `loadPlanningView()`, o novo loader da view) acima do painel
+de projeção já existente; nenhuma lógica de projeção foi alterada.
 
 ## Comparação visual de cenários de compra (Fase 3)
 
