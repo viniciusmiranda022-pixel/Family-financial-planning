@@ -11,6 +11,16 @@ const state = {
   captureAudio: null,
   captureRecorder: null,
   advisorHistory: [],
+  // October Go-Live Slice 5: Assistente Financeiro typed-action thread
+  // state, entirely separate from advisorHistory above (a different
+  // backend contract/conversation -- POST /assistant/interpret never
+  // shares history with POST /advisor/chat). Reset by resetAssistantThread()
+  // once a proposal executes, is cancelled, or the message turns out not to
+  // be an actionable request at all.
+  assistantHistory: [],
+  assistantTraceId: null,
+  assistantDisambiguationQa: [],
+  assistantPendingQuestion: null,
   // Draft-only, client-side: the actual price/entrada/parcelas/juros inputs
   // for `POST /purchases/scenario-comparison`. Never a computed financial
   // value -- every number this feature shows comes back from that endpoint
@@ -82,9 +92,14 @@ function confirmLargeTransactions(items) {
   return { allowed, confirmed: allowed };
 }
 const systemCategories = new Set(["Conciliação", "Transferência patrimonial", "Transferência interna", "Repasses a confirmar", "Reembolsos e estornos", "Receitas", "Revisar"]);
+// October Go-Live Slice 5: keys unchanged so every legacy view remains
+// routable via navigate()/data-go, but the labels shown as #page-title
+// reflect the target UX (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_5.md); views
+// without a permanent #main-nav button anymore are only reachable through a
+// data-go link from their new home (see the inventory in PR #93).
 const pageNames = {
-  dashboard: "Visão geral",
-  reports: "Relatórios e análises",
+  dashboard: "Dashboard Financeiro",
+  reports: "Relatórios",
   capture: "Lançar agora",
   entradas: "Entradas",
   saidas: "Saídas",
@@ -93,9 +108,8 @@ const pageNames = {
   imports: "Importações",
   transactions: "Lançamentos",
   reviews: "Revisar",
-  income: "Rendas",
-  planning: "Planejamento",
-  advisor: "Consultor financeiro",
+  planning: "Gastos & Economia",
+  advisor: "Assistente Financeiro",
   integrity: "Integridade",
   users: "Acessos",
   settings: "Configurações",
@@ -229,7 +243,13 @@ async function showApp() {
   document.querySelector("#app-shell").classList.remove("hidden");
   document.querySelector("#current-user").textContent = state.user.name;
   document.querySelector("#nav-users").classList.toggle("hidden", !state.user.is_admin);
-  document.querySelector("#nav-integrity").classList.toggle("hidden", !integrityUiEnabled());
+  // October Go-Live Slice 5: Integridade has no permanent #main-nav button
+  // anymore (not in the target navigation list) -- it stays reachable via
+  // the global BLOCK/CRITICAL banner's "Ver integridade" button and, for
+  // admins with the flag on, the "Integridade financeira" card in
+  // Configurações (#settings-integrity-link, toggled here).
+  const settingsIntegrityLink = document.querySelector("#settings-integrity-link");
+  if (settingsIntegrityLink) settingsIntegrityLink.classList.toggle("hidden", !(state.user.is_admin && integrityUiEnabled()));
   // `.admin-only` static forms/controls (see index.html) are only ever a UX
   // convenience -- `app/api.py::_require_admin` is what actually rejects a
   // consulta user's request, regardless of this class.
@@ -268,7 +288,6 @@ async function navigate(view) {
     imports: loadImports,
     transactions: loadTransactions,
     reviews: loadReviews,
-    income: loadIncome,
     planning: loadForecast,
     advisor: loadAdvisor,
     integrity: loadIntegrity,
@@ -605,6 +624,24 @@ async function applyFutureMonthDashboardSemantics(summary, selectedMonth, select
   const categoriesTitle=document.querySelector("#monthly-categories-title");
   if (categoriesTitle) categoriesTitle.textContent=`Compras já lançadas para ${selectedLabel} por categoria`;
 }
+// October Go-Live Slice 5: compact projection glance on the Dashboard,
+// reusing the exact `GET /forecast` response Gastos & Economia's own
+// "Calendário consolidado" renders (`loadForecast`) -- same summary/rows,
+// just the first three months and no chart, with a link to the full view.
+function renderDashboardProjection(forecast, selectedMonth) {
+  const summary = forecast?.summary;
+  const rows = forecast?.rows || [];
+  document.querySelector("#dashboard-forecast-final").textContent = money.format(summary?.final_delayed || 0);
+  document.querySelector("#dashboard-forecast-min").textContent = money.format(summary?.minimum_delayed || 0);
+  const status = document.querySelector("#dashboard-forecast-status");
+  status.textContent = summary ? (summary.viable ? "Viável" : "Revisar gastos") : "Configure o perfil";
+  status.className = summary ? (summary.viable ? "amount-income" : "amount-expense") : "";
+  const upcoming = rows.filter((item) => item.month >= selectedMonth).slice(0, 3);
+  document.querySelector("#dashboard-forecast-table").innerHTML = upcoming.length ? upcoming.map((item) => `
+    <tr><td>${escapeHtml(monthLabel(item.month))}</td><td class="right ${item.balance_delayed < (summary?.emergency_floor || 0) ? "amount-expense" : "amount-income"}">${money.format(item.balance_delayed)}</td></tr>
+  `).join("") : emptyRow(2, "Configure as premissas financeiras em Gastos & Economia");
+}
+
 async function loadDashboard() {
   const monthControl = document.querySelector("#dashboard-month");
   if (!monthControl.value) monthControl.value = currentMonthKey();
@@ -612,13 +649,18 @@ async function loadDashboard() {
   // FAMILY_FINANCE_FUTURE_DASHBOARD_V7
   // Snapshot = realizado; forecast = compromissos futuros conhecidos.
   const isFutureMonth = selectedMonth > currentMonthKey();
+  // October Go-Live Slice 5: `/forecast` is now always fetched (not only
+  // for a future selected month) -- the dashboard's compact projection
+  // panel below reuses this exact same response, never a second
+  // computation of the same projection Gastos & Economia shows.
   const [summary, transactions, cutPlan, pulse, forecast] = await Promise.all([
     api(`/dashboard?month=${encodeURIComponent(selectedMonth)}`),
     api(`/transactions?limit=8&month=${encodeURIComponent(selectedMonth)}`),
     api(`/cut-plan?month=${encodeURIComponent(selectedMonth)}`),
     api(`/reports?end_month=${encodeURIComponent(selectedMonth)}&months=6`),
-    isFutureMonth ? api(`/forecast`) : Promise.resolve(null),
+    api(`/forecast`),
   ]);
+  renderDashboardProjection(forecast, selectedMonth);
   const forecastRow = forecast?.rows?.find((item) => item.month === selectedMonth) || null;
   const forecastInstallments = Number(forecastRow?.installments || 0);
   const forecastObligations = Number(forecastRow?.obligations || 0);
@@ -688,7 +730,6 @@ async function loadDashboard() {
     ? `Teto ultrapassado em ${money.format(Math.abs(summary.remaining_cap))}`
     : "Valor ainda disponível no limite mensal";
   document.querySelector("#kpi-reviews").textContent = summary.review_count;
-  document.querySelector("#nav-review-count").textContent = summary.review_count;
   document.querySelector("#food-benefits").textContent = money.format(summary.food_benefits);
   const percent = summary.cash_cap > 0 ? Math.round((summary.spending / summary.cash_cap) * 100) : 0;
   const width = Math.min(percent, 100);
@@ -1070,39 +1111,112 @@ async function loadMovementEntries({ month, type, tableSelector, columns, column
   }));
 }
 
+// October Go-Live Slice 5: "tipos existentes e templates aprendidos do
+// Slice 4" / "Outra entrada"/"Outra saída" com fluxo de sugestão-confirmação
+// (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_5.md). Reuses
+// `app.services.entry_type_templates` (migração 0017) exactly as built in
+// Slice 4 -- this only ever lists templates already `active` (three
+// confirmations + activation happened server-side, admin-only) and records
+// one observation per confirmed submission; it never activates/deactivates
+// a template itself. A chip only prefills Descrição -- the entry is still
+// only registered when the human submits the form below.
+async function renderTypeTemplateChips(movementType, containerSelector, formSelector) {
+  const container = document.querySelector(containerSelector);
+  if (!container) return;
+  try {
+    const templates = await api(`/entry-type-templates?movement_type=${movementType}&active_only=true`);
+    if (!templates.length) {
+      container.classList.add("hidden");
+      container.innerHTML = "";
+      return;
+    }
+    container.classList.remove("hidden");
+    container.innerHTML = '<small>Tipos que você já usa:</small>' + templates.map((item) => `
+      <button type="button" class="type-template-chip" data-label="${escapeHtml(item.label)}" data-category-id="${escapeHtml(item.category_id || "")}">${escapeHtml(item.label)}</button>
+    `).join("");
+    container.querySelectorAll(".type-template-chip").forEach((button) => button.addEventListener("click", () => {
+      const form = document.querySelector(formSelector);
+      if (form.elements.description) form.elements.description.value = button.dataset.label;
+      if (button.dataset.categoryId && form.elements.category_id) {
+        form.elements.category_id.value = button.dataset.categoryId;
+        form.elements.category_id.dispatchEvent(new Event("change"));
+      }
+      form.elements.description?.focus();
+    }));
+  } catch (_) {
+    // Best-effort suggestion only -- the structured form still works
+    // without it.
+  }
+}
+
+// Records one observed use of a (possibly brand-new, "Outra entrada"/"Outra
+// saída") type label against the transaction just confirmed above. This
+// never creates/edits the transaction itself (`transaction_id` must already
+// exist -- `EntryTypeTemplateCreateRequest`), never auto-activates a
+// template (that still needs three observations + an admin's explicit
+// activation), and a failure here never rolls back or blocks the entry
+// that was already registered.
+async function recordEntryTypeObservation(movementType, transactionId, description, categoryId) {
+  const label = String(description || "").trim();
+  if (!label || label.length < 2 || !transactionId) return;
+  try {
+    await api("/entry-type-templates", {
+      method: "POST",
+      body: JSON.stringify({
+        movement_type: movementType,
+        label: label.slice(0, 100),
+        category_id: categoryId || null,
+        transaction_id: transactionId,
+      }),
+    });
+  } catch (_) {
+    // Learning signal only.
+  }
+}
+
 async function loadEntradas() {
   const month = document.querySelector("#income-entry-month").value;
-  await loadMovementEntries({
-    month,
-    type: "income",
-    tableSelector: "#income-entries-table",
-    columnCount: 5,
-    emptyText: "Nenhuma entrada registrada",
-    columns: (item) => `
-      <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
-      <td><strong>${escapeHtml(item.description)}</strong></td>
-      <td>${escapeHtml(item.account)}</td>
-      <td class="right amount-income">${money.format(item.amount)}</td>
-    `,
-  });
+  // October Go-Live Slice 5: "Rendas" absorvida em "Entradas" -- comissões e
+  // holerite carregam junto, mesmos endpoints/tabelas de antes, sem segundo
+  // cálculo.
+  await Promise.all([
+    loadMovementEntries({
+      month,
+      type: "income",
+      tableSelector: "#income-entries-table",
+      columnCount: 5,
+      emptyText: "Nenhuma entrada registrada",
+      columns: (item) => `
+        <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
+        <td><strong>${escapeHtml(item.description)}</strong></td>
+        <td>${escapeHtml(item.account)}</td>
+        <td class="right amount-income">${money.format(item.amount)}</td>
+      `,
+    }),
+    loadIncome(),
+    renderTypeTemplateChips("income", "#income-type-chips", "#income-entry-form"),
+  ]);
 }
 
 async function loadSaidas() {
   const month = document.querySelector("#expense-entry-month").value;
-  await loadMovementEntries({
-    month,
-    type: "expense",
-    tableSelector: "#expense-entries-table",
-    columnCount: 6,
-    emptyText: "Nenhuma saída registrada",
-    columns: (item) => `
-      <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
-      <td><strong>${escapeHtml(item.description)}</strong>${item.installment ? `<br><small>Parcela ${escapeHtml(item.installment)}</small>` : ""}</td>
-      <td>${escapeHtml(item.category)}</td>
-      <td>${escapeHtml(item.account)}</td>
-      <td class="right amount-expense">${money.format(item.amount)}</td>
-    `,
-  });
+  await Promise.all([
+    loadMovementEntries({
+      month,
+      type: "expense",
+      tableSelector: "#expense-entries-table",
+      columnCount: 6,
+      emptyText: "Nenhuma saída registrada",
+      columns: (item) => `
+        <td>${dateFormat.format(new Date(`${item.date}T00:00:00Z`))}</td>
+        <td><strong>${escapeHtml(item.description)}</strong>${item.installment ? `<br><small>Parcela ${escapeHtml(item.installment)}</small>` : ""}</td>
+        <td>${escapeHtml(item.category)}</td>
+        <td>${escapeHtml(item.account)}</td>
+        <td class="right amount-expense">${money.format(item.amount)}</td>
+      `,
+    }),
+    renderTypeTemplateChips("expense", "#expense-type-chips", "#expense-entry-form"),
+  ]);
 }
 
 // FAMILY_FINANCE_OBLIGATION_PAYMENT_V8
@@ -1311,21 +1425,33 @@ async function refreshObligationPaymentViews() {
   await loadDashboard();
 }
 
+// October Go-Live Slice 5: "Contas a pagar" agora é a única dona de
+// cadastro/conferência/pagamento de obrigação (docs/OCTOBER_GO_LIVE_REBASELINE.md
+// §2) -- esta linha reúne o que antes estava dividido entre esta tabela
+// (só conferência/pagamento) e a tabela de Gastos & Economia (que também
+// tinha grupo/repetição/exclusão). Mesmos dados de `GET /obligations`,
+// nenhum campo novo.
 function payablesObligationRow(item) {
   const singleOccurrence = Number(item.recurrence_months) === 0 && Number(item.occurrence_count) === 1;
-  const action = !isAdmin()
+  const paymentAction = !isAdmin()
     ? ""
     : item.status === "paid"
       ? `<button class="text-action unpay-obligation" data-id="${escapeHtml(item.id)}">Desfazer pagamento</button>`
       : singleOccurrence
         ? `<button class="text-action pay-obligation" data-id="${escapeHtml(item.id)}">Marcar como paga</button>`
         : "";
+  const deleteAction = item.status === "paid" || !isAdmin()
+    ? ""
+    : `<button class="danger-button delete-obligation" data-id="${escapeHtml(item.id)}">Excluir</button>`;
   return `
     <tr>
       <td>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))}</td>
       <td><strong>${escapeHtml(item.name)}</strong></td>
-      <td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span>${action ? `<br>${action}` : ""}</td>
+      <td>${escapeHtml(item.category)}</td>
+      <td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td>
+      <td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td>
       <td class="right ${item.status === "paid" ? "amount-income" : "amount-expense"}">${money.format(item.amount)}</td>
+      <td class="right"><div class="obligation-row-actions">${paymentAction}${deleteAction}</div></td>
     </tr>
   `;
 }
@@ -1351,8 +1477,13 @@ async function loadPayables() {
   state.obligations = obligations;
   document.querySelector("#payables-obligations-table").innerHTML = obligations.length
     ? obligations.map(payablesObligationRow).join("")
-    : emptyRow(4, "Nenhuma obrigação cadastrada. Cadastre em Planejamento.");
+    : emptyRow(7, "Nenhuma obrigação cadastrada.");
   bindObligationPaymentActions();
+  document.querySelectorAll(".delete-obligation").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("Excluir este compromisso das projeções futuras?")) return;
+    try { await api(`/obligations/${button.dataset.id}`, { method: "DELETE" }); await loadPayables(); toast("Compromisso excluído"); }
+    catch (error) { toast(error.message, true); }
+  }));
 
   const pending = invoices.filter((item) => item.status === "pending");
   document.querySelector("#payables-pending-invoices-table").innerHTML = pending.length ? pending.map((item) => `
@@ -1777,7 +1908,6 @@ async function loadCardPaymentReconciliations(month) {
 
 async function loadReviews() {
   const items = await api("/reviews");
-  document.querySelector("#nav-review-count").textContent = items.length;
   document.querySelector("#reviews-list").innerHTML = items.length ? items.map((item) => `
     <article class="review-card" data-review-id="${escapeHtml(item.id)}">
       <div class="review-icon">!</div>
@@ -1845,6 +1975,12 @@ async function loadProfile() {
 }
 
 async function loadForecast() {
+  // October Go-Live Slice 5: obligation cadastro/conferência/pagamento
+  // moved entirely to loadPayables()/#view-payables
+  // (docs/OCTOBER_GO_LIVE_REBASELINE.md §2 -- "Contas a pagar contém
+  // cadastro..."); this view keeps only the projection/calendar it already
+  // owned, still fed by the same `GET /obligations` response, no second
+  // calculation.
   const [data, obligations] = await Promise.all([api("/forecast"), api("/obligations")]);
   state.forecast = data.rows;
   state.forecastFloor = data.summary.emergency_floor;
@@ -1857,28 +1993,6 @@ async function loadForecast() {
     <tr><td>${escapeHtml(item.month)}</td><td class="right">${money.format(item.salary)}</td><td class="right">${money.format(item.payroll_extras)}</td><td class="right amount-income">${money.format(item.commission_delayed)}</td><td class="right amount-expense">${money.format(item.obligations)}</td><td class="right amount-expense">${money.format(item.installments)}</td><td class="right amount-income">${money.format(item.investment_return_delayed)}</td><td class="right ${item.balance_delayed < data.summary.emergency_floor ? "amount-expense" : "amount-income"}">${money.format(item.balance_delayed)}</td></tr>
   `).join("") : emptyRow(8, "Configure as premissas financeiras");
   state.obligations = obligations;
-  document.querySelector("#obligations-table").innerHTML = obligations.length ? obligations.map((item) => {
-    const singleOccurrence = Number(item.recurrence_months) === 0 && Number(item.occurrence_count) === 1;
-    const paymentAction = !isAdmin()
-      ? ""
-      : item.status === "paid"
-        ? `<button class="text-action unpay-obligation" data-id="${escapeHtml(item.id)}">Desfazer pagamento</button>`
-        : singleOccurrence
-          ? `<button class="text-action pay-obligation" data-id="${escapeHtml(item.id)}">Marcar como paga</button>`
-          : "";
-    const deleteAction = item.status === "paid" || !isAdmin()
-      ? ""
-      : `<button class="danger-button delete-obligation" data-id="${escapeHtml(item.id)}">Excluir</button>`;
-    return `
-      <tr><td>${dateFormat.format(new Date(`${item.next_due_date}T00:00:00Z`))}</td><td><strong>${escapeHtml(item.name)}</strong></td><td>${escapeHtml(item.category)}</td><td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td><td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td><td class="right ${item.status === "paid" ? "amount-income" : "amount-expense"}">${money.format(item.amount)}</td><td class="right"><div class="obligation-row-actions">${paymentAction}${deleteAction}</div></td></tr>
-    `;
-  }).join("") : emptyRow(7, "Nenhum compromisso ativo");
-  bindObligationPaymentActions();
-  document.querySelectorAll(".delete-obligation").forEach((button) => button.addEventListener("click", async () => {
-    if (!window.confirm("Excluir este compromisso das projeções futuras?")) return;
-    try { await api(`/obligations/${button.dataset.id}`, { method: "DELETE" }); await loadForecast(); toast("Compromisso excluído"); }
-    catch (error) { toast(error.message, true); }
-  }));
   drawForecast(data.rows, data.summary.emergency_floor);
   renderScenarioAlternativesForm();
   renderDueNotificationsPanel(obligations);
@@ -2781,8 +2895,13 @@ function renderAdvisorAnswer(bubble, result) {
 async function loadAdvisor() {
   const messages = document.querySelector("#advisor-messages");
   if (!messages.children.length) {
-    appendAdvisorMessage("assistant", "Olá! Posso avaliar uma compra, explicar entradas e saídas, listar vencimentos e sugerir cortes com base na sua base financeira.");
+    appendAdvisorMessage(
+      "assistant",
+      "Olá! Me conte o que aconteceu (ex.: \"Gastei R$ 150 de combustível hoje no cartão Itaú\") que eu preparo o lançamento para você confirmar. "
+      + "Também respondo perguntas: se posso comprar algo, quanto saiu do banco e dos cartões, quais obrigações estão próximas ou onde dá para economizar.",
+    );
   }
+  await loadAssistantActionsPanel();
   const badge = document.querySelector("#advisor-provider-status");
   try {
     const result = await api("/advisor/status");
@@ -2809,25 +2928,388 @@ async function loadAdvisor() {
   }
 }
 
-async function askAdvisor(message) {
-  appendAdvisorMessage("user", message);
-  const loading = appendAdvisorMessage("assistant", "Analisando seus dados...");
+// `bubble` already exists (appended by the caller) -- this only ever fills
+// it in, it never appends the user's own message a second time. Kept
+// separate from the typed-action flow below: `/advisor/chat` is the
+// pre-existing read-only financial consultant (explains numbers the
+// deterministic engine already computed) and keeps its own conversation
+// history, never mixed with the Assistente's `/assistant/interpret` thread.
+async function answerAdvisorQuestion(message, bubble) {
   try {
     const result = await api("/advisor/chat", {
       method: "POST",
       body: JSON.stringify({ message, history: state.advisorHistory.slice(-8) }),
     });
-    renderAdvisorAnswer(loading, result);
+    renderAdvisorAnswer(bubble, result);
     state.advisorHistory.push(
       { role: "user", content: message },
       { role: "assistant", content: result.answer.slice(0, 8000) },
     );
     state.advisorHistory = state.advisorHistory.slice(-8);
   } catch (error) {
+    bubble.textContent = error.message;
+    bubble.className = "advisor-message assistant error";
+  }
+  bubble.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// October Go-Live Slice 5 (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_5.md):
+// Assistente Financeiro typed-action UI. This is the ONLY frontend surface
+// that calls `/assistant/interpret` and `/assistant/execute`
+// (`app.services.assistant_actions`, Slice 4 contract) -- it never sends a
+// `typed_action`/`payload` directly, only ever the `proposal_id` the
+// server already resolved and persisted server-side
+// (`persist_action_proposal`), matching the engineering-review contract in
+// PR #92/#93: the client cannot forge or edit a proposal, only confirm or
+// cancel the one the server built.
+const ASSISTANT_TYPED_ACTION_INTENTS = new Set([
+  "create_expense", "create_income", "create_internal_transfer",
+  "pay_obligation", "pay_card_invoice", "register_refund",
+]);
+const ASSISTANT_TYPED_ACTION_LABELS = {
+  create_expense: "Registrar saída",
+  create_income: "Registrar entrada",
+  create_internal_transfer: "Transferência interna",
+  pay_obligation: "Pagar obrigação",
+  pay_card_invoice: "Pagar fatura de cartão",
+  register_refund: "Registrar estorno/reembolso",
+};
+const ASSISTANT_PAYLOAD_FIELD_LABELS = {
+  amount: "Valor",
+  description: "Descrição",
+  account_id: "Conta",
+  category_id: "Categoria",
+  booked_at: "Data",
+  from_account_id: "Conta de origem",
+  to_account_id: "Conta de destino",
+  funding_source: "Origem do dinheiro",
+  obligation_id: "Obrigação",
+  card_transaction_id: "Fatura",
+  paying_account_id: "Conta pagadora",
+  confirmed: "Confirmado",
+  transaction_id: "Transação original",
+};
+
+function assistantFieldLabel(key) {
+  return ASSISTANT_PAYLOAD_FIELD_LABELS[key]
+    || key.replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase());
+}
+
+// Resolves an opaque id in a proposal payload to the same human-readable
+// name already shown everywhere else in the app (docs/FINANCIAL_RULES.md,
+// dashboard principle: no internal identifiers in user-facing copy) --
+// using `state.accounts`/`state.categories`, already loaded at login, never
+// a second fetch or a second source of truth for the name itself.
+function assistantFieldValue(key, value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "boolean") return value ? "Sim" : "Não";
+  if (key.endsWith("account_id")) {
+    const account = state.accounts.find((item) => item.id === value);
+    if (account) return `${account.name} • ${account.owner_label}`;
+  } else if (key === "category_id") {
+    const category = state.categories.find((item) => item.id === value);
+    if (category) return category.name;
+  } else if (typeof value === "number" && /amount|balance/.test(key)) {
+    return money.format(value);
+  }
+  return String(value);
+}
+
+function resetAssistantThread() {
+  state.assistantHistory = [];
+  state.assistantTraceId = null;
+  state.assistantDisambiguationQa = [];
+  state.assistantPendingQuestion = null;
+}
+
+async function loadAssistantActionsPanel() {
+  const list = document.querySelector("#assistant-actions-list");
+  if (!list) return;
+  try {
+    const actions = await api("/assistant/actions");
+    list.innerHTML = actions.length ? actions.slice(0, 10).map((action) => `
+      <article class="assistant-action-row" data-id="${escapeHtml(action.id)}">
+        <div>
+          <strong>${escapeHtml(ASSISTANT_TYPED_ACTION_LABELS[action.typed_action] || action.typed_action)}</strong>
+          <small>${dateFormat.format(new Date(action.created_at))}${action.undone_at ? " • desfeita" : ""}</small>
+        </div>
+        ${action.undone_at
+          ? '<span class="status-chip muted">Desfeita</span>'
+          : action.undoable
+            ? `<button class="secondary assistant-undo-action" data-id="${escapeHtml(action.id)}" type="button">Desfazer</button>`
+            : `<small class="muted-copy" title="${escapeHtml(action.non_reversible_reason || "")}">Não reversível</small>`}
+      </article>
+    `).join("") : '<p class="muted-copy">Nenhuma ação registrada ainda.</p>';
+    list.querySelectorAll(".assistant-undo-action").forEach((button) => button.addEventListener("click", async () => {
+      const reason = window.prompt("Motivo para desfazer esta ação (obrigatório):");
+      if (reason === null) return;
+      if (reason.trim().length < 3) { toast("Motivo deve ter ao menos 3 caracteres", true); return; }
+      button.disabled = true;
+      try {
+        await api(`/assistant/actions/${button.dataset.id}/undo`, {
+          method: "POST",
+          body: JSON.stringify({ reason: reason.trim() }),
+        });
+        toast("Ação desfeita");
+        await loadAssistantActionsPanel();
+      } catch (error) {
+        toast(error.message, true);
+        button.disabled = false;
+      }
+    }));
+  } catch (_) {
+    // Best-effort: the chat itself never depends on this panel loading.
+  }
+}
+
+function renderAssistantProposal(bubble, proposal, proposalId) {
+  bubble.replaceChildren();
+  bubble.className = "advisor-message assistant assistant-proposal";
+  bubble.dataset.source = "Confirme antes de registrar";
+  const header = advisorElement("div", "advisor-answer-header");
+  header.append(
+    advisorElement("span", "advisor-answer-icon", "✓"),
+    advisorElement("strong", "", ASSISTANT_TYPED_ACTION_LABELS[proposal.typed_action] || proposal.typed_action),
+  );
+  bubble.appendChild(header);
+  const grid = advisorElement("div", "advisor-metric-grid assistant-proposal-grid");
+  Object.entries(proposal.payload || {}).forEach(([key, value]) => {
+    if (value === null || value === undefined || value === "") return;
+    const card = advisorElement("div", "advisor-metric");
+    card.append(
+      advisorElement("span", "", assistantFieldLabel(key)),
+      advisorElement("strong", "", assistantFieldValue(key, value)),
+    );
+    grid.appendChild(card);
+  });
+  bubble.appendChild(grid);
+  const actions = advisorElement("div", "assistant-proposal-actions");
+  const confirmButton = advisorElement("button", "primary", "Confirmar e registrar");
+  const cancelButton = advisorElement("button", "secondary", "Cancelar");
+  confirmButton.type = "button";
+  cancelButton.type = "button";
+  confirmButton.addEventListener("click", async () => {
+    confirmButton.disabled = true;
+    cancelButton.disabled = true;
+    await executeAssistantProposal(proposalId, bubble);
+  });
+  cancelButton.addEventListener("click", () => {
+    actions.remove();
+    bubble.appendChild(advisorElement("p", "advisor-answer-paragraph", "Ok, não registrei essa ação."));
+    resetAssistantThread();
+  });
+  actions.append(confirmButton, cancelButton);
+  bubble.appendChild(actions);
+}
+
+function renderAssistantClarifyingQuestion(bubble, text) {
+  bubble.replaceChildren();
+  bubble.className = "advisor-message assistant";
+  bubble.textContent = text;
+}
+
+function renderAssistantDuplicateChoice(bubble, proposal, originalMessage) {
+  bubble.replaceChildren();
+  bubble.className = "advisor-message assistant assistant-proposal";
+  bubble.dataset.source = "Possível duplicidade";
+  const candidate = (proposal.candidates || [])[0] || null;
+  bubble.appendChild(advisorElement(
+    "p",
+    "advisor-answer-paragraph",
+    proposal.clarifying_question || "Encontrei um lançamento parecido. O que você quer fazer?",
+  ));
+  if (candidate) bubble.appendChild(advisorElement("p", "advisor-answer-paragraph", candidate.label));
+  const actions = advisorElement("div", "assistant-proposal-actions");
+  [
+    ["skip", "Pular", "secondary"],
+    ["import_anyway", "Importar mesmo assim", "primary"],
+    ["view_existing", "Ver existente", "secondary"],
+  ].forEach(([decision, label, kind]) => {
+    const button = advisorElement("button", kind, label);
+    button.type = "button";
+    button.addEventListener("click", async () => {
+      actions.querySelectorAll("button").forEach((item) => { item.disabled = true; });
+      if (decision === "view_existing" && candidate) {
+        toast(`Lançamento existente: ${candidate.label}`);
+        navigate("transactions");
+      }
+      if (!candidate) { toast("Não encontrei o lançamento candidato; tente reescrever a mensagem.", true); return; }
+      await resolveAssistantDuplicate(originalMessage, decision, candidate.id, bubble);
+    });
+    actions.appendChild(button);
+  });
+  bubble.appendChild(actions);
+}
+
+function renderAssistantCandidates(bubble, proposal, originalMessage) {
+  bubble.replaceChildren();
+  bubble.className = "advisor-message assistant";
+  bubble.appendChild(advisorElement(
+    "p",
+    "advisor-answer-paragraph",
+    proposal.clarifying_question || "Encontrei mais de uma opção. Qual delas?",
+  ));
+  const list = advisorElement("div", "assistant-candidate-list");
+  (proposal.candidates || []).forEach((candidate) => {
+    const button = advisorElement("button", "secondary assistant-candidate", candidate.label);
+    button.type = "button";
+    button.addEventListener("click", async () => {
+      list.querySelectorAll("button").forEach((item) => { item.disabled = true; });
+      await sendAssistantMessage(candidate.label);
+    });
+    list.appendChild(button);
+  });
+  bubble.appendChild(list);
+}
+
+function renderAssistantExecutionResult(bubble, result) {
+  bubble.replaceChildren();
+  bubble.className = "advisor-message assistant assistant-proposal";
+  bubble.dataset.source = result.idempotent_replay ? "Já registrado" : "Registrado pelo Assistente";
+  const action = result.action;
+  bubble.appendChild(advisorElement(
+    "p",
+    "advisor-answer-paragraph",
+    result.idempotent_replay
+      ? "Essa ação já tinha sido registrada antes -- não criei de novo."
+      : "Pronto, registrei essa ação.",
+  ));
+  if (action) {
+    bubble.appendChild(advisorElement(
+      "p",
+      "advisor-answer-paragraph",
+      `${ASSISTANT_TYPED_ACTION_LABELS[action.typed_action] || action.typed_action} • ${dateFormat.format(new Date(action.created_at))}`,
+    ));
+    const actionsRow = advisorElement("div", "assistant-proposal-actions");
+    if (action.undoable) {
+      const undoButton = advisorElement("button", "secondary", "Desfazer");
+      undoButton.type = "button";
+      undoButton.addEventListener("click", async () => {
+        const reason = window.prompt("Motivo para desfazer esta ação (obrigatório):");
+        if (reason === null) return;
+        if (reason.trim().length < 3) { toast("Motivo deve ter ao menos 3 caracteres", true); return; }
+        undoButton.disabled = true;
+        try {
+          await api(`/assistant/actions/${action.id}/undo`, {
+            method: "POST",
+            body: JSON.stringify({ reason: reason.trim() }),
+          });
+          toast("Ação desfeita");
+          undoButton.replaceWith(advisorElement("small", "muted-copy", "Ação desfeita."));
+          await loadAssistantActionsPanel();
+        } catch (error) {
+          toast(error.message, true);
+          undoButton.disabled = false;
+        }
+      });
+      actionsRow.appendChild(undoButton);
+    } else if (action.non_reversible_reason) {
+      actionsRow.appendChild(advisorElement("small", "muted-copy", action.non_reversible_reason));
+    }
+    bubble.appendChild(actionsRow);
+  }
+  loadAssistantActionsPanel();
+}
+
+// The one place that turns a `/assistant/interpret` response into UI. Used
+// both by a fresh message and by the duplicate-resolution retry below, so
+// the branching (proposal ready / possible duplicate / pick a candidate /
+// missing fields / not a typed action at all) only exists once.
+async function handleAssistantInterpretResult(bubble, result, originalMessage) {
+  state.assistantTraceId = result.trace_id;
+  const { interpretation, proposal, proposal_id: proposalId } = result;
+  if (proposal.can_execute) {
+    renderAssistantProposal(bubble, proposal, proposalId);
+    state.assistantHistory = [];
+    state.assistantPendingQuestion = null;
+  } else if (proposal.candidate_kind === "possible_duplicate") {
+    renderAssistantDuplicateChoice(bubble, proposal, originalMessage);
+  } else if (proposal.candidates && proposal.candidates.length) {
+    state.assistantHistory.push({ role: "user", content: originalMessage });
+    if (proposal.clarifying_question) state.assistantHistory.push({ role: "assistant", content: proposal.clarifying_question });
+    state.assistantHistory = state.assistantHistory.slice(-8);
+    state.assistantPendingQuestion = proposal.clarifying_question || null;
+    renderAssistantCandidates(bubble, proposal, originalMessage);
+  } else if (interpretation.available && ASSISTANT_TYPED_ACTION_INTENTS.has(interpretation.intent)) {
+    // Actionable intent, but the resolution is still incomplete
+    // (`proposal.missing_fields`) -- keep the thread open so the next
+    // message can fill in what's missing instead of starting over.
+    const question = proposal.clarifying_question || "Preciso de mais alguns dados para continuar.";
+    state.assistantHistory.push({ role: "user", content: originalMessage }, { role: "assistant", content: question });
+    state.assistantHistory = state.assistantHistory.slice(-8);
+    state.assistantPendingQuestion = question;
+    renderAssistantClarifyingQuestion(bubble, question);
+  } else {
+    // Not a typed-action request at all (intent null/query/unknown, or the
+    // Codex sidecar was unavailable) -- this is a question, not something
+    // to register; answer it with the existing read-only consultant.
+    resetAssistantThread();
+    await answerAdvisorQuestion(originalMessage, bubble);
+    return;
+  }
+  bubble.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function sendAssistantMessage(message) {
+  if (state.assistantPendingQuestion) {
+    state.assistantDisambiguationQa.push({ question: state.assistantPendingQuestion, answer: message });
+    state.assistantDisambiguationQa = state.assistantDisambiguationQa.slice(-20);
+    state.assistantPendingQuestion = null;
+  }
+  appendAdvisorMessage("user", message);
+  const loading = appendAdvisorMessage("assistant", "Pensando...");
+  try {
+    const result = await api("/assistant/interpret", {
+      method: "POST",
+      body: JSON.stringify({
+        message,
+        history: state.assistantHistory.slice(-8),
+        trace_id: state.assistantTraceId,
+      }),
+    });
+    await handleAssistantInterpretResult(loading, result, message);
+  } catch (error) {
     loading.textContent = error.message;
     loading.className = "advisor-message assistant error";
   }
-  loading.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function resolveAssistantDuplicate(originalMessage, decision, transactionId, bubble) {
+  bubble.replaceChildren();
+  bubble.className = "advisor-message assistant";
+  bubble.textContent = "Um instante...";
+  try {
+    const result = await api("/assistant/interpret", {
+      method: "POST",
+      body: JSON.stringify({
+        message: originalMessage,
+        history: [],
+        trace_id: state.assistantTraceId,
+        duplicate_resolution: { decision, transaction_id: transactionId },
+      }),
+    });
+    await handleAssistantInterpretResult(bubble, result, originalMessage);
+  } catch (error) {
+    bubble.textContent = error.message;
+    bubble.className = "advisor-message assistant error";
+  }
+}
+
+async function executeAssistantProposal(proposalId, bubble) {
+  try {
+    const result = await api("/assistant/execute", {
+      method: "POST",
+      body: JSON.stringify({
+        proposal_id: proposalId,
+        disambiguation_qa: state.assistantDisambiguationQa.slice(-20),
+      }),
+    });
+    resetAssistantThread();
+    renderAssistantExecutionResult(bubble, result);
+  } catch (error) {
+    bubble.querySelector(".assistant-proposal-actions")?.remove();
+    bubble.appendChild(advisorElement("p", "advisor-answer-paragraph", error.message));
+  }
 }
 
 async function loadUsers() {
@@ -2881,10 +3363,8 @@ async function refreshIntegrityBanner() {
       document.querySelector("#integrity-banner-text").textContent =
         `Integridade financeira: BLOCK ativo (${status.open_findings || 0} finding(s) aberto(s)). Os números ainda podem ser corrigidos; nada foi escondido.`;
       banner.classList.remove("hidden");
-      document.querySelector("#nav-integrity-badge").classList.remove("hidden");
     } else {
       banner.classList.add("hidden");
-      document.querySelector("#nav-integrity-badge").classList.add("hidden");
     }
   } catch (_) {
     // Best-effort: never let the banner check break navigation.
@@ -3231,11 +3711,22 @@ document.querySelectorAll("#main-nav button").forEach((button) => button.addEven
 document.querySelector("#mobile-menu-toggle").addEventListener("click", () => {
   setMobileMenu(!document.querySelector(".sidebar").classList.contains("menu-open"));
 });
-document.querySelectorAll("[data-go]").forEach((button) => button.addEventListener("click", () => {
-  if (button.dataset.go === "transactions") document.querySelector("#transaction-month").value = document.querySelector("#dashboard-month").value;
-  navigate(button.dataset.go);
-  toggleDueNotificationsPanel(false);
-}));
+document.querySelectorAll("[data-go]").forEach((button) => {
+  const go = () => {
+    if (button.dataset.go === "transactions") document.querySelector("#transaction-month").value = document.querySelector("#dashboard-month").value;
+    navigate(button.dataset.go);
+    toggleDueNotificationsPanel(false);
+  };
+  button.addEventListener("click", go);
+  // October Go-Live Slice 5: some data-go targets (e.g. the Pendências KPI
+  // card) are non-button elements with role="button" for the absorbed
+  // legacy navigation (Revisar/etc.) -- keep them keyboard-operable.
+  if (button.getAttribute("role") === "button") {
+    button.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); go(); }
+    });
+  }
+});
 document.querySelector("#due-notifications-toggle").addEventListener("click", () => toggleDueNotificationsPanel());
 document.addEventListener("click", (event) => {
   const container = document.querySelector(".due-notifications");
@@ -3518,7 +4009,8 @@ document.querySelector("#income-entry-form").addEventListener("submit", async (e
     const largeConfirmation = confirmLargeTransactions([{ ...payload, kind: "transaction" }]);
     if (!largeConfirmation.allowed) return toast("Lançamento cancelado; use o Consultor para simulações", true);
     payload.confirmed_large_amount = largeConfirmation.confirmed;
-    await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
+    const created = await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
+    await recordEntryTypeObservation("income", created.id, payload.description, null);
     const month = payload.booked_at.slice(0, 7);
     event.target.reset();
     event.target.elements.booked_at.value = currentDateKey();
@@ -3541,7 +4033,8 @@ document.querySelector("#expense-entry-form").addEventListener("submit", async (
     const largeConfirmation = confirmLargeTransactions([{ ...payload, kind: "transaction" }]);
     if (!largeConfirmation.allowed) return toast("Lançamento cancelado; use o Consultor para simulações", true);
     payload.confirmed_large_amount = largeConfirmation.confirmed;
-    await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
+    const created = await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
+    await recordEntryTypeObservation("expense", created.id, payload.description, payload.category_id);
     const month = payload.booked_at.slice(0, 7);
     event.target.reset();
     event.target.elements.booked_at.value = currentDateKey();
@@ -3647,8 +4140,15 @@ document.querySelector("#payroll-form").addEventListener("submit", async (event)
 });
 document.querySelector("#obligation-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  try { await api("/obligations", { method: "POST", body: JSON.stringify(formJson(event.target, ["amount", "recurrence_months", "occurrence_count"])) }); event.target.reset(); event.target.elements.recurrence_months.value = "0"; event.target.elements.occurrence_count.value = "1"; await loadForecast(); toast("Compromisso incluído na projeção"); }
-  catch (error) { toast(error.message, true); }
+  try {
+    await api("/obligations", { method: "POST", body: JSON.stringify(formJson(event.target, ["amount", "recurrence_months", "occurrence_count"])) });
+    event.target.reset();
+    event.target.elements.recurrence_months.value = "0";
+    event.target.elements.occurrence_count.value = "1";
+    await loadPayables();
+    await loadDashboard();
+    toast("Obrigação cadastrada");
+  } catch (error) { toast(error.message, true); }
 });
 document.querySelector("#scenario-add-alternative").addEventListener("click", () => {
   if (state.scenarioAlternatives.length >= 5) { toast("Máximo de 5 alternativas por comparação"); return; }
@@ -3676,10 +4176,10 @@ document.querySelector("#advisor-form").addEventListener("submit", async (event)
   const message = input.value.trim();
   if (!message) return;
   input.value = "";
-  await askAdvisor(message);
+  await sendAssistantMessage(message);
 });
 document.querySelectorAll(".advisor-suggestion").forEach((button) => button.addEventListener("click", async () => {
-  await askAdvisor(button.textContent.trim());
+  await sendAssistantMessage(button.textContent.trim());
 }));
 document.querySelector("#profile-form").addEventListener("submit", async (event) => {
   event.preventDefault();
