@@ -606,8 +606,13 @@ em uma única tabela em vez de duas divergentes). `Gastos & Economia` (renomeaç
 `pageNames.planning`, mesma `id="view-planning"`/`loadForecast()`) ficou só com o que é
 projeção/economia de fato: cenário conservador, calendário consolidado e comparação de cenários de
 compra -- a análise mais profunda (tendências, categorias, anomalias --
-rebaseline §"Slice 7 -- Gastos & Economia + Relatórios") é escopo do **Slice 7**, ainda não
-implementado. O Dashboard ganhou um card de projeção compacto (`renderDashboardProjection`) que
+rebaseline §"Slice 7 -- Gastos & Economia + Relatórios") passou a ser servida pelo mesmo
+`#view-planning`, acima do painel de projeção: `loadSpendingEconomy()` (chamada por
+`loadPlanningView()`, o novo loader dessa view) lê `GET /spending-economy` -- que por sua vez
+constrói sobre `_build_report_payload` (`GET /reports`), nunca uma segunda soma/classificação --
+para exibir tendências por categoria, oportunidades de economia e a análise Codex separada em
+"Seus dados / Referências externas / Análise / Recomendação" (rebaseline §14). O Dashboard ganhou
+um card de projeção compacto (`renderDashboardProjection`) que
 reusa a mesma resposta de `GET /forecast` (nenhuma segunda chamada com lógica própria) para
 satisfazer "projeção no Dashboard" sem recortar a tela cheia.
 
@@ -871,6 +876,115 @@ normativos; os quatro foram corrigidos no mesmo PR, sem migration destrutiva e s
    em branco virava `0` e era enviado como fato financeiro confirmado. Novo `parseMoneyPromptInput`
    (`app/static/app.js`) rejeita entrada inválida em vez de normalizá-la; `promptMoney` repete o
    prompt até um valor válido ou cancelamento explícito -- nunca deixa `0` passar por coincidência.
+
+## Gastos & Economia e Relatórios (October Go-Live Slice 7, P0 #87)
+
+Work Order: `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md`. Rebaseline §§14, 15, 16, 17, 21.
+
+**Sem segundo motor: tudo compõe sobre `_build_report_payload`.** `GET /reports`
+(`app.api._build_report_payload`) já era a única fonte de `spending`/`categories`/`accounts`/
+`monthly` publicada tanto pela tela quanto pela exportação Excel/PDF (INV-020). Este slice estende
+a mesma função com seis seções novas -- `patrimony`, `investments`, `card_invoices`, `obligations`,
+`financial_states`, `ledger` -- e uma granularidade nova (`monthly_categories`, a mesma
+`category_spending_rows(snapshot)` já somada em `categories`, mas preservada por mês em vez de
+descartada) em vez de criar um segundo endpoint/serviço de agregação. Cada seção nova chama
+exatamente a função canônica que `/dashboard`/`/investments`/`/obligations`/`/card-invoices` já
+usam:
+
+- `patrimony`/`investments`: `app.services.investments.household_patrimony_summary`/
+  `investments_summary` -- as mesmas duas funções `/dashboard` chama, fechando a lacuna que
+  `docs/ARCHITECTURE.md` (seção do Slice 6, acima) já registrava como pendente ("o Work Order pede
+  o contrato para os Relatórios do Slice 7"). O componente de caixa do patrimônio usa a mesma
+  resolução "saldo confirmado soberano no instante observado, senão o saldo de liquidez calculado"
+  que `/dashboard` já fazia inline -- extraída para `app.api._current_liquidity_observation` e
+  chamada por ambos os endpoints (nunca duas implementações da mesma consulta).
+- `card_invoices`: `app.services.card_invoice_lifecycle.list_invoices`/`serialize_card_invoice`
+  (o mesmo par `GET /card-invoices` usa; `serialize_card_invoice` já inclui `financial_state`).
+- `obligations`: `app.api._obligation_rows` (o mesmo `GET /obligations`/`/dashboard` usam; já
+  retorna `financial_state` REALIZADO/COMPROMETIDO por linha). Ganhou um parâmetro opcional
+  `due_before` (engineering review, PR #95, Round 1, item 1): `/reports` chama
+  `_obligation_rows(..., due_before=end)` para ancorar COMPROMETIDO ao `end_month` do próprio
+  relatório -- uma obrigação com vencimento *depois* do fechamento do período não "aconteceu" como
+  compromisso ainda naquele instante, então um relatório histórico não pode deixá-la contaminar sua
+  própria leitura. Todo outro chamador (`/dashboard`, `GET /obligations`, o Assistente) continua
+  passando `due_before=None` -- comportamento inalterado.
+- `financial_states.comprometido`: `report_obligations_pending_total` (soma das linhas já ancoradas
+  acima) + o outstanding de faturas fechadas/parcialmente pagas, também ancorado a
+  `invoice.competence <= end_month`. A soma de faturas usa apenas a fatura de **maior competência
+  elegível por conta** (`latest_outstanding_invoice_by_account`), nunca a soma de todas -- o próprio
+  `outstanding_balance()` já inclui `principal_carried_in` (o saldo não pago da fatura anterior), de
+  modo que somar `outstanding_balance()` de duas faturas consecutivas do mesmo cartão contaria o
+  saldo carregado duas vezes. Engineering review PR #95, Round 2: `GET /dashboard`/`GET /forecast`'s
+  `_forecast_card_invoices` tinha essa mesma lacuna latente -- inicialmente registrada como Technical
+  Challenge (adiamento para fora do escopo do Slice 7) e depois rejeitada pelo revisor, porque a
+  paridade Dashboard/Forecast/Relatórios exigida pelo próprio Work Order tornava a divergência um
+  bloqueador, não uma melhoria futura. `_forecast_card_invoices` agora seleciona a mesma fatura de
+  maior competência elegível por conta antes de aplicar seu próprio agrupamento por mês de
+  vencimento (usado por `GET /forecast`) -- o corte temporal por competência/mês de vencimento é
+  preservado exatamente como antes, só a soma por conta deixou de contar o principal carregado mais
+  de uma vez. Testes: `tests/test_obligation_lifecycle_slice3.py`
+  (`test_forecast_card_invoices_does_not_double_count_two_consecutive_carried_cycles`,
+  `..._three_consecutive_carried_cycles`, `..._two_independent_cards_both_count_in_full`,
+  `test_dashboard_forecast_and_report_agree_on_carried_card_commitment`,
+  `test_card_invoice_payment_reduces_carried_commitment_without_erasing_history`).
+- `financial_states.previsto`: **deliberadamente restrito** ao salário recorrente configurado do
+  período seguinte ao relatório, via `app.services.recurring_income.reconcile_recurring_income` (a
+  mesma função `GET /forecast` usa) -- nunca uma comissão (rebaseline §8.3/INV-031) e nunca uma
+  segunda chamada à projeção completa (`_build_projection_gate_checks`, que também persiste um
+  `IntegrityRun`): rodar o motor de projeção inteiro a cada `GET /reports` só para popular um
+  resumo teria efeito colateral desproporcional ao valor exibido. A projeção completa (30/60/90
+  dias) continua exclusivamente em `GET /forecast`; `financial_states.previsto.note` aponta para lá.
+- `ledger`: os mesmos `movement_rows` que `_build_report_payload` já buscava para os totais mensais
+  (`_consolidated_transactions`) -- nenhuma query nova, só serialização dos fatos já carregados.
+
+**`GET /spending-economy` (novo) não recalcula nada -- ele lê `_build_report_payload`.** A tela
+"Gastos & Economia" precisava de comparação histórica/tendências/oportunidades por categoria, que
+exigem a série mensal por categoria (não só o total do período). Em vez de duplicar o laço de
+`_build_report_payload`, o próprio laço passou a acumular `monthly_categories` (a mesma
+`category_spending_rows(snapshot)` já chamada para `categories`, só que preservada por mês);
+`GET /spending-economy` chama `_build_report_payload` uma vez e deriva `tendencias`/
+`oportunidades_economia` com aritmética pura (variação percentual mês a mês e contra a própria
+média histórica -- `app.api._category_trends`/`_spending_opportunities`) sobre esses números já
+canônicos. `seus_dados.origem_por_conta_cartao` (engineering review, PR #95, Round 1, item 2 --
+a dimensão "origem por conta/cartão" que o Work Order lista como obrigatória) é `report["accounts"]`
+copiado verbatim -- a mesma agregação por conta que `GET /reports` já publica -- nunca uma terceira
+soma; é explicativa (onde o consumo aconteceu), nunca redefine o conceito de gasto de
+`categories`/`summary`.
+
+**Fluxo de caixa por conta agora inclui o pagamento de fatura (Slice 1, engineering review PR #95,
+Round 1, item 3).** `account_cash_flow_rows`/`GET /reports`' `accounts` (e `GET /dashboard`'s
+`cash_flow_by_account`, a mesma função) publicam, por conta, quanto saiu fisicamente dela --
+rebaseline §16 "Quanto saiu desta conta? -- débitos físicos daquela conta, incluindo pagamento de
+fatura e transferências". Antes deste PR, o débito de conta corrente que paga uma fatura (a perna
+`card_payments` de uma `reconciliation`, em `app.services.financial_snapshots._collect`) nunca
+entrava em nenhuma linha de `accounts` -- a conta que pagou a fatura simplesmente não aparecia na
+visão "fluxo de caixa por conta", embora o dinheiro tivesse saído de verdade. `card_payments` foi
+adicionado ao conjunto de métricas que alimentam `accounts[...].gross_out` (logo `cash_out`/
+`bank_cash_out`) sem tocar `totals["expenses"]`/`categories` -- o pagamento de fatura continua nunca
+contando como um segundo gasto (`total_spending`/`total_bank_cash_out` agregados, que vêm de
+`totals`, ficam exatamente como estavam).
+
+**Separação "Seus dados / Referências externas / Análise / Recomendação" (rebaseline §14).** O
+Advisor sidecar (`advisor/server.mjs`) não tem acesso à internet nem provedor de busca externa
+(`advisor/providers/` só tem `fakeProvider.mjs`) -- então `referencias_externas` fica
+estruturalmente presente e vazia por padrão, nunca inventada, em vez deste slice simular uma busca
+que não existe de fato. `analise`/`recomendacao` reaproveitam a rota `/v1/analyze` já existente
+(schema `advisor-schema.json`, o mesmo `POST /advisor/question` já usa) com a mesma regra de
+autoridade do INV-021: um veredito determinístico é calculado primeiro
+(`app.api._spending_economy_codex_analysis`); o Codex só substitui o texto quando devolve
+exatamente esse veredito, nunca um mais/menos conservador. Uma divergência de veredito nunca é
+aplicada silenciosamente -- fica em `divergencia_codex` para o usuário/engenheiro revisar
+(diferente de `POST /advisor/question`, que hoje só descarta a resposta divergente sem sinalizar;
+este endpoint melhora esse ponto porque o Work Order deste slice pede explicitamente
+"divergência... deve ser sinalizada, nunca sobrescrita silenciosamente" -- um Technical Challenge
+futuro pode avaliar levar o mesmo campo `divergence` para `POST /advisor/question`).
+
+**Frontend.** `renderReport`/`renderReportSlice7Sections` (`app/static/app.js`) só formatam os
+campos novos de `GET /reports` (nunca somam nada); a nova tabela "Cartões" reaproveita
+`cardInvoiceStatusLabels` e a de "Obrigações" reaproveita `payableInvoiceStatusLabels` -- os mesmos
+dois mapas de rótulo que `Contas a pagar` já usa, não uma terceira cópia. `#view-planning` ganhou
+`loadSpendingEconomy()` (chamada por `loadPlanningView()`, o novo loader da view) acima do painel
+de projeção já existente; nenhuma lógica de projeção foi alterada.
 
 ## Comparação visual de cenários de compra (Fase 3)
 

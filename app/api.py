@@ -650,14 +650,26 @@ def _obligation_rows(
     reference: date | None = None,
     *,
     include_paid: bool = False,
+    due_before: date | None = None,
 ) -> list[dict]:
     # FAMILY_FINANCE_OBLIGATION_PAYMENT_V8
+    #
+    # October Go-Live Slice 7 engineering review (PR #95, Round 1, item 1):
+    # `due_before` anchors this list to a caller-chosen instant -- e.g.
+    # `GET /reports`' own `end_month` -- so a historical report never lets an
+    # obligation contracted/due *after* the period it is reporting on
+    # silently inflate that period's COMPROMETIDO. `None` (every existing
+    # caller: the Dashboard, `GET /obligations`, the Assistant) keeps the
+    # unfiltered "everything currently pending" behaviour unchanged -- this
+    # is opt-in, not a change to what those call sites already return.
     query = select(Obligation).where(
         Obligation.household_id == household_id,
         Obligation.active.is_(True),
     )
     if not include_paid:
         query = query.where(Obligation.status == "pending")
+    if due_before is not None:
+        query = query.where(Obligation.due_date < due_before)
     rows = db.scalars(query.order_by(Obligation.due_date)).all()
 
     result = []
@@ -8549,6 +8561,22 @@ def _forecast_card_invoices(
     `_forecast_obligations`'s own overdue clamp: an invoice whose `due_date`
     has already passed is folded into `start_month` instead of a past month
     the projection's forward-only cursor never visits.
+
+    October Go-Live Slice 7 engineering review (PR #95, Round 2): a balance
+    left unpaid across two or more *consecutive* cycles of the same card is
+    folded into every later cycle's own `principal_carried_in`
+    (`card_invoice_lifecycle.get_or_sync_invoice`) -- `outstanding_balance`
+    of the closed/partially_paid invoice for competence N already equals
+    "this cycle's purchases + everything still owed from every earlier
+    cycle". Naively summing `outstanding_balance()` across *every* eligible
+    invoice of the same card therefore counts that carried principal once
+    per cycle it survived. Only the single latest (highest-competence)
+    eligible invoice *per account* is ever counted here -- its own total
+    already includes every earlier unpaid cycle -- exactly the same model
+    `_build_report_payload`'s `report_card_invoices_outstanding_total`
+    already uses, so `GET /dashboard`, `GET /forecast` and `GET /reports`
+    can never diverge on this figure (rebaseline requires that parity; see
+    docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md).
     """
 
     rows = db.scalars(
@@ -8557,8 +8585,13 @@ def _forecast_card_invoices(
             CardInvoice.status.in_(("closed", "partially_paid")),
         )
     ).all()
-    values: dict[str, Decimal] = {}
+    latest_outstanding_invoice_by_account: dict[str, CardInvoice] = {}
     for invoice in rows:
+        current = latest_outstanding_invoice_by_account.get(invoice.account_id)
+        if current is None or invoice.competence > current.competence:
+            latest_outstanding_invoice_by_account[invoice.account_id] = invoice
+    values: dict[str, Decimal] = {}
+    for invoice in latest_outstanding_invoice_by_account.values():
         owed = outstanding_balance(invoice)
         if owed <= 0:
             continue
@@ -9836,6 +9869,83 @@ def credit_cards_summary(
     }
 
 
+def _current_liquidity_observation(
+    db: Session,
+    *,
+    household_id: str,
+    profile: FinancialProfile,
+    window_start: date,
+    window_end: date,
+) -> tuple[dict | None, Decimal | None]:
+    """The confirmed Privilège/liquidity balance observed inside
+    `[window_start, window_end)`, if any -- rebaseline §5.1 ("saldo
+    confirmado é soberano no instante observado").
+
+    Extracted from `GET /dashboard` (October Go-Live Slice 1) so `/reports`
+    (October Go-Live Slice 7, rebaseline §16.2/§17 -- Patrimônio "usa
+    somente o Valor de hoje"/"saldos... reais") can resolve the exact same
+    cash-position-as-of-a-period fact for its own `patrimony` section
+    instead of a second, independently-written observation query -- see
+    `docs/ARCHITECTURE.md` on `household_patrimony_summary` for why the
+    cash component must always be *this* already-canonical figure, never a
+    third derivation. Behaviour for `GET /dashboard` (`window_start`/
+    `window_end` = the requested month) is unchanged; `/reports` calls this
+    with the *last* reporting month's window, matching how it already
+    resolves every other "as of the report's end month" figure.
+
+    Returns `(display_dict_or_None, raw_amount_or_None)`: the display dict
+    is the exact `noncanonical.current_liquidity_observation` shape
+    `/dashboard` has always published (JSON-safe `decimal_value`d amount);
+    the raw `Decimal` twin is what `household_patrimony_summary` needs to
+    add to the investments total without re-deriving it from the display
+    dict.
+    """
+
+    observation: dict | None = None
+    observation_amount: Decimal | None = None
+    liquidity_account = db.scalar(
+        select(Account)
+        .where(
+            Account.household_id == household_id,
+            Account.active.is_(True),
+            Account.account_type == "investment",
+            Account.name == profile.investment_name,
+        )
+        .limit(1)
+    )
+    if liquidity_account is not None:
+        observed = db.scalar(
+            select(AccountBalanceObservation)
+            .where(
+                AccountBalanceObservation.household_id == household_id,
+                AccountBalanceObservation.account_id == liquidity_account.id,
+                AccountBalanceObservation.as_of_date >= window_start,
+                AccountBalanceObservation.as_of_date < window_end,
+                AccountBalanceObservation.invalidated_at.is_(None),
+                AccountBalanceObservation.superseded_by_id.is_(None),
+                AccountBalanceObservation.source == "manual_confirmed",
+                AccountBalanceObservation.confidence >= Decimal("1"),
+            )
+            .order_by(
+                AccountBalanceObservation.as_of_date.desc(),
+                AccountBalanceObservation.created_at.desc(),
+            )
+            .limit(1)
+        )
+        if observed is not None:
+            observation = {
+                "value": decimal_value(observed.amount),
+                "as_of_date": observed.as_of_date.isoformat(),
+                "account_id": observed.account_id,
+                "source": "account_balance_observation",
+                "freshness": "point_in_time",
+                "certified_by": "manual_confirmed",
+                "trusted": True,
+            }
+            observation_amount = observed.amount
+    return observation, observation_amount
+
+
 @router.get("/dashboard")
 def dashboard(
     month: str | None = None,
@@ -9896,53 +10006,18 @@ def dashboard(
             Commission.status != "cancelled",
         )
     )
-    current_liquidity_observation = None
     # Raw `Decimal` twin of `current_liquidity_observation["value"]` (which
     # already went through the JSON-boundary `decimal_value()` cast) --
     # `household_patrimony_summary` below needs an exact `Decimal` to add to
     # the investments total, never the float re-derived from the display
     # dict.
-    current_liquidity_observation_amount: Decimal | None = None
-    liquidity_account = db.scalar(
-        select(Account)
-        .where(
-            Account.household_id == user.household_id,
-            Account.active.is_(True),
-            Account.account_type == "investment",
-            Account.name == profile.investment_name,
-        )
-        .limit(1)
+    current_liquidity_observation, current_liquidity_observation_amount = _current_liquidity_observation(
+        db,
+        household_id=user.household_id,
+        profile=profile,
+        window_start=start,
+        window_end=end,
     )
-    if liquidity_account is not None:
-        observed = db.scalar(
-            select(AccountBalanceObservation)
-            .where(
-                AccountBalanceObservation.household_id == user.household_id,
-                AccountBalanceObservation.account_id == liquidity_account.id,
-                AccountBalanceObservation.as_of_date >= start,
-                AccountBalanceObservation.as_of_date < end,
-                AccountBalanceObservation.invalidated_at.is_(None),
-                AccountBalanceObservation.superseded_by_id.is_(None),
-                AccountBalanceObservation.source == "manual_confirmed",
-                AccountBalanceObservation.confidence >= Decimal("1"),
-            )
-            .order_by(
-                AccountBalanceObservation.as_of_date.desc(),
-                AccountBalanceObservation.created_at.desc(),
-            )
-            .limit(1)
-        )
-        if observed is not None:
-            current_liquidity_observation = {
-                "value": decimal_value(observed.amount),
-                "as_of_date": observed.as_of_date.isoformat(),
-                "account_id": observed.account_id,
-                "source": "account_balance_observation",
-                "freshness": "point_in_time",
-                "certified_by": "manual_confirmed",
-                "trusted": True,
-            }
-            current_liquidity_observation_amount = observed.amount
 
     pending_obligation_rows = _obligation_rows(db, user.household_id)
     obligation_alerts = [item for item in pending_obligation_rows if item["days_until_due"] <= 30][:5]
@@ -10201,6 +10276,16 @@ def _build_report_payload(db: Session, user: User, *, end_month: str | None, mon
     serialized_months = []
     report_snapshots: list[FinancialSnapshot] = []
     category_totals: dict[str, Decimal] = {}
+    # October Go-Live Slice 7 (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md`):
+    # per-month category breakdown, kept alongside the window-wide
+    # `category_totals` accumulated below -- "Gastos & Economia" (rebaseline
+    # §14 "comparação histórica; tendências") needs the *trajectory* of each
+    # category across months, not only the summed total this function has
+    # always published. Reuses the exact same `category_spending_rows(snapshot)`
+    # call already made for `category_totals` (captured once into
+    # `category_rows` and consumed by both) -- never a second,
+    # independently-computed monthly breakdown.
+    monthly_categories: list[dict[str, object]] = []
     duplicates_ignored = 0
     previous_active_spending: Decimal | None = None
     for key, item in month_rows.items():
@@ -10219,11 +10304,24 @@ def _build_report_payload(db: Session, user: User, *, end_month: str | None, mon
         # `/reports`' own `categories` totals too, closing the INV-020 gap
         # the engineering review named on PR 7, Round 7 ("nested amounts of
         # categories ... continues coming direct from snapshot.payload").
-        for category in category_spending_rows(snapshot):
+        category_rows = category_spending_rows(snapshot)
+        for category in category_rows:
             name = str(category["category"])
             category_totals[name] = category_totals.get(name, Decimal("0")) + Decimal(
                 str(category["amount"])
             )
+        monthly_categories.append(
+            {
+                "month": key,
+                "categories": [
+                    {
+                        "category": str(row["category"]),
+                        "amount": decimal_value(row["amount"]),
+                    }
+                    for row in category_rows
+                ],
+            }
+        )
         # `report_month_monetary_publication` is the exact function INV-020
         # reads to verify this response -- see its docstring and
         # `dashboard_and_report_consistency_facts`. This row spreads its
@@ -10251,6 +10349,18 @@ def _build_report_payload(db: Session, user: User, *, end_month: str | None, mon
                 "snapshot_id": snapshot.id,
                 "snapshot_checksum": snapshot.checksum,
                 "integrity_status": snapshot.integrity_status,
+                # October Go-Live Slice 7 (rebaseline §15 "transferências
+                # internas"): a direct, verbatim read of the snapshot's own
+                # `internal_transfers` column -- the exact figure
+                # `_collect`/`calculate_actual_snapshot` already computed
+                # (Privilège <-> Conta Corrente and equivalent internal
+                # movements, rebaseline §4.2) and never folded into
+                # `spending`/`cash_in`/`cash_out` above. Published here so a
+                # month's internal-transfer volume is visible in the ledger
+                # view without ever being summed into "quanto eu gastei"
+                # (rebaseline §17) -- see `internal_transfers_total` below
+                # for the window-wide sum of this exact same per-month value.
+                "internal_transfers": decimal_value(snapshot.internal_transfers),
             }
         )
         if item["transaction_count"] > 0:
@@ -10391,6 +10501,176 @@ def _build_report_payload(db: Session, user: User, *, end_month: str | None, mon
             key=lambda item: (str(item["account_type"]), str(item["account"])),
         )
     ]
+
+    # October Go-Live Slice 7 (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md`,
+    # rebaseline §15/§16/§17): Relatórios must offer patrimônio/investimentos/
+    # cartões/obrigações/REALIZADO-COMPROMETIDO-PREVISTO alongside the
+    # caixa/consumo views above -- `docs/ARCHITECTURE.md` explicitly named
+    # this integration as deferred from Slice 6 to Slice 7. Every figure
+    # below calls the exact same canonical function Slice 1-6 already
+    # published elsewhere (`/dashboard`, `/investments`, `/obligations`,
+    # `/card-invoices`) -- never a second computation -- so this report can
+    # never diverge from those surfaces on the same fact.
+    account_names = {
+        str(item["account_id"]): {"account": item["account"], "account_type": item["account_type"]}
+        for item in report_accounts
+    }
+    internal_transfers_total = money(
+        sum((Decimal(item.internal_transfers) for item in report_snapshots), Decimal("0"))
+    )
+    # `household_patrimony_summary`'s cash component resolves the same
+    # "quanto tenho hoje" fact `/dashboard` resolves -- the confirmed
+    # observation inside the report's *last* month when one exists
+    # (rebaseline §5.1, sovereign), else that month's own closing liquidity
+    # balance -- via the exact function `dashboard()` was refactored to
+    # share (`_current_liquidity_observation`), never a third, independently
+    # written lookup.
+    report_liquidity_observation, report_liquidity_observation_amount = _current_liquidity_observation(
+        db,
+        household_id=user.household_id,
+        profile=profile,
+        window_start=last_month,
+        window_end=end,
+    )
+    patrimony_cash_position = (
+        report_liquidity_observation_amount
+        if report_liquidity_observation_amount is not None
+        else last_snapshot.closing_liquidity_balance
+    )
+    report_investments = investments_summary(db, household_id=user.household_id)
+    report_patrimony = household_patrimony_summary(
+        cash_position=patrimony_cash_position,
+        investments_total=report_investments["total_current_value"],
+    )
+    # October Go-Live Slice 7 engineering review (PR #95, Round 1, item 1):
+    # `due_before=end` anchors COMPROMETIDO to *this report's own*
+    # `end_month` -- an obligation due after the window's last month has not
+    # happened "as of" the instant this report describes and must not
+    # contaminate a historical period's reading. `end` is the first day of
+    # the month right after `last_month`, so `due_date < end` keeps every
+    # obligation due on or before `last_month`'s last day, regardless of
+    # whether it was already overdue before `start` (still a real pending
+    # commitment as of `end_month`, so it must still count).
+    report_obligations = _obligation_rows(db, user.household_id, due_before=end)
+    report_obligations_pending_total = money(
+        sum((Decimal(str(item["amount"])) for item in report_obligations if item["status"] == "pending"), Decimal("0"))
+    )
+    household_card_invoices = list_card_invoices(db, household_id=user.household_id)
+    report_card_invoices = [
+        serialize_card_invoice(invoice)
+        for invoice in household_card_invoices
+        if month_key(last_month) >= invoice.competence >= month_key(start)
+    ]
+    # Same anchor as `report_obligations` above, applied to card invoices:
+    # unlike the displayed `report_card_invoices` list (bounded on *both*
+    # ends to the requested window), the outstanding total looks back past
+    # `start` too -- an invoice from before the window that is still
+    # `closed`/`partially_paid` still owes money as of `end_month` and must
+    # keep counting -- but never past `last_month`'s own competence, or a
+    # future invoice would leak into a historical period's COMPROMETIDO the
+    # same way an unanchored obligation would (PR #95 review).
+    #
+    # Independently found while implementing that anchor: `outstanding_balance`'s
+    # own docstring says an invoice's total is "this cycle's purchases plus
+    # whatever principal it inherited" -- `principal_carried_in` mirrors the
+    # *immediately preceding* competence's own outstanding balance
+    # (`get_or_sync_invoice`), so a balance left unpaid across two or more
+    # consecutive cycles is folded into every later cycle's own total. Naively
+    # summing `outstanding_balance()` across *every* eligible invoice of the
+    # same card would therefore count that carried balance once per cycle it
+    # survived -- exactly the "não pode ser somada duas vezes na mesma
+    # métrica" this Work Order (§ Relatórios) forbids. The correct "owed on
+    # this card right now" figure is only the *single latest* (highest-
+    # competence) eligible invoice per account -- its own total already
+    # includes every earlier unpaid cycle. (Round 2 of this same PR #95
+    # review required the identical fix in `GET /dashboard`'s/`GET
+    # /forecast`'s `_forecast_card_invoices` for Dashboard<->Forecast<->
+    # Relatórios parity -- see that function's own docstring; both now
+    # select the same single latest-per-account invoice, never a second,
+    # diverging model.)
+    latest_outstanding_invoice_by_account: dict[str, CardInvoice] = {}
+    for invoice in household_card_invoices:
+        if invoice.status not in ("closed", "partially_paid"):
+            continue
+        if invoice.competence > month_key(last_month):
+            continue
+        current = latest_outstanding_invoice_by_account.get(invoice.account_id)
+        if current is None or invoice.competence > current.competence:
+            latest_outstanding_invoice_by_account[invoice.account_id] = invoice
+    report_card_invoices_outstanding_total = money(
+        sum(
+            (outstanding_balance(invoice) for invoice in latest_outstanding_invoice_by_account.values()),
+            Decimal("0"),
+        )
+    )
+    # PREVISTO for the period immediately after the report window: the
+    # configured recurring salary (rebaseline §8.4, "Kelly") only, via the
+    # same `reconcile_recurring_income` the projection engine uses -- never
+    # a second projection formula, and never a commission (rebaseline §8.3
+    # "comissão não entra em previsão futura automaticamente" / INV-031).
+    previsto_period = month_key(end)
+    previsto_salary: dict[str, object] | None = None
+    if profile.monthly_salary_net > 0:
+        salary_reconciliation = reconcile_recurring_income(
+            db,
+            household_id=user.household_id,
+            period=previsto_period,
+            expected_amount=profile.monthly_salary_net,
+        )
+        previsto_salary = {
+            "period": previsto_period,
+            "expected_amount": decimal_value(profile.monthly_salary_net),
+            "financial_state": salary_reconciliation.financial_state,
+            "matched_amount": decimal_value(salary_reconciliation.matched_amount)
+            if salary_reconciliation.matched_amount is not None
+            else None,
+            "ambiguous": salary_reconciliation.ambiguous,
+        }
+    financial_states = {
+        "realizado": {
+            "spending": decimal_value(total_spending),
+            "cash_in": decimal_value(total_cash_in),
+            "cash_out": decimal_value(total_cash_out),
+            "source": "report_summary",
+        },
+        "comprometido": {
+            "obligations_pending": decimal_value(report_obligations_pending_total),
+            "card_invoices_outstanding": decimal_value(report_card_invoices_outstanding_total),
+            "total": decimal_value(
+                money(report_obligations_pending_total + report_card_invoices_outstanding_total)
+            ),
+            "source": "obligation_rows+card_invoice_outstanding_balance",
+        },
+        # PREVISTO here only ever covers the household's own configured
+        # recurring salary for the period right after the window -- the full
+        # multi-month projection (installments/obligations/card invoices/
+        # investment yield) remains `GET /forecast`'s own responsibility;
+        # this report never re-runs that engine (which also persists an
+        # `IntegrityRun`) just to render a summary card.
+        "previsto": {
+            "recurring_salary": previsto_salary,
+            "note": "Projeção completa (30/60/90 dias) disponível em GET /forecast.",
+        },
+    }
+    ledger = [
+        {
+            "transaction_id": transaction.id,
+            "booked_at": transaction.booked_at.isoformat(),
+            "description": transaction.description,
+            "amount": decimal_value(transaction.amount),
+            "category": category_name,
+            "transaction_type": transaction.transaction_type,
+            "account_id": transaction.account_id,
+            "account": account_names.get(str(transaction.account_id), {}).get("account"),
+            "card_invoice_id": transaction.card_invoice_id,
+            "refund_of_transaction_id": transaction.refund_of_transaction_id,
+            "excluded": transaction.excluded,
+            "possible_duplicate": transaction.possible_duplicate,
+        }
+        for transaction, category_name in sorted(
+            movement_rows, key=lambda row: (row[0].booked_at, row[0].id)
+        )
+    ]
     db.commit()
     return {
         "start_month": month_key(start),
@@ -10418,10 +10698,35 @@ def _build_report_payload(db: Session, user: User, *, end_month: str | None, mon
             "highest_month": highest_month["month"],
             "lowest_month": lowest_month["month"],
             "last_change_percentage": last_change,
+            "internal_transfers_total": decimal_value(internal_transfers_total),
         },
         "monthly": serialized_months,
+        "monthly_categories": monthly_categories,
         "categories": categories,
         "accounts": report_accounts,
+        # Every key below is new in October Go-Live Slice 7 -- see the
+        # comment above `account_names` for why each one reuses an
+        # already-canonical function rather than computing anything fresh.
+        "patrimony": {
+            "value": decimal_value(report_patrimony["total"]),
+            "cash_component": decimal_value(report_patrimony["cash_position"]),
+            "cash_source": (
+                "current_liquidity_observation"
+                if report_liquidity_observation_amount is not None
+                else "liquidity_balance"
+            ),
+            "investments_component": decimal_value(report_patrimony["investments_total"]),
+            "as_of_month": month_key(last_month),
+            "source": "household_patrimony_summary",
+        },
+        "investments": [
+            {key: decimal_value(value) if isinstance(value, Decimal) else value for key, value in row.items()}
+            for row in report_investments["investments"]
+        ],
+        "card_invoices": report_card_invoices,
+        "obligations": report_obligations,
+        "financial_states": financial_states,
+        "ledger": ledger,
     }
 
 
@@ -10463,6 +10768,289 @@ def export_report(
         media_type=REPORT_EXPORT_MEDIA_TYPES[format],
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# October Go-Live Slice 7 (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md`,
+# rebaseline §14): "Gastos & Economia" -- historical/trend analysis and
+# contextual savings opportunities over the exact same canonical monthly
+# category amounts `_build_report_payload` already returns (`categories`,
+# `monthly_categories`) -- never a second spending calculation. Amounts
+# below are consumed as plain `float` (already `decimal_value()`-cast at
+# the report boundary): this module computes only ratios/percentages over
+# them, never a new monetary total.
+SPENDING_OPPORTUNITY_THRESHOLD_PCT = 15.0
+
+
+def _category_trends(monthly_categories: list[dict]) -> list[dict]:
+    """Deterministic month-over-month trend per category, built only from
+    `monthly_categories` (itself built only from `category_spending_rows`,
+    the exact rows `/dashboard` publishes -- see `_build_report_payload`).
+    Requires at least two months of window to say anything about a trend;
+    with a single month this returns `[]` rather than fabricating a
+    "previous"/"average" out of nothing (rebaseline "não inventar fato" --
+    absence of history is `[]`, never a manufactured zero baseline)."""
+
+    if len(monthly_categories) < 2:
+        return []
+    by_category: dict[str, list[tuple[str, float]]] = {}
+    for month_row in monthly_categories:
+        month = str(month_row["month"])
+        for entry in month_row["categories"]:
+            name = str(entry["category"])
+            by_category.setdefault(name, []).append((month, float(entry["amount"])))
+    trends: list[dict] = []
+    for name, series in by_category.items():
+        series.sort(key=lambda item: item[0])
+        amounts = [amount for _, amount in series]
+        current_month, current_amount = series[-1]
+        previous_amount = amounts[-2] if len(amounts) >= 2 else None
+        history = amounts[:-1]
+        average_amount = (sum(history) / len(history)) if history else None
+        change_percentage = (
+            round(((current_amount - previous_amount) / previous_amount) * 100, 2)
+            if previous_amount and previous_amount > 0
+            else None
+        )
+        vs_average_percentage = (
+            round(((current_amount - average_amount) / average_amount) * 100, 2)
+            if average_amount and average_amount > 0
+            else None
+        )
+        direction = "stable"
+        if change_percentage is not None:
+            if change_percentage > 5:
+                direction = "up"
+            elif change_percentage < -5:
+                direction = "down"
+        trends.append(
+            {
+                "category": name,
+                "current_month": current_month,
+                "current_amount": round(current_amount, 2),
+                "previous_amount": round(previous_amount, 2) if previous_amount is not None else None,
+                "average_amount": round(average_amount, 2) if average_amount is not None else None,
+                "change_percentage": change_percentage,
+                "vs_average_percentage": vs_average_percentage,
+                "direction": direction,
+            }
+        )
+    trends.sort(key=lambda item: item["current_amount"], reverse=True)
+    return trends
+
+
+def _spending_opportunities(trends: list[dict], category_meta: dict[str, dict]) -> list[dict]:
+    """Candidate savings opportunities: a category running materially
+    (`SPENDING_OPPORTUNITY_THRESHOLD_PCT`) above its own historical
+    average this window. Every field is copied from `trends`/the
+    household's own `Category.essential` flag -- never a value this
+    function invents, and never a directive ("cut this") -- only a
+    factual comparison the user (or a Codex recommendation layered on top
+    in `_spending_economy_codex_analysis`) can act on."""
+
+    opportunities: list[dict] = []
+    for item in trends:
+        vs_average = item["vs_average_percentage"]
+        if vs_average is None or vs_average < SPENDING_OPPORTUNITY_THRESHOLD_PCT:
+            continue
+        meta = category_meta.get(item["category"], {})
+        opportunities.append(
+            {
+                "category": item["category"],
+                "current_amount": item["current_amount"],
+                "average_amount": item["average_amount"],
+                "vs_average_percentage": vs_average,
+                "essential": bool(meta.get("essential", False)),
+                "message": (
+                    f"{item['category']} está {vs_average:.0f}% acima da média dos meses "
+                    f"anteriores ({_brl(item['current_amount'])} vs. média de "
+                    f"{_brl(item['average_amount'])})."
+                ),
+            }
+        )
+    opportunities.sort(key=lambda item: item["vs_average_percentage"], reverse=True)
+    return opportunities[:5]
+
+
+def _spending_economy_codex_analysis(
+    *, months: int, top_categories: list[dict], opportunities: list[dict]
+) -> dict:
+    """Rebaseline §12 dupla validação, applied to "Gastos & Economia":
+    a deterministic verdict/answer is computed first from facts this
+    module already holds; only when Codex is configured and its own
+    verdict matches exactly is its nicer prose substituted in (same
+    authority boundary `POST /advisor/question` already enforces -- see
+    the comment on `verdict_matches` there). A configured Codex that
+    disagrees never overwrites the deterministic answer -- the
+    disagreement is surfaced under `divergence` instead (rebaseline §12,
+    Work Order "divergência relevante motor x Codex deve ser sinalizada,
+    nunca sobrescrita silenciosamente").
+
+    There is deliberately no live external web/market-data search here --
+    the Advisor sidecar (`advisor/server.mjs`) has no internet access and
+    no such provider (see `docs/ARCHITECTURE.md`). `referencias_externas`
+    stays a structurally-present, empty list at the caller
+    (`GET /spending-economy`) rather than this function fabricating a
+    reference that was never actually looked up -- rebaseline §14 "a
+    recomendação externa nunca deve substituir fatos internos" applies
+    doubly to a reference that does not exist.
+    """
+
+    if not opportunities:
+        verdict = "informative"
+        answer = (
+            "Nenhuma categoria está com gasto materialmente acima da média dos meses "
+            "anteriores neste período."
+        )
+    else:
+        top = opportunities[0]
+        verdict = "informative"
+        answer = (
+            f"A categoria com maior variação acima da média é {top['category']}: "
+            f"{_brl(top['current_amount'])} neste mês contra uma média recente de "
+            f"{_brl(top['average_amount'])} ({top['vs_average_percentage']:.0f}% acima)."
+        )
+    evidence = [item["message"] for item in opportunities] or [
+        "Nenhuma categoria ultrapassou o limite de variação configurado."
+    ]
+    assumptions = [
+        f"Limite de variação considerado: {SPENDING_OPPORTUNITY_THRESHOLD_PCT:.0f}% acima da "
+        "média histórica da própria categoria.",
+        f"Janela histórica considerada: {months} mes(es).",
+    ]
+    result: dict[str, object] = {
+        "disponivel": False,
+        "veredito": verdict,
+        "resposta": answer,
+        "evidencias": evidence,
+        "premissas": assumptions,
+        "confianca": None,
+        "provider": "local",
+        "divergence": None,
+    }
+    client = CodexAdvisorClient()
+    if not client.configured:
+        return result
+    codex_payload = {
+        "question": "Quais oportunidades de economia existem nos dados reais da família?",
+        "financial_summary": {
+            "months": months,
+            "top_categories": top_categories,
+            "opportunities": opportunities,
+        },
+        "deterministic_result": {
+            "intent": "spending_economy",
+            "verdict": verdict,
+            "answer": answer,
+            "evidence": evidence,
+            "assumptions": assumptions,
+        },
+    }
+    candidate = client.analyze(codex_payload).payload
+    candidate_verdict = candidate.get("verdict") if candidate else None
+    # Same non-negotiable rule as `POST /advisor/question` (INV-021, PR 6):
+    # `verdict` computed above is final. Codex may only restate it in nicer
+    # prose when it reproduces that exact verdict -- never move it.
+    if (
+        candidate
+        and candidate_verdict == verdict
+        and isinstance(candidate.get("answer"), str)
+        and candidate["answer"].strip()
+    ):
+        result.update(
+            {
+                "disponivel": True,
+                "resposta": candidate["answer"].strip(),
+                "evidencias": [str(item) for item in candidate.get("evidence", evidence)][:6],
+                "premissas": [str(item) for item in candidate.get("assumptions", assumptions)][:6],
+                "confianca": candidate.get("confidence"),
+                "provider": "codex",
+            }
+        )
+    elif candidate is not None:
+        result["divergence"] = {
+            "codex_verdict": candidate_verdict,
+            "deterministic_verdict": verdict,
+            "note": (
+                "O Codex retornou um veredito diferente do motor determinístico; "
+                "o resultado determinístico foi mantido e a divergência fica sinalizada "
+                "aqui em vez de ser aplicada silenciosamente."
+            ),
+        }
+    return result
+
+
+@router.get("/spending-economy")
+def spending_economy(
+    end_month: str | None = None,
+    months: int = 6,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """`Gastos & Economia` (rebaseline §14): monthly/historical spending
+    view plus contextual savings opportunities and a Codex recommendation
+    -- built entirely on top of `_build_report_payload`'s already-canonical
+    `categories`/`monthly_categories`/`summary` (the same function
+    `GET /reports`/`GET /reports/export` call, `end_month`/`months` taking
+    the exact same validation/semantics), never a second spending
+    calculation. Response is split into the four sections the Work Order
+    requires whenever external research is in play: `seus_dados` (always
+    populated, always real), `referencias_externas` (structurally present,
+    empty -- see `_spending_economy_codex_analysis`'s docstring for why),
+    `analise` and `recomendacao` (both derived from the same single
+    validated Codex/local result -- see that function for the dupla
+    validação contract).
+    """
+
+    report = _build_report_payload(db, user, end_month=end_month, months=months)
+    category_meta = {
+        item.name: {"essential": item.essential, "color": item.color}
+        for item in db.scalars(select(Category).where(Category.household_id == user.household_id)).all()
+    }
+    trends = _category_trends(report["monthly_categories"])
+    opportunities = _spending_opportunities(trends, category_meta)
+    top_categories = report["categories"][:5]
+    codex_analysis = _spending_economy_codex_analysis(
+        months=report["months"],
+        top_categories=top_categories,
+        opportunities=opportunities,
+    )
+    db.commit()
+    return {
+        "months": report["months"],
+        "start_month": report["start_month"],
+        "end_month": report["end_month"],
+        "seus_dados": {
+            "summary": report["summary"],
+            "categories": report["categories"],
+            "monthly": report["monthly"],
+            # October Go-Live Slice 7 engineering review (PR #95, Round 1,
+            # item 2): the Work Order's obligatory "origem por conta/cartão"
+            # dimension for `Gastos & Economia` -- the exact per-account rows
+            # `GET /reports`' own `accounts` already publishes (cash_out/
+            # bank_cash_out/card_spending/refunds/net), never a second
+            # calculation. Explanatory only: it shows *where* the spending
+            # happened, it never changes `categories`/`summary`'s own concept
+            # of gasto above.
+            "origem_por_conta_cartao": report["accounts"],
+        },
+        "tendencias": trends,
+        "oportunidades_economia": opportunities,
+        "referencias_externas": [],
+        "analise": {
+            "disponivel": codex_analysis["disponivel"],
+            "resposta": codex_analysis["resposta"],
+            "evidencias": codex_analysis["evidencias"],
+            "premissas": codex_analysis["premissas"],
+            "confianca": codex_analysis["confianca"],
+            "provider": codex_analysis["provider"],
+        },
+        "recomendacao": {
+            "disponivel": codex_analysis["disponivel"],
+            "veredito": codex_analysis["veredito"],
+            "texto": codex_analysis["resposta"],
+        },
+        "divergencia_codex": codex_analysis["divergence"],
+    }
 
 
 @router.get("/advisor/status")

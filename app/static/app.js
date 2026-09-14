@@ -339,7 +339,7 @@ async function navigate(view) {
     imports: loadImports,
     transactions: loadTransactions,
     reviews: loadReviews,
-    planning: loadForecast,
+    planning: loadPlanningView,
     advisor: loadAdvisor,
     integrity: loadIntegrity,
     users: loadUsers,
@@ -1134,6 +1134,57 @@ function renderReport(report) {
   document.querySelector("#report-data-quality").textContent = report.duplicates_ignored
     ? `${report.duplicates_ignored} cópia(s) entre fontes foram desconsideradas; os registros permanecem preservados para auditoria.`
     : "Nenhuma sobreposição entre fontes foi identificada neste período.";
+
+  renderReportSlice7Sections(report);
+}
+
+// October Go-Live Slice 7 (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md):
+// patrimônio/investimentos/cartões/obrigações/estados financeiros --
+// every field read below already comes fully computed from GET /reports
+// (household_patrimony_summary/investments_summary/_obligation_rows/
+// serialize_card_invoice on the backend); this function only formats
+// already-canonical numbers for display, it never sums or derives a new
+// one (rebaseline "nenhum cálculo financeiro duplicado no frontend").
+function renderReportSlice7Sections(report) {
+  const patrimony = report.patrimony || {};
+  document.querySelector("#report-patrimony-total").textContent = money.format(patrimony.value || 0);
+  document.querySelector("#report-patrimony-breakdown").textContent =
+    `Caixa ${money.format(patrimony.cash_component || 0)} + investimentos ${money.format(patrimony.investments_component || 0)}`;
+
+  const states = report.financial_states || {};
+  const comprometido = states.comprometido || {};
+  document.querySelector("#report-comprometido-total").textContent = money.format(comprometido.total || 0);
+
+  const previsto = states.previsto || {};
+  const recurringSalary = previsto.recurring_salary;
+  document.querySelector("#report-previsto-total").textContent = money.format(
+    recurringSalary ? recurringSalary.expected_amount : 0
+  );
+  document.querySelector("#report-previsto-caption").textContent = recurringSalary
+    ? `Salário recorrente • estado ${recurringSalary.financial_state === "REALIZADO" ? "já realizado" : "previsto"}${recurringSalary.ambiguous ? " (conciliação ambígua)" : ""}`
+    : "Nenhum salário recorrente configurado";
+
+  document.querySelector("#report-internal-transfers-total").textContent = money.format(
+    report.summary?.internal_transfers_total || 0
+  );
+
+  const investments = report.investments || [];
+  document.querySelector("#report-investments-table").innerHTML = investments.length
+    ? investments.map((item) => {
+        const gain = item.gain_current || 0;
+        return `<tr><td><strong>${escapeHtml(item.name)}</strong></td><td class="right">${money.format(item.current_value)}</td><td class="right ${gain < 0 ? "amount-expense" : "amount-income"}">${money.format(gain)}</td></tr>`;
+      }).join("")
+    : emptyRow(3, "Nenhum investimento cadastrado");
+
+  const cardInvoices = report.card_invoices || [];
+  document.querySelector("#report-card-invoices-table").innerHTML = cardInvoices.length
+    ? cardInvoices.map((item) => `<tr><td>${escapeHtml(item.competence)}</td><td>${cardInvoiceStatusLabels[item.status] || escapeHtml(item.status)}</td><td class="right">${money.format(item.computed_total)}</td><td class="right">${money.format(item.outstanding_balance)}</td></tr>`).join("")
+    : emptyRow(4, "Nenhuma fatura no período");
+
+  const obligations = report.obligations || [];
+  document.querySelector("#report-obligations-table").innerHTML = obligations.length
+    ? obligations.map((item) => `<tr><td><strong>${escapeHtml(item.name)}</strong></td><td>${item.due_date ? dateFormat.format(new Date(`${item.due_date}T00:00:00Z`)) : "—"}</td><td>${payableInvoiceStatusLabels[item.status] || escapeHtml(item.status)}</td><td class="right">${money.format(item.amount)}</td></tr>`).join("")
+    : emptyRow(4, "Nenhuma obrigação pendente");
 }
 
 async function loadReports() {
@@ -2225,6 +2276,72 @@ async function loadProfile() {
   form.querySelector('button[type="submit"]').classList.toggle("hidden", !isAdmin());
   renderDueNotificationsSettings();
   await renderMfaSettings();
+}
+
+// October Go-Live Slice 7 (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md,
+// rebaseline §14): "Gastos & Economia" -- gasto do mês/categorias/
+// comparação histórica/tendências/oportunidades de economia, plus the
+// Codex "Seus dados / Referências externas / Análise / Recomendação"
+// split. Everything here is read verbatim from GET /spending-economy
+// (itself built on the same canonical GET /reports contract) -- this
+// function never sums, averages or classifies a transaction on its own.
+async function loadSpendingEconomy() {
+  const monthsControl = document.querySelector("#spending-economy-months");
+  const months = monthsControl.value;
+  const data = await api(`/spending-economy?months=${encodeURIComponent(months)}`);
+  document.querySelector("#spending-economy-period-label").textContent =
+    `${monthLabel(data.start_month)} a ${monthLabel(data.end_month)}`;
+
+  const trends = data.tendencias || [];
+  document.querySelector("#spending-economy-trends-table").innerHTML = trends.length
+    ? trends.slice(0, 10).map((item) => {
+        const change = item.vs_average_percentage;
+        const changeText = change === null || change === undefined ? "—" : `${change > 0 ? "+" : ""}${change.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`;
+        return `<tr><td><strong>${escapeHtml(item.category)}</strong></td><td class="right">${money.format(item.current_amount)}</td><td class="right">${item.average_amount === null ? "—" : money.format(item.average_amount)}</td><td class="right ${change > 0 ? "amount-expense" : change < 0 ? "amount-income" : ""}">${changeText}</td></tr>`;
+      }).join("")
+    : emptyRow(4, "Sem histórico suficiente para comparar tendências ainda");
+
+  const opportunities = data.oportunidades_economia || [];
+  document.querySelector("#spending-economy-opportunities").innerHTML = opportunities.length
+    ? opportunities.map((item) => reportInsight("◎", item.essential ? "CATEGORIA ESSENCIAL" : "OPORTUNIDADE", item.category, item.message, item.essential ? "sunshine" : "coral")).join("")
+    : '<div class="empty compact-empty">Nenhuma categoria está rodando acima da própria média recente.</div>';
+
+  document.querySelector("#spending-economy-seus-dados").textContent =
+    `Gasto total no período: ${money.format(data.seus_dados.summary.total_spending)}. Categoria com maior variação: ${opportunities[0] ? opportunities[0].category : "nenhuma acima do limite configurado"}.`;
+
+  // October Go-Live Slice 7 engineering review (PR #95, Round 1, item 2):
+  // "origem por conta/cartão" -- read verbatim from
+  // `seus_dados.origem_por_conta_cartao` (the same `accounts` rows
+  // `GET /reports` already publishes); this table never sums anything on
+  // its own.
+  const origins = data.seus_dados.origem_por_conta_cartao || [];
+  document.querySelector("#spending-economy-origin-table").innerHTML = origins.length
+    ? origins.map((item) => `<tr><td><strong>${escapeHtml(item.account)}</strong></td><td>${escapeHtml(accountTypeLabels[item.account_type] || item.account_type)}</td><td class="right amount-expense">${money.format(item.card_spending)}</td><td class="right amount-expense">${money.format(item.bank_cash_out)}</td></tr>`).join("")
+    : emptyRow(4, "Sem movimentação no período");
+
+  const externalReferences = data.referencias_externas || [];
+  document.querySelector("#spending-economy-referencias-externas").textContent = externalReferences.length
+    ? externalReferences.join(" ")
+    : "Nenhuma referência externa disponível nesta instalação -- a análise usa só os seus dados.";
+
+  const analise = data.analise || {};
+  document.querySelector("#spending-economy-analise").textContent = analise.resposta || "Sem análise disponível.";
+
+  const recomendacao = data.recomendacao || {};
+  document.querySelector("#spending-economy-recomendacao").textContent = recomendacao.texto || "Sem recomendação disponível.";
+
+  const divergence = document.querySelector("#spending-economy-divergence");
+  if (data.divergencia_codex) {
+    divergence.textContent = data.divergencia_codex.note;
+    divergence.classList.remove("hidden");
+  } else {
+    divergence.classList.add("hidden");
+    divergence.textContent = "";
+  }
+}
+
+async function loadPlanningView() {
+  await Promise.all([loadSpendingEconomy(), loadForecast()]);
 }
 
 async function loadForecast() {
@@ -4017,6 +4134,8 @@ document.querySelector("#report-export-xlsx").addEventListener("click", () => do
 document.querySelector("#report-export-pdf").addEventListener("click", () => downloadReportExport("pdf").catch((error) => toast(error.message, true)));
 document.querySelector("#refresh-transactions").addEventListener("click", loadTransactions);
 document.querySelector("#refresh-forecast").addEventListener("click", loadForecast);
+document.querySelector("#spending-economy-refresh").addEventListener("click", () => loadSpendingEconomy().catch((error) => toast(error.message, true)));
+document.querySelector("#spending-economy-months").addEventListener("change", () => loadSpendingEconomy().catch((error) => toast(error.message, true)));
 document.querySelector("#refresh-income-entries").addEventListener("click", loadEntradas);
 document.querySelector("#refresh-expense-entries").addEventListener("click", loadSaidas);
 document.querySelector("#expense-entry-category").addEventListener("change", updateExpenseCustomCategoryField);

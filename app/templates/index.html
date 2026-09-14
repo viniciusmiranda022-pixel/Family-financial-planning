@@ -379,6 +379,34 @@
           <div class="panel-heading"><div><span class="step-label">MÊS A MÊS</span><h2>Detalhamento do período</h2><small id="report-data-quality">Os cálculos respeitam as mesmas regras de consolidação da visão geral.</small></div></div>
           <div class="table-wrap"><table><thead><tr><th>Mês</th><th class="right">Receitas reais</th><th class="right">Saída bancária</th><th class="right">Compras no cartão</th><th class="right">Gastos</th><th class="right">Resultado</th><th class="right">Teto disponível</th><th class="right">Variação</th></tr></thead><tbody id="report-monthly-table"></tbody></table></div>
         </article>
+
+        <!-- October Go-Live Slice 7 (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md,
+             rebaseline §15/§16/§17): patrimônio/investimentos/cartões/
+             obrigações/REALIZADO-COMPROMETIDO-PREVISTO -- every value below
+             is rendered verbatim from GET /reports (renderReport in app.js),
+             never recomputed here. -->
+        <div class="report-kpi-grid">
+          <article class="report-kpi sunshine"><span>Patrimônio (caixa + investimentos)</span><strong id="report-patrimony-total">R$ 0,00</strong><small id="report-patrimony-breakdown">Caixa + valor de hoje dos ativos</small></article>
+          <article class="report-kpi bad"><span>Comprometido (a pagar)</span><strong id="report-comprometido-total">R$ 0,00</strong><small>Obrigações pendentes + faturas em aberto</small></article>
+          <article class="report-kpi teal"><span>Previsto (próximo período)</span><strong id="report-previsto-total">R$ 0,00</strong><small id="report-previsto-caption">Somente salário recorrente configurado</small></article>
+          <article class="report-kpi sky"><span>Transferências internas</span><strong id="report-internal-transfers-total">R$ 0,00</strong><small>Privilège ⇄ Conta Corrente e equivalentes -- nunca renda/despesa</small></article>
+        </div>
+
+        <div class="report-analysis-grid categories-layout">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">PATRIMÔNIO</span><h2>Investimentos e ativos</h2><small>Valor de hoje de cada ativo -- custo histórico e valor previsto ficam de fora do patrimônio atual (rebaseline §16.2).</small></div></div>
+            <div class="table-wrap"><table><thead><tr><th>Ativo</th><th class="right">Valor de hoje</th><th class="right">Ganho atual</th></tr></thead><tbody id="report-investments-table"></tbody></table></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">CARTÕES</span><h2>Faturas do período</h2><small>Estado COMPROMETIDO até o pagamento; nunca conta como gasto novo.</small></div></div>
+            <div class="table-wrap"><table><thead><tr><th>Competência</th><th>Status</th><th class="right">Total</th><th class="right">Em aberto</th></tr></thead><tbody id="report-card-invoices-table"></tbody></table></div>
+          </article>
+        </div>
+
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">OBRIGAÇÕES</span><h2>Contas a pagar</h2><small>REALIZADO quando já pago; COMPROMETIDO enquanto pendente -- nunca duplicado com a fatura/compra original.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Nome</th><th>Vencimento</th><th>Estado</th><th class="right">Valor</th></tr></thead><tbody id="report-obligations-table"></tbody></table></div>
+        </article>
       </section>
 
       <section id="view-capture" class="view">
@@ -671,6 +699,56 @@
              compromissos/faturas" -- o cadastro de obrigação (`#obligation-
              form`) mora em #view-payables agora; esta tela mantém somente a
              projeção/calendário e a simulação de compra, que já eram dela. -->
+
+        <!-- October Go-Live Slice 7 (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md,
+             rebaseline §14): gastos do mês/categorias/comparação histórica/
+             tendências/oportunidades de economia -- tudo lido de
+             GET /spending-economy (loadSpendingEconomy em app.js), que por
+             sua vez reaproveita GET /reports; nenhum total é recalculado
+             aqui. -->
+        <div class="period-toolbar report-toolbar">
+          <div><span class="step-label">GASTOS &amp; ECONOMIA</span><strong id="spending-economy-period-label">Últimos meses</strong></div>
+          <div class="report-controls">
+            <label>Meses<select id="spending-economy-months" aria-label="Quantidade de meses para comparação">
+              <option value="3">3 meses</option><option value="6" selected>6 meses</option><option value="12">Ano completo</option>
+            </select></label>
+            <button id="spending-economy-refresh" class="primary" type="button">Atualizar análise</button>
+          </div>
+        </div>
+
+        <div class="report-analysis-grid categories-layout">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">TENDÊNCIAS</span><h2>Categorias mês a mês</h2><small>Comparação com a média dos meses anteriores do próprio período -- nunca com uma referência externa.</small></div></div>
+            <div class="table-wrap"><table><thead><tr><th>Categoria</th><th class="right">Mês atual</th><th class="right">Média anterior</th><th class="right">Variação</th></tr></thead><tbody id="spending-economy-trends-table"></tbody></table></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">OPORTUNIDADES</span><h2>Onde revisar o gasto</h2><small>Categorias rodando acima da própria média recente -- um fato, não uma ordem.</small></div></div>
+            <div id="spending-economy-opportunities" class="report-insights"></div>
+          </article>
+        </div>
+
+        <!-- October Go-Live Slice 7 engineering review (PR #95, Round 1,
+             item 2): origem por conta/cartão -- dimensão obrigatória do
+             Work Order, lida verbatim de GET /spending-economy's
+             seus_dados.origem_por_conta_cartao (o mesmo `accounts` que
+             GET /reports já publica); explicativa apenas, nunca redefine
+             o conceito de gasto acima. -->
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">ORIGEM</span><h2>Onde o gasto aconteceu (conta/cartão)</h2><small>Mostra onde o consumo ocorreu -- não muda o conceito de gasto acima.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Conta</th><th>Tipo</th><th class="right">Gasto no cartão</th><th class="right">Débito físico</th></tr></thead><tbody id="spending-economy-origin-table"></tbody></table></div>
+        </article>
+
+        <article class="panel" id="spending-economy-analysis-panel">
+          <div class="panel-heading"><div><span class="step-label">ANÁLISE CODEX</span><h2>Seus dados, análise e recomendação</h2><small>O Codex nunca inventa fato: só interpreta os números já calculados abaixo.</small></div></div>
+          <div class="codex-analysis-grid">
+            <div><h3>Seus dados</h3><p id="spending-economy-seus-dados">Carregando…</p></div>
+            <div><h3>Referências externas</h3><p id="spending-economy-referencias-externas">Nenhuma referência externa disponível nesta instalação.</p></div>
+            <div><h3>Análise</h3><p id="spending-economy-analise">—</p></div>
+            <div><h3>Recomendação</h3><p id="spending-economy-recomendacao">—</p></div>
+          </div>
+          <p id="spending-economy-divergence" class="hidden amount-expense"></p>
+        </article>
+
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">CENÁRIO CONSERVADOR</span><h2>Resultado projetado</h2><small>Reflete as obrigações cadastradas em Contas a pagar.</small></div><button id="refresh-forecast" class="secondary">Recalcular</button></div>
           <div class="projection-kpis"><div><span>Privilège DI no final</span><strong id="forecast-final">R$ 0,00</strong></div><div><span>Menor saldo projetado</span><strong id="forecast-min">R$ 0,00</strong></div><div><span>Decisão</span><strong id="forecast-status">Configure o perfil</strong></div></div>
