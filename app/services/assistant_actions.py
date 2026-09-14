@@ -412,7 +412,7 @@ def _candidate_investments(db: Session, *, household_id: str, hint: str) -> list
     ][:MAX_CANDIDATES]
 
 
-def _candidate_investment_funding_transactions(
+def candidate_investment_funding_transactions(
     db: Session, *, household_id: str, amount: Decimal | None
 ) -> list[Any]:
     """Candidate already-existing "Transferência patrimonial" cash-out
@@ -423,7 +423,13 @@ def _candidate_investment_funding_transactions(
     caixa": this module never creates the cash movement itself, it only
     resolves a link to one that already exists). Narrowed by amount when
     known, since a "Transferência patrimonial" transaction carries no
-    description tying it to a specific asset."""
+    description tying it to a specific asset.
+
+    Exported (no leading underscore) since `GET /investments/contribution-
+    candidates` (`app.api`) also calls it -- the manual Aporte UI must
+    resolve/ask for a funding origin exactly like the Assistant does
+    (engineering review on PR #94, blocking item 2), so both paths share
+    this one candidate-matching query instead of each re-deriving it."""
 
     from app.api import _LEDGER_PATRIMONIAL_CATEGORY_NAME
     from app.models import Category, InvestmentValuation, Transaction
@@ -1024,7 +1030,7 @@ def _propose_register_asset_contribution(
     if amount is None:
         return _needs_disambiguation("Qual foi o valor do aporte?", missing_fields=("amount",))
 
-    funding_candidates = _candidate_investment_funding_transactions(
+    funding_candidates = candidate_investment_funding_transactions(
         db, household_id=household_id, amount=amount
     )
     if len(funding_candidates) != 1:

@@ -690,13 +690,23 @@ tr:last-child td { border-bottom: 0; }
   .credit-card-summary-totals { grid-template-columns: 1fr; }
 }
 
-/* October Go-Live Slice 6: patrimônio/investimentos */
+/* October Go-Live Slice 6: patrimônio/investimentos. `.net-worth-total-row`
+   holds two distinct figures side by side (engineering review on PR #94,
+   blocking item 1) -- PATRIMÔNIO TOTAL (caixa + investimentos) and
+   INVESTIMENTOS (somente valor de hoje dos ativos) are never the same
+   number whenever the household has any bank/Privilège balance. */
+.net-worth-total-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 4px 0 18px;
+}
 .net-worth-total {
   padding: 15px 16px;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: #f8fafc;
-  margin: 4px 0 18px;
+  flex: 1 1 260px;
   max-width: 320px;
 }
 .net-worth-total small {

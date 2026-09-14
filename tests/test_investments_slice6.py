@@ -4,7 +4,7 @@ e Studio.
 Work Order: `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md`.
 
 Section 1 unit-tests `app.services.investments` directly (no DB, no HTTP):
-the derived gain/return calculations and the canonical `net_worth_summary`
+the derived gain/return calculations and the canonical `investments_summary`
 aggregation -- proving the rebaseline §16.2 invariant ("patrimônio atual usa
 somente o valor de hoje") holds by construction.
 
@@ -20,8 +20,9 @@ Section 1.
 
 Section 4 is an HTTP-level functional suite for the Assistant's
 `interpret -> execute -> undo` contract applied to the two new typed
-actions, plus the Dashboard regression proving `noncanonical.net_worth`
-never sums historical cost or projected value.
+actions, plus the Dashboard regression proving `noncanonical.investments_total`
+never sums historical cost or projected value, and `noncanonical.patrimony`
+correctly includes cash (engineering review on PR #94).
 """
 
 import os
@@ -50,11 +51,12 @@ from app.services.assistant_actions import (  # noqa: E402
 )
 from app.services.assistant_interpreter import StructuredInterpretation  # noqa: E402
 from app.services.investments import (  # noqa: E402
+    household_patrimony_summary,
     investment_gain_current,
     investment_gain_projected,
     investment_return_current_pct,
     investment_return_projected_pct,
-    net_worth_summary,
+    investments_summary,
     serialize_investment,
 )
 from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
@@ -109,7 +111,7 @@ def _session_factory():
     return session_factory
 
 
-def test_net_worth_summary_sums_current_value_only_never_historical_or_projected() -> None:
+def test_investments_summary_sums_current_value_only_never_historical_or_projected() -> None:
     session_factory = _session_factory()
     with session_factory() as db:
         household = Household(name="Família Patrimônio")
@@ -141,7 +143,7 @@ def test_net_worth_summary_sums_current_value_only_never_historical_or_projected
         db.add_all([studio, other_asset, inactive_asset])
         db.commit()
 
-        summary = net_worth_summary(db, household_id=household.id)
+        summary = investments_summary(db, household_id=household.id)
         # Exactly current_value(Studio) + current_value(other_asset); never
         # historical_cost, never expected_receivable_value, and the
         # inactive asset is excluded entirely.
@@ -179,6 +181,27 @@ def test_serialize_investment_matches_service_level_derivations() -> None:
         assert row["return_current_pct"] == investment_return_current_pct(studio)
         assert row["gain_projected"] == investment_gain_projected(studio)
         assert row["return_projected_pct"] == investment_return_projected_pct(studio)
+
+
+def test_household_patrimony_summary_adds_cash_and_investments_exactly_once() -> None:
+    # Engineering review on PR #94, blocking item 1: household Patrimônio
+    # (rebaseline §13.1 item 4) is cash + investments -- never investments
+    # alone, never cash alone, never double-counted.
+    summary = household_patrimony_summary(
+        cash_position=Decimal("12000.00"), investments_total=Decimal("35000.00")
+    )
+    assert summary["total"] == Decimal("47000.00")
+    assert summary["cash_position"] == Decimal("12000.00")
+    assert summary["investments_total"] == Decimal("35000.00")
+
+
+def test_household_patrimony_summary_never_reads_historical_or_projected_value() -> None:
+    # `household_patrimony_summary` only ever sees the already-reduced
+    # `investments_summary()["total_current_value"]` -- it has no access to
+    # `historical_cost`/`expected_receivable_value` at all, so there is no
+    # way for either to leak into the total by construction.
+    summary = household_patrimony_summary(cash_position=Decimal("0.00"), investments_total=Decimal("35000.00"))
+    assert summary["total"] == Decimal("35000.00")
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +337,11 @@ def test_updating_current_value_changes_net_worth_and_preserves_history() -> Non
         assert values_seen == [35000.0, 38000.0]
 
 
-def test_contribution_increases_historical_cost_without_double_counting_net_worth() -> None:
+def test_contribution_without_funding_transaction_is_rejected() -> None:
+    # Engineering review on PR #94, blocking item 2: a new aporte must
+    # always resolve to a real, already-existing cash movement -- omitting
+    # `funding_transaction_id` must never silently increase cost basis with
+    # no corresponding funding fact.
     client, session_factory = _client()
     with client:
         _setup_household(client)
@@ -334,17 +361,15 @@ def test_contribution_increases_historical_cost_without_double_counting_net_wort
             f"/api/investments/{investment_id}/contributions",
             json={"contribution_amount": "5000.00", "valuation_date": "2026-09-20"},
         )
-        assert contribution.status_code == 201, contribution.text
-        after_net_worth = client.get("/api/investments").json()["total_current_value"]
+        assert contribution.status_code == 422, contribution.text
 
-        # Rebaseline §16.3: "Coloquei mais 5 mil no Studio" changes cost
-        # basis only -- patrimônio atual is untouched until a separate
-        # valuation confirms a new current_value.
+        after_net_worth = client.get("/api/investments").json()["total_current_value"]
         assert after_net_worth == before_net_worth == 35000.0
         row = next(
             item for item in client.get("/api/investments").json()["investments"] if item["id"] == investment_id
         )
-        assert row["historical_cost"] == 35000.0
+        # The rejected request never touched historical_cost either.
+        assert row["historical_cost"] == 30000.0
 
 
 def test_contribution_with_funding_transaction_is_not_a_second_expense() -> None:
@@ -385,6 +410,7 @@ def test_contribution_with_funding_transaction_is_not_a_second_expense() -> None
         )
         investment_id = created.json()["id"]
 
+        before_net_worth = client.get("/api/investments").json()["total_current_value"]
         contribution = client.post(
             f"/api/investments/{investment_id}/contributions",
             json={
@@ -395,6 +421,16 @@ def test_contribution_with_funding_transaction_is_not_a_second_expense() -> None
         )
         assert contribution.status_code == 201, contribution.text
         assert contribution.json()["funding_transaction_id"] == funding_transaction_id
+
+        # Rebaseline §16.3: "Coloquei mais 5 mil no Studio" changes cost
+        # basis only -- patrimônio atual (soma de current_value) is
+        # untouched until a separate valuation confirms a new current_value.
+        after_net_worth = client.get("/api/investments").json()["total_current_value"]
+        assert after_net_worth == before_net_worth == 35000.0
+        row = next(
+            item for item in client.get("/api/investments").json()["investments"] if item["id"] == investment_id
+        )
+        assert row["historical_cost"] == 35000.0
 
         with session_factory() as db:
             household_id = db.scalar(select(User.household_id))
@@ -779,7 +815,7 @@ def test_execute_update_asset_value_via_assistant_is_audited_and_undoable() -> N
         assert row_after_undo["current_value"] == 35000.0
 
 
-def test_dashboard_regression_never_sums_historical_or_projected_into_net_worth() -> None:
+def test_dashboard_regression_never_sums_historical_or_projected_into_investments_total() -> None:
     client, session_factory = _client()
     with client:
         _setup_household(client)
@@ -795,8 +831,8 @@ def test_dashboard_regression_never_sums_historical_or_projected_into_net_worth(
         )
         dashboard = client.get("/api/dashboard")
         assert dashboard.status_code == 200, dashboard.text
-        net_worth = dashboard.json()["noncanonical"]["net_worth"]
-        assert net_worth["value"] == 35000.0
+        investments_total = dashboard.json()["noncanonical"]["investments_total"]
+        assert investments_total["value"] == 35000.0
         investments = dashboard.json()["noncanonical"]["investments"]
         assert len(investments) == 1
         assert investments[0]["current_value"] == 35000.0
@@ -806,4 +842,63 @@ def test_dashboard_regression_never_sums_historical_or_projected_into_net_worth(
         # The exact figure GET /investments reports must never diverge --
         # rebaseline "nenhum cálculo patrimonial duplicado no frontend".
         direct = client.get("/api/investments").json()
-        assert direct["total_current_value"] == net_worth["value"]
+        assert direct["total_current_value"] == investments_total["value"]
+
+
+def test_dashboard_patrimony_includes_confirmed_cash_and_investments_never_historical_or_projected() -> None:
+    """Engineering review on PR #94, blocking item 1: rebaseline §13.1 item 4
+    defines Patrimônio as "valor líquido atual dos ativos/caixa" -- an
+    earlier revision of this endpoint published the investments-only total
+    as `noncanonical.net_worth` ("Patrimônio"), silently excluding cash
+    whenever a bank/Privilège balance existed. With both a confirmed
+    current-month liquidity observation (rebaseline §5.1 "saldo confirmado
+    é soberano") and the Studio present, `noncanonical.patrimony` must equal
+    their sum -- never investments alone, never cash alone, and never with
+    historical cost/expected receivable leaking in."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        account = client.post("/api/accounts", json={"name": "Reserva DI", "account_type": "investment"})
+        assert account.status_code == 201, account.text
+        account_id = account.json()["id"]
+
+        today = date.today()
+        observation = client.post(
+            "/api/account-balances",
+            json={
+                "account_id": account_id,
+                "amount": "12000.00",
+                "as_of_date": today.isoformat(),
+                "observation_type": "point_in_time",
+            },
+        )
+        assert observation.status_code == 201, observation.text
+
+        client.post(
+            "/api/investments",
+            json={
+                "name": "Studio",
+                "historical_cost": "30000.00",
+                "current_value": "35000.00",
+                "expected_receivable_value": "45000.00",
+                "valuation_date": today.isoformat(),
+            },
+        )
+
+        dashboard = client.get("/api/dashboard")
+        assert dashboard.status_code == 200, dashboard.text
+        patrimony = dashboard.json()["noncanonical"]["patrimony"]
+        # 12000.00 (confirmed cash) + 35000.00 (Studio current_value) --
+        # never + historical_cost (30000.00), never + expected_receivable_value (45000.00).
+        assert patrimony["value"] == 47000.0
+        assert patrimony["cash_component"] == 12000.0
+        assert patrimony["investments_component"] == 35000.0
+        assert patrimony["cash_source"] == "current_liquidity_observation"
+        assert patrimony["certified_by"] == "manual_confirmed"
+
+        # Sanity: the forbidden sum (cash + historical_cost + current_value
+        # + expected_receivable_value) must not equal the reported total by
+        # coincidence of this fixture's numbers.
+        forbidden_sum = 12000.0 + 30000.0 + 35000.0 + 45000.0
+        assert patrimony["value"] != forbidden_sum

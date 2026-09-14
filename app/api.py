@@ -129,6 +129,7 @@ from app.services.assistant_actions import (
     AssistantActionError,
     DuplicateResolution,
     build_typed_action_proposal,
+    candidate_investment_funding_transactions,
     execute_typed_action,
     list_assistant_actions,
     persist_action_proposal,
@@ -233,7 +234,10 @@ from app.services.financial_integrity import (
     serialize_run,
 )
 from app.services.financial_invariants import InvariantContext, InvariantScope, InvariantStatus
-from app.services.financial_revision import current_household_financial_revision
+from app.services.financial_revision import (
+    current_household_financial_revision,
+    lock_household_financial_revision,
+)
 from app.services.financial_snapshots import (
     account_cash_flow_rows,
     build_snapshot,
@@ -258,7 +262,7 @@ from app.services.importer import (
     transaction_fingerprint,
 )
 from app.services.invariant_registry import evaluate_invariant
-from app.services.investments import net_worth_summary
+from app.services.investments import household_patrimony_summary, investments_summary
 from app.services.monthly_close import (
     MonthlyCloseGateError,
     MonthlyCloseStateError,
@@ -7802,14 +7806,16 @@ def _serialize_investment_valuation(row: InvestmentValuation) -> dict:
 
 @router.get("/investments")
 def investments(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
-    """Rebaseline §16 -- canonical patrimony/investments read, including the
-    Studio. Spreads `app.services.investments.net_worth_summary` verbatim
-    (only the uniform `decimal_value()` cast applied) so the Dashboard's own
-    `noncanonical.net_worth`/`noncanonical.investments` block and this
-    endpoint can never diverge -- both call this exact function, never a
-    second sum."""
+    """Rebaseline §16 -- canonical investments-only read, including the
+    Studio (not household Patrimônio -- that is cash + this total, see
+    `noncanonical.patrimony` on `GET /dashboard`). Spreads
+    `app.services.investments.investments_summary` verbatim (only the
+    uniform `decimal_value()` cast applied) so the Dashboard's own
+    `noncanonical.investments_total`/`noncanonical.investments` block and
+    this endpoint can never diverge -- both call this exact function, never
+    a second sum."""
 
-    summary = net_worth_summary(db, household_id=user.household_id)
+    summary = investments_summary(db, household_id=user.household_id)
     return {
         "total_current_value": decimal_value(summary["total_current_value"]),
         "investments": [
@@ -8025,6 +8031,36 @@ def _update_investment_value_impl(
     }
 
 
+@router.get("/investments/contribution-candidates")
+def investment_contribution_candidates(
+    amount: Decimal = Query(..., gt=0),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Already-existing "Transferência patrimonial" cash-out transactions
+    (unlinked, amount-matched) the manual Aporte UI can offer as the
+    funding origin for a new `POST /investments/{id}/contributions` --
+    engineering review on PR #94, blocking item 2: a human recording an
+    aporte manually must resolve/ask for the real cash origin exactly like
+    the Assistant's `register_asset_contribution` proposal already does.
+    Reuses `app.services.assistant_actions.candidate_investment_funding_transactions`
+    verbatim -- the same query, not a second one -- so the manual and
+    Assistant paths can never disagree about which transactions qualify."""
+
+    _require_admin(user)
+    candidates = candidate_investment_funding_transactions(db, household_id=user.household_id, amount=amount)
+    return [
+        {
+            "transaction_id": item.id,
+            "account_id": item.account_id,
+            "date": item.booked_at.isoformat(),
+            "description": item.description,
+            "amount": decimal_value(abs(item.amount)),
+        }
+        for item in candidates
+    ]
+
+
 @router.post("/investments/{investment_id}/contributions", status_code=201)
 def register_investment_contribution(
     investment_id: str,
@@ -8050,58 +8086,69 @@ def _register_investment_contribution_impl(
     typed action). Rebaseline §16.2/§16.3: a contribution increases
     `historical_cost` only -- it never touches `current_value` (that is
     exclusively `_update_investment_value_impl`'s job) and it never
-    fabricates the cash movement: `funding_transaction_id`, when given,
-    only *links* to an already-existing `Transaction` (Work Order "sem
-    fabricar gasto econômico ou origem de caixa"), exactly like
+    fabricates the cash movement: `funding_transaction_id` (required --
+    engineering review on PR #94, blocking item 2) only *links* to an
+    already-existing `Transaction` (Work Order "sem fabricar gasto
+    econômico ou origem de caixa"), exactly like
     `_link_refund_transaction_impl` only links an already-existing refund.
+
+    `lock_household_financial_revision` (PR #94, blocking item 3) closes the
+    race between the "already linked?" read below and this function's own
+    insert: without it, two concurrent requests linking the same
+    `funding_transaction_id` can both observe "not linked" and both commit a
+    contribution against the same real cash movement, double-increasing
+    `historical_cost`. Same dialect gate as every other caller of this
+    lock (`SELECT ... FOR UPDATE` on PostgreSQL, a no-op read on SQLite) --
+    see `docs/ARCHITECTURE.md`'s "Uso único sob concorrência real" section
+    and `tests/test_postgresql_integration.py::
+    test_investment_contribution_concurrent_same_funding_transaction_is_serialized_to_a_single_link`.
     """
 
     _require_admin(user)
     item = _get_household_investment(
         db, household_id=user.household_id, investment_id=investment_id
     )
+    lock_household_financial_revision(db, household_id=user.household_id)
 
-    funding_transaction: Transaction | None = None
-    if payload.funding_transaction_id:
-        funding_transaction = db.scalar(
-            select(Transaction).where(
-                Transaction.id == payload.funding_transaction_id,
-                Transaction.household_id == user.household_id,
-            )
+    funding_transaction = db.scalar(
+        select(Transaction).where(
+            Transaction.id == payload.funding_transaction_id,
+            Transaction.household_id == user.household_id,
         )
-        if funding_transaction is None:
-            raise HTTPException(status_code=404, detail="Lançamento de origem do aporte não encontrado")
-        category = db.get(Category, funding_transaction.category_id) if funding_transaction.category_id else None
-        if (
-            funding_transaction.transaction_type != "transfer"
-            or funding_transaction.amount >= 0
-            or category is None
-            or category.name != _LEDGER_PATRIMONIAL_CATEGORY_NAME
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "O lançamento indicado não é uma saída de \"Transferência patrimonial\" válida "
-                    "para financiar este aporte"
-                ),
-            )
-        if money(abs(funding_transaction.amount)) != money(payload.contribution_amount):
-            raise HTTPException(
-                status_code=422,
-                detail="O valor do lançamento de origem não corresponde ao valor do aporte",
-            )
-        already_linked = db.scalar(
-            select(InvestmentValuation).where(
-                InvestmentValuation.household_id == user.household_id,
-                InvestmentValuation.funding_transaction_id == funding_transaction.id,
-                InvestmentValuation.invalidated_at.is_(None),
-            )
+    )
+    if funding_transaction is None:
+        raise HTTPException(status_code=404, detail="Lançamento de origem do aporte não encontrado")
+    category = db.get(Category, funding_transaction.category_id) if funding_transaction.category_id else None
+    if (
+        funding_transaction.transaction_type != "transfer"
+        or funding_transaction.amount >= 0
+        or category is None
+        or category.name != _LEDGER_PATRIMONIAL_CATEGORY_NAME
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "O lançamento indicado não é uma saída de \"Transferência patrimonial\" válida "
+                "para financiar este aporte"
+            ),
         )
-        if already_linked is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="Este lançamento já está vinculado a outro aporte",
-            )
+    if money(abs(funding_transaction.amount)) != money(payload.contribution_amount):
+        raise HTTPException(
+            status_code=422,
+            detail="O valor do lançamento de origem não corresponde ao valor do aporte",
+        )
+    already_linked = db.scalar(
+        select(InvestmentValuation).where(
+            InvestmentValuation.household_id == user.household_id,
+            InvestmentValuation.funding_transaction_id == funding_transaction.id,
+            InvestmentValuation.invalidated_at.is_(None),
+        )
+    )
+    if already_linked is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Este lançamento já está vinculado a outro aporte",
+        )
 
     before_state = {
         "historical_cost": str(item.historical_cost),
@@ -8110,7 +8157,7 @@ def _register_investment_contribution_impl(
     item.historical_cost = money(item.historical_cost + payload.contribution_amount)
     item.last_updated_at = payload.valuation_date
 
-    trace_id = funding_transaction.trace_id if funding_transaction is not None else str(uuid.uuid4())
+    trace_id = funding_transaction.trace_id
     valuation = InvestmentValuation(
         household_id=user.household_id,
         investment_id=item.id,
@@ -8119,7 +8166,7 @@ def _register_investment_contribution_impl(
         current_value=item.current_value,
         expected_receivable_value=item.expected_receivable_value,
         contribution_amount=money(payload.contribution_amount),
-        funding_transaction_id=funding_transaction.id if funding_transaction is not None else None,
+        funding_transaction_id=funding_transaction.id,
         source="manual_confirmed",
         recorded_by=user.id,
         note=payload.note,
@@ -8137,7 +8184,7 @@ def _register_investment_contribution_impl(
         {
             "valuation_id": valuation.id,
             "contribution_amount": str(money(payload.contribution_amount)),
-            "funding_transaction_id": funding_transaction.id if funding_transaction is not None else None,
+            "funding_transaction_id": funding_transaction.id,
         },
         before_state=before_state,
         after_state={
@@ -8157,7 +8204,7 @@ def _register_investment_contribution_impl(
         "investment_id": item.id,
         "valuation_id": valuation.id,
         "historical_cost": decimal_value(item.historical_cost),
-        "funding_transaction_id": funding_transaction.id if funding_transaction is not None else None,
+        "funding_transaction_id": funding_transaction.id,
     }
 
 
@@ -9841,6 +9888,12 @@ def dashboard(
         )
     )
     current_liquidity_observation = None
+    # Raw `Decimal` twin of `current_liquidity_observation["value"]` (which
+    # already went through the JSON-boundary `decimal_value()` cast) --
+    # `household_patrimony_summary` below needs an exact `Decimal` to add to
+    # the investments total, never the float re-derived from the display
+    # dict.
+    current_liquidity_observation_amount: Decimal | None = None
     liquidity_account = db.scalar(
         select(Account)
         .where(
@@ -9880,6 +9933,7 @@ def dashboard(
                 "certified_by": "manual_confirmed",
                 "trusted": True,
             }
+            current_liquidity_observation_amount = observed.amount
 
     pending_obligation_rows = _obligation_rows(db, user.household_id)
     obligation_alerts = [item for item in pending_obligation_rows if item["days_until_due"] <= 30][:5]
@@ -9899,9 +9953,9 @@ def dashboard(
         sum(_forecast_card_invoices(db, user.household_id, start).values(), Decimal("0"))
     )
     # October Go-Live Slice 6: the exact same function `GET /investments`
-    # calls -- see the comment on `noncanonical.net_worth` below for why
-    # this is a live query, not a snapshot column.
-    investment_net_worth = net_worth_summary(db, household_id=user.household_id)
+    # calls -- see the comment on `noncanonical.investments_total` below for
+    # why this is a live query, not a snapshot column.
+    investment_net_worth = investments_summary(db, household_id=user.household_id)
     db.commit()
     # `dashboard_monetary_publication` is the exact function INV-019 reads to
     # verify this response -- see its docstring and
@@ -9917,6 +9971,25 @@ def dashboard(
     # `publication` too, so INV-019's `dashboard_and_report_consistency_facts`
     # (which reads the exact same function) observes them as well.
     publication = dashboard_monetary_publication(snapshot, profile=profile)
+    # October Go-Live Slice 6 (P0 #87), engineering review on PR #94,
+    # blocking item 1: household Patrimônio (rebaseline §13.1 item 4 --
+    # "valor líquido atual dos ativos/caixa") is cash + investments, never
+    # investments alone. The cash component reuses whichever figure is
+    # already canonical for "quanto tenho hoje" -- the confirmed
+    # `AccountBalanceObservation` for this period when one exists
+    # (`current_liquidity_observation_amount`, sovereign per rebaseline
+    # §5.1), else the Financial Engine's own computed closing liquidity
+    # balance (`publication["liquidity_balance"]`) -- never a third,
+    # independently-derived cash figure.
+    patrimony_cash_position = (
+        current_liquidity_observation_amount
+        if current_liquidity_observation_amount is not None
+        else publication["liquidity_balance"]
+    )
+    household_patrimony = household_patrimony_summary(
+        cash_position=patrimony_cash_position,
+        investments_total=investment_net_worth["total_current_value"],
+    )
     return {
         "month": month_key(start),
         "snapshot_id": snapshot.id,
@@ -10019,19 +10092,43 @@ def dashboard(
             },
             # October Go-Live Slice 6 (P0 #87): patrimônio/investimentos,
             # incluindo o Studio -- rebaseline §13.1 item 4 ("Patrimônio --
-            # valor líquido atual dos ativos/caixa") e §16. Live query
-            # (current `Investment.current_value` rows), not a
+            # valor líquido atual dos ativos/caixa") e §16. Live query, not a
             # `FinancialSnapshot` column, so `noncanonical` like every other
             # entry in this block -- see the comment above `future_commission`.
-            # `app.services.investments.net_worth_summary` is the single
-            # function this dict and `GET /investments` both call, so the
-            # Dashboard and a future Slice 7 report can never diverge on
-            # this number (rebaseline "nenhum cálculo patrimonial duplicado
-            # no frontend"). Sums `current_value` only -- never
+            #
+            # `patrimony` is the true household Patrimônio (engineering
+            # review on PR #94, blocking item 1): cash + investments, built
+            # by `app.services.investments.household_patrimony_summary` from
+            # `patrimony_cash_position` (the already-canonical "quanto tenho
+            # hoje" figure -- confirmed observation when sovereign, else the
+            # Financial Engine's closing liquidity balance) and
+            # `investments_total.value` below. `investments_total` alone is
+            # the **investments-only** subtotal (never call this
+            # "Patrimônio" -- an earlier revision of this endpoint did
+            # exactly that, omitting cash whenever a bank/Privilège balance
+            # existed) -- `app.services.investments.investments_summary` is
+            # the single function this dict and `GET /investments` both
+            # call, so the Dashboard and a future Slice 7 report can never
+            # diverge on this number (rebaseline "nenhum cálculo patrimonial
+            # duplicado no frontend"). Sums `current_value` only -- never
             # `historical_cost`/`expected_receivable_value` -- INV-034.
-            "net_worth": {
+            "patrimony": {
+                "value": decimal_value(household_patrimony["total"]),
+                "cash_component": decimal_value(household_patrimony["cash_position"]),
+                "cash_source": (
+                    "current_liquidity_observation"
+                    if current_liquidity_observation_amount is not None
+                    else "liquidity_balance"
+                ),
+                "investments_component": decimal_value(household_patrimony["investments_total"]),
+                "source": "household_patrimony_summary",
+                "freshness": "live",
+                "certified_by": "manual_confirmed" if current_liquidity_observation_amount is not None else None,
+                "as_of": datetime.now(UTC).isoformat(),
+            },
+            "investments_total": {
                 "value": decimal_value(investment_net_worth["total_current_value"]),
-                "source": "net_worth_summary",
+                "source": "investments_summary",
                 "freshness": "live",
                 "certified_by": None,
                 "as_of": datetime.now(UTC).isoformat(),

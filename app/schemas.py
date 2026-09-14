@@ -523,9 +523,10 @@ class InvestmentCreateRequest(BaseModel):
 
     `historical_cost` is the initial cost basis (e.g. what the Studio has
     already cost so far); `current_value` is required so patrimony
-    (`app.services.investments.net_worth_summary`) always has a real
-    "Valor de hoje" from the moment an asset is created, never an implicit
-    zero standing in for "unknown". Creating an investment also appends its
+    (`app.services.investments.investments_summary`/
+    `household_patrimony_summary`) always has a real "Valor de hoje" from
+    the moment an asset is created, never an implicit zero standing in for
+    "unknown". Creating an investment also appends its
     first `InvestmentValuation` snapshot (`app.api._create_investment_impl`)
     so history is complete from day one.
     """
@@ -568,22 +569,32 @@ class InvestmentContributionRequest(BaseModel):
     """Records a contribution (aporte) into an existing `Investment` --
     increases `historical_cost` only (rebaseline §16.2/§16.3: "Coloquei
     mais 5 mil no Studio" never changes `current_value`, which is only ever
-    confirmed by a separate valuation event). `funding_transaction_id`, when
-    given, must name an already-existing `Transaction` representing the
-    real cash movement out of an account (the same
+    confirmed by a separate valuation event).
+
+    `funding_transaction_id` is **required** (engineering review on PR #94,
+    blocking item 2): it must name an already-existing `Transaction`
+    representing the real cash movement out of an account (the same
     `movement_type="investment"`/"Transferência patrimonial" manual entry
     already supported by `ManualTransactionRequest`, or an imported
     equivalent) -- this endpoint never creates that transaction itself, it
     only links to one that already exists, exactly like `RefundLinkRequest`
-    only links an already-existing refund (Work Order: "sem fabricar gasto
-    econômico ou origem de caixa"). Omitting it is allowed for a human who
-    has not yet recorded, or does not need to record, that cash movement;
-    the Assistant's own typed-action proposal (`register_asset_contribution`)
-    asks for it explicitly when the message left it materially undefined."""
+    always requires (never optionally links) an already-existing refund
+    (Work Order: "sem fabricar gasto econômico ou origem de caixa"). A new
+    aporte event must never silently increase cost basis with no
+    corresponding real funding fact -- the opening/historical cost basis
+    captured at asset creation, import or backfill time
+    (`InvestmentCreateRequest.historical_cost`) is the only place a cost
+    figure is ever accepted without a linked cash movement, because that is
+    a point-in-time fact about the past, not a new event. A human who has
+    not yet recorded the outgoing transfer must record it first (the
+    existing manual-entry form), then link it here -- the Assistant's own
+    typed-action proposal (`register_asset_contribution`) already follows
+    the same rule, asking for the origin when it cannot resolve exactly one
+    matching transaction."""
 
     contribution_amount: Decimal = Field(gt=0)
     valuation_date: date
-    funding_transaction_id: str | None = Field(default=None, min_length=1, max_length=36)
+    funding_transaction_id: str = Field(min_length=1, max_length=36)
     note: str | None = Field(default=None, max_length=2000)
 
 

@@ -1,22 +1,30 @@
 """Canonical patrimony/investment calculations (P0 #87, October Go-Live
 Slice 6 -- `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md`, rebaseline §16).
 
-Every derived investment figure (gain, return %) and the household's net
-worth total are computed here exactly once. `app.api` (the `/dashboard`
-endpoint and the `/investments*` routes) and, later, Slice 7's reports must
-call these functions instead of re-deriving any of them independently --
-rebaseline "nenhum cálculo patrimonial duplicado no frontend"/"não criar
-segundo motor de cálculo".
+Every derived investment figure (gain, return %) and the household's
+investments subtotal are computed here exactly once. `app.api` (the
+`/dashboard` endpoint and the `/investments*` routes) and, later, Slice 7's
+reports must call these functions instead of re-deriving any of them
+independently -- rebaseline "nenhum cálculo patrimonial duplicado no
+frontend"/"não criar segundo motor de cálculo".
 
-**Invariant central (rebaseline §16.2):** `net_worth_summary` sums
+**Invariant central (rebaseline §16.2):** `investments_summary` sums
 `current_value` only. `historical_cost` (cost basis) and
 `expected_receivable_value` (future projection) never enter the total --
 see `tests/test_investments_slice6.py` for the property/regression tests
 proving this, and `app.services.financial_invariants.
 validate_net_worth_current_value_only` (INV-034) for the formal contract.
 
+**`investments_summary` is investments-only, not household Patrimônio.**
+Rebaseline §13.1 item 4 defines Patrimônio as "valor líquido atual dos
+ativos/caixa" -- cash included. `household_patrimony_summary` below is the
+function that composes the two (this module has no `Session`/cash access
+of its own, so it takes the already-computed cash figure as a plain
+argument -- see the engineering review on PR #94, blocking item 1, for why
+publishing `investments_summary`'s total alone as "Patrimônio" was wrong).
+
 Deliberately independent from SQLAlchemy's `Session` type where possible
-(only `net_worth_summary` needs a `Session` to query); the per-asset
+(only `investments_summary` needs a `Session` to query); the per-asset
 derived calculations take a plain `Investment` ORM instance (or any object
 exposing the same four Decimal-typed attributes) so they stay trivially
 unit-testable without a database.
@@ -93,7 +101,7 @@ def investment_return_projected_pct(investment: _InvestmentLike) -> Decimal | No
 
 def serialize_investment(investment: Any) -> dict[str, Any]:
     """Canonical row shape for one investment, including every derived
-    figure -- the one function `GET /investments`, `net_worth_summary`'s
+    figure -- the one function `GET /investments`, `investments_summary`'s
     `investments` list, and (in Slice 7) reports must all use, instead of
     each re-deriving `gain_current`/`return_current_pct`/etc. independently.
     Values stay `Decimal`/`date`/`None` here (no JSON coercion) -- callers
@@ -117,16 +125,20 @@ def serialize_investment(investment: Any) -> dict[str, Any]:
     }
 
 
-def net_worth_summary(db: Session, *, household_id: str) -> dict[str, Any]:
-    """The single, canonical patrimony aggregation for a household
+def investments_summary(db: Session, *, household_id: str) -> dict[str, Any]:
+    """The single, canonical *investments-only* aggregation for a household
     (rebaseline §16.2 -- "o patrimônio atual usa somente o Valor de hoje").
 
     Sums `current_value` across every *active* investment exactly once
     each; `historical_cost`/`expected_receivable_value` never enter
     `total_current_value` -- see `tests/test_investments_slice6.py::
-    test_net_worth_summary_sums_current_value_only_never_historical_or_projected`.
-    `/dashboard` and, in Slice 7, reports must call this function rather
-    than re-querying/re-summing `Investment` rows independently."""
+    test_investments_summary_sums_current_value_only_never_historical_or_projected`.
+    `GET /investments`, `household_patrimony_summary`'s `investments_total`
+    input and, in Slice 7, reports must call this function rather than
+    re-querying/re-summing `Investment` rows independently.
+
+    This is deliberately **not** household Patrimônio -- it excludes cash.
+    See `household_patrimony_summary`."""
 
     from app.models import Investment
 
@@ -141,4 +153,31 @@ def net_worth_summary(db: Session, *, household_id: str) -> dict[str, Any]:
     return {
         "total_current_value": total_current_value,
         "investments": [serialize_investment(item) for item in investments],
+    }
+
+
+def household_patrimony_summary(*, cash_position: Decimal, investments_total: Decimal) -> dict[str, Decimal]:
+    """The household's total current Patrimônio (rebaseline §13.1 item 4:
+    "valor líquido atual dos ativos/caixa"; §17 "Quanto tenho
+    disponível/patrimônio? Saldos/ativos reais") -- the sovereign current
+    cash/account position plus the eligible assets' current value, never
+    historical cost or a future projection.
+
+    Deliberately takes both components as already-computed `Decimal`
+    arguments instead of querying anything itself: the caller
+    (`GET /dashboard` today, Slice 7 reports later) is the one place that
+    already knows which cash figure is canonical for "quanto tenho hoje"
+    (the confirmed `AccountBalanceObservation` when one exists for the
+    period -- rebaseline §5.1 "saldo confirmado é soberano" -- else the
+    Financial Engine's computed closing liquidity balance) -- this function
+    never re-derives or second-guesses that choice, it only adds the two
+    already-canonical numbers together exactly once. See the engineering
+    review on PR #94, blocking item 1: publishing `investments_summary`'s
+    investments-only total as "Patrimônio" omitted cash entirely."""
+
+    total = money(Decimal(cash_position) + Decimal(investments_total))
+    return {
+        "total": total,
+        "cash_position": money(Decimal(cash_position)),
+        "investments_total": money(Decimal(investments_total)),
     }

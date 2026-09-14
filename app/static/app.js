@@ -32,6 +32,34 @@ const state = {
   ],
 };
 const money = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+// Engineering review on PR #94, blocking item 4: `Number(text.replace(",",
+// ".")) || 0` silently turned invalid/blank input, and any pt-BR
+// thousands-grouped value ("35.000,00"), into a confirmed `0`. Every
+// window.prompt-driven money entry in the Investments/Studio panel below
+// must reject invalid input instead of coercing it -- never send an amount
+// the user did not actually type. Returns `null` (never `0`) when `text`
+// cannot be parsed as a non-negative monetary amount.
+function parseMoneyPromptInput(text) {
+  if (typeof text !== "string") return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  let normalized;
+  if (/^\d{1,3}(\.\d{3})+,\d{1,2}$/.test(trimmed)) {
+    // pt-BR grouped: "35.000,00" -> "35000.00"
+    normalized = trimmed.replace(/\./g, "").replace(",", ".");
+  } else if (/^\d+,\d{1,2}$/.test(trimmed)) {
+    // pt-BR decimal, no grouping: "300,50" -> "300.50"
+    normalized = trimmed.replace(",", ".");
+  } else if (/^\d+$/.test(trimmed) || /^\d+\.\d{1,2}$/.test(trimmed)) {
+    // Plain integer or already-dotted decimal: "300" / "300.50"
+    normalized = trimmed;
+  } else {
+    return null;
+  }
+  const value = Number(normalized);
+  if (!Number.isFinite(value) || value < 0) return null;
+  return value;
+}
 const compactMoney = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", notation: "compact", maximumFractionDigits: 1 });
 const dateFormat = new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" });
 const monthFormat = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
@@ -850,13 +878,21 @@ async function loadDashboard() {
   renderInvestments(summary);
 }
 
-// October Go-Live Slice 6: reads noncanonical.net_worth/noncanonical.investments
-// verbatim from GET /dashboard -- app.services.investments.net_worth_summary
-// is the one function that computed both; nothing here sums, derives a
+// October Go-Live Slice 6: reads noncanonical.patrimony/noncanonical.investments_total/
+// noncanonical.investments verbatim from GET /dashboard --
+// app.services.investments.household_patrimony_summary/investments_summary
+// are the functions that computed them; nothing here sums, derives a
 // gain/return, or re-decides which field counts as patrimony a second time.
+// `patrimony` (cash + investments) and `investments_total` (investments
+// only) are deliberately two different numbers -- engineering review on PR
+// #94, blocking item 1: an earlier revision of this panel labelled the
+// investments-only subtotal "Patrimônio", which is wrong whenever the
+// household has any bank/Privilège balance.
 function renderInvestments(summary) {
-  const netWorth = summary.noncanonical?.net_worth?.value;
-  document.querySelector("#net-worth-total").textContent = money.format(netWorth || 0);
+  const patrimony = summary.noncanonical?.patrimony?.value;
+  document.querySelector("#patrimony-total").textContent = money.format(patrimony || 0);
+  const investmentsTotal = summary.noncanonical?.investments_total?.value;
+  document.querySelector("#investments-total").textContent = money.format(investmentsTotal || 0);
   const rows = summary.noncanonical?.investments || [];
   document.querySelector("#investments-table").innerHTML = rows.length
     ? rows.map((item) => {
@@ -880,20 +916,83 @@ function renderInvestments(summary) {
     : emptyRow(7, "Nenhum investimento cadastrado ainda");
 }
 
+// Engineering review on PR #94, blocking item 4: loops window.prompt until
+// the user types a valid non-negative amount or cancels -- never lets an
+// invalid/blank value fall through as a silent `0`. Returns `null` only on
+// explicit cancel (matching every other prompt-based flow in this file).
+async function promptMoney(message, defaultText) {
+  let text = window.prompt(message, defaultText);
+  while (text !== null) {
+    const value = parseMoneyPromptInput(text);
+    if (value !== null) return value;
+    toast('Valor inválido. Digite um número, ex.: "300" ou "35.000,00".', true);
+    text = window.prompt(message, text);
+  }
+  return null;
+}
+
+// Engineering review on PR #94, blocking item 2: a new aporte must always
+// resolve to a real, already-existing "Transferência patrimonial" cash-out
+// transaction -- POST /investments/{id}/contributions now rejects a
+// request with no `funding_transaction_id`. Mirrors exactly what the
+// Assistant's own `register_asset_contribution` proposal already does
+// (`app.services.assistant_actions._propose_register_asset_contribution`):
+// resolve when there is exactly one amount-matched candidate, ask when
+// there are none or several, never fabricate the link. Returns the chosen
+// `transaction_id`, or `null` if the user cancels/there is no way forward.
+async function resolveContributionFunding(amount, assetName) {
+  let candidates;
+  try {
+    candidates = await api(`/investments/contribution-candidates?amount=${encodeURIComponent(amount)}`);
+  } catch (error) {
+    toast(error.message, true);
+    return null;
+  }
+  if (candidates.length === 1) {
+    const candidate = candidates[0];
+    const confirmed = window.confirm(
+      `Usar o lançamento de "Transferência patrimonial" de ${money.format(candidate.amount)} em ` +
+      `${candidate.date} (${candidate.description}) como origem deste aporte em "${assetName}"?`
+    );
+    return confirmed ? candidate.transaction_id : null;
+  }
+  if (candidates.length === 0) {
+    toast(
+      `Nenhum lançamento de "Transferência patrimonial" de ${money.format(amount)} encontrado. ` +
+      "Registre primeiro a saída em Saídas/Transações (tipo Aplicação/investimento) e tente o aporte novamente.",
+      true
+    );
+    return null;
+  }
+  const listing = candidates
+    .map((candidate, index) => `${index + 1}. ${candidate.date} - ${candidate.description} - ${money.format(candidate.amount)}`)
+    .join("\n");
+  const choiceText = window.prompt(
+    `Mais de um lançamento de "Transferência patrimonial" corresponde a esse valor. Qual é a origem deste aporte?\n\n${listing}\n\nDigite o número da opção:`
+  );
+  if (choiceText === null) return null;
+  const choiceIndex = Number(choiceText.trim()) - 1;
+  if (!Number.isInteger(choiceIndex) || choiceIndex < 0 || choiceIndex >= candidates.length) {
+    toast("Opção inválida; aporte não registrado", true);
+    return null;
+  }
+  return candidates[choiceIndex].transaction_id;
+}
+
 document.querySelector("#new-investment-button").addEventListener("click", async () => {
   const name = window.prompt("Nome do ativo/investimento (ex.: Studio):");
   if (!name) return;
-  const historicalCostText = window.prompt("Valor investido até hoje (custo histórico), em R$:", "0");
-  if (historicalCostText === null) return;
-  const currentValueText = window.prompt("Valor de hoje (patrimônio atual deste ativo), em R$:");
-  if (currentValueText === null) return;
+  const historicalCost = await promptMoney("Valor investido até hoje (custo histórico), em R$:", "0");
+  if (historicalCost === null) return;
+  const currentValue = await promptMoney("Valor de hoje (patrimônio atual deste ativo), em R$:");
+  if (currentValue === null) return;
   try {
     await api("/investments", {
       method: "POST",
       body: JSON.stringify({
         name,
-        historical_cost: Number(historicalCostText.replace(",", ".")) || 0,
-        current_value: Number(currentValueText.replace(",", ".")) || 0,
+        historical_cost: historicalCost,
+        current_value: currentValue,
         valuation_date: currentDateKey(),
       }),
     });
@@ -909,13 +1008,13 @@ document.querySelector("#investments-table").addEventListener("click", async (ev
   const updateProjectionButton = event.target.closest(".investment-update-projection");
   const contributeButton = event.target.closest(".investment-contribute");
   if (updateValueButton) {
-    const amountText = window.prompt(`Novo valor de hoje para "${updateValueButton.dataset.name}", em R$:`);
-    if (amountText === null) return;
+    const amount = await promptMoney(`Novo valor de hoje para "${updateValueButton.dataset.name}", em R$:`);
+    if (amount === null) return;
     try {
       await api(`/investments/${updateValueButton.dataset.id}/valuations`, {
         method: "POST",
         body: JSON.stringify({
-          current_value: Number(amountText.replace(",", ".")) || 0,
+          current_value: amount,
           valuation_date: currentDateKey(),
         }),
       });
@@ -925,13 +1024,13 @@ document.querySelector("#investments-table").addEventListener("click", async (ev
       toast(error.message, true);
     }
   } else if (updateProjectionButton) {
-    const amountText = window.prompt(`Novo valor previsto a receber para "${updateProjectionButton.dataset.name}", em R$:`);
-    if (amountText === null) return;
+    const amount = await promptMoney(`Novo valor previsto a receber para "${updateProjectionButton.dataset.name}", em R$:`);
+    if (amount === null) return;
     try {
       await api(`/investments/${updateProjectionButton.dataset.id}/valuations`, {
         method: "POST",
         body: JSON.stringify({
-          expected_receivable_value: Number(amountText.replace(",", ".")) || 0,
+          expected_receivable_value: amount,
           valuation_date: currentDateKey(),
         }),
       });
@@ -941,14 +1040,17 @@ document.querySelector("#investments-table").addEventListener("click", async (ev
       toast(error.message, true);
     }
   } else if (contributeButton) {
-    const amountText = window.prompt(`Valor do aporte em "${contributeButton.dataset.name}", em R$:`);
-    if (amountText === null) return;
+    const amount = await promptMoney(`Valor do aporte em "${contributeButton.dataset.name}", em R$:`);
+    if (amount === null) return;
+    const fundingTransactionId = await resolveContributionFunding(amount, contributeButton.dataset.name);
+    if (fundingTransactionId === null) return;
     try {
       await api(`/investments/${contributeButton.dataset.id}/contributions`, {
         method: "POST",
         body: JSON.stringify({
-          contribution_amount: Number(amountText.replace(",", ".")) || 0,
+          contribution_amount: amount,
           valuation_date: currentDateKey(),
+          funding_transaction_id: fundingTransactionId,
         }),
       });
       toast("Aporte registrado");

@@ -866,10 +866,11 @@ class Investment(Base, TimestampMixin):
     Three fields are semantically distinct and must never be summed
     (rebaseline §16.2): `historical_cost` ("Valor investido") is the
     accumulated cost basis/contributions; `current_value` ("Valor de hoje")
-    is the sole field `app.services.investments.net_worth_summary` reads
-    into patrimony; `expected_receivable_value` ("Valor previsto a
-    receber") is a future projection that never contributes to current net
-    worth. This row always holds the *current* state; every mutation
+    is the sole field `app.services.investments.investments_summary` reads
+    into the investments-only subtotal that feeds household Patrimônio
+    (`household_patrimony_summary`); `expected_receivable_value` ("Valor
+    previsto a receber") is a future projection that never contributes to
+    current patrimony. This row always holds the *current* state; every mutation
     (`app.services.investments.update_investment_value`/
     `register_investment_contribution`) also appends an immutable
     `InvestmentValuation` snapshot row -- never rewritten, only

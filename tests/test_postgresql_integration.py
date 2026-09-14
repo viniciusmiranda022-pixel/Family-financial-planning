@@ -1169,3 +1169,165 @@ def test_assistant_execute_concurrent_same_proposal_is_serialized_to_a_single_mu
         engine.dispose()
     finally:
         get_settings.cache_clear()
+
+
+def test_investment_contribution_concurrent_same_funding_transaction_is_serialized_to_a_single_link() -> None:
+    """Engineering review on PR #94, blocking item 3: the "already linked?"
+    read and the `InvestmentValuation` insert in
+    `_register_investment_contribution_impl` are two separate statements;
+    without `lock_household_financial_revision` serializing them, two
+    concurrent requests linking the *same* `funding_transaction_id` (even
+    against two different investments) can both observe "not linked" and
+    both commit a contribution, double-increasing historical cost against
+    one real cash movement.
+
+    Proves the fix under a real two-connection PostgreSQL race, mirroring
+    `test_assistant_execute_concurrent_same_proposal_is_serialized_to_a_single_mutation`
+    above: pausing the first connection mid-transaction (after it has taken
+    the household-revision row lock and validated/dispatched the write, but
+    before its own commit) while a fully concurrent second connection
+    attempts to link the exact same funding transaction (to a *different*
+    investment, proving this is a household-wide lock, not a
+    per-investment one). The second must block on PostgreSQL's row-level
+    write lock until the first commits, then observe the now-linked
+    funding transaction and be refused with 409 -- never a second,
+    silently-accepted link.
+    """
+
+    from fastapi import HTTPException
+
+    from app.api import _register_investment_contribution_impl
+    from app.models import Investment, InvestmentValuation
+    from app.schemas import InvestmentContributionRequest
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as setup_db:
+            synthetic = build_synthetic_household(setup_db)
+            synthetic.user.is_admin = True
+            household_id = synthetic.household.id
+            user_id = synthetic.user.id
+            # `investment_out` is `build_synthetic_household`'s existing
+            # "Transferência patrimonial" cash-out (-1000.00, transfer,
+            # category "Transferência patrimonial") -- exactly the shape
+            # `_register_investment_contribution_impl` requires a funding
+            # transaction to have; no need to fabricate a second one.
+            funding_transaction_id = synthetic.transactions["investment_out"].id
+            investment_a = Investment(
+                household_id=household_id,
+                name="Studio A",
+                historical_cost=Decimal("30000.00"),
+                current_value=Decimal("35000.00"),
+                last_updated_at=date(2026, 6, 8),
+            )
+            investment_b = Investment(
+                household_id=household_id,
+                name="Studio B",
+                historical_cost=Decimal("10000.00"),
+                current_value=Decimal("12000.00"),
+                last_updated_at=date(2026, 6, 8),
+            )
+            setup_db.add_all([investment_a, investment_b])
+            setup_db.commit()
+            investment_a_id = investment_a.id
+            investment_b_id = investment_b.id
+
+        payload = InvestmentContributionRequest(
+            contribution_amount=Decimal("1000.00"),
+            valuation_date=date(2026, 6, 8),
+            funding_transaction_id=funding_transaction_id,
+        )
+
+        first_paused = threading.Event()
+        release_first = threading.Event()
+        first_done = threading.Event()
+        first_result: list[dict] = []
+        first_error: list[BaseException] = []
+
+        def _first_attempt() -> None:
+            try:
+                first_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(first_engine, autoflush=False) as first_db:
+                    user = first_db.get(User, user_id)
+                    real_flush = first_db.flush
+
+                    def _pausing_flush(*args, **kwargs):
+                        # By the time `_register_investment_contribution_impl`
+                        # first calls `db.flush()` (adding the new
+                        # `InvestmentValuation`), it has already taken the
+                        # household-revision row lock and passed the
+                        # "already linked?" check -- pausing here holds
+                        # that lock open across the gap the second
+                        # connection needs to race into.
+                        first_paused.set()
+                        release_first.wait(timeout=10.0)
+                        return real_flush(*args, **kwargs)
+
+                    first_db.flush = _pausing_flush
+                    result = _register_investment_contribution_impl(
+                        investment_a_id, payload, user, first_db, commit=True
+                    )
+                    first_result.append(result)
+                first_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001 - surfaced via assertion below
+                first_error.append(exc)
+            finally:
+                first_done.set()
+
+        first_worker = threading.Thread(target=_first_attempt, daemon=True)
+        first_worker.start()
+        assert first_paused.wait(timeout=5.0), "first contribution never reached its pause point"
+
+        second_done = threading.Event()
+        second_result: list[dict] = []
+        second_error: list[BaseException] = []
+
+        def _second_attempt() -> None:
+            try:
+                second_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(second_engine) as second_db:
+                    user = second_db.get(User, user_id)
+                    result = _register_investment_contribution_impl(
+                        investment_b_id, payload, user, second_db, commit=True
+                    )
+                    second_result.append(result)
+                second_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001 - the 409 below is asserted, not swallowed
+                second_error.append(exc)
+            finally:
+                second_done.set()
+
+        second_worker = threading.Thread(target=_second_attempt, daemon=True)
+        second_worker.start()
+        still_blocked = not second_done.wait(timeout=1.0)
+        assert still_blocked, (
+            "second contribution completed before the first transaction committed -- "
+            "lock_household_financial_revision is not actually serializing"
+        )
+
+        release_first.set()
+        assert first_done.wait(timeout=10.0), "first contribution never finished"
+        if first_error:
+            raise first_error[0]
+        assert first_result[0]["funding_transaction_id"] == funding_transaction_id
+
+        assert second_done.wait(timeout=10.0), "second contribution never finished"
+        assert len(second_error) == 1, "second contribution must be refused, never silently linked"
+        assert isinstance(second_error[0], HTTPException), second_error[0]
+        assert second_error[0].status_code == 409
+        assert not second_result, "no result may be returned for a refused contribution"
+
+        with Session(engine) as verify_db:
+            linked = verify_db.scalars(
+                select(InvestmentValuation).where(
+                    InvestmentValuation.household_id == household_id,
+                    InvestmentValuation.funding_transaction_id == funding_transaction_id,
+                    InvestmentValuation.invalidated_at.is_(None),
+                )
+            ).all()
+            assert len(linked) == 1, "exactly one contribution may ever link this funding transaction"
+            assert linked[0].investment_id == investment_a_id
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()

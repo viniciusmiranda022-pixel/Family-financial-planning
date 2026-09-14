@@ -9,8 +9,8 @@ P0 #87, October Go-Live Slice 6 (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md`,
 patrimonial assets/investments (including the Studio), keeping cost basis
 (`historical_cost`), current value (`current_value`) and future projection
 (`expected_receivable_value`) as three distinct columns so no consumer can
-ever sum them into net worth by construction -- see
-`app.services.investments.net_worth_summary`, which reads `current_value`
+ever sum them into the investments-only subtotal by construction -- see
+`app.services.investments.investments_summary`, which reads `current_value`
 only.
 
 `investments` holds the current state; `investment_valuations` is an

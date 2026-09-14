@@ -651,7 +651,13 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             "investment register contribution",
             "post",
             "/api/investments/missing/contributions",
-            {"json": {"contribution_amount": "500.00", "valuation_date": "2026-08-01"}},
+            {
+                "json": {
+                    "contribution_amount": "500.00",
+                    "valuation_date": "2026-08-01",
+                    "funding_transaction_id": "missing-transaction-id",
+                }
+            },
         ),
         (
             "investment undo valuation",
