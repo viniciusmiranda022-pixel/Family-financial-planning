@@ -92,15 +92,48 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Safe to drop unconditionally: this table only ever narrates an
-    action already fully recorded in `audit_events` (the paired row is
-    never deleted by this downgrade), so nothing here is a fact this
-    project could not reconstruct from the paired `AuditEvent` -- unlike
-    `transactions.refund_of_transaction_id` (migration 0015), losing this
-    table loses presentation detail (the exact typed-action narration,
-    undo bookkeeping), never a financial fact.
+    """Refuses (raises `RuntimeError`, changes nothing) when any row exists
+    -- same guarded pattern as migration 0015's downgrade.
+
+    Engineering review of PR #92 (blocker 3) corrected the original claim
+    here that this table is always "safe to drop unconditionally" because
+    it is "reconstructable from the paired `AuditEvent`". That is not true
+    in general: the paired `audit_events.details`/`before_state`/
+    `after_state` for an `assistant.execute` event does not, by itself,
+    carry `original_message`, `structured_interpretation`,
+    `disambiguation_qa`, or this table's own undo bookkeeping
+    (`undoable`/`non_reversible_reason`/`undone_at`/`undone_by`/
+    `undo_audit_event_id`) -- those live only here. Dropping this table
+    while it holds rows would therefore silently destroy exactly the
+    typed-action narration and undo trail the Work Order requires to be
+    permanent (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_4.md` item 6/7),
+    which this downgrade previously did unconditionally.
+
+    Export first if this ever fires in practice:
+
+        SELECT * FROM assistant_action_events;
+
+    keep that result outside the database, then retry the downgrade once
+    it is safe to lose these rows.
+
+    Offline SQL generation (`alembic downgrade --sql`) has no live
+    connection to check against -- matches every other guarded downgrade in
+    this chain (0015).
     """
 
+    if not op.get_context().as_sql:
+        row_count = op.get_bind().execute(
+            sa.text("SELECT COUNT(*) FROM assistant_action_events")
+        ).scalar()
+        if row_count:
+            raise RuntimeError(
+                f"Downgrade de 0016 abortado: {row_count} linha(s) de "
+                "assistant_action_events (narração de ação tipada + trilha de undo do "
+                "Assistente Financeiro) seriam perdidas silenciosamente e não são "
+                "totalmente reconstruíveis a partir de audit_events. Exporte "
+                "`SELECT * FROM assistant_action_events` primeiro, preserve o resultado "
+                "fora do banco, e só então repita o downgrade."
+            )
     op.drop_index("ix_assistant_action_events_created_at", table_name="assistant_action_events")
     op.drop_index("ix_assistant_action_events_typed_action", table_name="assistant_action_events")
     op.drop_index("ix_assistant_action_events_audit_event_id", table_name="assistant_action_events")

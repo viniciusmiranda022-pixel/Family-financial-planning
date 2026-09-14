@@ -607,6 +607,61 @@ class AssistantActionEvent(Base):
     )
 
 
+class AssistantActionProposal(Base):
+    """A single-use, server-resolved typed-action proposal (P0 #87, October
+    Go-Live Slice 4 -- engineering review of PR #92, blocker 1).
+
+    `POST /assistant/interpret` persists exactly one row here whenever
+    `app.services.assistant_actions.build_typed_action_proposal` returns
+    `can_execute=True` -- i.e. only once the message has already been
+    deterministically resolved against real household data with zero
+    ambiguity. `POST /assistant/execute` accepts nothing but this row's
+    `id`: `typed_action`/`payload`/`path_params`/`structured_interpretation`
+    are always read back from here, never re-supplied by the HTTP caller,
+    so a client can never skip `/assistant/interpret` and hand-execute a
+    fabricated or spoofed interpretation for a message that was actually
+    ambiguous (Work Order invariant "Nenhuma ação ambígua é executada
+    automaticamente"). `original_message`/`structured_interpretation` are
+    what let a downstream audit reconstruct that the recorded
+    interpretation genuinely came from the Codex sidecar's own response,
+    not from an unverified client claim.
+
+    Single-use and time-boxed: `consumed_at`/`consumed_action_event_id` are
+    set exactly once, by `execute_typed_action`, the moment the proposal is
+    successfully dispatched -- a retry with the same `id` afterwards is an
+    idempotent replay of that one recorded action, never a second
+    execution. `expires_at` bounds how long a resolved-but-unconfirmed
+    proposal (household data could have changed meanwhile -- an account
+    closed, an obligation already paid another way) stays eligible to
+    execute; an expired, never-consumed proposal is simply left in place
+    for audit/debugging, exactly like any other stale credential -- nothing
+    here ever deletes a financial fact, because a proposal never contains
+    one until it is consumed.
+    """
+
+    __tablename__ = "assistant_action_proposals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(64), index=True)
+    original_message: Mapped[str] = mapped_column(Text)
+    structured_interpretation: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    typed_action: Mapped[str] = mapped_column(String(60), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+    path_params: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_action_event_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assistant_action_events.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 class IntegrityRun(Base):
     __tablename__ = "integrity_runs"
     __table_args__ = (
