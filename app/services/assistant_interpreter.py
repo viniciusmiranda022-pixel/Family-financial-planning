@@ -38,9 +38,16 @@ _ALLOWED_EXTRACTED_FIELD_KEYS = frozenset(
         "date_text",
         "funding_source_hint",
         "target_hint",
+        "asset_value_kind_hint",
     }
 )
 _ALLOWED_FUNDING_SOURCE_HINTS = frozenset({"account", "privilege", "unspecified"})
+# October Go-Live Slice 6 (P0 #87): disambiguates which field
+# `update_asset_value` updates -- rebaseline §16.3 never lets a bare amount
+# guess between "Valor de hoje" and "Valor previsto a receber".
+_ALLOWED_ASSET_VALUE_KIND_HINTS = frozenset(
+    {"current_value", "expected_receivable_value", "unspecified"}
+)
 
 MAX_MISSING_FIELDS = 8
 MAX_CLARIFYING_QUESTION_LENGTH = 300
@@ -94,6 +101,8 @@ def _coerce_extracted_fields(raw: Any) -> dict[str, str]:
         if not cleaned:
             continue
         if key == "funding_source_hint" and cleaned not in _ALLOWED_FUNDING_SOURCE_HINTS:
+            continue
+        if key == "asset_value_kind_hint" and cleaned not in _ALLOWED_ASSET_VALUE_KIND_HINTS:
             continue
         fields[key] = cleaned[:300]
     return fields

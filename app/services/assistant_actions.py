@@ -82,14 +82,16 @@ from sqlalchemy.orm import Session
 
 from app.services.assistant_interpreter import StructuredInterpretation
 
-# Typed actions the Assistant may propose/execute this slice. Deliberately a
-# closed list matching `app.services.assistant_sanitizer.KNOWN_INTENTS`
-# minus the two non-mutating intents (`query`/`unknown`, which never reach
+# Typed actions the Assistant may propose/execute. Deliberately a closed
+# list matching `app.services.assistant_sanitizer.KNOWN_INTENTS` minus the
+# two non-mutating intents (`query`/`unknown`, which never reach
 # `execute_typed_action`) -- see the Work Order's mandatory scope (§ escopo
-# obrigatório item 5). Asset/investment typed actions
-# (`UPDATE_ASSET_VALUE`/`REGISTER_ASSET_CONTRIBUTION`) are deliberately not
-# included: `Investment`/asset entities do not exist yet (October Go-Live
-# Slice 6, not yet implemented) -- see the PR description's scope note.
+# obrigatório item 5). `update_asset_value`/`register_asset_contribution`
+# (October Go-Live Slice 6, P0 #87 -- `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md`)
+# were deliberately excluded before this slice because `Investment` did not
+# exist yet; both now dispatch into `app.api._update_investment_value_impl`/
+# `_register_investment_contribution_impl`, the exact same functions the
+# manual `POST /investments/{id}/valuations`/`/contributions` endpoints call.
 TYPED_ACTIONS = (
     "create_expense",
     "create_income",
@@ -97,6 +99,8 @@ TYPED_ACTIONS = (
     "pay_obligation",
     "pay_card_invoice",
     "register_refund",
+    "update_asset_value",
+    "register_asset_contribution",
 )
 
 _INTENT_TO_TYPED_ACTION = {
@@ -106,6 +110,8 @@ _INTENT_TO_TYPED_ACTION = {
     "pay_obligation": "pay_obligation",
     "pay_card_invoice": "pay_card_invoice",
     "register_refund": "register_refund",
+    "update_asset_value": "update_asset_value",
+    "register_asset_contribution": "register_asset_contribution",
 }
 
 MAX_CANDIDATES = 5
@@ -380,6 +386,81 @@ def _candidate_refund_transactions(db: Session, *, household_id: str, hint: str)
     return candidates[:MAX_CANDIDATES]
 
 
+def _candidate_investments(db: Session, *, household_id: str, hint: str) -> list[Any]:
+    """Candidate active `Investment` rows matching `hint` by name (October
+    Go-Live Slice 6). The Studio is resolved the same way as any other
+    asset -- no special-cased lookup by a hardcoded name."""
+
+    from app.models import Investment
+
+    if not hint:
+        return []
+    normalized_hint = _strip_accents(hint).strip().lower()
+    if not normalized_hint:
+        return []
+    investments = list(
+        db.scalars(
+            select(Investment).where(
+                Investment.household_id == household_id, Investment.active.is_(True)
+            )
+        )
+    )
+    return [
+        investment
+        for investment in investments
+        if normalized_hint in _strip_accents(investment.name).lower()
+    ][:MAX_CANDIDATES]
+
+
+def candidate_investment_funding_transactions(
+    db: Session, *, household_id: str, amount: Decimal | None
+) -> list[Any]:
+    """Candidate already-existing "Transferência patrimonial" cash-out
+    transactions (`movement_type="investment"` manual entries, or an
+    imported equivalent) a contribution might link to -- the same
+    already-existing-fact requirement `_candidate_refund_transactions`
+    applies to `register_refund` (Work Order "sem fabricar ... origem de
+    caixa": this module never creates the cash movement itself, it only
+    resolves a link to one that already exists). Narrowed by amount when
+    known, since a "Transferência patrimonial" transaction carries no
+    description tying it to a specific asset.
+
+    Exported (no leading underscore) since `GET /investments/contribution-
+    candidates` (`app.api`) also calls it -- the manual Aporte UI must
+    resolve/ask for a funding origin exactly like the Assistant does
+    (engineering review on PR #94, blocking item 2), so both paths share
+    this one candidate-matching query instead of each re-deriving it."""
+
+    from app.api import _LEDGER_PATRIMONIAL_CATEGORY_NAME
+    from app.models import Category, InvestmentValuation, Transaction
+
+    query = (
+        select(Transaction)
+        .join(Category, Category.id == Transaction.category_id)
+        .where(
+            Transaction.household_id == household_id,
+            Transaction.transaction_type == "transfer",
+            Transaction.amount < 0,
+            Category.name == _LEDGER_PATRIMONIAL_CATEGORY_NAME,
+        )
+    )
+    if amount is not None:
+        query = query.where(
+            Transaction.amount.between(-(amount + Decimal("0.01")), -(amount - Decimal("0.01")))
+        )
+    candidates = list(db.scalars(query.order_by(Transaction.booked_at.desc()).limit(50)))
+    already_linked_ids = set(
+        db.scalars(
+            select(InvestmentValuation.funding_transaction_id).where(
+                InvestmentValuation.household_id == household_id,
+                InvestmentValuation.funding_transaction_id.isnot(None),
+                InvestmentValuation.invalidated_at.is_(None),
+            )
+        )
+    )
+    return [item for item in candidates if item.id not in already_linked_ids][:MAX_CANDIDATES]
+
+
 @dataclass(frozen=True, slots=True)
 class _PendingTransaction:
     """The minimal shape `app.services.duplicates.assess_duplicate` needs
@@ -476,6 +557,8 @@ def _serialize_candidate(entity: Any, kind: str) -> dict[str, Any]:
         return {"id": entity.id, "label": f"{entity.name} - vencimento {entity.due_date.isoformat()}"}
     if kind == "card_invoice":
         return {"id": entity.id, "label": f"Fatura {entity.competence} ({entity.status})"}
+    if kind == "investment":
+        return {"id": entity.id, "label": f"{entity.name} (R$ {entity.current_value:,.2f})".replace(",", "_").replace(".", ",").replace("_", ".")}
     if kind == "transaction":
         return {
             "id": entity.id,
@@ -570,6 +653,10 @@ def build_typed_action_proposal(
         return _propose_pay_card_invoice(db, household_id=household_id, fields=fields)
     if typed_action == "register_refund":
         return _propose_register_refund(db, household_id=household_id, fields=fields)
+    if typed_action == "update_asset_value":
+        return _propose_update_asset_value(db, household_id=household_id, fields=fields)
+    if typed_action == "register_asset_contribution":
+        return _propose_register_asset_contribution(db, household_id=household_id, fields=fields)
     return _needs_disambiguation("Não sei executar esse tipo de ação ainda pelo Assistente.")
 
 
@@ -869,6 +956,110 @@ def _propose_register_refund(db: Session, *, household_id: str, fields: dict[str
     )
 
 
+def _propose_update_asset_value(
+    db: Session, *, household_id: str, fields: dict[str, str]
+) -> TypedActionProposal:
+    """`update_asset_value` (October Go-Live Slice 6): rebaseline §16.3 --
+    "Hoje acho que o Studio vale 35 mil" updates `current_value`; "A
+    previsão agora é receber 45 mil" updates `expected_receivable_value`.
+    Never guesses which field a bare amount refers to: Codex must supply
+    `asset_value_kind_hint`, or this asks."""
+
+    hint = fields.get("target_hint") or fields.get("counterparty_hint") or fields.get("description")
+    if not hint:
+        return _needs_disambiguation("Qual ativo/investimento você quer atualizar?", missing_fields=("target",))
+    investments = _candidate_investments(db, household_id=household_id, hint=hint)
+    if len(investments) == 0:
+        return _needs_disambiguation(f'Não encontrei nenhum investimento cadastrado parecido com "{hint}".')
+    if len(investments) > 1:
+        return TypedActionProposal(
+            can_execute=False,
+            clarifying_question="Encontrei mais de um investimento parecido. Qual deles?",
+            candidates=tuple(_serialize_candidate(item, "investment") for item in investments),
+            candidate_kind="investment",
+        )
+    investment = investments[0]
+
+    amount = parse_amount_text(fields.get("amount_text"))
+    if amount is None:
+        return _needs_disambiguation("Qual é o novo valor?", missing_fields=("amount",))
+
+    value_kind = fields.get("asset_value_kind_hint")
+    if value_kind not in ("current_value", "expected_receivable_value"):
+        return _needs_disambiguation(
+            "Esse valor é o valor de hoje do ativo ou o valor previsto a receber no futuro?"
+        )
+
+    valuation_date = parse_date_text(fields.get("date_text")) or date.today()
+    payload: dict[str, Any] = {"valuation_date": valuation_date.isoformat()}
+    payload[value_kind] = str(amount)
+    return TypedActionProposal(
+        can_execute=True,
+        typed_action="update_asset_value",
+        payload=payload,
+        path_params={"investment_id": investment.id},
+    )
+
+
+def _propose_register_asset_contribution(
+    db: Session, *, household_id: str, fields: dict[str, str]
+) -> TypedActionProposal:
+    """`register_asset_contribution` (October Go-Live Slice 6): rebaseline
+    §16.3 -- "Coloquei mais 5 mil no Studio" increases `historical_cost`
+    and asks the funding origin when it is materially undefined, exactly
+    like `_propose_register_refund` requires the refund transaction to
+    already exist rather than fabricating it (Work Order "sem fabricar ...
+    origem de caixa")."""
+
+    hint = fields.get("target_hint") or fields.get("counterparty_hint") or fields.get("description")
+    if not hint:
+        return _needs_disambiguation("Em qual ativo/investimento você fez esse aporte?", missing_fields=("target",))
+    investments = _candidate_investments(db, household_id=household_id, hint=hint)
+    if len(investments) == 0:
+        return _needs_disambiguation(f'Não encontrei nenhum investimento cadastrado parecido com "{hint}".')
+    if len(investments) > 1:
+        return TypedActionProposal(
+            can_execute=False,
+            clarifying_question="Encontrei mais de um investimento parecido. Em qual deles?",
+            candidates=tuple(_serialize_candidate(item, "investment") for item in investments),
+            candidate_kind="investment",
+        )
+    investment = investments[0]
+
+    amount = parse_amount_text(fields.get("amount_text"))
+    if amount is None:
+        return _needs_disambiguation("Qual foi o valor do aporte?", missing_fields=("amount",))
+
+    funding_candidates = candidate_investment_funding_transactions(
+        db, household_id=household_id, amount=amount
+    )
+    if len(funding_candidates) != 1:
+        return TypedActionProposal(
+            can_execute=False,
+            clarifying_question=(
+                "De onde saiu esse aporte? Registre a saída em Saídas como \"Transferência "
+                "patrimonial\" primeiro, ou me diga qual lançamento já existente corresponde a "
+                "esse aporte."
+            ),
+            candidates=tuple(_serialize_candidate(item, "transaction") for item in funding_candidates),
+            candidate_kind="transaction" if funding_candidates else None,
+        )
+    funding_transaction = funding_candidates[0]
+
+    valuation_date = parse_date_text(fields.get("date_text")) or date.today()
+    payload = {
+        "contribution_amount": str(amount),
+        "valuation_date": valuation_date.isoformat(),
+        "funding_transaction_id": funding_transaction.id,
+    }
+    return TypedActionProposal(
+        can_execute=True,
+        typed_action="register_asset_contribution",
+        payload=payload,
+        path_params={"investment_id": investment.id},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Execution -- dispatches to the exact existing deterministic endpoint.
 # ---------------------------------------------------------------------------
@@ -898,6 +1089,18 @@ _TYPED_ACTION_SPECS: dict[str, _TypedActionSpec] = {
     "register_refund": _TypedActionSpec(
         "RefundLinkRequest", "_link_refund_transaction_impl", ("transaction_id",)
     ),
+    "update_asset_value": _TypedActionSpec(
+        "InvestmentValuationRequest",
+        "_update_investment_value_impl",
+        ("investment_id",),
+        entity_type="investment",
+    ),
+    "register_asset_contribution": _TypedActionSpec(
+        "InvestmentContributionRequest",
+        "_register_investment_contribution_impl",
+        ("investment_id",),
+        entity_type="investment",
+    ),
 }
 
 # Typed actions whose dispatched `_impl` mutates an *existing* entity and
@@ -906,8 +1109,18 @@ _TYPED_ACTION_SPECS: dict[str, _TypedActionSpec] = {
 # docstring and blocker 2 of the engineering review of PR #92. The other
 # three typed actions *create* a new row (`before_state=None` is the
 # accepted shape for a create, per that same review) and their `_impl`s do
-# not accept the parameter at all.
-_ENTITY_MUTATION_TYPED_ACTIONS = frozenset({"pay_obligation", "pay_card_invoice", "register_refund"})
+# not accept the parameter at all. `update_asset_value`/
+# `register_asset_contribution` (October Go-Live Slice 6) also mutate an
+# existing `Investment`, so they join this set too.
+_ENTITY_MUTATION_TYPED_ACTIONS = frozenset(
+    {
+        "pay_obligation",
+        "pay_card_invoice",
+        "register_refund",
+        "update_asset_value",
+        "register_asset_contribution",
+    }
+)
 
 
 def _target_entity_ids(typed_action: str, response: dict[str, Any], path_params: dict[str, str]) -> list[str]:
@@ -926,6 +1139,15 @@ def _target_entity_ids(typed_action: str, response: dict[str, Any], path_params:
         return [path_params["invoice_id"]]
     if typed_action == "register_refund":
         return [path_params["transaction_id"]]
+    if typed_action in ("update_asset_value", "register_asset_contribution"):
+        # `investment_id` first, `valuation_id` second -- `undo_assistant_action`
+        # needs both to invalidate the exact `InvestmentValuation` row this
+        # event created, not just "the latest one" (see
+        # `app.api._undo_investment_valuation_impl`).
+        ids = [path_params["investment_id"]]
+        if response.get("valuation_id"):
+            ids.append(str(response["valuation_id"]))
+        return ids
     return []
 
 
@@ -1112,6 +1334,8 @@ def execute_typed_action(
             response = dispatcher(path_params["invoice_id"], request_payload, user, db, **dispatch_kwargs)
         elif typed_action == "register_refund":
             response = dispatcher(path_params["transaction_id"], request_payload, user, db, **dispatch_kwargs)
+        elif typed_action in ("update_asset_value", "register_asset_contribution"):
+            response = dispatcher(path_params["investment_id"], request_payload, user, db, **dispatch_kwargs)
         else:
             response = dispatcher(request_payload, user, db, **dispatch_kwargs)
     except Exception:
@@ -1240,6 +1464,12 @@ def undo_assistant_action(
                 user,
                 db,
                 commit=False,
+            )
+        elif typed_action in ("update_asset_value", "register_asset_contribution"):
+            if len(target_ids) < 2:
+                raise AssistantActionError("Não há avaliação/aporte de ativo para desfazer")
+            api._undo_investment_valuation_impl(
+                target_ids[0], target_ids[1], reason, user, db, commit=False
             )
         else:
             raise AssistantActionError(

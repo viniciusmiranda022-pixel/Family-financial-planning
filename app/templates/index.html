@@ -235,6 +235,51 @@
             </table>
           </div>
         </article>
+        <!-- October Go-Live Slice 6: patrimônio/investimentos, incluindo o
+             Studio. Nenhum item novo no menu principal (rebaseline §16) --
+             o painel consome noncanonical.patrimony/noncanonical.investments_total/
+             noncanonical.investments de GET /dashboard, o mesmo dado de
+             GET /investments; nenhum cálculo é refeito no frontend.
+             `PATRIMÔNIO TOTAL` (caixa + investimentos, rebaseline §13.1
+             item 4) e `INVESTIMENTOS` (somente o valor de hoje dos ativos)
+             são números diferentes -- engineering review on PR #94,
+             blocking item 1. -->
+        <article class="panel net-worth-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="step-label">PATRIMÔNIO</span>
+              <h2>Patrimônio, investimentos e ativos</h2>
+              <small>Custo histórico, valor de hoje e valor previsto ficam sempre separados -- o patrimônio soma somente o valor de hoje.</small>
+            </div>
+            <button id="new-investment-button" class="secondary" type="button">Novo investimento</button>
+          </div>
+          <div class="net-worth-total-row">
+            <div class="net-worth-total">
+              <small>PATRIMÔNIO TOTAL (CAIXA + INVESTIMENTOS)</small>
+              <strong id="patrimony-total">R$ 0,00</strong>
+            </div>
+            <div class="net-worth-total">
+              <small>INVESTIMENTOS (SOMA DO VALOR DE HOJE)</small>
+              <strong id="investments-total">R$ 0,00</strong>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Ativo</th>
+                  <th class="right">Valor investido</th>
+                  <th class="right">Valor de hoje</th>
+                  <th class="right">Valor previsto a receber</th>
+                  <th class="right">Ganho atual</th>
+                  <th class="right">Retorno atual</th>
+                  <th class="right">Ações</th>
+                </tr>
+              </thead>
+              <tbody id="investments-table"></tbody>
+            </table>
+          </div>
+        </article>
         <article class="panel obligation-alert-panel">
           <div class="panel-heading"><div><span class="step-label">ALERTAS</span><h2>Obrigações próximas do vencimento</h2><small>O sistema alerta com 30 dias de antecedência e destaca os últimos 7 dias.</small></div><button data-go="planning" class="secondary">Ver Gastos &amp; Economia</button></div>
           <div id="dashboard-obligation-alerts" class="alert-list"></div>

@@ -12,6 +12,8 @@
         "pay_obligation",
         "pay_card_invoice",
         "register_refund",
+        "update_asset_value",
+        "register_asset_contribution",
         "query",
         "unknown"
       ]
@@ -29,7 +31,11 @@
           "type": "string",
           "enum": ["account", "privilege", "unspecified"]
         },
-        "target_hint": { "type": "string", "maxLength": 300 }
+        "target_hint": { "type": "string", "maxLength": 300 },
+        "asset_value_kind_hint": {
+          "type": "string",
+          "enum": ["current_value", "expected_receivable_value", "unspecified"]
+        }
       },
       "additionalProperties": false
     },

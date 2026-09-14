@@ -29,6 +29,7 @@ from app.services.financial_invariants import (
     validate_investment_application,
     validate_investment_redemption,
     validate_lineage,
+    validate_net_worth_current_value_only,
     validate_no_automatic_unreceived_commission_in_projection,
     validate_non_negative_liquidity,
     validate_payroll_loan,
@@ -503,6 +504,25 @@ _DEFINITIONS = (
             "undone_at_recorded",
         ),
         validator=validate_assistant_undo_preserves_history,
+    ),
+    InvariantDefinition(
+        id="INV-034",
+        name="net_worth_uses_current_value_only",
+        title="Patrimônio do ativo",
+        description=(
+            "October Go-Live Slice 6: o patrimônio de um investimento/ativo "
+            "(incluindo o Studio) usa somente o valor de hoje -- nunca soma "
+            "custo histórico e/ou valor previsto a receber ao valor de hoje "
+            "do mesmo ativo -- rebaseline §16.2."
+        ),
+        severity=IntegritySeverity.CRITICAL,
+        required_facts=(
+            "historical_cost",
+            "current_value",
+            "expected_receivable_value",
+            "net_worth_contribution",
+        ),
+        validator=validate_net_worth_current_value_only,
     ),
 )
 

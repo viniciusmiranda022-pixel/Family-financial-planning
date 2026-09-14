@@ -518,6 +518,90 @@ class RefundUnlinkRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class InvestmentCreateRequest(BaseModel):
+    """October Go-Live Slice 6 (P0 #87), rebaseline §16.1 minimum model.
+
+    `historical_cost` is the initial cost basis (e.g. what the Studio has
+    already cost so far); `current_value` is required so patrimony
+    (`app.services.investments.investments_summary`/
+    `household_patrimony_summary`) always has a real "Valor de hoje" from
+    the moment an asset is created, never an implicit zero standing in for
+    "unknown". Creating an investment also appends its
+    first `InvestmentValuation` snapshot (`app.api._create_investment_impl`)
+    so history is complete from day one.
+    """
+
+    name: str = Field(min_length=2, max_length=120)
+    historical_cost: Decimal = Field(ge=0)
+    current_value: Decimal = Field(ge=0)
+    expected_receivable_value: Decimal | None = Field(default=None, ge=0)
+    expected_receipt_date: date | None = None
+    valuation_date: date
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class InvestmentValuationRequest(BaseModel):
+    """Records a new valuation event for an existing `Investment`
+    (`POST /investments/{investment_id}/valuations`) -- rebaseline §16.3
+    examples ("Hoje acho que o Studio vale 35 mil"/"A previsão agora é
+    receber 45 mil"). At least one of `current_value`/
+    `expected_receivable_value` must be given; the other keeps its current
+    value in the new snapshot. Never touches `historical_cost` -- that is
+    exclusively `InvestmentContributionRequest`'s job (rebaseline §16.2:
+    cost basis and current value are distinct facts, one event never moves
+    both)."""
+
+    current_value: Decimal | None = Field(default=None, ge=0)
+    expected_receivable_value: Decimal | None = Field(default=None, ge=0)
+    valuation_date: date
+    note: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_at_least_one_value(self) -> "InvestmentValuationRequest":
+        if self.current_value is None and self.expected_receivable_value is None:
+            raise ValueError(
+                "Informe o novo valor de hoje e/ou o novo valor previsto a receber"
+            )
+        return self
+
+
+class InvestmentContributionRequest(BaseModel):
+    """Records a contribution (aporte) into an existing `Investment` --
+    increases `historical_cost` only (rebaseline §16.2/§16.3: "Coloquei
+    mais 5 mil no Studio" never changes `current_value`, which is only ever
+    confirmed by a separate valuation event).
+
+    `funding_transaction_id` is **required** (engineering review on PR #94,
+    blocking item 2): it must name an already-existing `Transaction`
+    representing the real cash movement out of an account (the same
+    `movement_type="investment"`/"Transferência patrimonial" manual entry
+    already supported by `ManualTransactionRequest`, or an imported
+    equivalent) -- this endpoint never creates that transaction itself, it
+    only links to one that already exists, exactly like `RefundLinkRequest`
+    always requires (never optionally links) an already-existing refund
+    (Work Order: "sem fabricar gasto econômico ou origem de caixa"). A new
+    aporte event must never silently increase cost basis with no
+    corresponding real funding fact -- the opening/historical cost basis
+    captured at asset creation, import or backfill time
+    (`InvestmentCreateRequest.historical_cost`) is the only place a cost
+    figure is ever accepted without a linked cash movement, because that is
+    a point-in-time fact about the past, not a new event. A human who has
+    not yet recorded the outgoing transfer must record it first (the
+    existing manual-entry form), then link it here -- the Assistant's own
+    typed-action proposal (`register_asset_contribution`) already follows
+    the same rule, asking for the origin when it cannot resolve exactly one
+    matching transaction."""
+
+    contribution_amount: Decimal = Field(gt=0)
+    valuation_date: date
+    funding_transaction_id: str = Field(min_length=1, max_length=36)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class InvestmentValuationUndoRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+
 class ClassificationRuleEditRequest(BaseModel):
     """Admin-only edit of an eligible local merchant rule's category.
 

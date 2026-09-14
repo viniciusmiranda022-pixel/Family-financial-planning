@@ -553,8 +553,11 @@ template quando normalizam igual.
 **Decisões de escopo deste slice (não são Technical Challenge -- refinamento de implementação):**
 
 - Nenhuma ação tipada de patrimônio/investimento (`UPDATE_ASSET_VALUE`/
-  `REGISTER_ASSET_CONTRIBUTION`) é exposta: o modelo `Investment` ainda não existe (October Go-Live
-  Slice 6, não implementado). Antecipar essas ações apontaria para um contrato que não existe.
+  `REGISTER_ASSET_CONTRIBUTION`) foi exposta neste slice: o modelo `Investment` ainda não existia
+  (October Go-Live Slice 6, não implementado). Antecipar essas ações apontaria para um contrato que
+  não existe. **Atualização (Slice 6):** o modelo `Investment`/`InvestmentValuation` existe agora e
+  `update_asset_value`/`register_asset_contribution` já são typed actions integradas -- ver a seção
+  "Patrimônio e investimentos" abaixo.
 - `register_refund` espera que o lançamento de estorno já exista (importado ou criado manualmente/
   via `create_expense` com `movement_type="refund"`) e apenas confirma o vínculo -- não cria e
   vincula em uma única ação composta. Mantém `execute_typed_action` como despachante puro de um
@@ -711,6 +714,163 @@ normativos; os três foram corrigidos no mesmo PR, sem migration e sem segundo m
    Slice 4, só o gatilho do cliente ficou explícito. Regressão:
    `test_entry_type_observation_is_gated_by_explicit_outra_entrada_saida_opt_in`,
    `test_type_template_chip_click_checks_the_explicit_save_as_type_box`.
+
+## Patrimônio e investimentos (October Go-Live Slice 6, P0 #87)
+
+`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md`, `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.4.
+Greenfield feature confirmed by inventory: no `Investment`/`Asset`/`Studio` model, migration,
+endpoint or UI existed anywhere in the codebase before this slice (every "Studio" hit was planning
+documentation only) -- there was no legacy data to migrate.
+
+**Modelo (migração `0019`, puramente aditiva).** `Investment` (`app/models.py`) holds the *current*
+state -- `historical_cost` ("Valor investido"), `current_value` ("Valor de hoje"),
+`expected_receivable_value` ("Valor previsto a receber", nullable), `last_updated_at`,
+`expected_receipt_date`, `notes`, `active` -- exactly the rebaseline §16.1 minimum model; the Studio
+is one row here, never a special-cased entity. `InvestmentValuation` is an immutable, append-only
+history mirroring `AccountBalanceObservation`'s "a correction creates a new row, never rewrites a
+prior one" contract: every valuation update and every contribution appends exactly one row, snapshotting
+the *entire* post-event state (`historical_cost`/`current_value`/`expected_receivable_value`), not
+just the field that changed -- a deliberate extension of the conflict matrix's illustrative sketch
+(which listed only `current_value`/`expected_receivable_value`) so history alone can always
+reconstruct the parent's state at any point in time. `invalidated_at`/`invalidated_by`/
+`invalidation_reason` (also not in the original sketch) support undo without ever deleting a row --
+see "Undo" below. Migration `0019`'s downgrade is guarded like `0016`'s: it refuses (raises
+`RuntimeError`, changes nothing) when either table holds any row, since `investment_valuations` is
+the only durable record of every valuation/contribution event and even a lone `investments` row with
+no history yet is still a real financial fact.
+
+**Invariante central (rebaseline §16.2), estrutural por construção.**
+`app.services.investments.investments_summary` is the single function that sums `current_value`
+across a household's active investments -- `historical_cost`/`expected_receivable_value` never enter
+the total, by construction, not by a runtime check. `GET /investments` and `GET /dashboard`
+(`noncanonical.investments_total`/`noncanonical.investments`) both call this exact function, so they
+can never diverge on this number (rebaseline "nenhum cálculo patrimonial duplicado no frontend"/"não
+criar segundo motor de cálculo"). This total is **investments-only**, not household Patrimônio --
+see "Correções da revisão de engenharia" below for `household_patrimony_summary`, which adds the
+cash component rebaseline §13.1 item 4 requires. `app.services.investments.serialize_investment` is
+the one
+function that derives `gain_current`/`return_current_pct`/`gain_projected`/`return_projected_pct`
+for a row -- percentages are `None` (never `0`, never a `ZeroDivisionError`) when `historical_cost`
+is zero/negative or when there is no `expected_receivable_value` yet. INV-034
+(`app.services.invariant_registry`/`docs/FINANCIAL_INVARIANTS.md`) formalizes the same contract as
+an executable invariant so the Financial Integrity Engine/an independent Codex recomputation can
+verify it too -- wiring INV-034 into a live `IntegrityRun` fact-producer is left to a future
+integrity-engine slice (not required by this Work Order's acceptance criteria); the guarantee itself
+is unconditional today because there is exactly one summation function, not because a periodic scan
+polices a second one.
+
+**Aportes nunca fabricam a origem do caixa.** `POST /investments/{id}/contributions`
+(`app.api._register_investment_contribution_impl`) increases `historical_cost` only -- it never
+touches `current_value` (exclusively `_update_investment_value_impl`'s job, so one event never moves
+both facts) and it never creates the cash-movement `Transaction` itself. `funding_transaction_id` is
+**required** (engineering review on PR #94, blocking item 2 -- see "Correções da revisão de
+engenharia" below) and only *links* to an already-existing `movement_type="investment"`/
+"Transferência patrimonial" transaction (the same manual-entry cash-out `ManualTransactionRequest`
+already supports, or an imported equivalent) -- exactly the same "link, never create-and-link as one
+composite action" discipline `register_refund` already established in Slice 4. The endpoint
+validates that transaction's type/category/sign/amount and that it is not already linked to another
+contribution before accepting the link, under `lock_household_financial_revision`'s household-wide
+row lock (blocking item 3) so two concurrent requests can never both observe "not linked" for the
+same funding transaction. Opening/historical cost basis is captured once, at asset creation
+(`InvestmentCreateRequest.historical_cost`) -- a point-in-time fact about the past, not a new event
+-- never through this endpoint.
+
+**Assistente Financeiro (Slice 4's typed-action framework, reused, not a second write path).**
+`update_asset_value`/`register_asset_contribution` join `TYPED_ACTIONS` and dispatch into the exact
+same `_update_investment_value_impl`/`_register_investment_contribution_impl` the manual
+`POST /investments/{id}/valuations`/`/contributions` endpoints call, with `commit=False` +
+`domain_audit_sink` -- identical atomicity/audit contract to `pay_obligation` (one transaction, one
+`db.commit()` covering the domain write and the `AssistantActionEvent` together). Rebaseline §16.3's
+three examples map onto two typed actions, disambiguated by a new `asset_value_kind_hint` extracted
+field (`current_value`/`expected_receivable_value`/`unspecified`) that Codex must supply for
+`update_asset_value` -- "Hoje acho que o Studio vale 35 mil" never silently guesses whether a bare
+amount means today's value or a future projection; an `unspecified`/missing hint always asks.
+`register_asset_contribution`'s proposal resolver
+(`app.services.assistant_actions._propose_register_asset_contribution`) requires exactly one
+matching, not-yet-linked "Transferência patrimonial" transaction near the stated amount to resolve
+without a question -- zero or multiple matches return the Work Order's required clarifying question
+("De onde saiu esse aporte?") instead of fabricating the link, mirroring
+`_propose_register_refund` exactly.
+
+**Undo sem apagar histórico.** `_undo_investment_valuation_impl` (dispatched by both a manual
+`POST /investments/{id}/valuations/{valuation_id}/undo` endpoint and
+`undo_assistant_action`) invalidates the targeted `InvestmentValuation` row (`invalidated_at`/
+`invalidated_by`/`invalidation_reason` -- never deleted) and restores the parent `Investment` to the
+exact state recorded by the previous still-valid valuation (or the zeroed pre-creation baseline when
+none remains). Refuses (409) when a later, still-valid valuation already exists for the same
+investment -- the same "a later confirmed fact blocks an automatic reversal" guard
+`_undo_obligation_privilege_funding` already applies to a Privilège-funded obligation payment.
+`target_entity_ids` for these two typed actions is `[investment_id, valuation_id]` (not just the
+investment id) so undo reverses the exact event an `AssistantActionEvent` recorded, never "whatever
+the latest valuation happens to be" at undo time.
+
+**Decisões de escopo deste slice (não são Technical Challenge -- refinamento de implementação):**
+
+- Nenhum endpoint de exclusão/desativação de investimento foi adicionado: o Work Order não exige
+  esse fluxo, e a coluna `active` (presente para o mesmo padrão household-scoped de `Account`/
+  `Obligation`) já existe para uma extensão futura sem migration adicional.
+- `Investment`/`InvestmentValuation` foram deliberadamente excluídos de `FINANCIAL_REVISION_MODELS`
+  (`app/models.py`): `HouseholdFinancialRevision` guarda a consistência ponto-no-tempo de
+  `FinancialSnapshot`/fechamento mensal, que cobrem fatos de renda/despesa/fluxo de caixa do
+  período -- patrimônio não é uma entrada do `FinancialSnapshot` neste slice (o Work Order pede o
+  contrato para os Relatórios do Slice 7, não a integração plena com o snapshot fechado por mês). Se
+  um slice futuro amarrar patrimônio a um cálculo com trava de revisão, adicionar os dois modelos
+  ali então -- não preventivamente agora.
+- Nenhuma UI de página dedicada: rebaseline "sem criar item adicional obrigatório no menu
+  principal" -- o painel de patrimônio vive dentro de `#view-dashboard`
+  (`app/templates/index.html`/`app/static/app.js`), reaproveitando exatamente
+  `noncanonical.patrimony`/`noncanonical.investments_total`/`noncanonical.investments` do
+  `/dashboard`, sem segundo cálculo no frontend.
+
+### Correções da revisão de engenharia (PR #94, 2026-09-14)
+
+A revisão técnica do engenheiro responsável bloqueou o head inicial deste slice em quatro pontos
+normativos; os quatro foram corrigidos no mesmo PR, sem migration destrutiva e sem segundo motor:
+
+1. **`noncanonical.net_worth` era investimentos apenas, e era rotulado "Patrimônio".** Rebaseline
+   §13.1 item 4 define Patrimônio como "valor líquido atual dos ativos/caixa" -- caixa incluído.
+   `app.services.investments.net_worth_summary` (renomeada `investments_summary`) sempre somou
+   apenas `current_value` dos investimentos, correto para o subtotal "Investimentos", mas o
+   `/dashboard` publicava esse número sob o rótulo `net_worth`/"PATRIMÔNIO ATUAL", ficando
+   materialmente errado sempre que existisse saldo bancário/Privilège. Nova função
+   `app.services.investments.household_patrimony_summary` soma o componente de caixa já canônico
+   para "quanto tenho hoje" (observação confirmada do período, soberana pela §5.1, senão o saldo de
+   fechamento de liquidez do Financial Engine) com o subtotal de investimentos -- nunca uma terceira
+   derivação de caixa. `GET /dashboard` agora publica `noncanonical.patrimony` (caixa +
+   investimentos) e `noncanonical.investments_total` (somente investimentos, renomeado de
+   `net_worth`) como dois números explicitamente distintos; o painel do Dashboard mostra ambos lado
+   a lado ("PATRIMÔNIO TOTAL (CAIXA + INVESTIMENTOS)" e "INVESTIMENTOS (SOMA DO VALOR DE HOJE)").
+   Regressão: `tests/test_investments_slice6.py::
+   test_dashboard_patrimony_includes_confirmed_cash_and_investments_never_historical_or_projected`,
+   `test_household_patrimony_summary_adds_cash_and_investments_exactly_once`.
+
+2. **Aporte manual não exigia origem de caixa.** `InvestmentContributionRequest.funding_transaction_id`
+   era opcional e o botão "Aporte" do Dashboard só perguntava o valor -- violando diretamente o
+   Work Order ("o movimento de caixa correspondente deve ser representado conforme a origem real") e
+   o critério de aceite 5. O campo agora é obrigatório no schema; a UI manual resolve/pergunta a
+   origem exatamente como o Assistente já fazia (`_propose_register_asset_contribution`), reusando a
+   mesma consulta de candidatos (`app.services.assistant_actions.candidate_investment_funding_transactions`,
+   agora exportada) através de um novo `GET /investments/contribution-candidates`. Custo histórico de
+   abertura continua exclusivo de `POST /investments` (fato pontual sobre o passado, não um novo
+   evento). Regressão: `test_contribution_without_funding_transaction_is_rejected`.
+
+3. **Vínculo `funding_transaction_id` sujeito a corrida.** A leitura "já vinculado?" e o insert da
+   `InvestmentValuation` eram duas instruções separadas sem trava alguma -- duas requisições
+   concorrentes linkando a mesma transação de origem podiam ambas observar "não vinculado" e ambas
+   commitarem, duplicando o custo histórico contra um único movimento real de caixa. Corrigido
+   reusando `app.services.financial_revision.lock_household_financial_revision` (o mesmo
+   `SELECT ... FOR UPDATE`/no-op-no-SQLite já usado por `monthly_close`/`card_competence_repair`) como
+   a primeira ação de `_register_investment_contribution_impl`, serializando a leitura e o insert
+   entre duas conexões concorrentes. Provado sob duas conexões PostgreSQL reais em
+   `tests/test_postgresql_integration.py::
+   test_investment_contribution_concurrent_same_funding_transaction_is_serialized_to_a_single_link`.
+
+4. **Entrada monetária inválida virava `0` silenciosamente.** As cinco entradas de dinheiro do
+   painel (novo investimento, valor de hoje, valor previsto, aporte) usavam
+   `Number(text.replace(",", ".")) || 0` -- um valor pt-BR agrupado ("35.000,00"), texto inválido ou
+   em branco virava `0` e era enviado como fato financeiro confirmado. Novo `parseMoneyPromptInput`
+   (`app/static/app.js`) rejeita entrada inválida em vez de normalizá-la; `promptMoney` repete o
+   prompt até um valor válido ou cancelamento explícito -- nunca deixa `0` passar por coincidência.
 
 ## Comparação visual de cenários de compra (Fase 3)
 
