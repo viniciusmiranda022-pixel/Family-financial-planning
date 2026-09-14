@@ -8157,7 +8157,16 @@ def _register_investment_contribution_impl(
     item.historical_cost = money(item.historical_cost + payload.contribution_amount)
     item.last_updated_at = payload.valuation_date
 
-    trace_id = funding_transaction.trace_id
+    # `Transaction.trace_id` is nullable (not every transaction -- e.g. an
+    # imported one -- carries one); `InvestmentValuation.trace_id` is not.
+    # Reuse the funding transaction's trace_id when it has one (keeps the
+    # audit trail correlated to the same trace as the cash movement),
+    # otherwise mint a fresh one -- never leave it `None` and violate the
+    # NOT NULL constraint. Caught by the real-PostgreSQL concurrency test
+    # (`tests/test_postgresql_integration.py::
+    # test_investment_contribution_concurrent_same_funding_transaction_is_serialized_to_a_single_link`),
+    # whose funding transaction fixture has no `trace_id` of its own.
+    trace_id = funding_transaction.trace_id or str(uuid.uuid4())
     valuation = InvestmentValuation(
         household_id=user.household_id,
         investment_id=item.id,
