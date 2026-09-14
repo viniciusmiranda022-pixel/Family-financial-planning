@@ -22,7 +22,7 @@ from datetime import date
 from decimal import Decimal
 
 from cryptography.fernet import Fernet
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -41,7 +41,11 @@ from app.api import (  # noqa: E402
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Account, CardInvoice, Category, Household, Obligation, Transaction, User  # noqa: E402
-from app.services.card_invoice_lifecycle import invoice_financial_state  # noqa: E402
+from app.services.card_invoice_lifecycle import (  # noqa: E402
+    close_invoice,
+    get_or_sync_invoice,
+    invoice_financial_state,
+)
 from app.services.financial_state import COMPROMETIDO, PREVISTO, REALIZADO  # noqa: E402
 from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
@@ -237,25 +241,76 @@ def _card_invoice(
         return invoice.id
 
 
+def _category_id(session_factory, *, household_id, name="Compras, casa e vestuário") -> str:
+    with session_factory() as db:
+        existing = db.scalar(select(Category).where(Category.household_id == household_id, Category.name == name))
+        if existing:
+            return existing.id
+        category = Category(household_id=household_id, name=name)
+        db.add(category)
+        db.commit()
+        return category.id
+
+
+def _purchase(
+    session_factory,
+    *,
+    household_id,
+    account_id,
+    amount: str,
+    booked_at: date,
+    competence: str,
+    category_id: str,
+    description: str = "Compra",
+) -> str:
+    with session_factory() as db:
+        txn = Transaction(
+            household_id=household_id,
+            account_id=account_id,
+            category_id=category_id,
+            booked_at=booked_at,
+            occurred_at=booked_at,
+            competence=competence,
+            description=description,
+            normalized_description=description.upper(),
+            amount=-abs(Decimal(amount)),
+            transaction_type="expense",
+            fingerprint=f"slice3carry{uuid.uuid4().hex}".ljust(64, "0")[:64],
+            source_priority=50,
+            confidence=Decimal("1"),
+            reviewed=True,
+        )
+        db.add(txn)
+        db.commit()
+        return txn.id
+
+
 def test_forecast_card_invoices_only_counts_closed_and_partially_paid() -> None:
+    """Status filtering only -- each competence lives on its own,
+    unrelated card so this test never conflates "which statuses count" with
+    the carried-principal dedup covered separately below."""
+
     session_factory = _session_factory()
     household_id = _household(session_factory)
-    account_id = _card_account(session_factory, household_id=household_id)
+    open_account_id = _card_account(session_factory, household_id=household_id, name="Cartão Aberto")
+    closed_account_id = _card_account(session_factory, household_id=household_id, name="Cartão Fechado")
+    partial_account_id = _card_account(session_factory, household_id=household_id, name="Cartão Parcial")
+    paid_account_id = _card_account(session_factory, household_id=household_id, name="Cartão Pago")
     _card_invoice(
-        session_factory, household_id=household_id, account_id=account_id,
+        session_factory, household_id=household_id, account_id=open_account_id,
         competence="2026-06", status="open", computed_total="900.00", due_date=date(2026, 6, 17),
     )
     _card_invoice(
-        session_factory, household_id=household_id, account_id=account_id,
+        session_factory, household_id=household_id, account_id=closed_account_id,
         competence="2026-07", status="closed", computed_total="1200.00", due_date=date(2026, 7, 17),
     )
     _card_invoice(
-        session_factory, household_id=household_id, account_id=account_id,
+        session_factory, household_id=household_id, account_id=partial_account_id,
         competence="2026-08", status="partially_paid", computed_total="800.00",
         paid_total="300.00", due_date=date(2026, 8, 17),
     )
     _card_invoice(
-        session_factory, household_id=household_id, account_id=account_id,
+        session_factory, household_id=household_id, account_id=paid_account_id,
         competence="2026-09", status="paid", computed_total="400.00",
         paid_total="400.00", due_date=date(2026, 9, 17),
     )
@@ -278,6 +333,92 @@ def test_forecast_card_invoices_clamps_overdue_due_date_into_start_month() -> No
     with session_factory() as db:
         result = _forecast_card_invoices(db, household_id, date(2026, 7, 1))
     assert result == {"2026-07": Decimal("600.00")}
+
+
+def test_forecast_card_invoices_does_not_double_count_two_consecutive_carried_cycles() -> None:
+    """October Go-Live Slice 7 engineering review (PR #95, Round 2):
+    August's `principal_carried_in` mirrors July's own (unpaid)
+    `outstanding_balance` -- exactly what `get_or_sync_invoice` recomputes
+    live for a real chain. Summing both invoices' `outstanding_balance`
+    would count July's $1,200 twice; the correct total is August's own
+    total alone (it already embeds July's carry)."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    account_id = _card_account(session_factory, household_id=household_id)
+    _card_invoice(
+        session_factory, household_id=household_id, account_id=account_id,
+        competence="2026-07", status="closed", computed_total="1200.00",
+        due_date=date(2026, 7, 17),
+    )
+    _card_invoice(
+        session_factory, household_id=household_id, account_id=account_id,
+        competence="2026-08", status="partially_paid", computed_total="800.00",
+        paid_total="300.00", principal_carried_in="1200.00", due_date=date(2026, 8, 17),
+    )
+
+    with session_factory() as db:
+        result = _forecast_card_invoices(db, household_id, date(2026, 6, 1))
+
+    # 1200 (carried from July) + 800 (August purchases) - 300 (paid) = 1700,
+    # counted exactly once, in August's own due month. July's own key never
+    # appears -- its debt is not dropped, it survives inside August's total.
+    assert result == {"2026-08": Decimal("1700.00")}
+
+
+def test_forecast_card_invoices_does_not_double_count_three_consecutive_carried_cycles() -> None:
+    """Same as above with a three-cycle chain, proving the dedup holds for
+    "duas ou mais competências consecutivas" as the review explicitly
+    required, not merely the two-cycle base case."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    account_id = _card_account(session_factory, household_id=household_id)
+    _card_invoice(
+        session_factory, household_id=household_id, account_id=account_id,
+        competence="2026-06", status="closed", computed_total="1000.00",
+        due_date=date(2026, 6, 17),
+    )
+    _card_invoice(
+        session_factory, household_id=household_id, account_id=account_id,
+        competence="2026-07", status="closed", computed_total="200.00",
+        principal_carried_in="1000.00", due_date=date(2026, 7, 17),
+    )
+    _card_invoice(
+        session_factory, household_id=household_id, account_id=account_id,
+        competence="2026-08", status="partially_paid", computed_total="300.00",
+        paid_total="500.00", principal_carried_in="1200.00", due_date=date(2026, 8, 17),
+    )
+
+    with session_factory() as db:
+        result = _forecast_card_invoices(db, household_id, date(2026, 6, 1))
+
+    # August alone: 1200 (carried from June+July) + 300 - 500 = 1000.
+    assert result == {"2026-08": Decimal("1000.00")}
+
+
+def test_forecast_card_invoices_two_independent_cards_both_count_in_full() -> None:
+    """Dedup applies *per account* -- two different cards, each with their
+    own single unpaid cycle, are unrelated debts and must both count in
+    full, never collapsed into one."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    card_a = _card_account(session_factory, household_id=household_id, name="Cartão A")
+    card_b = _card_account(session_factory, household_id=household_id, name="Cartão B")
+    _card_invoice(
+        session_factory, household_id=household_id, account_id=card_a,
+        competence="2026-08", status="closed", computed_total="500.00", due_date=date(2026, 8, 17),
+    )
+    _card_invoice(
+        session_factory, household_id=household_id, account_id=card_b,
+        competence="2026-08", status="closed", computed_total="300.00", due_date=date(2026, 8, 17),
+    )
+
+    with session_factory() as db:
+        result = _forecast_card_invoices(db, household_id, date(2026, 6, 1))
+
+    assert result == {"2026-08": Decimal("800.00")}
 
 
 def test_invoice_financial_state_mapping() -> None:
@@ -496,6 +637,177 @@ def test_dashboard_commitments_match_obligations_and_card_invoices_sources() -> 
         assert commitments["card_invoices_outstanding"]["value"] == 777.0
         assert commitments["card_invoices_outstanding"]["financial_state"] == COMPROMETIDO
         assert commitments["total"]["value"] == float(expected_obligations_total) + 777.0
+
+
+def test_dashboard_forecast_and_report_agree_on_carried_card_commitment() -> None:
+    """October Go-Live Slice 7 engineering review (PR #95, Round 2): with
+    two consecutive unpaid cycles on the same card (August's
+    `principal_carried_in` chained from July's own unpaid balance), `GET
+    /dashboard`, `GET /forecast` and `GET /reports` must all publish the
+    exact same COMPROMETIDO card-invoice total -- the carried principal
+    counted exactly once everywhere, never a per-surface-diverging figure."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        with session_factory() as db:
+            household_id = db.scalar(select(Household)).id
+        account_id = _card_account(session_factory, household_id=household_id, name="Cartão Paridade")
+        _card_invoice(
+            session_factory, household_id=household_id, account_id=account_id,
+            competence="2026-07", status="closed", computed_total="1200.00",
+            due_date=date(2026, 7, 17),
+        )
+        _card_invoice(
+            session_factory, household_id=household_id, account_id=account_id,
+            competence="2026-08", status="partially_paid", computed_total="800.00",
+            paid_total="300.00", principal_carried_in="1200.00", due_date=date(2026, 8, 17),
+        )
+        expected_total = Decimal("1700.00")  # 1200 (carried) + 800 - 300, counted once
+
+        forecast = client.get("/api/forecast")
+        assert forecast.status_code == 200
+        forecast_total = sum(
+            (Decimal(str(row.get("card_invoices", "0"))) for row in forecast.json()["rows"]),
+            Decimal("0"),
+        )
+        assert forecast_total == expected_total
+
+        dashboard = client.get("/api/dashboard")
+        assert dashboard.status_code == 200
+        dashboard_total = Decimal(
+            str(dashboard.json()["noncanonical"]["commitments"]["card_invoices_outstanding"]["value"])
+        )
+        assert dashboard_total == expected_total
+
+        report = client.get("/api/reports?end_month=2026-08&months=1")
+        assert report.status_code == 200
+        report_total = Decimal(str(report.json()["financial_states"]["comprometido"]["card_invoices_outstanding"]))
+        assert report_total == expected_total
+
+
+def test_card_invoice_payment_reduces_carried_commitment_without_erasing_history() -> None:
+    """October Go-Live Slice 7 engineering review (PR #95, Round 2), test
+    obrigatório "pagamento posterior reduz o compromisso sem apagar o
+    histórico": a real chain (`get_or_sync_invoice`/`close_invoice`) of two
+    consecutive unpaid cycles, then a partial payment against the latest
+    invoice. The forecast/dashboard total must drop by exactly the amount
+    paid, never re-inflate, and both invoice rows (and the payment
+    transaction) must remain queryable -- nothing is deleted to implement
+    the reduction."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        checking = client.post("/api/accounts", json={"name": "Conta Corrente", "account_type": "checking"})
+        assert checking.status_code == 201, checking.text
+        checking_id = checking.json()["id"]
+
+        with session_factory() as db:
+            household_id = db.scalar(select(Household)).id
+        account_id = _card_account(session_factory, household_id=household_id, name="Cartão Pagamento")
+        category_id = _category_id(session_factory, household_id=household_id)
+
+        _purchase(
+            session_factory, household_id=household_id, account_id=account_id,
+            amount="1200.00", booked_at=date(2026, 7, 3), competence="2026-07",
+            category_id=category_id, description="Compra de julho",
+        )
+        with session_factory() as db:
+            account = db.get(Account, account_id)
+            july_invoice = get_or_sync_invoice(
+                db, household_id=household_id, account=account, competence="2026-07", as_of=date(2026, 7, 3)
+            )
+            july_invoice = close_invoice(
+                db, household_id=household_id, invoice_id=july_invoice.id, as_of=date(2026, 7, 11)
+            )
+            db.commit()
+            july_invoice_id = july_invoice.id
+
+        _purchase(
+            session_factory, household_id=household_id, account_id=account_id,
+            amount="900.00", booked_at=date(2026, 8, 3), competence="2026-08",
+            category_id=category_id, description="Compra de agosto",
+        )
+        with session_factory() as db:
+            account = db.get(Account, account_id)
+            august_invoice = get_or_sync_invoice(
+                db, household_id=household_id, account=account, competence="2026-08", as_of=date(2026, 8, 3)
+            )
+            august_invoice = close_invoice(
+                db, household_id=household_id, invoice_id=august_invoice.id, as_of=date(2026, 8, 11)
+            )
+            db.commit()
+            august_invoice_id = august_invoice.id
+            # July's $1,200 was folded live into August's own carry -- the
+            # exact chain this fix relies on, not a hand-set test fixture.
+            assert august_invoice.principal_carried_in == Decimal("1200.00")
+
+        before_forecast = client.get("/api/forecast")
+        assert before_forecast.status_code == 200
+        before_total = sum(
+            (Decimal(str(row.get("card_invoices", "0"))) for row in before_forecast.json()["rows"]),
+            Decimal("0"),
+        )
+        # 1200 (carried) + 900 (August) = 2100, counted once (not 1200+2100).
+        assert before_total == Decimal("2100.00")
+
+        pay = client.post(
+            f"/api/card-invoices/{august_invoice_id}/pay",
+            json={
+                "paying_account_id": checking_id,
+                "amount": "500.00",
+                "booked_at": "2026-08-15",
+                "description": "Pagamento parcial fatura",
+                "confirmed": True,
+            },
+        )
+        assert pay.status_code == 201, pay.text
+        assert pay.json()["invoice"]["status"] == "partially_paid"
+
+        after_forecast = client.get("/api/forecast")
+        assert after_forecast.status_code == 200
+        after_total = sum(
+            (Decimal(str(row.get("card_invoices", "0"))) for row in after_forecast.json()["rows"]),
+            Decimal("0"),
+        )
+        # The $500 payment reduces the compromisso by exactly $500 -- never
+        # re-inflated by re-counting July separately, never left unchanged.
+        assert after_total == Decimal("1600.00")
+        assert before_total - after_total == Decimal("500.00")
+
+        dashboard = client.get("/api/dashboard")
+        assert dashboard.status_code == 200
+        dashboard_total = Decimal(
+            str(dashboard.json()["noncanonical"]["commitments"]["card_invoices_outstanding"]["value"])
+        )
+        assert dashboard_total == Decimal("1600.00")
+
+        # History preserved: both invoices and the payment transaction are
+        # still there -- the reduction is a new fact, never a deletion.
+        invoices = client.get("/api/card-invoices").json()
+        invoice_ids = {item["id"] for item in invoices}
+        assert july_invoice_id in invoice_ids
+        assert august_invoice_id in invoice_ids
+        july_row = next(item for item in invoices if item["id"] == july_invoice_id)
+        assert july_row["status"] == "closed"
+        assert Decimal(july_row["outstanding_balance"]) == Decimal("1200.00")
+        august_row = next(item for item in invoices if item["id"] == august_invoice_id)
+        assert august_row["status"] == "partially_paid"
+        assert Decimal(august_row["outstanding_balance"]) == Decimal("1600.00")
+
+        with session_factory() as db:
+            payment_txn = db.get(Transaction, pay.json()["checking_transaction_id"])
+            assert payment_txn is not None
+            assert payment_txn.transaction_type == "reconciliation"
+            # rebaseline §6.3: paying the invoice never counts as a second
+            # economic expense on top of the original July/August purchases.
+            expense_count = db.scalar(
+                select(func.count(Transaction.id)).where(
+                    Transaction.household_id == household_id, Transaction.transaction_type == "expense"
+                )
+            )
+            assert expense_count == 2
 
 
 def test_reports_never_count_pending_commitments_as_realized_spending() -> None:

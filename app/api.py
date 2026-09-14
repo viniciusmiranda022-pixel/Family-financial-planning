@@ -8561,6 +8561,22 @@ def _forecast_card_invoices(
     `_forecast_obligations`'s own overdue clamp: an invoice whose `due_date`
     has already passed is folded into `start_month` instead of a past month
     the projection's forward-only cursor never visits.
+
+    October Go-Live Slice 7 engineering review (PR #95, Round 2): a balance
+    left unpaid across two or more *consecutive* cycles of the same card is
+    folded into every later cycle's own `principal_carried_in`
+    (`card_invoice_lifecycle.get_or_sync_invoice`) -- `outstanding_balance`
+    of the closed/partially_paid invoice for competence N already equals
+    "this cycle's purchases + everything still owed from every earlier
+    cycle". Naively summing `outstanding_balance()` across *every* eligible
+    invoice of the same card therefore counts that carried principal once
+    per cycle it survived. Only the single latest (highest-competence)
+    eligible invoice *per account* is ever counted here -- its own total
+    already includes every earlier unpaid cycle -- exactly the same model
+    `_build_report_payload`'s `report_card_invoices_outstanding_total`
+    already uses, so `GET /dashboard`, `GET /forecast` and `GET /reports`
+    can never diverge on this figure (rebaseline requires that parity; see
+    docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md).
     """
 
     rows = db.scalars(
@@ -8569,8 +8585,13 @@ def _forecast_card_invoices(
             CardInvoice.status.in_(("closed", "partially_paid")),
         )
     ).all()
-    values: dict[str, Decimal] = {}
+    latest_outstanding_invoice_by_account: dict[str, CardInvoice] = {}
     for invoice in rows:
+        current = latest_outstanding_invoice_by_account.get(invoice.account_id)
+        if current is None or invoice.competence > current.competence:
+            latest_outstanding_invoice_by_account[invoice.account_id] = invoice
+    values: dict[str, Decimal] = {}
+    for invoice in latest_outstanding_invoice_by_account.values():
         owed = outstanding_balance(invoice)
         if owed <= 0:
             continue
@@ -10561,13 +10582,12 @@ def _build_report_payload(db: Session, user: User, *, end_month: str | None, mon
     # métrica" this Work Order (§ Relatórios) forbids. The correct "owed on
     # this card right now" figure is only the *single latest* (highest-
     # competence) eligible invoice per account -- its own total already
-    # includes every earlier unpaid cycle. (`GET /dashboard`'s
-    # `_forecast_card_invoices` has this same latent double-count for a
-    # household with 2+ consecutive unpaid cycles on one card; its own
-    # per-month due-date bucketing for `GET /forecast`'s projection is a
-    # materially different Slice 1/3 change and is flagged as a Technical
-    # Challenge in the PR rather than fixed here, out of this Work Order's
-    # Slice 7 scope.)
+    # includes every earlier unpaid cycle. (Round 2 of this same PR #95
+    # review required the identical fix in `GET /dashboard`'s/`GET
+    # /forecast`'s `_forecast_card_invoices` for Dashboard<->Forecast<->
+    # Relatórios parity -- see that function's own docstring; both now
+    # select the same single latest-per-account invoice, never a second,
+    # diverging model.)
     latest_outstanding_invoice_by_account: dict[str, CardInvoice] = {}
     for invoice in household_card_invoices:
         if invoice.status not in ("closed", "partially_paid"):

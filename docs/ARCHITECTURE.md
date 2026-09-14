@@ -914,10 +914,19 @@ usam:
   elegível por conta** (`latest_outstanding_invoice_by_account`), nunca a soma de todas -- o próprio
   `outstanding_balance()` já inclui `principal_carried_in` (o saldo não pago da fatura anterior), de
   modo que somar `outstanding_balance()` de duas faturas consecutivas do mesmo cartão contaria o
-  saldo carregado duas vezes. `GET /dashboard`'s `_forecast_card_invoices` tem essa mesma lacuna
-  latente (soma sem esse cuidado) -- ficou registrada como Technical Challenge no PR #95 em vez de
-  corrigida aqui, porque seu próprio agrupamento por mês de vencimento (usado por `GET /forecast`)
-  é uma mudança de escopo maior (Slice 1/3), fora deste Work Order.
+  saldo carregado duas vezes. Engineering review PR #95, Round 2: `GET /dashboard`/`GET /forecast`'s
+  `_forecast_card_invoices` tinha essa mesma lacuna latente -- inicialmente registrada como Technical
+  Challenge (adiamento para fora do escopo do Slice 7) e depois rejeitada pelo revisor, porque a
+  paridade Dashboard/Forecast/Relatórios exigida pelo próprio Work Order tornava a divergência um
+  bloqueador, não uma melhoria futura. `_forecast_card_invoices` agora seleciona a mesma fatura de
+  maior competência elegível por conta antes de aplicar seu próprio agrupamento por mês de
+  vencimento (usado por `GET /forecast`) -- o corte temporal por competência/mês de vencimento é
+  preservado exatamente como antes, só a soma por conta deixou de contar o principal carregado mais
+  de uma vez. Testes: `tests/test_obligation_lifecycle_slice3.py`
+  (`test_forecast_card_invoices_does_not_double_count_two_consecutive_carried_cycles`,
+  `..._three_consecutive_carried_cycles`, `..._two_independent_cards_both_count_in_full`,
+  `test_dashboard_forecast_and_report_agree_on_carried_card_commitment`,
+  `test_card_invoice_payment_reduces_carried_commitment_without_erasing_history`).
 - `financial_states.previsto`: **deliberadamente restrito** ao salário recorrente configurado do
   período seguinte ao relatório, via `app.services.recurring_income.reconcile_recurring_income` (a
   mesma função `GET /forecast` usa) -- nunca uma comissão (rebaseline §8.3/INV-031) e nunca uma
