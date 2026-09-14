@@ -1,7 +1,13 @@
 # Contrato de invariantes financeiros
 
-**Versão das regras:** `2026.10.3`
+**Versão das regras:** `2026.10.4`
 **Status:** normativo
+
+**Controle de mudança (2026-09-14, October Go-Live Slice 4, P0 #87):**
+INV-032/INV-033 adicionadas — auditoria e undo do Assistente Financeiro
+(`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_4.md`). Nenhuma regra anterior foi
+alterada; a versão avança porque o conjunto de invariantes deste contrato
+mudou.
 
 **Controle de mudança (2026-10, October Go-Live Slice 1, P0 #87):** INV-005,
 INV-006 e INV-007 foram rescopadas de "fato realizado" para "PROJEÇÃO/cenário
@@ -669,6 +675,65 @@ verificada contra a saída real de `build_projection` -- não apenas contra a co
 **Teste automatizado associado:**
 `tests/test_financial_invariants.py::test_no_automatic_unreceived_commission_in_projection_pass_and_fail`,
 `tests/test_commission_lifecycle_slice3.py::test_unreceived_commission_never_enters_forecast_projection`.
+
+## INV-032 — Ação do Assistente sempre auditável
+
+**Escopo:** `AssistantActionEvent`/`AuditEvent` (`app.services.assistant_actions.execute_typed_action`).
+**Título:** Ação do Assistente sempre auditável
+**Descrição:** Toda ação tipada executada pelo Assistente Financeiro produz um `AuditEvent`, um
+`AssistantActionEvent` pareado (1:1 via `audit_event_id`) e preserva a mensagem original do usuário
+-- nenhuma execução silenciosa sem trilha.
+**Motivação:** Rebaseline §11.3/§18 item 17 -- "ação do Assistente é auditável e reversível".
+**Entradas:** `has_audit_event`, `has_action_event`, `original_message_present`.
+**Resultado esperado:** os três verdadeiros em toda execução.
+**Severidade se violado:** `BLOCK`.
+**Implementação executável:** `app/services/invariant_registry.py`
+(`validate_assistant_action_always_audited`). Estrutural por construção -- `execute_typed_action`
+é o único caminho de escrita para `AssistantActionEvent`, e sempre cria os três juntos antes do
+commit. **Correção de revisão (2026-09-14, revisão de engenharia do PR #92, bloqueio 5):** até essa
+revisão, o `_impl` do endpoint despachado ainda commitava sua própria escrita de domínio *antes* de
+`execute_typed_action` gravar `AssistantActionEvent`/segundo `AuditEvent` -- uma falha nessa janela
+deixaria o fato financeiro persistido sem trilha do Assistente, contradizendo a alegação de
+"estrutural por construção" feita aqui. Corrigido despachando com `commit=False` e finalizando
+mutação de domínio + trilha do Assistente num único `db.commit()`; qualquer falha entre os dois
+reverte ambos via `db.rollback()`. A alegação estrutural acima só é verdadeira a partir dessa
+correção. **Correção de revisão (2026-09-14, revisão de engenharia do PR #92, segunda rodada):**
+a mesma garantia "estrutural por construção" também não valia sob concorrência real -- até essa
+correção, `execute_typed_action` lia a `AssistantActionProposal` com um `SELECT` comum, e só
+gravava `consumed_at`/`consumed_action_event_id` depois da mutação de domínio, imediatamente antes
+do `db.commit()`; duas execuções concorrentes do mesmo `proposal_id` podiam ambas ler `consumed_at
+IS NULL`, ambas atravessar a checagem e ambas despachar a ação financeira -- uma segunda mutação
+real (e um segundo `AuditEvent`/`AssistantActionEvent`), não apenas uma trilha ausente. Corrigido
+com `SELECT ... FOR UPDATE` (PostgreSQL; no-op no SQLite, mesmo padrão de
+`lock_household_financial_revision`) na leitura inicial da proposta, mantido por toda a transação
+até o `db.commit()` final: a segunda execução concorrente bloqueia no lock até a primeira commitar
+ou reverter, e então observa a proposta já consumida (replay idempotente) em vez de mutar de novo.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_assistant_action_always_audited_pass_and_fail`,
+`tests/test_assistant_slice4.py::test_execute_create_expense_writes_exactly_once_and_is_fully_audited`,
+`tests/test_assistant_slice4.py::test_execute_typed_action_is_atomic_on_a_failure_after_the_domain_write`,
+`tests/test_postgresql_integration.py::test_assistant_execute_concurrent_same_proposal_is_serialized_to_a_single_mutation`.
+
+## INV-033 — Undo do Assistente nunca apaga histórico
+
+**Escopo:** `AssistantActionEvent` (`app.services.assistant_actions.undo_assistant_action`).
+**Título:** Undo do Assistente nunca apaga histórico
+**Descrição:** Desfazer uma ação do Assistente preserva o `AssistantActionEvent` original (marcado
+`undone_at`/`undone_by`, nunca apagado) e registra a reversão como um novo `AuditEvent` -- a trilha
+só cresce, nunca encolhe.
+**Motivação:** Rebaseline §11.3, Work Order item 7 -- "Undo... nunca apagar história nem desfazer
+fato externo impossível de reverter".
+**Entradas:** `original_action_preserved`, `undo_audit_event_created`, `undone_at_recorded`.
+**Resultado esperado:** os três verdadeiros em toda reversão aceita.
+**Severidade se violado:** `BLOCK`.
+**Implementação executável:** `app/services/invariant_registry.py`
+(`validate_assistant_undo_preserves_history`). Estrutural por construção -- `undo_assistant_action`
+nunca chama `db.delete` sobre `AssistantActionEvent`, apenas marca campos e adiciona um novo
+`AuditEvent`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_assistant_undo_preserves_history_pass_and_fail`,
+`tests/test_assistant_slice4.py::test_execute_pay_obligation_via_assistant_matches_manual_contract_no_double_count`,
+`tests/test_assistant_slice4.py::test_undo_pay_card_invoice_is_refused_as_non_reversible_with_explicit_reason`.
 
 ## Controle de mudança
 

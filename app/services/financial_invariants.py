@@ -22,7 +22,7 @@ from typing import Any
 # a received Commission and a reconciled recurring income never re-enter the
 # forward projection as a second, duplicated income fact. See
 # docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md.
-FINANCIAL_RULES_VERSION = "2026.10.3"
+FINANCIAL_RULES_VERSION = "2026.10.4"
 MONEY_TOLERANCE = Decimal("0.01")
 PROBABLE_DUPLICATE_THRESHOLD = Decimal("0.60")
 STRONG_DUPLICATE_THRESHOLD = Decimal("0.85")
@@ -965,6 +965,68 @@ def validate_recurring_income_no_duplicate(
         expected=expected_projected,
         actual=projected_amount,
         difference=_money(projected_amount - expected_projected),
+    )
+
+
+def validate_assistant_action_always_audited(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-032 (October Go-Live Slice 4): every typed action the Assistente
+    Financeiro executes produces a persistent audit trail -- rebaseline
+    §11.3/§18 item 17 ("ação do Assistente é auditável e reversível"). A
+    typed-action execution that somehow produced no `AuditEvent`, no paired
+    `AssistantActionEvent`, or lost the original user message would be a
+    silent gap in exactly the trail the rebaseline requires; this proves
+    all three survive together, every time."""
+
+    has_audit_event = _boolean(context, "has_audit_event")
+    has_action_event = _boolean(context, "has_action_event")
+    original_message_present = _boolean(context, "original_message_present")
+    matches = has_audit_event and has_action_event and original_message_present
+    return _boolean_result(
+        definition,
+        context,
+        matches,
+        expected=True,
+        actual=matches,
+        pass_message="A ação do Assistente produziu AuditEvent, AssistantActionEvent e mensagem original.",
+        fail_message="A ação do Assistente executou sem trilha de auditoria completa.",
+        metadata={
+            "has_audit_event": has_audit_event,
+            "has_action_event": has_action_event,
+            "original_message_present": original_message_present,
+        },
+    )
+
+
+def validate_assistant_undo_preserves_history(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-033 (October Go-Live Slice 4): undoing an Assistant action never
+    erases the fact that the original action happened -- rebaseline §11.3,
+    Work Order item 7 ("Undo... nunca apagar história nem desfazer fato
+    externo impossível de reverter"). A reversal always (a) keeps the
+    original `AssistantActionEvent` row (marked `undone_at`/`undone_by`,
+    never deleted), and (b) creates a brand new `AuditEvent` for the
+    reversal itself -- the trail only ever grows."""
+
+    original_action_preserved = _boolean(context, "original_action_preserved")
+    undo_audit_event_created = _boolean(context, "undo_audit_event_created")
+    undone_at_recorded = _boolean(context, "undone_at_recorded")
+    matches = original_action_preserved and undo_audit_event_created and undone_at_recorded
+    return _boolean_result(
+        definition,
+        context,
+        matches,
+        expected=True,
+        actual=matches,
+        pass_message="O undo preservou a ação original e registrou um novo AuditEvent da reversão.",
+        fail_message="O undo apagou/perdeu a ação original ou não registrou a reversão.",
+        metadata={
+            "original_action_preserved": original_action_preserved,
+            "undo_audit_event_created": undo_audit_event_created,
+            "undone_at_recorded": undone_at_recorded,
+        },
     )
 
 

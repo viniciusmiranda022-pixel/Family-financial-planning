@@ -9,6 +9,8 @@ from app.services.financial_invariants import (
     InvariantDefinition,
     InvariantResult,
     validate_advisor_consistency,
+    validate_assistant_action_always_audited,
+    validate_assistant_undo_preserves_history,
     validate_benefits_not_cash,
     validate_canonical_historical_source,
     validate_card_competence,
@@ -469,6 +471,38 @@ _DEFINITIONS = (
         severity=IntegritySeverity.CRITICAL,
         required_facts=("total_projected_commission", "unreceived_commission_count"),
         validator=validate_no_automatic_unreceived_commission_in_projection,
+    ),
+    InvariantDefinition(
+        id="INV-032",
+        name="assistant_action_always_audited",
+        title="Ação do Assistente sempre auditável",
+        description=(
+            "October Go-Live Slice 4: toda ação tipada executada pelo "
+            "Assistente Financeiro produz um AuditEvent, um "
+            "AssistantActionEvent pareado e preserva a mensagem original do "
+            "usuário -- rebaseline §11.3/§18 item 17."
+        ),
+        severity=IntegritySeverity.BLOCK,
+        required_facts=("has_audit_event", "has_action_event", "original_message_present"),
+        validator=validate_assistant_action_always_audited,
+    ),
+    InvariantDefinition(
+        id="INV-033",
+        name="assistant_undo_preserves_history",
+        title="Undo do Assistente nunca apaga histórico",
+        description=(
+            "October Go-Live Slice 4: desfazer uma ação do Assistente nunca "
+            "apaga o AssistantActionEvent original nem deixa de registrar a "
+            "reversão como um novo AuditEvent -- rebaseline §11.3, Work "
+            "Order item 7."
+        ),
+        severity=IntegritySeverity.BLOCK,
+        required_facts=(
+            "original_action_preserved",
+            "undo_audit_event_created",
+            "undone_at_recorded",
+        ),
+        validator=validate_assistant_undo_preserves_history,
     ),
 )
 

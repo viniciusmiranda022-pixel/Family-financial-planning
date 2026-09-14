@@ -60,6 +60,9 @@ from app.schemas import (
     AccountBalanceObservationRequest,
     AccountRequest,
     AdvisorRequest,
+    AssistantExecuteRequest,
+    AssistantInterpretRequest,
+    AssistantUndoRequest,
     CaptureConfirmRequest,
     CardCompetenceRepairApplyRequest,
     CardCompetenceRepairRollbackRequest,
@@ -74,6 +77,8 @@ from app.schemas import (
     CommissionReceiveRequest,
     CommissionRequest,
     DuplicateResolutionRequest,
+    EntryTypeTemplateCreateRequest,
+    EntryTypeTemplateDeactivateRequest,
     FindingLifecycleRequest,
     IntegrityRunRequest,
     LoginRequest,
@@ -114,6 +119,16 @@ from app.security import (
 )
 from app.services import capture_worker
 from app.services import mfa as mfa_service
+from app.services.assistant_actions import (
+    AssistantActionError,
+    DuplicateResolution,
+    build_typed_action_proposal,
+    execute_typed_action,
+    list_assistant_actions,
+    persist_action_proposal,
+    undo_assistant_action,
+)
+from app.services.assistant_interpreter import interpret_message
 from app.services.card_competence import (
     card_invoice_competence,
     resolve_expense_competence,
@@ -173,6 +188,14 @@ from app.services.duplicates import (
     resolve_duplicate_group,
     serialize_duplicate_group,
     source_priority,
+)
+from app.services.entry_type_templates import (
+    EntryTypeTemplateError,
+    accept_entry_type_template,
+    deactivate_entry_type_template,
+    list_entry_type_templates,
+    record_observed_entry,
+    serialize_entry_type_template,
 )
 from app.services.finance import (
     ForecastCommission,
@@ -989,23 +1012,30 @@ def audit(
     trace_id: str | None = None,
     source: str = "application",
     request_id: str | None = None,
-) -> None:
-    db.add(
-        AuditEvent(
-            household_id=user.household_id,
-            user_id=user.id,
-            event_type=event_type,
-            entity_type=entity_type,
-            entity_id=entity_id,
-            details=json.dumps(details, ensure_ascii=False, default=str) if details else None,
-            before_state=_audit_state(before_state),
-            after_state=_audit_state(after_state),
-            reason=reason,
-            trace_id=trace_id,
-            source=source,
-            request_id=request_id,
-        )
+) -> AuditEvent:
+    """Records one `AuditEvent`. Returns the (unflushed) ORM object so a
+    caller that needs its own `before_state`/`after_state` right back --
+    `app.services.assistant_actions.execute_typed_action`, via the
+    `domain_audit_sink` parameter some endpoint `_impl`s accept -- can read
+    it without a second, ordering-fragile query; every pre-existing caller
+    still calls this as a bare statement and ignores the return value."""
+
+    event = AuditEvent(
+        household_id=user.household_id,
+        user_id=user.id,
+        event_type=event_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        details=json.dumps(details, ensure_ascii=False, default=str) if details else None,
+        before_state=_audit_state(before_state),
+        after_state=_audit_state(after_state),
+        reason=reason,
+        trace_id=trace_id,
+        source=source,
+        request_id=request_id,
     )
+    db.add(event)
+    return event
 
 
 def _audit_state(value: dict | None) -> dict | None:
@@ -4860,6 +4890,25 @@ def create_manual_transaction(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    return _create_manual_transaction_impl(payload, user, db)
+
+
+def _create_manual_transaction_impl(
+    payload: ManualTransactionRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Body of `create_manual_transaction`, factored out so
+    `app.services.assistant_actions.execute_typed_action` can dispatch into
+    it with `commit=False` and fold the domain write and the
+    `AssistantActionEvent` audit row into one atomic transaction (P0 #87,
+    October Go-Live Slice 4 -- see the module docstring's "Atomicidade"
+    note). `create_manual_transaction` itself is unchanged as the public
+    FastAPI route/contract; every other caller keeps `commit=True`
+    (default) and therefore this endpoint's exact existing behavior."""
+
     _require_admin(user)
     account = db.scalar(
         select(Account).where(
@@ -5048,7 +5097,8 @@ def create_manual_transaction(
             ),
         },
     )
-    db.commit()
+    if commit:
+        db.commit()
     return {"id": transaction.id}
 
 
@@ -5071,6 +5121,20 @@ def create_manual_transfer(
     duplicate-detection/audit building blocks every other manual command
     already uses -- no parallel financial engine.
     """
+    return _create_manual_transfer_impl(payload, user, db)
+
+
+def _create_manual_transfer_impl(
+    payload: TransferRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Body of `create_manual_transfer` -- see
+    `_create_manual_transaction_impl`'s docstring for why this is factored
+    out (commit control for the Assistant's atomic dispatch)."""
+
     _require_admin(user)
     from_account = db.scalar(
         select(Account).where(
@@ -5151,7 +5215,8 @@ def create_manual_transfer(
         },
         trace_id=result.transfer_group_id,
     )
-    db.commit()
+    if commit:
+        db.commit()
     return {
         "transfer_group_id": result.transfer_group_id,
         "from_transaction_id": result.debit.transaction.id,
@@ -5482,6 +5547,20 @@ def delete_manual_transaction(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    return _delete_manual_transaction_impl(transaction_id, user, db)
+
+
+def _delete_manual_transaction_impl(
+    transaction_id: str,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Body of `delete_manual_transaction` -- see
+    `_create_manual_transaction_impl`'s docstring for why this is factored
+    out (used by `app.services.assistant_actions.undo_assistant_action`)."""
+
     _require_admin(user)
     transaction = db.scalar(
         select(Transaction).where(
@@ -5566,7 +5645,8 @@ def delete_manual_transaction(
         )
         for item in group:
             db.delete(item)
-        db.commit()
+        if commit:
+            db.commit()
         return {"ok": True, "deleted_transaction_ids": [item.id for item in group]}
 
     audit(
@@ -5584,7 +5664,8 @@ def delete_manual_transaction(
     # mutation that never happened would silently corrupt the value instead
     # of restoring it.
     db.delete(transaction)
-    db.commit()
+    if commit:
+        db.commit()
     return {"ok": True}
 
 
@@ -6186,6 +6267,24 @@ def pay_card_invoice_lifecycle(
     `app.services.card_invoice_lifecycle.pay_invoice`.
     """
 
+    return _pay_card_invoice_lifecycle_impl(invoice_id, payload, user, db)
+
+
+def _pay_card_invoice_lifecycle_impl(
+    invoice_id: str,
+    payload: CardInvoicePayRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+    domain_audit_sink: list[AuditEvent] | None = None,
+) -> dict:
+    """Body of `pay_card_invoice_lifecycle` -- see
+    `_create_manual_transaction_impl`'s docstring for why this is factored
+    out. `domain_audit_sink` receives this call's own `card_invoice.pay`
+    `AuditEvent` (never the `.idempotent_replay` one, which changes
+    nothing) -- see `_pay_obligation_impl`'s docstring."""
+
     _require_admin(user)
     paying_account = db.scalar(
         select(Account).where(
@@ -6212,6 +6311,16 @@ def pay_card_invoice_lifecycle(
     invoice_before = db.get(CardInvoice, invoice_id)
     if invoice_before is None or invoice_before.household_id != user.household_id:
         raise HTTPException(status_code=404, detail="Fatura não encontrada")
+    # Snapshotted as a plain dict *now*, before `pay_invoice` mutates this
+    # same identity-mapped `CardInvoice` row in place -- `invoice_before`
+    # the ORM object would otherwise already reflect the post-payment state
+    # by the time `domain_audit_sink` is populated below (engineering
+    # review of PR #92, blocker 2).
+    invoice_before_snapshot = {
+        "status": invoice_before.status,
+        "paid_total": str(invoice_before.paid_total),
+        "outstanding_balance": str(outstanding_balance(invoice_before)),
+    }
     expense_count_before = _expense_count(
         db,
         household_id=user.household_id,
@@ -6257,7 +6366,8 @@ def pay_card_invoice_lifecycle(
             trace_id=checking_leg.trace_id,
             source="card_invoice_lifecycle",
         )
-        db.commit()
+        if commit:
+            db.commit()
         return {
             "checking_transaction_id": checking_leg.id,
             "invoice": serialize_card_invoice(invoice),
@@ -6308,7 +6418,7 @@ def pay_card_invoice_lifecycle(
         ),
     )
 
-    audit(
+    domain_audit_event = audit(
         db,
         user,
         "card_invoice.pay",
@@ -6321,10 +6431,19 @@ def pay_card_invoice_lifecycle(
             "status": invoice.status,
             "outstanding_balance": serialize_card_invoice(invoice)["outstanding_balance"],
         },
+        before_state=invoice_before_snapshot,
+        after_state={
+            "status": invoice.status,
+            "paid_total": str(invoice.paid_total),
+            "outstanding_balance": serialize_card_invoice(invoice)["outstanding_balance"],
+        },
         trace_id=checking_leg.trace_id,
         source="card_invoice_lifecycle",
     )
-    db.commit()
+    if domain_audit_sink is not None:
+        domain_audit_sink.append(domain_audit_event)
+    if commit:
+        db.commit()
     return {
         "checking_transaction_id": checking_leg.id,
         "invoice": serialize_card_invoice(invoice),
@@ -6344,6 +6463,23 @@ def link_refund_transaction(
     `transaction_id` (path) must equal `payload.refund_transaction_id`;
     the body keeps the field name explicit for clarity in the audit log.
     """
+
+    return _link_refund_transaction_impl(transaction_id, payload, user, db)
+
+
+def _link_refund_transaction_impl(
+    transaction_id: str,
+    payload: RefundLinkRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+    domain_audit_sink: list[AuditEvent] | None = None,
+) -> dict:
+    """Body of `link_refund_transaction` -- see
+    `_create_manual_transaction_impl`'s docstring for why this is factored
+    out. `domain_audit_sink` receives this call's own `refund.link`
+    `AuditEvent` -- see `_pay_obligation_impl`'s docstring."""
 
     _require_admin(user)
     if transaction_id != payload.refund_transaction_id:
@@ -6420,7 +6556,7 @@ def link_refund_transaction(
         ),
     )
 
-    audit(
+    domain_audit_event = audit(
         db,
         user,
         "refund.link",
@@ -6432,7 +6568,10 @@ def link_refund_transaction(
         reason=payload.reason,
         source="card_invoice_lifecycle",
     )
-    db.commit()
+    if domain_audit_sink is not None:
+        domain_audit_sink.append(domain_audit_event)
+    if commit:
+        db.commit()
     return {"refund_transaction_id": refund.id, "original_transaction_id": original.id}
 
 
@@ -6443,6 +6582,21 @@ def unlink_refund_transaction(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    return _unlink_refund_transaction_impl(transaction_id, payload, user, db)
+
+
+def _unlink_refund_transaction_impl(
+    transaction_id: str,
+    payload: RefundUnlinkRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Body of `unlink_refund_transaction` -- see
+    `_create_manual_transaction_impl`'s docstring for why this is factored
+    out (used by `app.services.assistant_actions.undo_assistant_action`)."""
+
     _require_admin(user)
     if transaction_id != payload.refund_transaction_id:
         raise HTTPException(status_code=422, detail="O identificador da rota não corresponde ao do corpo")
@@ -6466,7 +6620,8 @@ def unlink_refund_transaction(
         reason=payload.reason,
         source="card_invoice_lifecycle",
     )
-    db.commit()
+    if commit:
+        db.commit()
     return {"refund_transaction_id": refund.id}
 
 
@@ -7197,6 +7352,25 @@ def pay_obligation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    return _pay_obligation_impl(obligation_id, payload, user, db)
+
+
+def _pay_obligation_impl(
+    obligation_id: str,
+    payload: ObligationPaymentRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+    domain_audit_sink: list[AuditEvent] | None = None,
+) -> dict:
+    """Body of `pay_obligation` -- see `_create_manual_transaction_impl`'s
+    docstring for why this is factored out. `domain_audit_sink`, when given
+    a list, receives this call's own `obligation.pay` `AuditEvent` (with
+    the canonical `before_state`/`after_state` already computed below) so
+    the Assistant's `AssistantActionEvent` can copy it verbatim instead of
+    recomputing or guessing it (engineering review of PR #92, blocker 2)."""
+
     _require_admin(user)
     item = _get_payable_obligation(
         db, household_id=user.household_id, obligation_id=obligation_id
@@ -7393,7 +7567,7 @@ def pay_obligation(
         item.funding_transaction_id = None
         item.funding_balance_observation_id = None
 
-    audit(
+    domain_audit_event = audit(
         db,
         user,
         "obligation.pay",
@@ -7416,7 +7590,10 @@ def pay_obligation(
         trace_id=transaction.trace_id,
         source="obligation_payment",
     )
-    db.commit()
+    if domain_audit_sink is not None:
+        domain_audit_sink.append(domain_audit_event)
+    if commit:
+        db.commit()
     return {
         "ok": True,
         "obligation_id": item.id,
@@ -7436,6 +7613,21 @@ def unpay_obligation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    return _unpay_obligation_impl(obligation_id, payload, user, db)
+
+
+def _unpay_obligation_impl(
+    obligation_id: str,
+    payload: ObligationPaymentUndoRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Body of `unpay_obligation` -- see `_create_manual_transaction_impl`'s
+    docstring for why this is factored out (used by
+    `app.services.assistant_actions.undo_assistant_action`)."""
+
     _require_admin(user)
     item = _get_payable_obligation(
         db, household_id=user.household_id, obligation_id=obligation_id
@@ -7500,7 +7692,8 @@ def unpay_obligation(
         reason=payload.reason,
         source="obligation_payment",
     )
-    db.commit()
+    if commit:
+        db.commit()
     return {
         "ok": True,
         "obligation_id": item.id,
@@ -10126,6 +10319,239 @@ def advisor_chat(
         "snapshot_checksum": summary["snapshot_checksum"],
         "integrity_status": summary["integrity_status"],
     }
+
+
+# P0 #87, October Go-Live Slice 4 (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_4.md`):
+# the Assistente Financeiro's typed-action contract. `interpret` never
+# creates/edits/deletes a financial-fact row, but does persist a single-use
+# `AssistantActionProposal` whenever the resolution is already materially
+# complete and unambiguous (engineering review of PR #92, blocker 1);
+# `execute` accepts only that proposal's id -- never a `typed_action`/
+# `payload`/`path_params`/`structured_interpretation` the caller could
+# supply directly -- and dispatches it in-process to that exact endpoint's
+# `_impl` function -- see `app.services.assistant_actions` for the full
+# architecture note.
+@router.post("/assistant/interpret")
+def assistant_interpret(
+    payload: AssistantInterpretRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    trace_id = payload.trace_id or str(uuid.uuid4())
+    interpretation = interpret_message(
+        message=payload.message, history=payload.history, trace_id=trace_id
+    )
+    duplicate_resolution = (
+        DuplicateResolution(
+            decision=payload.duplicate_resolution.decision,
+            transaction_id=payload.duplicate_resolution.transaction_id,
+        )
+        if payload.duplicate_resolution is not None
+        else None
+    )
+    proposal = build_typed_action_proposal(
+        db,
+        household_id=user.household_id,
+        interpretation=interpretation,
+        duplicate_resolution=duplicate_resolution,
+    )
+    proposal_id = None
+    if proposal.can_execute:
+        proposal_id = persist_action_proposal(
+            db,
+            household_id=user.household_id,
+            user_id=user.id,
+            trace_id=trace_id,
+            original_message=payload.message,
+            structured_interpretation=interpretation.to_dict(),
+            proposal=proposal,
+        )
+    return {
+        "interpretation": interpretation.to_dict(),
+        "proposal": proposal.to_dict(),
+        "proposal_id": proposal_id,
+        "trace_id": trace_id,
+    }
+
+
+@router.post("/assistant/execute", status_code=status.HTTP_201_CREATED)
+def assistant_execute(
+    payload: AssistantExecuteRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    # Explicit here (not only delegated to the dispatched `_impl`, which
+    # also enforces it): `execute_typed_action`'s first step is now a
+    # proposal lookup, not a role check, so a non-admin probing with a
+    # nonexistent `proposal_id` must still be rejected as `_require_admin`
+    # before that lookup ever runs -- consistent with the sibling
+    # `assistant_interpret`/`assistant_action_undo` endpoints, which both
+    # already check this first.
+    _require_admin(user)
+    try:
+        return execute_typed_action(
+            db,
+            user=user,
+            proposal_id=payload.proposal_id,
+            disambiguation_qa=payload.disambiguation_qa,
+        )
+    except AssistantActionError as exc:
+        message = str(exc)
+        if message == "Proposta do Assistente não encontrada":
+            raise HTTPException(status_code=404, detail=message) from exc
+        if "expirou" in message or "já foi utilizada" in message:
+            raise HTTPException(status_code=409, detail=message) from exc
+        raise HTTPException(status_code=422, detail=message) from exc
+
+
+@router.get("/assistant/actions")
+def assistant_actions_list(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    return list_assistant_actions(db, user=user)
+
+
+@router.post("/assistant/actions/{action_id}/undo")
+def assistant_action_undo(
+    action_id: str,
+    payload: AssistantUndoRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        return undo_assistant_action(db, user=user, action_id=action_id, reason=payload.reason)
+    except AssistantActionError as exc:
+        message = str(exc)
+        if message == "Ação do Assistente não encontrada":
+            raise HTTPException(status_code=404, detail=message) from exc
+        raise HTTPException(status_code=409, detail=message) from exc
+
+
+@router.post("/entry-type-templates", status_code=status.HTTP_201_CREATED)
+def create_entry_type_template(
+    payload: EntryTypeTemplateCreateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Records one confirmed use of a custom "Outra entrada"/"Outra saída"
+    label -- rebaseline §8.2/§9, Work Order item 8. Mirrors
+    `record_confirmed_correction` (classification learning): evidence
+    accumulates here, activation is a separate, admin-only step
+    (`POST /entry-type-templates/{id}/activate`)."""
+
+    _require_admin(user)
+    transaction = db.scalar(
+        select(Transaction).where(
+            Transaction.id == payload.transaction_id, Transaction.household_id == user.household_id
+        )
+    )
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Lançamento não encontrado")
+    try:
+        recorded = record_observed_entry(
+            db,
+            household_id=user.household_id,
+            movement_type=payload.movement_type,
+            label=payload.label,
+            category_id=payload.category_id,
+            transaction_id=transaction.id,
+        )
+    except EntryTypeTemplateError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "entry_type_template.observe",
+        "entry_type_template",
+        recorded.template_id,
+        {"movement_type": payload.movement_type, "label": payload.label, "transaction_id": transaction.id},
+        source="entry_type_templates",
+    )
+    db.commit()
+    return {
+        "id": recorded.template_id,
+        "status": recorded.status,
+        "confirmation_count": recorded.confirmation_count,
+        "active": recorded.active,
+    }
+
+
+@router.get("/entry-type-templates")
+def entry_type_templates_list(
+    movement_type: str | None = Query(default=None, pattern="^(income|expense)$"),
+    active_only: bool = Query(default=False),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    templates = list_entry_type_templates(
+        db, household_id=user.household_id, movement_type=movement_type, active_only=active_only
+    )
+    return [serialize_entry_type_template(template) for template in templates]
+
+
+@router.post("/entry-type-templates/{template_id}/activate")
+def activate_entry_type_template(
+    template_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        template = accept_entry_type_template(
+            db, household_id=user.household_id, template_id=template_id, user_id=user.id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Tipo aprendido não encontrado") from exc
+    except EntryTypeTemplateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "entry_type_template.activate",
+        "entry_type_template",
+        template.id,
+        {"confirmation_count": template.confirmation_count},
+        before_state={"status": "pending_acceptance", "active": False},
+        after_state={"status": template.status, "active": template.active},
+        reason="Aceite explícito de tipo aprendido após três confirmações consistentes",
+        source="entry_type_templates",
+    )
+    db.commit()
+    return serialize_entry_type_template(template)
+
+
+@router.post("/entry-type-templates/{template_id}/deactivate")
+def deactivate_entry_type_template_endpoint(
+    template_id: str,
+    payload: EntryTypeTemplateDeactivateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        template = deactivate_entry_type_template(db, household_id=user.household_id, template_id=template_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Tipo aprendido não encontrado") from exc
+    except EntryTypeTemplateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "entry_type_template.deactivate",
+        "entry_type_template",
+        template.id,
+        {},
+        before_state={"status": "active", "active": True},
+        after_state={"status": template.status, "active": template.active},
+        reason=payload.reason,
+        source="entry_type_templates",
+    )
+    db.commit()
+    return serialize_entry_type_template(template)
+
 
 # FAMILY_FINANCE_CURRENT_CONFIRMED_LIQUIDITY_V16_1
 @router.get("/liquidity/current-confirmed")

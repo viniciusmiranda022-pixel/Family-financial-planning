@@ -14,13 +14,14 @@ Fotos, áudios e documentos originais são criptografados no volume local. O sis
 
 ## Onde o Codex participa
 
-O Codex é opcional e tem três funções delimitadas:
+O Codex é opcional e tem quatro funções delimitadas:
 
 1. sugerir categoria para uma frase ambígua quando as regras locais têm baixa confiança (`/v1/classify`);
 2. explicar em linguagem natural o resultado calculado pelo consultor local (`/v1/analyze`);
-3. auditoria semântica consultiva sobre o status/score/findings já calculados pelo Financial Integrity Engine (`/v1/audit`, `POST /api/integrity/semantic-audit` -- ver `docs/ARCHITECTURE.md` e `docs/SECURITY.md`).
+3. auditoria semântica consultiva sobre o status/score/findings já calculados pelo Financial Integrity Engine (`/v1/audit`, `POST /api/integrity/semantic-audit` -- ver `docs/ARCHITECTURE.md` e `docs/SECURITY.md`);
+4. interpretar a mensagem do Assistente Financeiro em intenção + campos extraídos como texto livre, nunca um id (`/v1/interpret`, `POST /assistant/interpret` -- October Go-Live Slice 4, P0 #87). O backend determinístico resolve cada indício contra os dados reais do household e só propõe uma ação tipada executável quando a resolução é inequívoca; caso contrário devolve uma pergunta de desambiguação. Ver `docs/ARCHITECTURE.md` ("Assistente Financeiro operacional — typed actions").
 
-O contêiner `advisor` não possui `DATABASE_URL`, volume do PostgreSQL nem volume dos documentos. A aplicação envia para ele apenas a pergunta (ou, na auditoria, um pacote de status/findings já sanitizado por allowlist) e o veredito determinístico. O Codex não pode mudar o veredito, criar lançamentos, resolver findings, corrigir dados ou executar pagamentos -- na auditoria semântica isso é reforçado estruturalmente: o schema de saída de `/v1/audit` não tem nenhum campo de status/score/gate, apenas observações consultivas (`observação`/`hipótese`/`explicação`/`recomendação`) com severidade limitada a `info`/`review`.
+O contêiner `advisor` não possui `DATABASE_URL`, volume do PostgreSQL nem volume dos documentos. A aplicação envia para ele apenas a pergunta (ou, na auditoria, um pacote de status/findings já sanitizado por allowlist; na interpretação, apenas a mensagem e um histórico curto) e o veredito determinístico. O Codex não pode mudar o veredito, criar lançamentos, resolver findings, corrigir dados ou executar pagamentos -- na auditoria semântica isso é reforçado estruturalmente: o schema de saída de `/v1/audit` não tem nenhum campo de status/score/gate, apenas observações consultivas (`observação`/`hipótese`/`explicação`/`recomendação`) com severidade limitada a `info`/`review`. Na interpretação, o schema de saída de `/v1/interpret` não tem nenhum campo de id/conta/categoria/confirmação -- apenas intenção e texto extraído; o backend (`app.services.assistant_actions`) é quem resolve, valida e executa.
 
 Se o Codex estiver desconectado, indisponível, expirar por timeout ou responder fora do schema, a captura, o consultor e a auditoria de integridade continuam usando as regras locais; a auditoria semântica aparece como indisponível (`semantic_audit.available = false`), nunca como aprovação.
 

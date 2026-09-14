@@ -544,6 +544,124 @@ class AuditEvent(Base):
     )
 
 
+class AssistantActionEvent(Base):
+    """One typed action executed by the Assistente Financeiro (P0 #87,
+    October Go-Live Slice 4 -- `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md`
+    §3.5).
+
+    1:1 with an `AuditEvent` row via `audit_event_id`, reusing
+    `AuditEvent.household_id`/`user_id`/`trace_id`/`created_at` instead of
+    duplicating them (household isolation for this table is therefore
+    always enforced through a join to `audit_events`, never through a
+    column of its own -- see `app.services.assistant_actions`). Never a
+    second ledger or a second audit trail: this row only ever *narrates*
+    what the paired `AuditEvent` already recorded, in the shape specific to
+    an Assistant-originated action (original message, Codex's structured
+    interpretation, disambiguation Q&A, and undo state).
+
+    `typed_action` always names an action whose execution is a direct call
+    into an already-existing deterministic endpoint/service (`pay_obligation`,
+    `card_invoice_lifecycle.pay_invoice`, `create_manual_transaction`,
+    `create_internal_transfer`, `link_refund`, ...) -- this table never
+    represents a parallel write path, only records that one of those
+    canonical paths was invoked by the Assistant instead of directly by a
+    human form.
+
+    `undoable`/`undone_at`/`undone_by` implement the Work Order's undo
+    contract: undo is only ever accepted when the underlying typed action
+    already has a deterministic reversal (`unpay_obligation`,
+    `unlink_refund`, the transfer/expense delete guard) --
+    `app.services.assistant_actions.undo_assistant_action` is the only
+    writer of `undone_at`/`undone_by`, and it never deletes this row or its
+    paired `AuditEvent`: undo creates a new, independent `AuditEvent` for
+    the reversal and marks this row as consumed, exactly like
+    `unpay_obligation` already does for `Obligation.status` -- it never
+    erases the fact that the original action happened.
+    """
+
+    __tablename__ = "assistant_action_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    audit_event_id: Mapped[str] = mapped_column(
+        ForeignKey("audit_events.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    original_message: Mapped[str] = mapped_column(Text)
+    structured_interpretation: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    disambiguation_qa: Mapped[list[Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    typed_action: Mapped[str] = mapped_column(String(60), index=True)
+    target_entity_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    target_entity_ids: Mapped[list[Any]] = mapped_column(JSON_DOCUMENT, default=list)
+    before_state: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    after_state: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    undoable: Mapped[bool] = mapped_column(Boolean, default=False)
+    non_reversible_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    undone_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    undo_audit_event_id: Mapped[str | None] = mapped_column(
+        ForeignKey("audit_events.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class AssistantActionProposal(Base):
+    """A single-use, server-resolved typed-action proposal (P0 #87, October
+    Go-Live Slice 4 -- engineering review of PR #92, blocker 1).
+
+    `POST /assistant/interpret` persists exactly one row here whenever
+    `app.services.assistant_actions.build_typed_action_proposal` returns
+    `can_execute=True` -- i.e. only once the message has already been
+    deterministically resolved against real household data with zero
+    ambiguity. `POST /assistant/execute` accepts nothing but this row's
+    `id`: `typed_action`/`payload`/`path_params`/`structured_interpretation`
+    are always read back from here, never re-supplied by the HTTP caller,
+    so a client can never skip `/assistant/interpret` and hand-execute a
+    fabricated or spoofed interpretation for a message that was actually
+    ambiguous (Work Order invariant "Nenhuma ação ambígua é executada
+    automaticamente"). `original_message`/`structured_interpretation` are
+    what let a downstream audit reconstruct that the recorded
+    interpretation genuinely came from the Codex sidecar's own response,
+    not from an unverified client claim.
+
+    Single-use and time-boxed: `consumed_at`/`consumed_action_event_id` are
+    set exactly once, by `execute_typed_action`, the moment the proposal is
+    successfully dispatched -- a retry with the same `id` afterwards is an
+    idempotent replay of that one recorded action, never a second
+    execution. `expires_at` bounds how long a resolved-but-unconfirmed
+    proposal (household data could have changed meanwhile -- an account
+    closed, an obligation already paid another way) stays eligible to
+    execute; an expired, never-consumed proposal is simply left in place
+    for audit/debugging, exactly like any other stale credential -- nothing
+    here ever deletes a financial fact, because a proposal never contains
+    one until it is consumed.
+    """
+
+    __tablename__ = "assistant_action_proposals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(64), index=True)
+    original_message: Mapped[str] = mapped_column(Text)
+    structured_interpretation: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    typed_action: Mapped[str] = mapped_column(String(60), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+    path_params: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_action_event_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assistant_action_events.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 class IntegrityRun(Base):
     __tablename__ = "integrity_runs"
     __table_args__ = (
@@ -832,6 +950,62 @@ class ClassificationRule(Base, TimestampMixin):
     last_confirmed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    accepted_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, default=dict)
+
+
+class EntryTypeTemplate(Base, TimestampMixin):
+    """A learned, reusable "Outra entrada"/"Outra saída" type (P0 #87,
+    October Go-Live Slice 4 -- rebaseline §8.2/§9,
+    `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.6).
+
+    Copies `ClassificationRule`'s exact evidence/lifecycle model
+    (`observed -> suggested -> pending_acceptance -> active`, admin-gated
+    activation) instead of inventing a second learning engine: a template
+    only ever *refines presentation* (which label/category/movement_type a
+    user picks from next time), never a financial invariant -- so, like
+    `ClassificationRule`, it is deliberately absent from
+    `FINANCIAL_REVISION_MODELS` below.
+
+    `normalized_label` is the deduplication key (`app.services.classifier
+    .normalize_description`, same normalizer already used for merchants) --
+    the mechanism that keeps "Aluguel"/"Recebi aluguel"/"Aluguel recebido"
+    from becoming three separate templates when they normalize the same
+    way; a genuinely distinct label is simply a different row.
+    """
+
+    __tablename__ = "entry_type_templates"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id",
+            "normalized_label",
+            "movement_type",
+            name="uq_entry_type_template_household_label_movement",
+        ),
+        Index("ix_entry_type_templates_household_label", "household_id", "normalized_label"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    # income|expense -- mirrors `ClassificationRule.movement_type` and the
+    # closed vocabulary already used everywhere else in this project
+    # (`ManualTransactionRequest.movement_type` only allows a wider set;
+    # a *learned type* only ever stands in for "Outra entrada"/"Outra
+    # saída", so it is restricted to exactly these two).
+    movement_type: Mapped[str] = mapped_column(String(20))
+    label: Mapped[str] = mapped_column(String(100))
+    normalized_label: Mapped[str] = mapped_column(String(100))
+    category_id: Mapped[str | None] = mapped_column(
+        ForeignKey("categories.id", ondelete="SET NULL"), nullable=True
+    )
+    confirmation_count: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(30), default="observed")
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     accepted_by: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True

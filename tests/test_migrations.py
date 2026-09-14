@@ -382,6 +382,64 @@ EXPECTED_CARD_INVOICE_COLUMNS = {
     "updated_at",
 }
 
+EXPECTED_0016_TABLES = {"assistant_action_events"}
+
+EXPECTED_ASSISTANT_ACTION_EVENT_COLUMNS = {
+    "id",
+    "audit_event_id",
+    "original_message",
+    "structured_interpretation",
+    "disambiguation_qa",
+    "typed_action",
+    "target_entity_type",
+    "target_entity_ids",
+    "before_state",
+    "after_state",
+    "undoable",
+    "non_reversible_reason",
+    "undone_at",
+    "undone_by",
+    "undo_audit_event_id",
+    "created_at",
+}
+
+EXPECTED_0017_TABLES = {"entry_type_templates"}
+
+EXPECTED_ENTRY_TYPE_TEMPLATE_COLUMNS = {
+    "id",
+    "household_id",
+    "movement_type",
+    "label",
+    "normalized_label",
+    "category_id",
+    "confirmation_count",
+    "status",
+    "active",
+    "accepted_at",
+    "accepted_by",
+    "evidence",
+    "created_at",
+    "updated_at",
+}
+
+EXPECTED_0018_TABLES = {"assistant_action_proposals"}
+
+EXPECTED_ASSISTANT_ACTION_PROPOSAL_COLUMNS = {
+    "id",
+    "household_id",
+    "user_id",
+    "trace_id",
+    "original_message",
+    "structured_interpretation",
+    "typed_action",
+    "payload",
+    "path_params",
+    "created_at",
+    "expires_at",
+    "consumed_at",
+    "consumed_action_event_id",
+}
+
 
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
@@ -433,6 +491,9 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0011_TABLES,
             *EXPECTED_0014_TABLES,
             *EXPECTED_0015_TABLES,
+            *EXPECTED_0016_TABLES,
+            *EXPECTED_0017_TABLES,
+            *EXPECTED_0018_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -558,6 +619,36 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_card_invoice_household_competence",
         "ix_card_invoice_trace_id",
     }
+    assert {
+        column["name"] for column in inspector.get_columns("assistant_action_events")
+    } == EXPECTED_ASSISTANT_ACTION_EVENT_COLUMNS
+    assert {
+        index["name"] for index in inspector.get_indexes("assistant_action_events")
+    } == {
+        "ix_assistant_action_events_audit_event_id",
+        "ix_assistant_action_events_typed_action",
+        "ix_assistant_action_events_created_at",
+    }
+    assert {
+        column["name"] for column in inspector.get_columns("entry_type_templates")
+    } == EXPECTED_ENTRY_TYPE_TEMPLATE_COLUMNS
+    assert {
+        index["name"] for index in inspector.get_indexes("entry_type_templates")
+    } == {
+        "ix_entry_type_templates_household_id",
+        "ix_entry_type_templates_household_label",
+    }
+    assert {
+        column["name"] for column in inspector.get_columns("assistant_action_proposals")
+    } == EXPECTED_ASSISTANT_ACTION_PROPOSAL_COLUMNS
+    assert {
+        index["name"] for index in inspector.get_indexes("assistant_action_proposals")
+    } == {
+        "ix_assistant_action_proposals_household_id",
+        "ix_assistant_action_proposals_trace_id",
+        "ix_assistant_action_proposals_typed_action",
+        "ix_assistant_action_proposals_created_at",
+    }
     assert {"card_invoice_id", "refund_of_transaction_id"}.issubset(
         {column["name"] for column in inspector.get_columns("transactions")}
     )
@@ -673,6 +764,71 @@ def test_downgrade_from_0015_refuses_to_discard_confirmed_refund_lineage(monkeyp
     get_settings.cache_clear()
 
 
+def test_downgrade_from_0016_refuses_to_discard_assistant_action_events(monkeypatch, tmp_path) -> None:
+    """Engineering review of PR #92 (blocker 3): the original `downgrade()`
+    claimed `assistant_action_events` is always reconstructable from its
+    paired `audit_events` row and therefore safe to drop unconditionally --
+    false, since `original_message`/`structured_interpretation`/
+    `disambiguation_qa` and the undo bookkeeping live only here. Same
+    guarded pattern as `test_downgrade_from_0015_refuses_to_discard_confirmed_refund_lineage`."""
+
+    from sqlalchemy.orm import sessionmaker
+
+    from app.models import AssistantActionEvent, AuditEvent, Household
+
+    database_url = f"sqlite:///{tmp_path / 'migrations-assistant-action-guard.sqlite'}"
+    config = _alembic_config(monkeypatch, database_url)
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        household = Household(name="Família Downgrade Assistente")
+        db.add(household)
+        db.flush()
+        audit_event = AuditEvent(
+            household_id=household.id,
+            event_type="assistant.execute",
+            entity_type="transaction",
+            details='{"typed_action": "create_expense"}',
+            source="assistant",
+        )
+        db.add(audit_event)
+        db.flush()
+        action_event = AssistantActionEvent(
+            audit_event_id=audit_event.id,
+            original_message="Gastei 300 de combustível",
+            typed_action="create_expense",
+            target_entity_ids=["fake-transaction-id"],
+            undoable=True,
+        )
+        db.add(action_event)
+        db.commit()
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="assistant_action_events"):
+        command.downgrade(config, "0015")
+
+    # Refused: schema (and the narration/undo trail itself) is left
+    # untouched.
+    engine, inspector = _inspect(database_url)
+    assert "assistant_action_events" in inspector.get_table_names()
+    engine.dispose()
+
+    # The documented export-then-clear path: once no row remains, the exact
+    # same downgrade proceeds like before this guard existed.
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM assistant_action_events")
+    engine.dispose()
+
+    command.downgrade(config, "0015")
+    engine, inspector = _inspect(database_url)
+    assert "assistant_action_events" not in inspector.get_table_names()
+    engine.dispose()
+    get_settings.cache_clear()
+
+
 def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     output = StringIO()
     config = _alembic_config(
@@ -702,6 +858,10 @@ def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     assert "ALTER TABLE users ADD COLUMN session_version" in sql
     assert "CREATE TABLE mfa_factors" in sql
     assert "CREATE TABLE mfa_recovery_codes" in sql
+    assert "CREATE TABLE card_invoices" in sql
+    assert "CREATE TABLE assistant_action_events" in sql
+    assert "CREATE TABLE entry_type_templates" in sql
+    assert "CREATE TABLE assistant_action_proposals" in sql
     assert "INSERT INTO alembic_version" in sql
     get_settings.cache_clear()
 
@@ -749,7 +909,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0015"
+        ).scalar_one() == "0018"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -775,6 +935,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0015"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0018"
     engine.dispose()
     get_settings.cache_clear()

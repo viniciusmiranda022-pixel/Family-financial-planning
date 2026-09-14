@@ -74,3 +74,25 @@ test("POST /v1/audit with the shared secret but no Codex auth answers 503, never
   // transport failure -- "provider_unreachable", never a verdict.
   assert.equal(response.status, 503);
 });
+
+test("POST /v1/interpret without the shared secret is rejected with 401", async () => {
+  const response = await fetch(`${baseUrl}/v1/interpret`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: "Gastei 300 de combustível no Nubank" }),
+  });
+  assert.equal(response.status, 401);
+});
+
+test("POST /v1/interpret with the shared secret but no Codex auth answers 503, never a fabricated intent", async () => {
+  const response = await fetch(`${baseUrl}/v1/interpret`, {
+    method: "POST",
+    headers: { "X-Advisor-Token": "test-shared-secret", "Content-Type": "application/json" },
+    body: JSON.stringify({ message: "Gastei 300 de combustível no Nubank" }),
+  });
+  // Same fail-safe boundary as /v1/audit/analyze/classify: an unauthenticated
+  // sidecar never returns an intent/typed-action shape, only a transport
+  // failure the Python caller (app.services.assistant_interpreter) treats
+  // uniformly as "interpretation unavailable".
+  assert.equal(response.status, 503);
+});

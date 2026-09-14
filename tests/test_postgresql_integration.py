@@ -133,7 +133,7 @@ def test_upgrade_empty_postgresql_database_to_head() -> None:
     }.issubset(tables)
     with engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0015"
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
         )
     engine.dispose()
 
@@ -154,7 +154,7 @@ def test_upgrade_from_legacy_0002_baseline_preserves_existing_rows() -> None:
 
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0015"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0018"
         preserved_name = connection.execute(
             text("SELECT name FROM households WHERE id = :id"), {"id": household_id}
         ).scalar_one()
@@ -984,6 +984,188 @@ def test_mfa_concurrent_totp_accept_of_same_timestep_yields_exactly_one_success_
         with Session(engine) as verify_db:
             factor_row = verify_db.get(MfaFactor, factor_id)
             assert factor_row.last_accepted_timestep == timestep
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_assistant_execute_concurrent_same_proposal_is_serialized_to_a_single_mutation() -> None:
+    """Engineering review of PR #92, second round: `AssistantActionProposal`
+    must be single-use under real concurrency, not merely under one
+    session's sequential retry (`tests/test_assistant_slice4.py` already
+    proves the sequential-retry/atomic-rollback cases against SQLite). Two
+    connections calling `execute_typed_action` for the *same* `proposal_id`
+    at the same time must produce exactly one financial mutation (one
+    `Transaction`) and exactly one `AssistantActionEvent` -- the loser is
+    required to observe the winner's committed outcome and return
+    `idempotent_replay=True`, never a second dispatch.
+
+    This proves it under a real two-connection PostgreSQL race, not merely
+    by reading the code: `execute_typed_action`'s initial
+    `SELECT ... FOR UPDATE` of the proposal row (see its docstring) is
+    exercised by pausing the *first* connection mid-transaction -- after it
+    has already taken the row lock and dispatched the domain write, but
+    before its own commit -- while a fully concurrent second connection
+    attempts to execute the exact same `proposal_id`. The second must block
+    on PostgreSQL's row-level write lock for as long as the first stays
+    open, then observe the now-consumed proposal and cleanly replay instead
+    of mutating a second time.
+    """
+
+    from app.models import AssistantActionEvent, AssistantActionProposal, AuditEvent
+    from app.services.assistant_actions import (
+        build_typed_action_proposal,
+        execute_typed_action,
+        persist_action_proposal,
+    )
+    from app.services.assistant_interpreter import StructuredInterpretation
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as setup_db:
+            synthetic = build_synthetic_household(setup_db)
+            synthetic.user.is_admin = True
+            setup_db.commit()
+            household_id = synthetic.household.id
+            user_id = synthetic.user.id
+
+        interpretation = StructuredInterpretation(
+            available=True,
+            reason=None,
+            intent="create_expense",
+            extracted_fields={
+                "amount_text": "120",
+                "description": "Mercado concorrência",
+                "account_hint": "Conta Corrente",
+                "funding_source_hint": "account",
+                "date_text": "2026-09-05",
+                "category_hint": "Alimentação",
+            },
+            missing_fields=(),
+            clarifying_question=None,
+            confidence=0.9,
+        )
+        with Session(engine) as propose_db:
+            proposal = build_typed_action_proposal(
+                propose_db, household_id=household_id, interpretation=interpretation
+            )
+            assert proposal.can_execute is True, proposal.clarifying_question
+            proposal_id = persist_action_proposal(
+                propose_db,
+                household_id=household_id,
+                user_id=user_id,
+                trace_id=str(uuid.uuid4()),
+                original_message="Gastei 120 no mercado",
+                structured_interpretation=interpretation.to_dict(),
+                proposal=proposal,
+            )
+
+        first_paused = threading.Event()
+        release_first = threading.Event()
+        first_done = threading.Event()
+        first_result: list[dict] = []
+        first_error: list[BaseException] = []
+
+        def _first_attempt() -> None:
+            try:
+                first_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                # `autoflush=False`: a plain autoflush Session calls
+                # `self.flush()` -- which resolves to the very same
+                # monkeypatched method below -- before *every* query,
+                # including the proposal's own locking `SELECT`. With
+                # autoflush left on, the pause below fires before that
+                # `SELECT ... FOR UPDATE` ever runs, so the row lock this
+                # test means to hold is never actually taken.
+                with Session(first_engine, autoflush=False) as first_db:
+                    user = first_db.get(User, user_id)
+                    real_flush = first_db.flush
+
+                    def _pausing_flush(*args, **kwargs):
+                        # By the time anything in `execute_typed_action`
+                        # first calls `db.flush()`, the locked `SELECT ...
+                        # FOR UPDATE` of the proposal has already run and
+                        # the domain write has already been dispatched
+                        # (`commit=False` never flushes on its own to get an
+                        # id -- every id here is a client-side default) --
+                        # pausing here holds the row lock open across the
+                        # gap the second connection needs to race into.
+                        first_paused.set()
+                        release_first.wait(timeout=10.0)
+                        return real_flush(*args, **kwargs)
+
+                    first_db.flush = _pausing_flush
+                    result = execute_typed_action(first_db, user=user, proposal_id=proposal_id)
+                    first_result.append(result)
+                first_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001 - surfaced via assertion below
+                first_error.append(exc)
+            finally:
+                first_done.set()
+
+        first_worker = threading.Thread(target=_first_attempt, daemon=True)
+        first_worker.start()
+        assert first_paused.wait(timeout=5.0), "first execute never reached its pause point"
+
+        second_done = threading.Event()
+        second_result: list[dict] = []
+        second_error: list[BaseException] = []
+
+        def _second_attempt() -> None:
+            try:
+                second_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(second_engine) as second_db:
+                    user = second_db.get(User, user_id)
+                    result = execute_typed_action(second_db, user=user, proposal_id=proposal_id)
+                    second_result.append(result)
+                second_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001 - surfaced via assertion below
+                second_error.append(exc)
+            finally:
+                second_done.set()
+
+        second_worker = threading.Thread(target=_second_attempt, daemon=True)
+        second_worker.start()
+        still_blocked = not second_done.wait(timeout=1.0)
+        assert still_blocked, (
+            "second execute completed before the first transaction committed -- "
+            "the proposal's SELECT ... FOR UPDATE is not actually serializing"
+        )
+
+        release_first.set()
+        assert first_done.wait(timeout=10.0), "first execute never finished"
+        if first_error:
+            raise first_error[0]
+        assert second_done.wait(timeout=10.0), "second execute never finished"
+        if second_error:
+            raise second_error[0]
+
+        assert first_result[0]["idempotent_replay"] is False
+        assert second_result[0]["idempotent_replay"] is True
+        assert second_result[0]["action"]["id"] == first_result[0]["action"]["id"]
+
+        with Session(engine) as verify_db:
+            # `build_synthetic_household` seeds several unrelated
+            # transactions of its own for this same household -- scope the
+            # count to the one description this typed action can possibly
+            # have produced, not every row on the household.
+            transactions = verify_db.scalars(
+                select(Transaction).where(
+                    Transaction.household_id == household_id,
+                    Transaction.description == "Mercado concorrência",
+                )
+            ).all()
+            assert len(transactions) == 1, "exactly one financial mutation, never two"
+            assert transactions[0].amount == Decimal("-120.00")
+            action_events = verify_db.scalars(select(AssistantActionEvent)).all()
+            assert len(action_events) == 1, "exactly one AssistantActionEvent, never two"
+            assistant_audit_events = verify_db.scalars(
+                select(AuditEvent).where(AuditEvent.event_type == "assistant.execute")
+            ).all()
+            assert len(assistant_audit_events) == 1
+            proposal_row = verify_db.get(AssistantActionProposal, proposal_id)
+            assert proposal_row.consumed_at is not None
+            assert proposal_row.consumed_action_event_id == action_events[0].id
         engine.dispose()
     finally:
         get_settings.cache_clear()
