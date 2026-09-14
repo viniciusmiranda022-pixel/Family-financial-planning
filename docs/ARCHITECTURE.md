@@ -740,12 +740,15 @@ the only durable record of every valuation/contribution event and even a lone `i
 no history yet is still a real financial fact.
 
 **Invariante central (rebaseline §16.2), estrutural por construção.**
-`app.services.investments.net_worth_summary` is the single function that sums `current_value` across
-a household's active investments -- `historical_cost`/`expected_receivable_value` never enter the
-total, by construction, not by a runtime check. `GET /investments` and `GET /dashboard`
-(`noncanonical.net_worth`/`noncanonical.investments`) both call this exact function, so they can
-never diverge on this number (rebaseline "nenhum cálculo patrimonial duplicado no frontend"/"não
-criar segundo motor de cálculo"). `app.services.investments.serialize_investment` is the one
+`app.services.investments.investments_summary` is the single function that sums `current_value`
+across a household's active investments -- `historical_cost`/`expected_receivable_value` never enter
+the total, by construction, not by a runtime check. `GET /investments` and `GET /dashboard`
+(`noncanonical.investments_total`/`noncanonical.investments`) both call this exact function, so they
+can never diverge on this number (rebaseline "nenhum cálculo patrimonial duplicado no frontend"/"não
+criar segundo motor de cálculo"). This total is **investments-only**, not household Patrimônio --
+see "Correções da revisão de engenharia" below for `household_patrimony_summary`, which adds the
+cash component rebaseline §13.1 item 4 requires. `app.services.investments.serialize_investment` is
+the one
 function that derives `gain_current`/`return_current_pct`/`gain_projected`/`return_projected_pct`
 for a row -- percentages are `None` (never `0`, never a `ZeroDivisionError`) when `historical_cost`
 is zero/negative or when there is no `expected_receivable_value` yet. INV-034
@@ -759,14 +762,18 @@ polices a second one.
 **Aportes nunca fabricam a origem do caixa.** `POST /investments/{id}/contributions`
 (`app.api._register_investment_contribution_impl`) increases `historical_cost` only -- it never
 touches `current_value` (exclusively `_update_investment_value_impl`'s job, so one event never moves
-both facts) and it never creates the cash-movement `Transaction` itself. `funding_transaction_id`,
-when given, only *links* to an already-existing `movement_type="investment"`/"Transferência
-patrimonial" transaction (the same manual-entry cash-out `ManualTransactionRequest` already
-supports, or an imported equivalent) -- exactly the same "link, never create-and-link as one
+both facts) and it never creates the cash-movement `Transaction` itself. `funding_transaction_id` is
+**required** (engineering review on PR #94, blocking item 2 -- see "Correções da revisão de
+engenharia" below) and only *links* to an already-existing `movement_type="investment"`/
+"Transferência patrimonial" transaction (the same manual-entry cash-out `ManualTransactionRequest`
+already supports, or an imported equivalent) -- exactly the same "link, never create-and-link as one
 composite action" discipline `register_refund` already established in Slice 4. The endpoint
 validates that transaction's type/category/sign/amount and that it is not already linked to another
-contribution before accepting the link; omitting it is allowed for a human recording a contribution
-whose cash side is not yet tracked.
+contribution before accepting the link, under `lock_household_financial_revision`'s household-wide
+row lock (blocking item 3) so two concurrent requests can never both observe "not linked" for the
+same funding transaction. Opening/historical cost basis is captured once, at asset creation
+(`InvestmentCreateRequest.historical_cost`) -- a point-in-time fact about the past, not a new event
+-- never through this endpoint.
 
 **Assistente Financeiro (Slice 4's typed-action framework, reused, not a second write path).**
 `update_asset_value`/`register_asset_contribution` join `TYPED_ACTIONS` and dispatch into the exact
@@ -812,8 +819,58 @@ the latest valuation happens to be" at undo time.
 - Nenhuma UI de página dedicada: rebaseline "sem criar item adicional obrigatório no menu
   principal" -- o painel de patrimônio vive dentro de `#view-dashboard`
   (`app/templates/index.html`/`app/static/app.js`), reaproveitando exatamente
-  `noncanonical.net_worth`/`noncanonical.investments` do `/dashboard`, sem segundo cálculo no
-  frontend.
+  `noncanonical.patrimony`/`noncanonical.investments_total`/`noncanonical.investments` do
+  `/dashboard`, sem segundo cálculo no frontend.
+
+### Correções da revisão de engenharia (PR #94, 2026-09-14)
+
+A revisão técnica do engenheiro responsável bloqueou o head inicial deste slice em quatro pontos
+normativos; os quatro foram corrigidos no mesmo PR, sem migration destrutiva e sem segundo motor:
+
+1. **`noncanonical.net_worth` era investimentos apenas, e era rotulado "Patrimônio".** Rebaseline
+   §13.1 item 4 define Patrimônio como "valor líquido atual dos ativos/caixa" -- caixa incluído.
+   `app.services.investments.net_worth_summary` (renomeada `investments_summary`) sempre somou
+   apenas `current_value` dos investimentos, correto para o subtotal "Investimentos", mas o
+   `/dashboard` publicava esse número sob o rótulo `net_worth`/"PATRIMÔNIO ATUAL", ficando
+   materialmente errado sempre que existisse saldo bancário/Privilège. Nova função
+   `app.services.investments.household_patrimony_summary` soma o componente de caixa já canônico
+   para "quanto tenho hoje" (observação confirmada do período, soberana pela §5.1, senão o saldo de
+   fechamento de liquidez do Financial Engine) com o subtotal de investimentos -- nunca uma terceira
+   derivação de caixa. `GET /dashboard` agora publica `noncanonical.patrimony` (caixa +
+   investimentos) e `noncanonical.investments_total` (somente investimentos, renomeado de
+   `net_worth`) como dois números explicitamente distintos; o painel do Dashboard mostra ambos lado
+   a lado ("PATRIMÔNIO TOTAL (CAIXA + INVESTIMENTOS)" e "INVESTIMENTOS (SOMA DO VALOR DE HOJE)").
+   Regressão: `tests/test_investments_slice6.py::
+   test_dashboard_patrimony_includes_confirmed_cash_and_investments_never_historical_or_projected`,
+   `test_household_patrimony_summary_adds_cash_and_investments_exactly_once`.
+
+2. **Aporte manual não exigia origem de caixa.** `InvestmentContributionRequest.funding_transaction_id`
+   era opcional e o botão "Aporte" do Dashboard só perguntava o valor -- violando diretamente o
+   Work Order ("o movimento de caixa correspondente deve ser representado conforme a origem real") e
+   o critério de aceite 5. O campo agora é obrigatório no schema; a UI manual resolve/pergunta a
+   origem exatamente como o Assistente já fazia (`_propose_register_asset_contribution`), reusando a
+   mesma consulta de candidatos (`app.services.assistant_actions.candidate_investment_funding_transactions`,
+   agora exportada) através de um novo `GET /investments/contribution-candidates`. Custo histórico de
+   abertura continua exclusivo de `POST /investments` (fato pontual sobre o passado, não um novo
+   evento). Regressão: `test_contribution_without_funding_transaction_is_rejected`.
+
+3. **Vínculo `funding_transaction_id` sujeito a corrida.** A leitura "já vinculado?" e o insert da
+   `InvestmentValuation` eram duas instruções separadas sem trava alguma -- duas requisições
+   concorrentes linkando a mesma transação de origem podiam ambas observar "não vinculado" e ambas
+   commitarem, duplicando o custo histórico contra um único movimento real de caixa. Corrigido
+   reusando `app.services.financial_revision.lock_household_financial_revision` (o mesmo
+   `SELECT ... FOR UPDATE`/no-op-no-SQLite já usado por `monthly_close`/`card_competence_repair`) como
+   a primeira ação de `_register_investment_contribution_impl`, serializando a leitura e o insert
+   entre duas conexões concorrentes. Provado sob duas conexões PostgreSQL reais em
+   `tests/test_postgresql_integration.py::
+   test_investment_contribution_concurrent_same_funding_transaction_is_serialized_to_a_single_link`.
+
+4. **Entrada monetária inválida virava `0` silenciosamente.** As cinco entradas de dinheiro do
+   painel (novo investimento, valor de hoje, valor previsto, aporte) usavam
+   `Number(text.replace(",", ".")) || 0` -- um valor pt-BR agrupado ("35.000,00"), texto inválido ou
+   em branco virava `0` e era enviado como fato financeiro confirmado. Novo `parseMoneyPromptInput`
+   (`app/static/app.js`) rejeita entrada inválida em vez de normalizá-la; `promptMoney` repete o
+   prompt até um valor válido ou cancelamento explícito -- nunca deixa `0` passar por coincidência.
 
 ## Comparação visual de cenários de compra (Fase 3)
 

@@ -743,7 +743,7 @@ nunca chama `db.delete` sobre `AssistantActionEvent`, apenas marca campos e adic
 
 ## INV-034 — Patrimônio do ativo
 
-**Escopo:** `Investment` (`app.services.investments.net_worth_summary`).
+**Escopo:** `Investment` (`app.services.investments.investments_summary`).
 **Título:** Patrimônio do ativo
 **Descrição:** O patrimônio de um investimento/ativo, incluindo o Studio, usa somente o valor de
 hoje (`current_value`) -- nunca a soma de custo histórico (`historical_cost`) e/ou valor previsto a
@@ -755,14 +755,17 @@ atual; Valor previsto a receber = projeção futura", e a proibição explícita
 **Resultado esperado:** `net_worth_contribution == current_value` dentro da tolerância monetária.
 **Severidade se violado:** `CRITICAL`.
 **Implementação executável:** `app/services/invariant_registry.py`
-(`validate_net_worth_current_value_only`). `app.services.investments.net_worth_summary` já garante
+(`validate_net_worth_current_value_only`). `app.services.investments.investments_summary` já garante
 esta propriedade por construção (soma somente `current_value` dos ativos ativos); esta invariante
 formaliza o contrato para o Financial Integrity Engine/validação independente do Codex também
-poderem recomputar e conferir o mesmo fato de forma determinística.
+poderem recomputar e conferir o mesmo fato de forma determinística. Escopo por ativo, não confundir
+com o Patrimônio total do household (`app.services.investments.household_patrimony_summary`, caixa +
+`investments_summary`'s total) que `GET /dashboard` publica em `noncanonical.patrimony`.
 **Teste automatizado associado:**
 `tests/test_financial_invariants.py::test_net_worth_uses_current_value_only_pass_and_fail`,
-`tests/test_investments_slice6.py::test_net_worth_summary_sums_current_value_only_never_historical_or_projected`,
-`tests/test_investments_slice6.py::test_updating_expected_receivable_value_never_changes_net_worth`.
+`tests/test_investments_slice6.py::test_investments_summary_sums_current_value_only_never_historical_or_projected`,
+`tests/test_investments_slice6.py::test_updating_expected_receivable_value_never_changes_net_worth`,
+`tests/test_investments_slice6.py::test_dashboard_patrimony_includes_confirmed_cash_and_investments_never_historical_or_projected`.
 
 ## Controle de mudança
 
