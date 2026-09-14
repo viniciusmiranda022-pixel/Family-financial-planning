@@ -22,7 +22,12 @@ from typing import Any
 # a received Commission and a reconciled recurring income never re-enter the
 # forward projection as a second, duplicated income fact. See
 # docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md.
-FINANCIAL_RULES_VERSION = "2026.10.4"
+# October Go-Live Rebaseline, Slice 6 (P0 #87): INV-034 is added so an
+# investment/asset's (including the Studio's) contribution to net worth is
+# always exactly its current value -- never the sum of cost basis, current
+# value and future projection. See
+# docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md.
+FINANCIAL_RULES_VERSION = "2026.10.5"
 MONEY_TOLERANCE = Decimal("0.01")
 PROBABLE_DUPLICATE_THRESHOLD = Decimal("0.60")
 STRONG_DUPLICATE_THRESHOLD = Decimal("0.85")
@@ -258,6 +263,42 @@ def validate_investment_redemption(
         ),
         pass_message="O resgate foi mantido como movimento patrimonial de liquidez.",
         fail_message="O resgate foi contado como renda, despesa, consumo ou ganho patrimonial fictício.",
+    )
+
+
+def validate_net_worth_current_value_only(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-034 (October Go-Live Slice 6): an asset's contribution to net
+    worth must equal exactly its `current_value` -- never `historical_cost`
+    plus `current_value` plus `expected_receivable_value`, and never any
+    other combination of the three (rebaseline §16.2). `historical_cost`/
+    `expected_receivable_value` are still required facts so a caller cannot
+    satisfy this check by omitting them; they are read here only to be
+    reported alongside a failure, never added into the comparison."""
+
+    historical_cost = _decimal(context, "historical_cost")
+    current_value = _decimal(context, "current_value")
+    expected_receivable_value = _decimal(context, "expected_receivable_value")
+    net_worth_contribution = _decimal(context, "net_worth_contribution")
+    difference = _money(net_worth_contribution - current_value)
+    matches = difference == Decimal("0.00")
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            "O patrimônio deste ativo considerou somente o valor de hoje."
+            if matches
+            else "O patrimônio deste ativo somou custo histórico e/ou valor previsto ao valor de hoje."
+        ),
+        expected={"net_worth_contribution": current_value},
+        actual={
+            "net_worth_contribution": net_worth_contribution,
+            "historical_cost": historical_cost,
+            "expected_receivable_value": expected_receivable_value,
+        },
+        difference=difference,
     )
 
 

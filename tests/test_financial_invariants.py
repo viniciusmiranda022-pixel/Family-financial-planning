@@ -41,16 +41,18 @@ ZERO_OPERATING_EFFECTS = {
 
 
 def test_registry_contains_all_permanent_invariants_once() -> None:
-    assert FINANCIAL_RULES_VERSION == "2026.10.4"
+    assert FINANCIAL_RULES_VERSION == "2026.10.5"
     # October Go-Live Slice 3 (P0 #87): INV-029/INV-030 join the registry,
     # guarding the forecast against a received Commission or a reconciled
     # recurring income being counted twice. Round 2 of the PR #91 review adds
     # INV-031, guarding the broader rebaseline §8.3 rule that no unreceived
     # commission may ever inflate the projection in the first place
     # (docs/FINANCIAL_INVARIANTS.md). October Go-Live Slice 4 adds INV-032/
-    # INV-033, guarding the Assistente Financeiro's audit/undo trail.
-    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 34))
-    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 33
+    # INV-033, guarding the Assistente Financeiro's audit/undo trail. October
+    # Go-Live Slice 6 adds INV-034, guarding that an investment/asset's net
+    # worth contribution is exactly its current value.
+    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 35))
+    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 34
     assert all(item.required_facts for item in INVARIANT_REGISTRY.values())
 
 
@@ -101,6 +103,57 @@ def test_card_payment_is_reconciliation_only() -> None:
     assert valid.status is InvariantStatus.PASS
     assert duplicated.status is InvariantStatus.FAIL
     assert duplicated.difference == Decimal("9032.65")
+
+
+def test_net_worth_uses_current_value_only_pass_and_fail() -> None:
+    # Rebaseline §16.2: the Studio's net worth contribution must equal its
+    # current value exactly -- historical cost and future projection never
+    # enter the total.
+    correct = _evaluate(
+        "INV-034",
+        historical_cost=Decimal("30000.00"),
+        current_value=Decimal("35000.00"),
+        expected_receivable_value=Decimal("45000.00"),
+        net_worth_contribution=Decimal("35000.00"),
+    )
+    assert correct.status is InvariantStatus.PASS
+    assert correct.difference == Decimal("0.00")
+
+    double_counted = _evaluate(
+        "INV-034",
+        historical_cost=Decimal("30000.00"),
+        current_value=Decimal("35000.00"),
+        expected_receivable_value=Decimal("45000.00"),
+        # A bug that summed historical_cost + current_value into net worth.
+        net_worth_contribution=Decimal("65000.00"),
+    )
+    assert double_counted.status is InvariantStatus.FAIL
+    assert double_counted.difference == Decimal("30000.00")
+
+    projection_inflated = _evaluate(
+        "INV-034",
+        historical_cost=Decimal("30000.00"),
+        current_value=Decimal("35000.00"),
+        expected_receivable_value=Decimal("45000.00"),
+        # A bug that reported the future projection as if it were patrimony.
+        net_worth_contribution=Decimal("45000.00"),
+    )
+    assert projection_inflated.status is InvariantStatus.FAIL
+    assert projection_inflated.difference == Decimal("10000.00")
+
+    # No projection yet (a brand-new asset): the fact producer sanitizes
+    # `expected_receivable_value` to zero rather than passing `None` through
+    # -- required_facts must always be a concrete decimal, never a raw
+    # nullable domain value (`app.services.financial_invariants._decimal`
+    # treats `None` as a missing fact, by design).
+    no_projection = _evaluate(
+        "INV-034",
+        historical_cost=Decimal("30000.00"),
+        current_value=Decimal("35000.00"),
+        expected_receivable_value=Decimal("0"),
+        net_worth_contribution=Decimal("35000.00"),
+    )
+    assert no_projection.status is InvariantStatus.PASS
 
 
 def test_application_is_patrimonial_movement() -> None:
