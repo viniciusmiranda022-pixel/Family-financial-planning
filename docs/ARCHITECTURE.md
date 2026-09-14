@@ -520,7 +520,16 @@ nunca recalculados uma segunda vez; para uma criação, `before_state=None` é o
 existia antes). Idempotência: a proposta é de uso único -- uma repetição com o mesmo `proposal_id`
 já consumido devolve o resultado já persistido em vez de executar de novo (chave mais forte que um
 `trace_id` fornecido pelo cliente) -- convivendo com, nunca substituindo, a proteção de duplicidade
-por fingerprint que cada endpoint já possui.
+por fingerprint que cada endpoint já possui. Uso único sob concorrência real, não só sob retry
+sequencial de uma sessão (revisão de engenharia do PR #92, segunda rodada, 2026-09-14): a leitura
+inicial da proposta em `execute_typed_action` usa `SELECT ... FOR UPDATE` no PostgreSQL (no-op no
+SQLite, mesmo padrão de dialeto de `lock_household_financial_revision`), e o lock é mantido por toda
+a transação, até o `db.commit()` final. Duas execuções concorrentes do mesmo `proposal_id` nunca
+observam ambas `consumed_at IS NULL`: a segunda bloqueia no lock até a primeira commitar ou
+reverter; se a primeira commitou, a segunda enxerga a proposta já consumida e devolve
+`idempotent_replay=True` em vez de despachar de novo; se a primeira reverteu, a segunda prossegue
+como execução legítima. Provado sob duas conexões PostgreSQL reais em
+`tests/test_postgresql_integration.py::test_assistant_execute_concurrent_same_proposal_is_serialized_to_a_single_mutation`.
 
 **Undo: nunca apaga a trilha.** `POST /assistant/actions/{id}/undo`
 (`app.services.assistant_actions.undo_assistant_action`) despacha para a reversão determinística já

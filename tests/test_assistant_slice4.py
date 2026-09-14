@@ -895,6 +895,25 @@ def test_execute_typed_action_is_atomic_on_a_failure_after_the_domain_write() ->
             proposal_row = db.get(AssistantActionProposal, proposal_id)
             assert proposal_row.consumed_at is None
 
+        # Concurrency review requirement (engineering review of PR #92,
+        # second round, point 4 of the required regression): a transaction
+        # that fails before its commit must release the proposal for a
+        # legitimate retry, not leave it permanently stuck -- the rollback
+        # above must have undone the `SELECT ... FOR UPDATE` claim as well
+        # as the domain write. Retrying with the *same* `proposal_id` here
+        # must now succeed exactly once.
+        with session_factory() as db:
+            user = db.scalar(select(User))
+            retry_result = execute_typed_action(db, user=user, proposal_id=proposal_id)
+        assert retry_result["idempotent_replay"] is False
+
+        with session_factory() as db:
+            obligation = db.get(Obligation, obligation_id)
+            assert obligation.status == "paid"
+            assert obligation.paid_transaction_id is not None
+            proposal_row = db.get(AssistantActionProposal, proposal_id)
+            assert proposal_row.consumed_at is not None
+
 
 def test_possible_duplicate_offers_three_human_choices_never_auto_resolves() -> None:
     """Work Order "deduplicação provável com as três escolhas humanas"

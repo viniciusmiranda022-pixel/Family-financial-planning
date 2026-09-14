@@ -697,11 +697,22 @@ deixaria o fato financeiro persistido sem trilha do Assistente, contradizendo a 
 "estrutural por construção" feita aqui. Corrigido despachando com `commit=False` e finalizando
 mutação de domínio + trilha do Assistente num único `db.commit()`; qualquer falha entre os dois
 reverte ambos via `db.rollback()`. A alegação estrutural acima só é verdadeira a partir dessa
-correção.
+correção. **Correção de revisão (2026-09-14, revisão de engenharia do PR #92, segunda rodada):**
+a mesma garantia "estrutural por construção" também não valia sob concorrência real -- até essa
+correção, `execute_typed_action` lia a `AssistantActionProposal` com um `SELECT` comum, e só
+gravava `consumed_at`/`consumed_action_event_id` depois da mutação de domínio, imediatamente antes
+do `db.commit()`; duas execuções concorrentes do mesmo `proposal_id` podiam ambas ler `consumed_at
+IS NULL`, ambas atravessar a checagem e ambas despachar a ação financeira -- uma segunda mutação
+real (e um segundo `AuditEvent`/`AssistantActionEvent`), não apenas uma trilha ausente. Corrigido
+com `SELECT ... FOR UPDATE` (PostgreSQL; no-op no SQLite, mesmo padrão de
+`lock_household_financial_revision`) na leitura inicial da proposta, mantido por toda a transação
+até o `db.commit()` final: a segunda execução concorrente bloqueia no lock até a primeira commitar
+ou reverter, e então observa a proposta já consumida (replay idempotente) em vez de mutar de novo.
 **Teste automatizado associado:**
 `tests/test_financial_invariants.py::test_assistant_action_always_audited_pass_and_fail`,
 `tests/test_assistant_slice4.py::test_execute_create_expense_writes_exactly_once_and_is_fully_audited`,
-`tests/test_assistant_slice4.py::test_execute_typed_action_is_atomic_on_a_failure_after_the_domain_write`.
+`tests/test_assistant_slice4.py::test_execute_typed_action_is_atomic_on_a_failure_after_the_domain_write`,
+`tests/test_postgresql_integration.py::test_assistant_execute_concurrent_same_proposal_is_serialized_to_a_single_mutation`.
 
 ## INV-033 — Undo do Assistente nunca apaga histórico
 

@@ -1009,6 +1009,22 @@ def execute_typed_action(
     endpoint's own duplicate-detection/fingerprint guard, which still
     applies unconditionally.
 
+    Concurrency (engineering review of PR #92, second round): the proposal
+    row is loaded with `SELECT ... FOR UPDATE` on PostgreSQL (a no-op on
+    SQLite, same dialect gate as `lock_household_financial_revision` --
+    SQLite has no cross-connection row lock and every test that needs true
+    concurrency runs against real PostgreSQL) and that lock is held for the
+    rest of this function, through the domain dispatch and the final
+    `db.commit()` below. Two concurrent `execute_typed_action` calls racing
+    on the same `proposal_id` therefore cannot both observe
+    `consumed_at IS NULL`: the second blocks on the lock until the first
+    commits or rolls back. If the first committed, the second's own locked
+    read now sees `consumed_at`/`consumed_action_event_id` already set and
+    takes the idempotent-replay branch below -- never a second dispatch. If
+    the first rolled back (any exception before its commit), the lock is
+    released with `consumed_at` still `NULL`, so the second proceeds as a
+    legitimate first execution.
+
     Atomicity (blocker 5): the dispatched `_impl` is called with
     `commit=False`, so its domain write and this function's own
     `AssistantActionEvent`/proposal-consumption write share one open
@@ -1023,12 +1039,13 @@ def execute_typed_action(
     from app.models import AssistantActionProposal as AssistantActionProposalModel
     from app.models import AuditEvent as AuditEventModel
 
-    proposal_row = db.scalar(
-        select(AssistantActionProposalModel).where(
-            AssistantActionProposalModel.id == proposal_id,
-            AssistantActionProposalModel.household_id == user.household_id,
-        )
+    proposal_query = select(AssistantActionProposalModel).where(
+        AssistantActionProposalModel.id == proposal_id,
+        AssistantActionProposalModel.household_id == user.household_id,
     )
+    if db.get_bind().dialect.name == "postgresql":
+        proposal_query = proposal_query.with_for_update()
+    proposal_row = db.scalar(proposal_query)
     if proposal_row is None:
         raise AssistantActionError("Proposta do Assistente não encontrada")
 

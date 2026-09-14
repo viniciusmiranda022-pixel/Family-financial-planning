@@ -275,6 +275,15 @@ executar (`can_execute=True`) e devolve apenas o `id` gerado; `POST /assistant/e
 uso único (`consumed_at`/`consumed_action_event_id`) e com validade de 30 minutos (`expires_at`). Ver
 `docs/ARCHITECTURE.md` ("Assistente Financeiro operacional — typed actions") para o fluxo completo.
 
+**Correção de revisão (2026-09-14, revisão de engenharia do PR #92, segunda rodada):** "proposta de
+uso único" acima ainda não era verdade sob concorrência real -- a leitura da proposta em
+`execute_typed_action` era um `SELECT` comum, e `consumed_at` só era gravado depois da mutação de
+domínio, então duas execuções concorrentes do mesmo `proposal_id` podiam ambas observar `consumed_at
+IS NULL` e ambas despachar a ação financeira (dupla mutação real, não apenas uma trilha duplicada).
+Corrigido com `SELECT ... FOR UPDATE` (PostgreSQL) na leitura inicial, mantido por toda a transação
+até o commit final -- ver `docs/ARCHITECTURE.md` e `docs/FINANCIAL_INVARIANTS.md` (INV-032) para o
+mecanismo completo e a regressão de concorrência em PostgreSQL real que prova isso.
+
 ### 3.6 Templates dinâmicos de Entrada/Saída (Slice 4; apresentação UX-only no Slice 5)
 
 **Correção de revisão (2026-09-11):** a atribuição original ("Slice 8, ou incremental 3-5") era
