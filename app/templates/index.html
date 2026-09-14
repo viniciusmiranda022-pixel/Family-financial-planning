@@ -82,22 +82,22 @@
         <div class="brand-wordmark"><strong>Family Finance</strong><small>Seu dinheiro, com clareza</small></div>
         <button id="mobile-menu-toggle" class="mobile-menu-toggle" type="button" aria-label="Abrir menu" aria-expanded="false">☰</button>
       </div>
+      <!-- October Go-Live Slice 5 (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_5.md):
+           navegação principal é exatamente esta lista -- superfícies legadas
+           (Lançar agora, Transferências, Importações, Lançamentos, Revisar,
+           Rendas, Planejamento, Integridade) continuam roteáveis por
+           `navigate()`/`data-go`, mas não têm mais botão fixo aqui; veja o
+           inventário legado -> destino no corpo do PR #93. -->
       <nav id="main-nav">
-        <button data-view="dashboard" class="active"><span>⌂</span>Visão geral</button>
-        <button data-view="reports"><span>▥</span>Relatórios</button>
-        <button data-view="capture" class="admin-only"><span>●</span>Lançar agora</button>
+        <button data-view="dashboard" class="active"><span>🏠</span>Dashboard Financeiro</button>
         <button data-view="entradas"><span>↓</span>Entradas</button>
         <button data-view="saidas"><span>↑</span>Saídas</button>
         <button data-view="payables"><span>▤</span>Contas a pagar</button>
-        <button data-view="transferencias"><span>⇄</span>Transferências</button>
-        <button data-view="imports"><span>⇧</span>Importações</button>
-        <button data-view="transactions"><span>≡</span>Lançamentos</button>
-        <button data-view="reviews"><span>!</span>Revisar <b id="nav-review-count" class="badge">0</b></button>
-        <button data-view="income"><span>+</span>Rendas</button>
-        <button data-view="planning"><span>↗</span>Planejamento</button>
-        <button data-view="advisor"><span>✦</span>Consultor</button>
-        <button data-view="integrity" id="nav-integrity" class="hidden"><span>◈</span>Integridade <b id="nav-integrity-badge" class="badge hidden">!</b></button>
-        <button data-view="users" id="nav-users" class="hidden"><span>♙</span>Acessos</button>
+        <button data-view="planning"><span>✦</span>Gastos &amp; Economia</button>
+        <button data-view="reports"><span>▥</span>Relatórios</button>
+        <button data-view="advisor"><span>✦</span>Assistente Financeiro</button>
+        <div class="nav-separator" role="separator"></div>
+        <button data-view="users" id="nav-users" class="hidden"><span>👥</span>Acessos</button>
         <button data-view="settings"><span>⚙</span>Configurações</button>
       </nav>
       <div class="sidebar-footer">
@@ -147,7 +147,7 @@
           <article class="kpi cash-out"><span>Saiu das contas</span><strong id="kpi-cash-out">R$ 0,00</strong><small id="kpi-cash-out-caption">Cartões e compromissos aparecem separados</small></article>
           <article class="kpi"><span>Gasto no mês</span><strong id="kpi-spending">R$ 0,00</strong><small id="kpi-cap-caption">de R$ 0,00</small></article>
           <article class="kpi" id="remaining-cap-card"><span>Disponível no teto</span><strong id="kpi-remaining">R$ 0,00</strong><small id="kpi-remaining-caption">Sem contar parcelas antigas</small></article>
-          <article class="kpi warning"><span>Pendências</span><strong id="kpi-reviews">0</strong><small>Itens aguardando confirmação</small></article>
+          <article class="kpi warning kpi-actionable" data-go="reviews" role="button" tabindex="0"><span>Pendências</span><strong id="kpi-reviews">0</strong><small>Itens aguardando confirmação -- toque para revisar</small></article>
         </div>
         <article id="liquidity-bridge" class="liquidity-bridge balanced">
           <div class="liquidity-bridge-icon" aria-hidden="true">↔</div>
@@ -236,8 +236,20 @@
           </div>
         </article>
         <article class="panel obligation-alert-panel">
-          <div class="panel-heading"><div><span class="step-label">ALERTAS</span><h2>Obrigações próximas do vencimento</h2><small>O sistema alerta com 30 dias de antecedência e destaca os últimos 7 dias.</small></div><button data-go="planning" class="secondary">Ver planejamento</button></div>
+          <div class="panel-heading"><div><span class="step-label">ALERTAS</span><h2>Obrigações próximas do vencimento</h2><small>O sistema alerta com 30 dias de antecedência e destaca os últimos 7 dias.</small></div><button data-go="planning" class="secondary">Ver Gastos &amp; Economia</button></div>
           <div id="dashboard-obligation-alerts" class="alert-list"></div>
+        </article>
+        <!-- October Go-Live Slice 5: "projeção no Dashboard" -- mesmos
+             dados/endpoint de Gastos & Economia (GET /forecast), sem
+             segundo cálculo; só um recorte compacto dos primeiros meses. -->
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">PROJEÇÃO</span><h2>Como fico nos próximos meses</h2><small>Cenário conservador da mesma projeção de Gastos &amp; Economia.</small></div><button data-go="planning" class="secondary">Ver projeção completa</button></div>
+          <div class="projection-kpis compact">
+            <div><span id="dashboard-projection-liquidity-name">Privilège DI no final</span><strong id="dashboard-forecast-final">R$ 0,00</strong></div>
+            <div><span>Menor saldo projetado</span><strong id="dashboard-forecast-min">R$ 0,00</strong></div>
+            <div><span>Decisão</span><strong id="dashboard-forecast-status">Configure o perfil</strong></div>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>Mês</th><th class="right">Saldo da liquidez</th></tr></thead><tbody id="dashboard-forecast-table"></tbody></table></div>
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">DETALHAMENTO MENSAL</span><h2 id="monthly-categories-title">Gastos por categoria</h2><small id="monthly-duplicates-note" class="hidden"></small></div></div>
@@ -261,6 +273,13 @@
             <p>Compare períodos, encontre tendências e descubra onde o orçamento realmente mudou.</p>
           </div>
           <div class="reports-hero-mark"><span>12</span><small>meses analisáveis</small></div>
+        </article>
+
+        <!-- October Go-Live Slice 5: "Lançamentos" absorvido aqui como
+             livro-razão/auditoria -- view-transactions continua existindo
+             sem alteração, só o ponto de entrada mudou. -->
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">LIVRO-RAZÃO</span><h2>Lançamentos consolidados e auditoria</h2><small>Consulta de todos os fatos já registrados por Entradas, Saídas, Transferências, Contas a pagar e Importações, além da conciliação fatura x débito bancário.</small></div><button data-go="transactions" class="secondary">Abrir livro-razão</button></div>
         </article>
 
         <div class="period-toolbar report-toolbar">
@@ -388,11 +407,23 @@
       <section id="view-entradas" class="view">
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">RECEITA</span><h2>Registrar entrada</h2><small>Só renda econômica real: salário, comissão, recebimento eventual. Dinheiro que apenas entrou por transferência, resgate de investimento ou estorno não pode virar receita aqui.</small></div></div>
+          <!-- October Go-Live Slice 5: "tipos existentes e templates
+               aprendidos do Slice 4" -- reuso de app.services.entry_type_templates
+               (migração 0017), sem novo motor de classificação. Um clique
+               aqui só preenche a Descrição; a entrada só é registrada
+               quando o formulário abaixo é enviado ("exigem confirmação"). -->
+          <div id="income-type-chips" class="type-template-chips hidden"></div>
           <form id="income-entry-form" class="form-grid three admin-only">
             <label>Data<input type="date" name="booked_at" required></label>
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Salário de agosto" maxlength="500"></label>
             <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
             <label>Conta<select name="account_id" id="income-entry-account" required></select></label>
+            <!-- October Go-Live Slice 5, engineering review blocker #3: a
+                 typed action here is "Outra entrada" (rebaseline §36) --
+                 opt-in and explicit, never every description. No `name`
+                 attribute on purpose: this must never be serialized into the
+                 POST /transactions payload (`formJson()` reads FormData). -->
+            <label class="full"><input type="checkbox" id="income-save-as-type"> Repito este tipo com frequência — salvar/reforçar como tipo reutilizável (Outra entrada)</label>
             <button class="primary" type="submit">Registrar entrada</button>
           </form>
         </article>
@@ -400,11 +431,49 @@
           <div class="panel-heading"><div><span class="step-label">ÚLTIMAS ENTRADAS</span><h2>Receitas do mês</h2></div><div class="filters"><input type="month" id="income-entry-month"><button id="refresh-income-entries" class="secondary">Atualizar</button></div></div>
           <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Conta</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="income-entries-table"></tbody></table></div>
         </article>
+        <!-- October Go-Live Slice 5: "Rendas" absorvida em "Entradas" -- os
+             mesmos formulários/tabelas de comissão e holerite, sem segundo
+             cálculo (app/services/finance.py continua a única fonte). -->
+        <div class="two-column form-layout">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">RENDA VARIÁVEL</span><h2>Adicionar comissão</h2></div></div>
+            <form id="commission-form" class="form-grid admin-only">
+              <label class="full">Descrição<input name="description" required placeholder="Projeto / recebível"></label>
+              <label>Previsão<input type="date" name="expected_date" required></label>
+              <label>Valor bruto<input type="number" name="gross_amount" min="0.01" step="0.01" required></label>
+              <label>Imposto<input type="number" name="tax_rate" min="0" max="1" step="0.01" value="0.06" required><small>0,06 corresponde a 6%</small></label>
+              <label>Atraso conservador<input type="number" name="delay_days" min="0" max="365" value="60"></label>
+              <button class="primary" type="submit">Adicionar comissão</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="step-label">FOLHA</span><h2>Adicionar holerite ou extra</h2></div></div>
+            <form id="payroll-form" class="form-grid admin-only">
+              <label>Nome<input name="person_name" required></label>
+              <label>Tipo<select name="payroll_kind"><option value="regular">Salário regular</option><option value="13_first">1ª parcela do 13º</option><option value="13_second">2ª parcela do 13º</option><option value="vacation_extra">Adicional líquido de férias</option><option value="other">Outro</option></select></label>
+              <label>Competência<input type="date" name="competence" required></label>
+              <label>Pagamento<input type="date" name="payment_date" required></label>
+              <label>Bruto<input type="number" name="gross_amount" step="0.01" value="0"></label>
+              <label>Descontos<input type="number" name="deductions" step="0.01" value="0"></label>
+              <label>Líquido<input type="number" name="net_amount" step="0.01" required></label>
+              <label>Consignado já descontado<input type="number" name="payroll_loan" step="0.01" value="0"></label>
+              <button class="primary" type="submit">Adicionar folha</button>
+            </form>
+          </article>
+        </div>
+        <div class="two-column">
+          <article class="panel"><div class="panel-heading"><h2>Comissões</h2></div><div class="table-wrap"><table><thead><tr><th>Previsão</th><th>Descrição</th><th class="right">Bruto</th><th class="right">Imposto</th><th class="right">Líquido</th><th class="right">Ações</th></tr></thead><tbody id="commissions-table"></tbody></table></div></article>
+          <article class="panel"><div class="panel-heading"><h2>Holerites e adicionais</h2></div><div class="table-wrap"><table><thead><tr><th>Pagamento</th><th>Pessoa</th><th>Tipo</th><th class="right">Líquido</th><th class="right">Ações</th></tr></thead><tbody id="payroll-table"></tbody></table></div></article>
+        </div>
+        <p class="muted-copy">Recebeu por transferência entre contas, resgatou investimento ou foi reembolsado? Isso não é receita -- registre em <button data-go="transferencias" class="text-button">Transferências e movimentações</button>.</p>
       </section>
 
       <section id="view-saidas" class="view">
         <article class="panel">
-          <div class="panel-heading"><div><span class="step-label">DESPESA</span><h2>Registrar saída</h2><small>Despesa à vista em conta ou cartão, com categoria e competência. Para compra parcelada, informe parcela atual e total; a prévia de parcelas futuras usa a mesma projeção canônica do painel de Planejamento.</small></div></div>
+          <div class="panel-heading"><div><span class="step-label">DESPESA</span><h2>Registrar saída</h2><small>Despesa à vista em conta ou cartão, com categoria e competência. Para compra parcelada, informe parcela atual e total; a prévia de parcelas futuras usa a mesma projeção canônica do painel de Gastos &amp; Economia.</small></div></div>
+          <!-- October Go-Live Slice 5: mesmo ciclo de aprendizado de
+               Entradas, para "Outra saída" (app.services.entry_type_templates). -->
+          <div id="expense-type-chips" class="type-template-chips hidden"></div>
           <form id="expense-entry-form" class="form-grid three admin-only">
             <label>Data<input type="date" name="booked_at" required></label>
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Supermercado" maxlength="500"></label>
@@ -423,6 +492,9 @@
             <label>Parcela atual (se parcelada)<input type="number" name="installment_current" id="expense-entry-installment-current" min="1" max="999" step="1"></label>
             <label>Total de parcelas (se parcelada)<input type="number" name="installment_total" id="expense-entry-installment-total" min="1" max="999" step="1"></label>
             <div id="expense-entry-installment-preview" class="capture-notes full hidden"></div>
+            <!-- October Go-Live Slice 5, engineering review blocker #3: see
+                 the equivalent income checkbox above -- opt-in, no `name`. -->
+            <label class="full"><input type="checkbox" id="expense-save-as-type"> Repito este tipo com frequência — salvar/reforçar como tipo reutilizável (Outra saída)</label>
             <button class="primary" type="submit">Registrar saída</button>
           </form>
         </article>
@@ -430,12 +502,29 @@
           <div class="panel-heading"><div><span class="step-label">ÚLTIMAS SAÍDAS</span><h2>Despesas do mês</h2></div><div class="filters"><input type="month" id="expense-entry-month"><button id="refresh-expense-entries" class="secondary">Atualizar</button></div></div>
           <div class="table-wrap"><table><thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Conta</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="expense-entries-table"></tbody></table></div>
         </article>
+        <p class="muted-copy">Isso foi uma transferência para outra conta da família, uma aplicação, um resgate ou um estorno? Isso não é despesa -- registre em <button data-go="transferencias" class="text-button">Transferências e movimentações</button>.</p>
       </section>
 
       <section id="view-payables" class="view">
+        <!-- October Go-Live Slice 5 / docs/OCTOBER_GO_LIVE_REBASELINE.md §2:
+             "Contas a pagar contém cadastro, conferência e pagamento de
+             compromissos/faturas" -- cadastro de obrigação mora aqui agora
+             (antes em Planejamento/Gastos & Economia). -->
         <article class="panel">
-          <div class="panel-heading"><div><span class="step-label">COMPROMISSOS</span><h2>Obrigações cadastradas</h2><small>A vencer, próximas do vencimento ou vencidas, conforme fatos já registrados. Cadastro e exclusão continuam em Planejamento.</small></div></div>
-          <div class="table-wrap"><table><thead><tr><th>Próximo vencimento</th><th>Nome</th><th>Status</th><th class="right">Valor</th></tr></thead><tbody id="payables-obligations-table"></tbody></table></div>
+          <div class="panel-heading"><div><span class="step-label">COMPROMISSOS</span><h2>Adicionar obrigação</h2></div></div>
+          <form id="obligation-form" class="form-grid admin-only">
+            <label class="full">Nome<input name="name" required placeholder="Parcela ou reforço"></label>
+            <label>Primeiro vencimento<input type="date" name="due_date" required></label>
+            <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
+            <label>Repetir a cada (meses)<input type="number" name="recurrence_months" min="0" value="0"><small>Use 0 para pagamento único</small></label>
+            <label>Quantidade<input type="number" name="occurrence_count" min="1" value="1"></label>
+            <label>Grupo<select name="category"><option value="chacara">Chácara</option><option value="loan">Empréstimo</option><option value="general">Geral</option></select></label>
+            <button class="primary" type="submit">Adicionar compromisso</button>
+          </form>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">COMPROMISSOS ATIVOS</span><h2>Obrigações cadastradas</h2><small>A vencer, próximas do vencimento ou vencidas, conforme fatos já registrados. Alertas automáticos aparecem 30 dias antes do próximo vencimento.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Próximo vencimento</th><th>Nome</th><th>Grupo</th><th>Repetição</th><th>Status</th><th>Estado financeiro</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="payables-obligations-table"></tbody></table></div>
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">FATURAS PENDENTES</span><h2>Faturas de cartão aguardando pagamento</h2><small>Só aparecem aqui faturas já importadas (linha de pagamento recebido do próprio extrato/PDF). Escolha "Pagar" para iniciar a quitação a partir da fatura.</small></div></div>
@@ -443,7 +532,7 @@
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">CICLO COMPLETO</span><h2>Faturas de cartão</h2><small>Ciclo aberta → fechada → parcialmente paga → paga (October Go-Live Slice 2). "Conferir e pagar" aparece assim que a fatura fecha; pagamento parcial é aceito e o saldo restante é transportado como principal, nunca como novo gasto.</small></div></div>
-          <div class="table-wrap"><table><thead><tr><th>Cartão</th><th>Competência</th><th>Status</th><th class="right">Total da fatura</th><th class="right">Saldo em aberto</th><th>Vencimento</th><th class="right">Ações</th></tr></thead><tbody id="card-invoices-table"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Cartão</th><th>Competência</th><th>Status</th><th>Estado financeiro</th><th class="right">Total da fatura</th><th class="right">Saldo em aberto</th><th>Vencimento</th><th class="right">Ações</th></tr></thead><tbody id="card-invoices-table"></tbody></table></div>
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">PAGAMENTO DE FATURA</span><h2>Registrar pagamento manual</h2><small>Pagamento de fatura é conciliação, nunca uma nova despesa (INV-002); as compras da fatura continuam sendo os fatos de despesa. Origem dos recursos, conta pagadora e fatura são sempre confirmadas por você.</small></div></div>
@@ -531,66 +620,22 @@
         <article class="panel"><div class="panel-heading"><div><span class="step-label">FILA DE CONTROLE</span><h2>Itens que exigem confirmação</h2><small>Corrija a categoria, decida se entra no cálculo ou apenas confirme que o item já está correto.</small></div></div><div id="reviews-list" class="review-list"></div></article>
       </section>
 
-      <section id="view-income" class="view">
-        <div class="two-column form-layout">
-          <article class="panel">
-            <div class="panel-heading"><div><span class="step-label">RENDA VARIÁVEL</span><h2>Adicionar comissão</h2></div></div>
-            <form id="commission-form" class="form-grid admin-only">
-              <label class="full">Descrição<input name="description" required placeholder="Projeto / recebível"></label>
-              <label>Previsão<input type="date" name="expected_date" required></label>
-              <label>Valor bruto<input type="number" name="gross_amount" min="0.01" step="0.01" required></label>
-              <label>Imposto<input type="number" name="tax_rate" min="0" max="1" step="0.01" value="0.06" required><small>0,06 corresponde a 6%</small></label>
-              <label>Atraso conservador<input type="number" name="delay_days" min="0" max="365" value="60"></label>
-              <button class="primary" type="submit">Adicionar comissão</button>
-            </form>
-          </article>
-          <article class="panel">
-            <div class="panel-heading"><div><span class="step-label">FOLHA</span><h2>Adicionar holerite ou extra</h2></div></div>
-            <form id="payroll-form" class="form-grid admin-only">
-              <label>Nome<input name="person_name" required></label>
-              <label>Tipo<select name="payroll_kind"><option value="regular">Salário regular</option><option value="13_first">1ª parcela do 13º</option><option value="13_second">2ª parcela do 13º</option><option value="vacation_extra">Adicional líquido de férias</option><option value="other">Outro</option></select></label>
-              <label>Competência<input type="date" name="competence" required></label>
-              <label>Pagamento<input type="date" name="payment_date" required></label>
-              <label>Bruto<input type="number" name="gross_amount" step="0.01" value="0"></label>
-              <label>Descontos<input type="number" name="deductions" step="0.01" value="0"></label>
-              <label>Líquido<input type="number" name="net_amount" step="0.01" required></label>
-              <label>Consignado já descontado<input type="number" name="payroll_loan" step="0.01" value="0"></label>
-              <button class="primary" type="submit">Adicionar folha</button>
-            </form>
-          </article>
-        </div>
-        <div class="two-column">
-          <article class="panel"><div class="panel-heading"><h2>Comissões</h2></div><div class="table-wrap"><table><thead><tr><th>Previsão</th><th>Descrição</th><th class="right">Bruto</th><th class="right">Imposto</th><th class="right">Líquido</th><th class="right">Ações</th></tr></thead><tbody id="commissions-table"></tbody></table></div></article>
-          <article class="panel"><div class="panel-heading"><h2>Holerites e adicionais</h2></div><div class="table-wrap"><table><thead><tr><th>Pagamento</th><th>Pessoa</th><th>Tipo</th><th class="right">Líquido</th><th class="right">Ações</th></tr></thead><tbody id="payroll-table"></tbody></table></div></article>
-        </div>
-      </section>
-
       <section id="view-planning" class="view">
-        <div class="two-column form-layout">
-          <article class="panel">
-            <div class="panel-heading"><div><span class="step-label">COMPROMISSOS</span><h2>Adicionar obrigação</h2></div></div>
-            <form id="obligation-form" class="form-grid admin-only">
-              <label class="full">Nome<input name="name" required placeholder="Parcela ou reforço"></label>
-              <label>Primeiro vencimento<input type="date" name="due_date" required></label>
-              <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
-              <label>Repetir a cada (meses)<input type="number" name="recurrence_months" min="0" value="0"><small>Use 0 para pagamento único</small></label>
-              <label>Quantidade<input type="number" name="occurrence_count" min="1" value="1"></label>
-              <label>Grupo<select name="category"><option value="chacara">Chácara</option><option value="loan">Empréstimo</option><option value="general">Geral</option></select></label>
-              <button class="primary" type="submit">Adicionar compromisso</button>
-            </form>
-          </article>
-          <article class="panel">
-            <div class="panel-heading"><div><span class="step-label">CENÁRIO CONSERVADOR</span><h2>Resultado projetado</h2></div><button id="refresh-forecast" class="secondary">Recalcular</button></div>
-            <div class="projection-kpis"><div><span>Privilège DI no final</span><strong id="forecast-final">R$ 0,00</strong></div><div><span>Menor saldo projetado</span><strong id="forecast-min">R$ 0,00</strong></div><div><span>Decisão</span><strong id="forecast-status">Configure o perfil</strong></div></div>
-            <canvas id="forecast-chart" width="900" height="320" aria-label="Gráfico da projeção financeira"></canvas>
-          </article>
-        </div>
-        <article class="panel"><div class="panel-heading"><div><span class="step-label">COMPROMISSOS ATIVOS</span><h2>Obrigações cadastradas</h2><small>Alertas automáticos aparecem 30 dias antes do próximo vencimento.</small></div></div><div class="table-wrap"><table><thead><tr><th>Próximo vencimento</th><th>Nome</th><th>Grupo</th><th>Repetição</th><th>Status</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="obligations-table"></tbody></table></div></article>
+        <!-- October Go-Live Slice 5 / docs/OCTOBER_GO_LIVE_REBASELINE.md §2:
+             "Contas a pagar contém cadastro, conferência e pagamento de
+             compromissos/faturas" -- o cadastro de obrigação (`#obligation-
+             form`) mora em #view-payables agora; esta tela mantém somente a
+             projeção/calendário e a simulação de compra, que já eram dela. -->
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">CENÁRIO CONSERVADOR</span><h2>Resultado projetado</h2><small>Reflete as obrigações cadastradas em Contas a pagar.</small></div><button id="refresh-forecast" class="secondary">Recalcular</button></div>
+          <div class="projection-kpis"><div><span>Privilège DI no final</span><strong id="forecast-final">R$ 0,00</strong></div><div><span>Menor saldo projetado</span><strong id="forecast-min">R$ 0,00</strong></div><div><span>Decisão</span><strong id="forecast-status">Configure o perfil</strong></div></div>
+          <canvas id="forecast-chart" width="900" height="320" aria-label="Gráfico da projeção financeira"></canvas>
+        </article>
         <article class="panel"><div class="panel-heading"><h2>Calendário consolidado</h2><small>O saldo representa a projeção mensal da conta central de liquidez.</small></div><div class="table-wrap wide"><table><thead><tr><th>Mês</th><th class="right">Salário</th><th class="right">Extras</th><th class="right">Comissão + atraso</th><th class="right">Compromissos</th><th class="right">Parcelas</th><th class="right">Rendimento</th><th class="right">Saldo da liquidez</th></tr></thead><tbody id="forecast-table"></tbody></table></div></article>
 
         <article class="panel" id="scenario-comparison-panel">
           <div class="panel-heading">
-            <div><span class="step-label">SIMULAÇÃO</span><h2>Comparar cenários de compra</h2><small>Cada alternativa é avaliada pelo mesmo motor de projeção deste Planejamento (Projection Engine/Validator) -- nada é calculado no navegador, e nenhuma compra é registrada até você confirmá-la pelos fluxos normais de Saídas/Contas a pagar.</small></div>
+            <div><span class="step-label">SIMULAÇÃO</span><h2>Comparar cenários de compra</h2><small>Cada alternativa é avaliada pelo mesmo motor de projeção desta tela (Projection Engine/Validator) -- nada é calculado no navegador, e nenhuma compra é registrada até você confirmá-la pelos fluxos normais de Saídas/Contas a pagar.</small></div>
             <button id="scenario-add-alternative" class="secondary" type="button">+ Alternativa</button>
           </div>
           <div id="scenario-alternatives-form" class="scenario-alternatives-form"></div>
@@ -604,31 +649,37 @@
         <div class="advisor-layout">
           <article class="panel advisor-intro">
             <div class="advisor-title-row"><span class="step-label">INTELIGÊNCIA FINANCEIRA</span><span id="advisor-provider-status" class="status-chip muted">Verificando Codex…</span></div>
-            <h2>Converse com seu consultor</h2>
-            <p>Os cálculos são feitos pelo motor financeiro local. Quando o Codex estiver conectado, ele recebe somente um resumo dos resultados para explicá-los com clareza — nunca credenciais, documentos ou acesso ao banco.</p>
+            <h2>Converse com o Assistente Financeiro</h2>
+            <p>Conte o que aconteceu que eu preparo o lançamento (entrada, saída, transferência, pagamento de obrigação/fatura ou estorno) para você confirmar antes de qualquer gravação -- nunca registro nada sozinho. Também respondo perguntas: os cálculos são sempre feitos pelo motor financeiro local; o Codex, quando conectado, só recebe um resumo já calculado para explicar com clareza -- nunca credenciais, documentos ou acesso direto ao banco.</p>
             <div class="advisor-suggestions admin-only">
+              <button class="secondary advisor-suggestion" type="button">Gastei R$ 150 de combustível hoje no cartão Itaú</button>
               <button class="secondary advisor-suggestion" type="button">Posso comprar algo de R$ 2.000 à vista?</button>
-              <button class="secondary advisor-suggestion" type="button">Quanto saiu do banco e dos cartões neste mês?</button>
               <button class="secondary advisor-suggestion" type="button">Quais obrigações estão próximas?</button>
               <button class="secondary advisor-suggestion" type="button">Onde posso economizar?</button>
             </div>
-            <div class="security-note"><strong>Análise com contexto</strong><p>Informe se é à vista ou parcelado e, no parcelamento, quantidade de parcelas e juros. O Privilège DI é a liquidez da família; o piso é uma meta e pode ser rompido quando o déficit consome o saldo.</p></div>
+            <p class="muted-copy admin-only">Prefere anexar uma foto, um comprovante, uma fatura ou gravar um áudio? Use a <button data-go="capture" class="text-button">captura assistida</button>.</p>
+            <div class="security-note"><strong>Você sempre confirma antes</strong><p>Toda ação do Assistente vira uma proposta para você revisar -- valor, conta, categoria -- e só é registrada depois que você confirmar. Se faltar algum dado ou houver um lançamento parecido no mesmo período, o Assistente pergunta antes de continuar; nada é decidido por hipótese.</p></div>
           </article>
           <article class="panel advisor-chat-panel">
             <div id="advisor-messages" class="advisor-messages" aria-live="polite"></div>
-            <!-- `POST /advisor/chat` persists an AuditEvent of the question
-                 itself, so it is admin-only (see
+            <!-- `POST /assistant/interpret`/`/assistant/execute` and
+                 `POST /advisor/chat` all persist an AuditEvent of the
+                 message itself, so this composer is admin-only (see
                  docs/WORK_ORDER_ADMIN_READONLY_PROFILES.md and
-                 `app.api.advisor_chat`'s docstring) -- hiding the form here
-                 is UX only, the real barrier is `_require_admin` in the
-                 backend. -->
+                 `app.api.advisor_chat`/`assistant_interpret`'s docstrings)
+                 -- hiding the form here is UX only, the real barrier is
+                 `_require_admin` in the backend. -->
             <form id="advisor-form" class="advisor-form admin-only">
-              <input name="message" id="advisor-input" autocomplete="off" required maxlength="1000" placeholder="Digite sua pergunta financeira...">
-              <button class="primary" type="submit">Analisar</button>
+              <input name="message" id="advisor-input" autocomplete="off" required maxlength="1000" placeholder="Conte o que aconteceu ou faça uma pergunta...">
+              <button class="primary" type="submit">Enviar</button>
             </form>
-            <p class="consulta-only muted-copy">Usuário de consulta não envia perguntas ao consultor (a pergunta é registrada como um evento auditável). Peça a um administrador da família.</p>
+            <p class="consulta-only muted-copy">Usuário de consulta não envia mensagens ao Assistente (a mensagem é registrada como um evento auditável). Peça a um administrador da família.</p>
           </article>
         </div>
+        <article class="panel" id="assistant-history-panel">
+          <div class="panel-heading"><div><span class="step-label">AUDITORIA</span><h2>Últimas ações do Assistente</h2><small>Cada ação registrada aqui pode ser desfeita quando reversível; quando não for, o motivo aparece no lugar do botão.</small></div></div>
+          <div id="assistant-actions-list"></div>
+        </article>
       </section>
 
       <section id="view-integrity" class="view">
@@ -729,7 +780,7 @@
             <label>Nome da conta central de liquidez<input name="investment_name" required><small>Ex.: Itaú Privilège DI</small></label>
             <label>Saldo atual confirmado da conta
               <input type="number" name="investment_balance" step="0.01" min="0" required>
-              <small>Este é o mesmo saldo da Visão geral. Ao salvar um novo valor, ele vira o saldo confirmado atual. Rentabilidade e IR alteram as projeções, não fabricam um saldo confirmado.</small>
+              <small>Este é o mesmo saldo do Dashboard Financeiro. Ao salvar um novo valor, ele vira o saldo confirmado atual. Rentabilidade e IR alteram as projeções, não fabricam um saldo confirmado.</small>
               <!-- FAMILY_FINANCE_PROFILE_BALANCE_HELP_V17 -->
             </label>
             <label>Retorno bruto anual<input type="number" name="investment_gross_annual_rate" step="0.0001" min="0" max="1" required><small>0,14 corresponde a 14% a.a.</small></label>
@@ -737,7 +788,20 @@
             <label>Projetar até<input type="date" name="projection_end" required></label>
             <div class="form-action"><button class="primary" type="submit">Salvar premissas</button></div>
           </form>
-          <div class="security-note"><strong>Como o Privilège DI funciona no sistema</strong><p>Ele é a conta central de liquidez da família: recebe a sobra do mês e cobre o déficit quando salário e outras receitas não bastam. Se o déficit superar o saldo, o Privilège zera e o restante aparece como dívida sem cobertura. O piso é uma meta de alerta, não dinheiro bloqueado.</p></div>
+          <div class="security-note"><strong>Como o Privilège DI funciona no sistema</strong><p>Ele é o caixa operacional remunerado da família: o dinheiro fica ali rendendo e é resgatado para a Conta Corrente quando for efetivamente usado. Aplicação e resgate só acontecem por movimento bancário observado/importado ou por confirmação explícita sua — o sistema nunca aplica a sobra do mês nem resgata automaticamente para cobrir déficit. Um resultado operacional negativo ou positivo é apenas o resultado econômico do período; sozinho, ele não é prova de resgate nem de aplicação. O piso é uma meta de alerta, não dinheiro bloqueado.</p></div>
+        </article>
+        <!-- October Go-Live Slice 5: "Importações" absorvida aqui -- a tela
+             view-imports continua existindo sem alteração, só o ponto de
+             entrada mudou de item principal de menu para este cartão. -->
+        <article class="panel settings-panel">
+          <div class="panel-heading"><div><span class="step-label">DADOS E IMPORTAÇÕES</span><h2>Importar documentos e cadastrar contas</h2><small>Extratos, faturas, holerites e cadastro de novas contas ou cartões.</small></div><button data-go="imports" class="secondary">Abrir importações</button></div>
+        </article>
+        <!-- October Go-Live Slice 5: Integridade não tem mais botão fixo em
+             #main-nav (fora da lista alvo); continua alcançável pelo banner
+             BLOCK/CRITICAL e por este cartão, visível só para administradores
+             com a flag `integrity_ui_enabled` (toggle em showApp()/app.js). -->
+        <article class="panel settings-panel hidden" id="settings-integrity-link">
+          <div class="panel-heading"><div><span class="step-label">FINANCIAL INTEGRITY ENGINE</span><h2>Integridade financeira</h2><small>Score, findings e fechamento mensal calculados apenas pelo motor determinístico.</small></div><button data-go="integrity" class="secondary">Ver integridade</button></div>
         </article>
         <article class="panel settings-panel" id="mfa-settings">
           <div class="panel-heading"><div><span class="step-label">SEGURANÇA</span><h2>Autenticação em duas etapas</h2></div></div>
@@ -771,7 +835,7 @@
         </article>
         <article class="panel settings-panel" id="due-notifications-settings">
           <div class="panel-heading"><div><span class="step-label">ALERTAS LOCAIS</span><h2>Notificações de vencimento no navegador</h2></div></div>
-          <p class="muted-copy">Avisos informativos sobre compromissos já cadastrados (o mesmo cálculo de vencimento usado em "Planejamento"). Nada é pago, criado, reclassificado ou conciliado automaticamente — é só um lembrete deste navegador.</p>
+          <p class="muted-copy">Avisos informativos sobre compromissos já cadastrados (o mesmo cálculo de vencimento usado em "Gastos &amp; Economia"). Nada é pago, criado, reclassificado ou conciliado automaticamente — é só um lembrete deste navegador.</p>
           <div id="due-notifications-status" class="security-note"></div>
           <div class="form-action">
             <button id="due-notifications-enable" class="primary" type="button">Ativar notificações no navegador</button>

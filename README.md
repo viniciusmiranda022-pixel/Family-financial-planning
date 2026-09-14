@@ -37,8 +37,8 @@ Esta primeira versão entrega:
 - exclusão auditada de registros manuais e desativação segura de acessos;
 - revisão assistida com correção de categoria e decisão de considerar ou ignorar cada item;
 - alertas de obrigações com 30 dias de antecedência e destaque nos últimos 7 dias;
-- consultor conversacional local para compras, fluxo mensal, vencimentos e cortes;
-- central “Lançar agora” com texto, gravação de áudio, foto, PDF, CSV e OFX;
+- Assistente Financeiro conversacional local para compras, fluxo mensal, vencimentos e cortes, além de registrar entradas/saídas/transferências/pagamentos por texto com confirmação antes de gravar;
+- captura assistida (a partir do Assistente Financeiro) com texto, gravação de áudio, foto, PDF, CSV e OFX;
 - OCR local de comprovantes, boletos, faturas, extratos e holerites;
 - transcrição local de áudio e prévia editável antes da gravação;
 - classificação assistida pelo Codex somente quando a regra local estiver ambígua;
@@ -151,11 +151,11 @@ sh ./scripts/setup-codex.sh
 
 Para acesso privado fora de casa, siga [docs/TAILSCALE.md](docs/TAILSCALE.md), que automatiza e verifica a publicação via `scripts/setup-tailscale.ps1`. Não abra a porta `8080` no roteador e não habilite o Tailscale Funnel.
 
-Na tela **Lançamentos**, despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo do Privilège DI, mas não entram nas receitas ou saídas operacionais. A visão geral mostra o saldo confirmado/atual do Privilège DI e uma projeção hipotética de sobra ou déficit para os próximos meses — mas um resultado do mês fechado, positivo ou negativo, nunca vira sozinho um resgate ou aplicação real: isso só acontece quando existe evidência de movimento real (extrato importado/observado) ou uma ação explicitamente confirmada. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
+No livro-razão de **Lançamentos** (dentro de **Relatórios**, a partir do October Go-Live Slice 5), despesas entram no consumo do teto. Aplicações e resgates atualizam o saldo do Privilège DI, mas não entram nas receitas ou saídas operacionais. A visão geral mostra o saldo confirmado/atual do Privilège DI e uma projeção hipotética de sobra ou déficit para os próximos meses — mas um resultado do mês fechado, positivo ou negativo, nunca vira sozinho um resgate ou aplicação real: isso só acontece quando existe evidência de movimento real (extrato importado/observado) ou uma ação explicitamente confirmada. Registros importados podem ser ignorados no cálculo sem perder a fonte; somente lançamentos manuais podem ser apagados definitivamente.
 
-O **Consultor** calcula localmente o veredito com regras financeiras auditáveis. Se o Codex estiver autenticado, recebe apenas pergunta, totais agregados, projeções e o veredito para produzir uma explicação; não recebe documentos, credenciais ou conexão com o banco. Para compras, informe pagamento à vista ou quantidade de parcelas e juros. Sem Codex, o consultor continua operando localmente.
+O **Assistente Financeiro** calcula localmente o veredito com regras financeiras auditáveis e também registra lançamentos: conte o que aconteceu (ex. "gastei R$150 de combustível hoje no Itaú") e confirme a proposta antes de qualquer gravação. Se o Codex estiver autenticado, recebe apenas pergunta, totais agregados, projeções e o veredito para produzir uma explicação, ou os campos já extraídos da sua mensagem para propor a ação; não recebe documentos, credenciais ou conexão com o banco. Para compras, informe pagamento à vista ou quantidade de parcelas e juros. Sem Codex, o Assistente continua operando localmente.
 
-Na central **Lançar agora**, toda extração gera uma prévia. Confira data, valor, conta, categoria e tipo antes de confirmar. O primeiro áudio pode demorar mais porque o modelo pequeno de transcrição é baixado para o volume local.
+A captura assistida (texto, áudio, foto, PDF, CSV ou OFX) é alcançada a partir do Assistente Financeiro; toda extração gera uma prévia. Confira data, valor, conta, categoria e tipo antes de confirmar. O primeiro áudio pode demorar mais porque o modelo pequeno de transcrição é baixado para o volume local.
 
 ## Carga da planilha consolidada
 
@@ -183,7 +183,7 @@ A carga inclui:
 - lançamentos consolidados das abas `Cartão - Dados`, `Nubank - Dados` e `Banco - Dados`;
 - envelopes de corte e pendências selecionadas da aba `Revisar`.
 
-O importador é idempotente: executar novamente atualiza registros reconhecidos e não duplica a carga. Depois dela, não reimporte os mesmos documentos históricos já cobertos pela planilha; use a tela **Importações** apenas para arquivos novos posteriores a 17/08/2026.
+O importador é idempotente: executar novamente atualiza registros reconhecidos e não duplica a carga. Depois dela, não reimporte os mesmos documentos históricos já cobertos pela planilha; use **Importações** (em **Configurações > Dados e importações**, a partir do October Go-Live Slice 5) apenas para arquivos novos posteriores a 17/08/2026.
 
 ## Diagnóstico mensal para conferência
 

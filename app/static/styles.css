@@ -83,6 +83,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--teal); box-shado
 .sidebar nav button { position: relative; display: flex; align-items: center; gap: 12px; width: 100%; border: 0; border-radius: 10px; color: #c4d2dc; background: transparent; padding: 11px 12px; text-align: left; font-weight: 650; }
 .sidebar nav button span { width: 21px; font-size: 18px; text-align: center; }
 .sidebar nav button.active, .sidebar nav button:hover { color: white; background: linear-gradient(110deg, rgba(37, 185, 154, .22), rgba(108, 99, 232, .22)); }
+.nav-separator { grid-column: 1 / -1; height: 1px; margin: 6px 4px; border: 0; background: rgba(255, 255, 255, .12); }
 .badge { min-width: 23px; margin-left: auto; padding: 3px 6px; border-radius: 999px; color: #fff; background: var(--amber); text-align: center; font-size: 11px; }
 .sidebar-footer { flex: 0 0 auto; margin-top: auto; border-top: 1px solid rgba(255,255,255,.12); padding: 17px 8px 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
 .text-button { border: 0; background: transparent; color: #70d7bd; font-weight: 800; }
@@ -122,6 +123,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--teal); box-shado
 .kpi { min-height: 145px; padding: 23px; border: 1px solid var(--line); border-radius: 15px; background: var(--surface); box-shadow: var(--shadow); }
 .kpi.highlight { background: var(--soft-green); border-color: #cbe9d8; }
 .kpi.warning { background: var(--soft-amber); border-color: #f3dfaa; }
+.kpi-actionable { cursor: pointer; transition: box-shadow .15s ease, transform .15s ease; }
+.kpi-actionable:hover, .kpi-actionable:focus-visible { box-shadow: 0 6px 18px rgba(16, 42, 67, .12); transform: translateY(-1px); }
+.kpi-actionable:focus-visible { outline: 2px solid var(--navy); outline-offset: 2px; }
 .kpi span, .kpi small { display: block; color: var(--muted); font-size: 12px; font-weight: 700; }
 .kpi strong { display: block; margin: 15px 0 7px; color: var(--navy); font-size: 29px; letter-spacing: -.04em; }
 .kpi.cash-in strong { color: var(--green); }
@@ -202,6 +206,12 @@ tr:last-child td { border-bottom: 0; }
 .status-chip.severity-review { color: #8a5a10; background: var(--soft-amber); }
 .status-chip.severity-warning { color: var(--navy-2); background: var(--soft-blue); }
 .status-chip.severity-info { color: var(--muted); background: #eef2f4; }
+/* October Go-Live Slice 5: REALIZADO / COMPROMETIDO / PREVISTO (rebaseline
+   §23) -- a distinct concept from the due-date/cycle status chips above,
+   never merged with them (Contas a pagar shows both side by side). */
+.status-chip.financial-state-realizado { color: var(--green); background: var(--soft-green); }
+.status-chip.financial-state-comprometido { color: var(--navy-2); background: var(--soft-blue); }
+.status-chip.financial-state-previsto { color: #8a5a10; background: var(--soft-amber); }
 .danger-button, .text-action { border: 0; border-radius: 8px; padding: 7px 9px; font-size: 10px; font-weight: 800; white-space: nowrap; }
 .danger-button { color: var(--red); background: #feeceb; }
 .text-action { color: var(--navy-2); background: var(--soft-blue); }
@@ -293,6 +303,23 @@ tr:last-child td { border-bottom: 0; }
 .advisor-metric.negative { border-color: #f0b7b2; background: #fff3f2; }
 .advisor-metric.negative strong { color: var(--red); }
 .advisor-reflection, .advisor-schedule { margin: 0 18px 18px; padding: 15px; border: 1px solid #ead69d; border-radius: 12px; background: #fffbef; }
+/* October Go-Live Slice 5: Assistente Financeiro typed-action cards
+   (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_5.md) -- reuse the advisor chat
+   bubble/card system above instead of a second visual language. */
+.assistant-proposal-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+.assistant-proposal-grid .advisor-metric strong { white-space: normal; word-break: break-word; }
+.assistant-proposal-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 3px 18px 18px; }
+.assistant-candidate-list { display: flex; flex-direction: column; gap: 6px; padding: 0 18px 18px; }
+.assistant-candidate { text-align: left; }
+.type-template-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 13px; }
+.type-template-chips small { color: var(--muted); font-weight: 700; margin-right: 2px; }
+.type-template-chip { padding: 6px 13px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--navy); font-size: 12px; font-weight: 650; }
+.type-template-chip:hover { border-color: var(--green); color: var(--green); }
+#assistant-actions-list { display: grid; gap: 8px; }
+.assistant-action-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 15px; border: 1px solid var(--line); border-radius: 12px; }
+.assistant-action-row small { display: block; color: var(--muted); margin-top: 2px; }
+.advisor-message.assistant .assistant-proposal-actions .primary,
+.advisor-message.assistant .assistant-proposal-actions .secondary { padding: 8px 14px; font-size: 13px; }
 .advisor-section-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 11px; }
 .advisor-section-heading h4 { margin: 0; color: var(--navy); font-size: 14px; }
 .advisor-section-heading small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }

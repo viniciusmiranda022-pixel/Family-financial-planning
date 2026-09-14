@@ -561,7 +561,9 @@ template quando normalizam igual.
   único endpoint por ação tipada, sem introduzir uma transação composta de dois efeitos.
 - Nenhuma UI nova: o Slice 5 é o dono da navegação/apresentação alvo
   (`docs/OCTOBER_GO_LIVE_REBASELINE.md` §19 Slice 5); este slice entrega o contrato de API completo
-  e testado, pronto para a tela "Assistente Financeiro" consumir.
+  e testado, pronto para a tela "Assistente Financeiro" consumir. **Atualização (Slice 5):** a tela
+  "Assistente Financeiro" (`#view-advisor`) já consome exatamente este contrato -- ver a seção
+  abaixo.
 - A checagem prévia de duplicidade provável (bloqueio 4 da revisão de engenharia do PR #92) só se
   aplica a `create_expense`/`create_income`: é o único par de ações tipadas que cria uma
   `Transaction` do zero através do motor de duplicidade genérico
@@ -570,6 +572,145 @@ template quando normalizam igual.
   `pay_card_invoice` já detecta e reutiliza um pagamento idêntico (`idempotent_replay`) via
   `app.services.card_invoice_lifecycle.pay_invoice`; `register_refund` depende das próprias
   invariantes de vínculo (INV-027). Nenhuma dessas três precisa de uma segunda checagem redundante.
+
+## Navegação e UX final (October Go-Live Slice 5, P0 #87)
+
+`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_5.md`, `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.6 e
+"Slice 5 -- puramente frontend". Sem endpoint novo, sem migration, sem segundo motor de cálculo:
+`app/templates/index.html` e `app/static/app.js` foram reorganizados para expor exatamente a
+navegação alvo do rebaseline, reaproveitando os contratos já integrados nos Slices 1-4.
+
+**Inventário legado -> destino** (a seção `#main-nav` de `index.html` documenta a mesma lista
+inline):
+
+| Legado | Destino | Mecanismo |
+| --- | --- | --- |
+| `Lançar agora` | Sem item principal; captura assistida por foto/áudio/documento continua em `#view-capture`, alcançável a partir do Assistente Financeiro (`data-go="capture"`). Captura por texto passa a ser o próprio Assistente (`/assistant/interpret`). | link contextual |
+| `Rendas` | `Entradas` | fusão completa: `commission-form`/`payroll-form` e suas tabelas viraram parte de `#view-entradas`; `loadEntradas()` chama `loadIncome()` |
+| `Transferências` | ação contextual em `Entradas`/`Saídas` | `#view-transferencias` inalterada, só o ponto de entrada muda (`data-go="transferencias"`) |
+| `Importações` | `Configurações > Dados e importações` | link contextual (`data-go="imports"`) |
+| `Lançamentos` | `Relatórios` (livro-razão/auditoria) | link contextual (`data-go="transactions"`) |
+| `Revisar` | alerta contextual no Dashboard | o KPI "Pendências" (`#kpi-reviews`) é clicável/navegável por teclado (`data-go="reviews"` + `role="button"`); sem badge fixa em nav |
+| `Planejamento` | Cadastro de obrigação -> `Contas a pagar`; projeção/calendário/simulação de compra -> `Gastos & Economia` (mesma view, `id="view-planning"`) | ver nota abaixo |
+| `Integridade` | banner BLOCK/CRITICAL + `Configurações` (admin, quando `integrity_ui_enabled`) | não fazia parte da lista alvo da navegação principal; `#settings-integrity-link` |
+
+**Por que "Planejamento" virou dois destinos:** o rebaseline (§2) é explícito --
+"**Contas a pagar** contém cadastro, conferência e pagamento de compromissos/faturas" -- então
+`#obligation-form` (cadastro) e a exclusão de obrigação saíram de `#view-planning` e entraram em
+`#view-payables`, junto da conferência/pagamento que já estava lá (`payablesObligationRow`, agora
+com grupo/repetição/exclusão -- as mesmas colunas que a tabela antiga de Planejamento tinha, só que
+em uma única tabela em vez de duas divergentes). `Gastos & Economia` (renomeação de rótulo de
+`pageNames.planning`, mesma `id="view-planning"`/`loadForecast()`) ficou só com o que é
+projeção/economia de fato: cenário conservador, calendário consolidado e comparação de cenários de
+compra -- a análise mais profunda (tendências, categorias, anomalias --
+rebaseline §"Slice 7 -- Gastos & Economia + Relatórios") é escopo do **Slice 7**, ainda não
+implementado. O Dashboard ganhou um card de projeção compacto (`renderDashboardProjection`) que
+reusa a mesma resposta de `GET /forecast` (nenhuma segunda chamada com lógica própria) para
+satisfazer "projeção no Dashboard" sem recortar a tela cheia.
+
+**Risco de concorrência encontrado e corrigido durante este slice (verificação end-to-end com
+Playwright real, não só a suíte estática):** tornar `GET /forecast` incondicional em
+`loadDashboard()` o colocou no mesmo `Promise.all` de `GET /dashboard` -- as duas rotas chamam
+`build_snapshot()` (`app/services/financial_snapshots.py`) como get-or-create para o mesmo
+household/período, e a concorrência abria uma janela TOCTOU (as duas veem "sem snapshot ainda" e
+as duas tentam inserir; a segunda viola a constraint UNIQUE de `financial_snapshots` e retorna
+500). Essa mesma race já existia antes deste slice para visualizações de mês futuro (`/forecast`
+já rodava dentro do mesmo `Promise.all` quando `isFutureMonth` era verdadeiro) -- tornar a chamada
+incondicional só tornou a exposição praticamente garantida em vez de rara. Corrigido sequenciando
+`/dashboard` sozinho primeiro em `loadDashboard()`, sem tocar `build_snapshot()`: por escopo, este
+slice é puramente frontend e o Work Order pede para não desviar para hardening do Financial
+Integrity Engine. **Risco residual registrado para hardening futuro:** `build_snapshot()` em si
+ainda não tem nenhum lock (nada equivalente ao `SELECT ... FOR UPDATE` que `execute_typed_action`
+já usa para o INV-032), então dois clientes genuinamente concorrentes (dois membros da família
+abrindo o Dashboard no mesmo instante) ainda podem colidir.
+
+**Decisão de design em aberto para revisão:** a absorção de `Transferências`/`Importações`/
+`Lançamentos`/`Revisar` usa links contextuais (`data-go`) para a view legada, que continua roteável
+e com seu HTML intacto, em vez de recortar o HTML dessas views para dentro de abas aninhadas nas
+telas novas. Isso preserva 100% do comportamento/testes já existentes com o menor diff possível,
+mas significa que, por exemplo, "Transferências" ainda é uma tela própria (só sem botão fixo no
+menu) em vez de um conjunto de campos embutidos dentro de `Entradas`/`Saídas`. Se o engenheiro
+responsável preferir a fusão de DOM completa, é um refinamento incremental sem impacto em dado ou
+contrato.
+
+**Assistente Financeiro (`#view-advisor`) agora consome o contrato tipado do Slice 4.** Antes deste
+slice, a tela só falava com `POST /advisor/chat` (consultor Q&A, inalterado). Agora toda mensagem
+passa primeiro por `POST /assistant/interpret` (`app/static/app.js::sendAssistantMessage`):
+
+- `proposal.can_execute` -> `renderAssistantProposal` mostra os campos da proposta (traduzindo
+  `account_id`/`category_id` para nome usando `state.accounts`/`state.categories`, já carregados --
+  nunca uma segunda consulta) com "Confirmar e registrar"/"Cancelar"; só o clique em confirmar chama
+  `POST /assistant/execute` com o `proposal_id` do servidor (`executeAssistantProposal`) -- o
+  cliente nunca serializa `typed_action`/`payload` (regressão coberta em
+  `tests/test_october_go_live_slice5_navigation.py::
+  test_assistant_execute_never_sends_typed_action_or_payload`).
+- `proposal.candidate_kind == "possible_duplicate"` -> `renderAssistantDuplicateChoice` oferece
+  exatamente `Pular`/`Importar mesmo assim`/`Ver existente`; qualquer escolha volta para
+  `POST /assistant/interpret` com `duplicate_resolution` (nunca escreve antes de uma decisão
+  humana explícita).
+- `proposal.candidates` genérico (conta/obrigação/fatura ambígua) -> `renderAssistantCandidates`
+  lista as opções; clicar uma reenvia o rótulo da opção como a próxima mensagem do usuário
+  (o mesmo `POST /assistant/interpret`, com histórico acumulado) -- a resolução de ambiguidade é
+  sempre conversacional, nunca um campo extra que o cliente inventa.
+- Intent não reconhecido (`interpretation.available=false` ou `intent` em `null`/`query`/`unknown`)
+  -> a mensagem cai no `answerAdvisorQuestion` já existente (`POST /advisor/chat`), preservando o
+  consultor Q&A original como um modo, não um motor paralelo.
+- Execução bem-sucedida -> `renderAssistantExecutionResult` mostra o resultado e um botão
+  "Desfazer" só quando `action.undoable` é verdadeiro; quando falso, mostra
+  `action.non_reversible_reason` no lugar do botão (nunca um botão desabilitado sem explicação). Um
+  painel de auditoria (`#assistant-actions-list`, `loadAssistantActionsPanel`) lista
+  `GET /assistant/actions` com o mesmo botão de desfazer por linha.
+
+**"Outra entrada"/"Outra saída" (Slice 4 `entry_type_templates`, apresentação apenas neste
+slice):** `renderTypeTemplateChips` lista `GET /entry-type-templates?movement_type=...&active_only=
+true` como chips acima de `#income-entry-form`/`#expense-entry-form`; clicar um chip só preenche a
+Descrição (e a Categoria, quando o template tiver uma) -- o lançamento só é gravado quando o
+formulário é enviado. Depois que `POST /transactions` confirma a criação,
+`recordEntryTypeObservation` registra a observação em `POST /entry-type-templates` (best-effort,
+nunca bloqueia nem reverte o lançamento já persistido). Nenhuma lógica de aprendizado nova: ativação
+(três confirmações + administrador) continua inteiramente no Slice 4/backend.
+
+### Correções da revisão de engenharia (PR #93, 2026-09-14)
+
+A revisão técnica do engenheiro responsável bloqueou o head inicial deste slice em três pontos
+normativos; os três foram corrigidos no mesmo PR, sem migration e sem segundo motor:
+
+1. **Cópia legada do Privilège em `#view-settings`.** O texto explicativo do Privilège ainda dizia
+   "recebe a sobra do mês e cobre o déficit quando salário e outras receitas não bastam" --
+   ensinando exatamente a regra proibida do rebaseline §4.3
+   (`resultado_operacional < 0 -> fabricar liquidity_withdrawal`, e o espelho de sobra/aplicação).
+   O texto foi reescrito para afirmar a semântica normativa (§4.2/§4.3): aplicação/resgate só por
+   movimento bancário observado/importado ou confirmação explícita, nunca por sobra/déficit do
+   período. Regressão:
+   `test_privilege_settings_copy_never_teaches_synthetic_deficit_surplus_rule`
+   (`tests/test_october_go_live_slice5_navigation.py`), que falha se qualquer uma das frases
+   proibidas voltar a aparecer no cartão.
+
+2. **`Contas a pagar` não expunha REALIZADO/COMPROMETIDO/PREVISTO.** O backend já calculava esse
+   estado canônico havia um slice inteiro (`GET /obligations`'s `financial_state`, Slice 3;
+   `card_invoice_lifecycle.serialize_card_invoice`'s `financial_state`, Slice 2/3) mas o frontend
+   nunca o lia -- só `alert_label` (urgência de vencimento) e `status`/cycle. `financialStateChip()`
+   (novo, `app/static/app.js`) renderiza literalmente o que o backend já devolve, sem nenhum cálculo
+   ou inferência no cliente, em uma coluna "Estado financeiro" própria (nunca misturada com
+   `alert_label`/`status`) tanto em `payablesObligationRow` quanto na tabela de faturas de cartão.
+   Três classes CSS distintas (`financial-state-realizado/comprometido/previsto`) provam que os três
+   estados nunca colapsam em um único rótulo. Regressão:
+   `test_payables_shows_realizado_comprometido_previsto_without_mixing`.
+
+3. **Aprendizado de tipo observava toda descrição, não só o fluxo "Outra".** Todo
+   `POST /transactions` (mesmo "Supermercado", "Combustível posto X") chamava
+   `recordEntryTypeObservation` incondicionalmente, tratando qualquer descrição livre como candidata
+   a virar um tipo reutilizável -- exatamente o que o rebaseline §8.2/§9 proíbe (tipo, categoria e
+   descrição são conceitos diferentes). Adicionado um checkbox opt-in, desmarcado por padrão, sem
+   atributo `name` (nunca serializado no payload de `/transactions`): `#income-save-as-type`/
+   `#expense-save-as-type`, "Repito este tipo com frequência -- salvar/reforçar como tipo
+   reutilizável". `recordEntryTypeObservation` só é chamado quando o checkbox está marcado. Clicar em
+   um chip de tipo já aprendido marca o checkbox automaticamente (reusar um tipo confirmado já é a
+   confirmação explícita); editar a Descrição manualmente desmarca (o rótulo não é mais o que foi
+   confirmado). Nenhuma lógica de aprendizado nova -- mesmo `record_observed_entry`/contrato do
+   Slice 4, só o gatilho do cliente ficou explícito. Regressão:
+   `test_entry_type_observation_is_gated_by_explicit_outra_entrada_saida_opt_in`,
+   `test_type_template_chip_click_checks_the_explicit_save_as_type_box`.
 
 ## Comparação visual de cenários de compra (Fase 3)
 
