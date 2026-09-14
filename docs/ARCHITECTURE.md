@@ -901,10 +901,23 @@ usam:
 - `card_invoices`: `app.services.card_invoice_lifecycle.list_invoices`/`serialize_card_invoice`
   (o mesmo par `GET /card-invoices` usa; `serialize_card_invoice` já inclui `financial_state`).
 - `obligations`: `app.api._obligation_rows` (o mesmo `GET /obligations`/`/dashboard` usam; já
-  retorna `financial_state` REALIZADO/COMPROMETIDO por linha).
-- `financial_states.comprometido`: soma de `report_obligations_pending_total` +
-  `outstanding_balance()` sobre as mesmas faturas fechadas/parcialmente pagas -- os mesmos dois
-  totais que `/dashboard`'s `noncanonical.commitments` já publica.
+  retorna `financial_state` REALIZADO/COMPROMETIDO por linha). Ganhou um parâmetro opcional
+  `due_before` (engineering review, PR #95, Round 1, item 1): `/reports` chama
+  `_obligation_rows(..., due_before=end)` para ancorar COMPROMETIDO ao `end_month` do próprio
+  relatório -- uma obrigação com vencimento *depois* do fechamento do período não "aconteceu" como
+  compromisso ainda naquele instante, então um relatório histórico não pode deixá-la contaminar sua
+  própria leitura. Todo outro chamador (`/dashboard`, `GET /obligations`, o Assistente) continua
+  passando `due_before=None` -- comportamento inalterado.
+- `financial_states.comprometido`: `report_obligations_pending_total` (soma das linhas já ancoradas
+  acima) + o outstanding de faturas fechadas/parcialmente pagas, também ancorado a
+  `invoice.competence <= end_month`. A soma de faturas usa apenas a fatura de **maior competência
+  elegível por conta** (`latest_outstanding_invoice_by_account`), nunca a soma de todas -- o próprio
+  `outstanding_balance()` já inclui `principal_carried_in` (o saldo não pago da fatura anterior), de
+  modo que somar `outstanding_balance()` de duas faturas consecutivas do mesmo cartão contaria o
+  saldo carregado duas vezes. `GET /dashboard`'s `_forecast_card_invoices` tem essa mesma lacuna
+  latente (soma sem esse cuidado) -- ficou registrada como Technical Challenge no PR #95 em vez de
+  corrigida aqui, porque seu próprio agrupamento por mês de vencimento (usado por `GET /forecast`)
+  é uma mudança de escopo maior (Slice 1/3), fora deste Work Order.
 - `financial_states.previsto`: **deliberadamente restrito** ao salário recorrente configurado do
   período seguinte ao relatório, via `app.services.recurring_income.reconcile_recurring_income` (a
   mesma função `GET /forecast` usa) -- nunca uma comissão (rebaseline §8.3/INV-031) e nunca uma
@@ -923,7 +936,24 @@ exigem a série mensal por categoria (não só o total do período). Em vez de d
 `GET /spending-economy` chama `_build_report_payload` uma vez e deriva `tendencias`/
 `oportunidades_economia` com aritmética pura (variação percentual mês a mês e contra a própria
 média histórica -- `app.api._category_trends`/`_spending_opportunities`) sobre esses números já
-canônicos.
+canônicos. `seus_dados.origem_por_conta_cartao` (engineering review, PR #95, Round 1, item 2 --
+a dimensão "origem por conta/cartão" que o Work Order lista como obrigatória) é `report["accounts"]`
+copiado verbatim -- a mesma agregação por conta que `GET /reports` já publica -- nunca uma terceira
+soma; é explicativa (onde o consumo aconteceu), nunca redefine o conceito de gasto de
+`categories`/`summary`.
+
+**Fluxo de caixa por conta agora inclui o pagamento de fatura (Slice 1, engineering review PR #95,
+Round 1, item 3).** `account_cash_flow_rows`/`GET /reports`' `accounts` (e `GET /dashboard`'s
+`cash_flow_by_account`, a mesma função) publicam, por conta, quanto saiu fisicamente dela --
+rebaseline §16 "Quanto saiu desta conta? -- débitos físicos daquela conta, incluindo pagamento de
+fatura e transferências". Antes deste PR, o débito de conta corrente que paga uma fatura (a perna
+`card_payments` de uma `reconciliation`, em `app.services.financial_snapshots._collect`) nunca
+entrava em nenhuma linha de `accounts` -- a conta que pagou a fatura simplesmente não aparecia na
+visão "fluxo de caixa por conta", embora o dinheiro tivesse saído de verdade. `card_payments` foi
+adicionado ao conjunto de métricas que alimentam `accounts[...].gross_out` (logo `cash_out`/
+`bank_cash_out`) sem tocar `totals["expenses"]`/`categories` -- o pagamento de fatura continua nunca
+contando como um segundo gasto (`total_spending`/`total_bank_cash_out` agregados, que vêm de
+`totals`, ficam exatamente como estavam).
 
 **Separação "Seus dados / Referências externas / Análise / Recomendação" (rebaseline §14).** O
 Advisor sidecar (`advisor/server.mjs`) não tem acesso à internet nem provedor de busca externa
