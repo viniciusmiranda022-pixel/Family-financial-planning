@@ -39,6 +39,8 @@ KNOWN_INTENTS = (
     "pay_obligation",
     "pay_card_invoice",
     "register_refund",
+    "update_asset_value",
+    "register_asset_contribution",
     "query",
     "unknown",
 )
