@@ -653,3 +653,35 @@ camada de serialização, exatamente como recomendado:
   individual) continua funcionando e já é coberto pela nova suíte funcional. Mudar esse contrato
   criaria uma decisão de design nova (qual ocorrência? como marcar as demais?) fora do escopo restrito
   deste slice — registrado aqui para o Slice 4/5 avaliar se necessário.
+
+### 11.1 Round 2 — correções da revisão de engenharia (PR #91, 2026-09-14)
+
+A revisão do engenheiro responsável bloqueou o head `1cf165c` (`BLOCKING CHANGES REQUIRED`) com
+quatro pontos materiais. Nenhum foi contestado por Technical Challenge — todos eram violações reais
+e concretas, com evidência de código, confirmadas ao investigar:
+
+1. **Comissão pendente inflava a projeção automaticamente**, violando o rebaseline §8.3 de forma
+   direta: INV-029 (Round 1) só protegia uma comissão *já recebida* de reentrar; nada impedia a
+   inclusão automática de toda comissão pendente antes disso. Corrigido:
+   `_build_projection_gate_checks` nunca mais deriva `ForecastInput.commissions` de `Commission`
+   — sempre uma tupla vazia. Nova **INV-031** prova isso contra a saída real de `build_projection`.
+   `GET /commissions` mantém `financial_state` como rótulo puramente descritivo.
+2. **`reconcile_recurring_income` podia promover renda errada por coincidência de valor** — valor +
+   competência, sem exigir nenhuma evidência de identidade, e um desempate silencioso quando havia
+   mais de um candidato. Corrigido: exige `owner_label` explícito ou marcador de descrição de folha
+   de pagamento; múltiplos candidatos identificados mantêm PREVISTO com `ambiguous=True` exposto em
+   `GET /forecast` (`salary_reconciliation_ambiguous`), em vez de escolher um por desempate.
+3. **`CardInvoice.open` rotulado REALIZADO** conflava o estado da fatura-como-obrigação com o estado
+   das compras (já REALIZADO) dentro dela. Corrigido: `open` passa a PREVISTO (total ainda não
+   consolidado, rebaseline §6.2); `closed`/`partially_paid` continuam COMPROMETIDO; `paid` continua
+   REALIZADO.
+4. **Dashboard/relatório sem prova de paridade de ponta a ponta.** `GET /dashboard` ganhou
+   `noncanonical.commitments` (COMPROMETIDO, mesmas fontes de `GET /obligations`/`GET /forecast`,
+   respondendo rebaseline §44); `GET /reports` permanece REALIZADO-only por construção (nunca lê
+   `Obligation`/`CardInvoice` diretamente) — regressão coberta por teste dedicado provando que um
+   compromisso pendente não vaza para `spending`/`cash_out`.
+
+Nenhuma migration nova; nenhum dado real alterado. `FINANCIAL_RULES_VERSION` avançou de `2026.10.2`
+para `2026.10.3`. Ver `docs/FINANCIAL_INVARIANTS.md` (Controle de mudança, Slice 3 Round 2) e
+`docs/ARCHITECTURE.md` ("Obrigações e projeção REALIZADO/COMPROMETIDO/PREVISTO") para o detalhamento
+técnico completo.

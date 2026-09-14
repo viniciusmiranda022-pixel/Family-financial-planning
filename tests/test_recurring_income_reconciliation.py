@@ -28,6 +28,9 @@ from app.models import Account, Household, Transaction  # noqa: E402
 from app.services.financial_state import PREVISTO, REALIZADO  # noqa: E402
 from app.services.recurring_income import reconcile_recurring_income  # noqa: E402
 
+_NON_SALARY_DESCRIPTION = "Reembolso viagem"
+_NON_SALARY_NORMALIZED = "REEMBOLSO VIAGEM"
+
 
 def _session_factory():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -64,6 +67,8 @@ def _income(
     possible_duplicate: bool = False,
     transaction_type: str = "income",
     booked_at: date | None = None,
+    description: str = "Salário",
+    normalized_description: str = "SALARIO",
 ) -> str:
     booked_at = booked_at or date(int(competence[:4]), int(competence[5:7]), 5)
     with session_factory() as db:
@@ -73,8 +78,8 @@ def _income(
             booked_at=booked_at,
             occurred_at=booked_at,
             competence=competence,
-            description="Salário",
-            normalized_description="SALARIO",
+            description=description,
+            normalized_description=normalized_description,
             amount=Decimal(amount),
             transaction_type=transaction_type,
             owner_label=owner_label,
@@ -227,7 +232,12 @@ def test_expense_transaction_of_same_amount_never_matches() -> None:
     assert result.candidate_count == 0
 
 
-def test_multiple_candidates_picks_closest_amount_deterministically() -> None:
+def test_multiple_identified_candidates_stays_previsto_and_ambiguous() -> None:
+    # October Go-Live Slice 3, Round 2 of PR #91's review: "não escolher
+    # `best` por tie-break e tratar como fato" -- two transactions that both
+    # look like the salary (amount + competence + identity evidence) must
+    # never be silently resolved to one of them. The period stays PREVISTO
+    # and the ambiguity is surfaced instead.
     session_factory = _session_factory()
     household_id = _household(session_factory)
     account_id = _account(session_factory, household_id=household_id)
@@ -253,8 +263,71 @@ def test_multiple_candidates_picks_closest_amount_deterministically() -> None:
         result = reconcile_recurring_income(
             db, household_id=household_id, period="2026-11", expected_amount=Decimal("5000.00")
         )
-    # Exact match wins over a same-tolerance-band alternative.
-    assert result.matched_transaction_id == far_id
+    assert result.financial_state == PREVISTO
+    assert result.matched_transaction_id is None
+    assert result.ambiguous is True
+    assert result.candidate_count == 2
+
+
+def test_description_without_salary_marker_never_promotes_to_realizado() -> None:
+    # October Go-Live Slice 3, Round 2: amount + competence alone is not
+    # identity evidence -- a coincidentally same-value reimbursement must
+    # never be silently promoted to "the salary".
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    account_id = _account(session_factory, household_id=household_id)
+    _income(
+        session_factory,
+        household_id=household_id,
+        account_id=account_id,
+        amount="5000.00",
+        competence="2026-11",
+        description=_NON_SALARY_DESCRIPTION,
+        normalized_description=_NON_SALARY_NORMALIZED,
+    )
+
+    with session_factory() as db:
+        result = reconcile_recurring_income(
+            db, household_id=household_id, period="2026-11", expected_amount=Decimal("5000.00")
+        )
+    assert result.financial_state == PREVISTO
+    assert result.matched_transaction_id is None
+    assert result.ambiguous is False
+    assert result.candidate_count == 1
+
+
+def test_single_salary_marked_candidate_among_non_salary_ones_is_realizado() -> None:
+    # A genuine payroll credit is still found even when an unrelated
+    # same-amount, same-competence income also exists -- because only the
+    # marked one carries identity evidence, there is exactly one identified
+    # candidate, not an ambiguity.
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    account_id = _account(session_factory, household_id=household_id)
+    salary_id = _income(
+        session_factory,
+        household_id=household_id,
+        account_id=account_id,
+        amount="5000.00",
+        competence="2026-11",
+    )
+    _income(
+        session_factory,
+        household_id=household_id,
+        account_id=account_id,
+        amount="5000.00",
+        competence="2026-11",
+        description=_NON_SALARY_DESCRIPTION,
+        normalized_description=_NON_SALARY_NORMALIZED,
+    )
+
+    with session_factory() as db:
+        result = reconcile_recurring_income(
+            db, household_id=household_id, period="2026-11", expected_amount=Decimal("5000.00")
+        )
+    assert result.financial_state == REALIZADO
+    assert result.matched_transaction_id == salary_id
+    assert result.ambiguous is False
     assert result.candidate_count == 2
 
 
@@ -297,3 +370,35 @@ def test_owner_label_filter_restricts_candidates() -> None:
         )
     assert result.financial_state == PREVISTO
     assert result.candidate_count == 0
+
+
+def test_owner_label_is_sufficient_identity_evidence_without_salary_marker() -> None:
+    # October Go-Live Slice 3, Round 2: an explicit `owner_label` is itself
+    # real, already-persisted identity evidence -- the query narrows to that
+    # one person's transactions, so a description marker is not additionally
+    # required to promote the match to REALIZADO.
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    account_id = _account(session_factory, household_id=household_id)
+    txn_id = _income(
+        session_factory,
+        household_id=household_id,
+        account_id=account_id,
+        amount="5000.00",
+        competence="2026-11",
+        owner_label="Kelly",
+        description=_NON_SALARY_DESCRIPTION,
+        normalized_description=_NON_SALARY_NORMALIZED,
+    )
+
+    with session_factory() as db:
+        result = reconcile_recurring_income(
+            db,
+            household_id=household_id,
+            period="2026-11",
+            expected_amount=Decimal("5000.00"),
+            owner_label="Kelly",
+        )
+    assert result.financial_state == REALIZADO
+    assert result.matched_transaction_id == txn_id
+    assert result.ambiguous is False

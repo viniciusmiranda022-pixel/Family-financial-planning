@@ -22,7 +22,7 @@ from typing import Any
 # a received Commission and a reconciled recurring income never re-enter the
 # forward projection as a second, duplicated income fact. See
 # docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md.
-FINANCIAL_RULES_VERSION = "2026.10.2"
+FINANCIAL_RULES_VERSION = "2026.10.3"
 MONEY_TOLERANCE = Decimal("0.01")
 PROBABLE_DUPLICATE_THRESHOLD = Decimal("0.60")
 STRONG_DUPLICATE_THRESHOLD = Decimal("0.85")
@@ -897,6 +897,43 @@ def validate_received_commission_excluded_from_projection(
         expected={"received_commissions_in_projection": []},
         actual={"received_commissions_in_projection": overlap},
         difference=Decimal(len(overlap)),
+    )
+
+
+def validate_no_automatic_unreceived_commission_in_projection(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-031 (October Go-Live Slice 3, Round 2 of PR #91's review): the
+    rebaseline's primary commission rule -- "Comissões nunca entram como
+    receita PREVISTA automaticamente ... não deve inflar projeções futuras
+    por expectativa" (`docs/OCTOBER_GO_LIVE_REBASELINE.md` §8.3) -- is
+    broader than INV-029 (which only guards a commission *already marked
+    received* from re-entering). This proves the primary rule directly: no
+    matter how many unreceived, non-cancelled `Commission` rows exist for the
+    household, the canonical projection's `commission_expected`/
+    `commission_delayed` totals across the whole displayed horizon are
+    always zero -- there is no explicit, audited opt-in mechanism yet, so
+    the only correct automatic contribution is none."""
+
+    total = _decimal(context, "total_projected_commission")
+    unreceived_count = _integer(context, "unreceived_commission_count")
+    matches = total == 0
+    return _result(
+        definition,
+        context,
+        InvariantStatus.PASS if matches else InvariantStatus.FAIL,
+        (
+            f"Nenhuma das {unreceived_count} comissões pendentes inflou a projeção "
+            "automaticamente."
+            if matches
+            else (
+                f"A projeção somou R$ {total} em comissões pendentes automaticamente -- "
+                "violação direta do rebaseline §8.3."
+            )
+        ),
+        expected=Decimal("0.00"),
+        actual=total,
+        difference=_money(total),
     )
 
 

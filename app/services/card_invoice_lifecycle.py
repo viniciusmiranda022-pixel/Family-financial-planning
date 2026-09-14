@@ -48,7 +48,7 @@ from sqlalchemy.orm import Session
 
 from app.services.card_competence import card_invoice_window
 from app.services.finance import add_months, money, month_key
-from app.services.financial_state import COMPROMETIDO, REALIZADO
+from app.services.financial_state import COMPROMETIDO, PREVISTO, REALIZADO
 from app.services.reconciliation import RECONCILIATION_TOLERANCE
 
 # Same category name every card-payment leg in this project already uses
@@ -752,16 +752,34 @@ def serialize_invoice_purchase_line(transaction: Any) -> dict[str, Any]:
 
 
 def invoice_financial_state(invoice: Any) -> str:
-    """October Go-Live Slice 3: an invoice `closed`/`partially_paid` is a
-    real, contracted-but-unliquidated payable -- COMPROMETIDO (rebaseline
-    §3/§6.2, "fatura fechada ainda não paga"). `open` (still accruing -- its
-    purchases already are individually REALIZADO, rebaseline §6.1) and
-    `paid` (liquidated) both describe a state with nothing left owed, so
-    neither is a pending commitment; label the invoice-as-payable itself
-    REALIZADO in both cases rather than inventing a fourth bucket outside
-    the rebaseline's three."""
+    """October Go-Live Slice 3, Round 2 of PR #91's review: this label
+    describes the *invoice itself* as a settlement/payable object -- never
+    the individual purchases inside it, which are already, separately,
+    REALIZADO the moment they are booked (rebaseline §6.1) regardless of
+    what state their invoice is in. Reusing REALIZADO for an `open` invoice
+    because its underlying purchases already happened conflated those two
+    different things: an `open` invoice has not even reached "fechada, total
+    consolidado" yet (rebaseline §6.2) -- its running total can still grow
+    with new purchases, so as a payable it is not a fixed, liquidated fact.
 
-    return COMPROMETIDO if invoice.status in ("closed", "partially_paid") else REALIZADO
+    - `paid`: the payable was actually liquidated -- a real, evidenced cash
+      event happened. REALIZADO.
+    - `closed`/`partially_paid`: the total is consolidated and contracted,
+      the desembolso (remaining balance) has not happened yet. COMPROMETIDO
+      (rebaseline §3/§6.2, "fatura fechada ainda não paga").
+    - `open`: still accruing, not yet consolidated -- an estimate of what
+      will be owed once it closes, not a rigid obligation yet (rebaseline
+      §23's PREVISTO: "estimativa futura, sem obrigação rígida"). Neither a
+      liquidated fact nor a fixed commitment, so it gets the third bucket
+      instead of overloading REALIZADO or COMPROMETIDO with a second
+      meaning.
+    """
+
+    if invoice.status == "paid":
+        return REALIZADO
+    if invoice.status in ("closed", "partially_paid"):
+        return COMPROMETIDO
+    return PREVISTO
 
 
 def serialize_card_invoice(invoice: Any) -> dict[str, Any]:

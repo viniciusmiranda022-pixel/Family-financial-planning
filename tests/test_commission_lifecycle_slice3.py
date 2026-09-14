@@ -158,11 +158,47 @@ def test_commission_receive_rejects_missing_commission() -> None:
         assert response.status_code == 404
 
 
-def test_received_commission_excluded_from_forecast_projection() -> None:
-    """INV-029: a commission expected within the forecast horizon disappears
-    from every scenario's projected income the moment it is marked received
-    -- the real credit is assumed to already exist as a fact elsewhere, so
-    projecting it again would duplicate income."""
+def test_unreceived_commission_never_enters_forecast_projection() -> None:
+    """INV-031 (October Go-Live Slice 3, Round 2 of PR #91's review):
+    rebaseline §8.3 -- "Comissões nunca entram como receita PREVISTA
+    automaticamente ... não deve inflar projeções futuras por expectativa."
+    A pending, not-yet-received commission contributes exactly zero to every
+    scenario's projected income, before *and* after it exists -- there is no
+    explicit opt-in mechanism, so the only correct automatic contribution is
+    none."""
+
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+
+        before = client.get("/api/forecast")
+        assert before.status_code == 200
+        commission_before = sum(
+            Decimal(str(row["commission_expected"])) for row in before.json()["rows"]
+        )
+        assert commission_before == Decimal("0.00")
+
+        created = client.post(
+            "/api/commissions",
+            json={"description": "Comissão a receber", "expected_date": "2027-01-01", "gross_amount": "10000.00"},
+        )
+        assert created.status_code == 201, created.text
+
+        after = client.get("/api/forecast")
+        assert after.status_code == 200
+        commission_after = sum(
+            Decimal(str(row["commission_expected"])) for row in after.json()["rows"]
+        )
+        assert commission_after == Decimal("0.00")
+
+
+def test_received_commission_still_excluded_from_forecast_projection() -> None:
+    """INV-029: a commission already marked received never contributes to
+    the projected income either -- it is REALIZADO (the real credit already
+    exists elsewhere), and (per INV-031 above) it never contributed while
+    pending in the first place, so nothing changes about the forecast when
+    it is received -- only `GET /commissions`' own `financial_state` label
+    flips from PREVISTO to REALIZADO."""
 
     client, _ = _client()
     with client:
@@ -173,13 +209,6 @@ def test_received_commission_excluded_from_forecast_projection() -> None:
         )
         commission_id = created.json()["id"]
 
-        before = client.get("/api/forecast")
-        assert before.status_code == 200
-        commission_before = sum(
-            Decimal(str(row["commission_expected"])) for row in before.json()["rows"]
-        )
-        assert commission_before > Decimal("0.00")
-
         receive = client.post(f"/api/commissions/{commission_id}/receive", json={"received_date": "2027-01-05"})
         assert receive.status_code == 200, receive.text
 
@@ -189,6 +218,11 @@ def test_received_commission_excluded_from_forecast_projection() -> None:
             Decimal(str(row["commission_expected"])) for row in after.json()["rows"]
         )
         assert commission_after == Decimal("0.00")
+
+        listed = client.get("/api/commissions")
+        assert listed.status_code == 200
+        (row,) = [item for item in listed.json() if item["id"] == commission_id]
+        assert row["financial_state"] == "REALIZADO"
 
 
 def test_cancelled_commission_cannot_be_marked_received() -> None:

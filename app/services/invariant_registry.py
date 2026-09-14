@@ -27,6 +27,7 @@ from app.services.financial_invariants import (
     validate_investment_application,
     validate_investment_redemption,
     validate_lineage,
+    validate_no_automatic_unreceived_commission_in_projection,
     validate_non_negative_liquidity,
     validate_payroll_loan,
     validate_probable_duplicate,
@@ -452,6 +453,22 @@ _DEFINITIONS = (
             "projected_amount",
         ),
         validator=validate_recurring_income_no_duplicate,
+    ),
+    InvariantDefinition(
+        id="INV-031",
+        name="no_automatic_unreceived_commission_in_projection",
+        title="Comissão não recebida nunca infla a projeção",
+        description=(
+            "October Go-Live Slice 3 (Round 2): rebaseline §8.3 -- 'Comissões "
+            "nunca entram como receita PREVISTA automaticamente'. Mais amplo "
+            "que INV-029 (que só protege uma comissão já recebida de "
+            "reentrar): prova que nenhuma comissão pendente/não recebida "
+            "contribui para nenhum cenário de projeção automaticamente, "
+            "verificado contra a saída real de `build_projection`."
+        ),
+        severity=IntegritySeverity.CRITICAL,
+        required_facts=("total_projected_commission", "unreceived_commission_count"),
+        validator=validate_no_automatic_unreceived_commission_in_projection,
     ),
 )
 

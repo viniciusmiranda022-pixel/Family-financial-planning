@@ -22,6 +22,29 @@ persisted for the exact competence in question. This is not a second
 reconciliation engine: it never creates, edits or deletes a `Transaction`,
 never guesses a competence, and a period with no match simply stays
 PREVISTO -- an ambiguous or absent match is never promoted to fact.
+
+October Go-Live Slice 3, Round 2 of PR #91's review: the first cut matched
+on amount + competence alone, so *any* income `Transaction` of a
+coincidentally similar value in the same month (a reimbursement, a gift, an
+unrelated receipt) could silently be promoted to REALIZADO and presented as
+"the salary" -- violating "hipótese não vira fato silenciosamente"
+(rebaseline invariant list) and the Slice 3 Work Order's own invariant
+("Hipótese não vira fato silenciosamente"). Two changes close that gap:
+
+1. Amount + competence alone is no longer sufficient identity evidence.
+   Unless the caller passes an explicit `owner_label` (itself a real,
+   already-persisted identity signal -- narrows the query to one person's
+   transactions), a candidate must also carry a description marker that
+   plausibly identifies it as a payroll credit (`SALARY_DESCRIPTION_MARKERS`
+   below) -- the same kind of keyword evidence
+   `app.services.classifier.normalize_description` already normalizes
+   transaction text for elsewhere in this codebase, not a new
+   classification engine.
+2. When more than one transaction satisfies amount + competence + identity
+   evidence, the period is **not** silently resolved by picking the closest
+   amount. It stays PREVISTO and the ambiguity is surfaced
+   (`ambiguous=True`) so a human can review it -- "não escolher `best` por
+   tie-break e tratar como fato".
 """
 
 from __future__ import annotations
@@ -34,9 +57,27 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Transaction
+from app.services.classifier import normalize_description
 from app.services.finance import money
 from app.services.financial_invariants import MONEY_TOLERANCE
 from app.services.financial_state import PREVISTO, REALIZADO
+
+# Deliberately small and literal -- not a learned/fuzzy classifier. A real
+# payroll credit's bank description reliably carries one of these words in
+# Portuguese bank statements; anything else requires an explicit
+# `owner_label` instead (see module docstring, point 1).
+SALARY_DESCRIPTION_MARKERS: tuple[str, ...] = (
+    "SALARIO",
+    "HOLERITE",
+    "FOLHA DE PAGAMENTO",
+    "FOLHA PAGAMENTO",
+    "PAYROLL",
+)
+
+
+def _has_salary_marker(description: str) -> bool:
+    normalized = normalize_description(description)
+    return any(marker in normalized for marker in SALARY_DESCRIPTION_MARKERS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +91,11 @@ class RecurringIncomeReconciliation:
     matched_amount: Decimal | None = None
     matched_booked_at: date | None = None
     candidate_count: int = 0
+    # October Go-Live Slice 3, Round 2: true when two or more transactions
+    # independently satisfied amount + competence + identity evidence for
+    # this period -- the period stays PREVISTO and this flag tells a caller
+    # a human review is warranted, instead of the ambiguity being invisible.
+    ambiguous: bool = False
 
 
 def reconcile_recurring_income(
@@ -64,14 +110,17 @@ def reconcile_recurring_income(
     (a canonical "YYYY-MM" competence) that plausibly *is* the household's
     configured recurring salary for that month.
 
-    Never invents a match: outside the tolerance window this reports
-    PREVISTO untouched. A duplicate/possible-duplicate or excluded
-    transaction is never a candidate -- the same guard `_forecast_obligations`
-    and every other canonical aggregate already respects. `owner_label` is an
-    optional extra filter (e.g. restrict to one person's transactions); the
-    matching itself never hardcodes a name -- the recurring salary belongs to
-    whichever household member `FinancialProfile.monthly_salary_net` was
-    configured for.
+    Never invents a match: outside the tolerance window, without salary
+    identity evidence, or with more than one equally-plausible candidate,
+    this reports PREVISTO untouched. A duplicate/possible-duplicate or
+    excluded transaction is never a candidate -- the same guard
+    `_forecast_obligations` and every other canonical aggregate already
+    respects. `owner_label` is an optional extra filter (e.g. restrict to
+    one person's transactions); when passed, it *is* the identity evidence
+    (the query itself narrows to that person), so a description marker is
+    not additionally required. The matching itself never hardcodes a
+    name -- the recurring salary belongs to whichever household member
+    `FinancialProfile.monthly_salary_net` was configured for.
     """
 
     expected = money(expected_amount)
@@ -93,12 +142,25 @@ def reconcile_recurring_income(
     if not matches:
         return RecurringIncomeReconciliation(period, expected, PREVISTO, candidate_count=len(candidates))
 
-    # Deterministic tie-break: closest amount first, then earliest booking --
-    # never a heuristic guess presented as certainty.
-    best = min(
-        matches,
-        key=lambda tx: (abs(money(tx.amount) - expected), tx.booked_at, tx.id),
-    )
+    # October Go-Live Slice 3, Round 2: identity evidence beyond amount +
+    # competence. An explicit `owner_label` already narrowed `candidates` at
+    # the query level, so every remaining match carries that evidence;
+    # otherwise each candidate must independently carry a salary marker in
+    # its own description.
+    identified = matches if owner_label else [tx for tx in matches if _has_salary_marker(tx.description)]
+    if not identified:
+        return RecurringIncomeReconciliation(period, expected, PREVISTO, candidate_count=len(candidates))
+
+    if len(identified) > 1:
+        # Never pick a "best" candidate by tie-break here -- multiple
+        # transactions independently look like this period's salary, so the
+        # period stays a hypothesis and the ambiguity is surfaced instead of
+        # silently resolved.
+        return RecurringIncomeReconciliation(
+            period, expected, PREVISTO, candidate_count=len(candidates), ambiguous=True
+        )
+
+    best = identified[0]
     return RecurringIncomeReconciliation(
         period,
         expected,

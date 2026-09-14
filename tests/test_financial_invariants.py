@@ -41,12 +41,15 @@ ZERO_OPERATING_EFFECTS = {
 
 
 def test_registry_contains_all_permanent_invariants_once() -> None:
-    assert FINANCIAL_RULES_VERSION == "2026.10.2"
+    assert FINANCIAL_RULES_VERSION == "2026.10.3"
     # October Go-Live Slice 3 (P0 #87): INV-029/INV-030 join the registry,
     # guarding the forecast against a received Commission or a reconciled
-    # recurring income being counted twice (docs/FINANCIAL_INVARIANTS.md).
-    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 31))
-    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 30
+    # recurring income being counted twice. Round 2 of the PR #91 review adds
+    # INV-031, guarding the broader rebaseline §8.3 rule that no unreceived
+    # commission may ever inflate the projection in the first place
+    # (docs/FINANCIAL_INVARIANTS.md).
+    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 32))
+    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 31
     assert all(item.required_facts for item in INVARIANT_REGISTRY.values())
 
 
@@ -726,3 +729,26 @@ def test_recurring_income_no_duplicate_pass_and_fail() -> None:
     assert double_counted.status is InvariantStatus.FAIL
     assert double_counted.difference == Decimal("5000.00")
     assert stale_estimate_kept_despite_evidence.status is InvariantStatus.FAIL
+
+
+def test_no_automatic_unreceived_commission_in_projection_pass_and_fail() -> None:
+    clean_no_pending = _evaluate(
+        "INV-031",
+        total_projected_commission=Decimal("0.00"),
+        unreceived_commission_count=0,
+    )
+    clean_with_pending = _evaluate(
+        "INV-031",
+        total_projected_commission=Decimal("0.00"),
+        unreceived_commission_count=3,
+    )
+    leaked = _evaluate(
+        "INV-031",
+        total_projected_commission=Decimal("10000.00"),
+        unreceived_commission_count=1,
+    )
+    assert clean_no_pending.status is InvariantStatus.PASS
+    assert clean_with_pending.status is InvariantStatus.PASS
+    assert leaked.status is InvariantStatus.FAIL
+    assert leaked.difference == Decimal("10000.00")
+    assert leaked.severity.value == "critical"

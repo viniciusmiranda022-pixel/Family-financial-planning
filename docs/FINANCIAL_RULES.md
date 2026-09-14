@@ -75,11 +75,15 @@ conciliação):
 - O cenário conservador desloca o mês; não muda o ano de origem nem antecipa receita.
 - Uma comissão só entra na visão financeira quando efetivamente registrada; nunca é criada
   automaticamente por importação ou classificação (rebaseline §8.3).
-- **October Go-Live Slice 3 (P0 #87):** `POST /commissions/{id}/receive` marca explicitamente uma
+- **October Go-Live Slice 3 (P0 #87):** uma comissão pendente/não recebida **nunca** contribui
+  automaticamente para nenhum cenário de `GET /forecast` -- recebida ou não, o campo
+  `ForecastInput.commissions` que o gate canônico monta é sempre vazio; só um futuro mecanismo de
+  opt-in explícito e auditável (ainda não implementado) poderia alimentá-lo (INV-031,
+  `docs/FINANCIAL_INVARIANTS.md`). `POST /commissions/{id}/receive` marca explicitamente uma
   comissão como recebida (`status="received"`, `received_date`) sem criar/editar/apagar nenhuma
-  `Transaction` -- o crédito real é esperado já existir pelo fluxo normal de renda. A partir desse
-  momento, a comissão sai da projeção futura (`GET /forecast`) em todos os cenários -- nunca soma o
-  valor previsto ao valor real do mesmo evento (INV-029, `docs/FINANCIAL_INVARIANTS.md`).
+  `Transaction` -- o crédito real é esperado já existir pelo fluxo normal de renda; isso só muda o
+  rótulo `financial_state` de `GET /commissions` de PREVISTO para REALIZADO e garante que, se um
+  opt-in futuro existir, uma comissão recebida nunca volta a ser somada (INV-029).
 
 ## Holerites
 
@@ -91,9 +95,13 @@ conciliação):
 - **October Go-Live Slice 3 (P0 #87):** o salário-base configurado
   (`FinancialProfile.monthly_salary_net`) é aplicado como PREVISTO em todo mês futuro da projeção.
   Quando já existe um lançamento real de renda para a mesma competência dentro da tolerância
-  monetária padrão, esse mês passa a usar o valor real em vez do valor previsto -- nunca a soma dos
-  dois (`app.services.recurring_income.reconcile_recurring_income`, INV-030). "PREVISTO -> REALIZADO"
-  nunca cria uma segunda renda.
+  monetária padrão **e** evidência material de identidade suficiente -- um `owner_label` explícito ou
+  um marcador de descrição plausível de folha de pagamento -- esse mês passa a usar o valor real em
+  vez do valor previsto -- nunca a soma dos dois
+  (`app.services.recurring_income.reconcile_recurring_income`, INV-030). Valor + competência sozinhos
+  nunca bastam, e mais de um candidato igualmente identificado nunca é resolvido por desempate: o mês
+  permanece PREVISTO e a ambiguidade fica visível (`ambiguous=True`). "PREVISTO -> REALIZADO" nunca
+  cria uma segunda renda.
 
 ## Benefícios
 
@@ -341,7 +349,9 @@ projeção/simulação (30/60/90 dias, comparação de cenário de compra). Elas
   REALIZADO, COMPROMETIDO ou PREVISTO. Nunca somados nem tratados como o mesmo conceito.
 - O rótulo é sempre computado (`app.services.financial_state`), nunca uma coluna persistida
   independente: uma `Obligation` paga é REALIZADO, pendente é COMPROMETIDO -- inclusive vencida; uma
-  `CardInvoice` fechada/parcialmente paga é COMPROMETIDO; toda linha de projeção é PREVISTO.
+  `CardInvoice` paga é REALIZADO, fechada/parcialmente paga é COMPROMETIDO, aberta é PREVISTO (seu
+  total ainda pode crescer -- só "consolida" no fechamento, rebaseline §6.2); toda linha de projeção
+  é PREVISTO.
 - Uma obrigação vencida e não paga permanece COMPROMETIDA e visível; atraso nunca a remove da lista
   nem da projeção.
 - Uma fatura de cartão já fechada e ainda não paga é um compromisso real, com o mesmo direito de
@@ -351,20 +361,26 @@ projeção/simulação (30/60/90 dias, comparação de cenário de compra). Elas
 
 ## Projeções
 
-O sistema produz três cenários:
-
-1. sem comissões;
-2. comissões com atraso conservador;
-3. comissões no mês esperado.
+O motor de projeção (`app.services.projection_engine`) sabe calcular três cenários -- sem
+comissões, comissões com atraso conservador, comissões no mês esperado -- mas **nenhum dos três é
+alimentado automaticamente com uma `Commission`** (rebaseline §8.3: "Comissões nunca entram como
+receita PREVISTA automaticamente ... não deve inflar projeções futuras por expectativa"). O gate
+canônico que produz `GET /forecast`/`POST /monthly-closes/{period}/run`
+(`app.api._build_projection_gate_checks`) sempre passa uma lista de comissões vazia; hoje os três
+cenários só divergem quando um chamador explícito (ex.: uma futura ação tipada de opt-in, ainda não
+implementada) fornece comissões diretamente ao motor -- nunca a partir da mera existência de uma
+`Commission` no banco. INV-031 prova isso contra a saída real da projeção canônica.
 
 Cada linha mensal considera:
 
 ```text
 saldo anterior
 + rendimento estimado
-+ salário líquido (real, quando reconciliado; previsto, caso contrário)
++ salário líquido (real, quando reconciliado com evidência de identidade suficiente; previsto,
+  caso contrário -- nunca ambíguo: mais de um candidato identificado mantém o previsto)
 + eventos adicionais da folha
-+ comissão líquida do cenário (nunca uma comissão já marcada como recebida)
++ comissão líquida do cenário (sempre zero no gate canônico; nunca uma comissão já marcada como
+  recebida, mesmo se um chamador explícito algum dia alimentar este campo)
 - compromissos
 - faturas de cartão já fechadas e ainda não pagas
 - parcelas futuras

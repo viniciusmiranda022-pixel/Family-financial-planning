@@ -42,7 +42,7 @@ from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Account, CardInvoice, Category, Household, Obligation, Transaction, User  # noqa: E402
 from app.services.card_invoice_lifecycle import invoice_financial_state  # noqa: E402
-from app.services.financial_state import COMPROMETIDO, REALIZADO  # noqa: E402
+from app.services.financial_state import COMPROMETIDO, PREVISTO, REALIZADO  # noqa: E402
 from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -281,8 +281,13 @@ def test_forecast_card_invoices_clamps_overdue_due_date_into_start_month() -> No
 
 
 def test_invoice_financial_state_mapping() -> None:
+    # October Go-Live Slice 3, Round 2 of PR #91's review: `open` is neither
+    # a liquidated fact (REALIZADO) nor a fixed, consolidated commitment
+    # (COMPROMETIDO) -- its running total can still grow until it closes, so
+    # it is PREVISTO at the invoice-as-payable level, distinct from the
+    # individually-REALIZADO purchases already inside it.
     for status, expected in (
-        ("open", REALIZADO),
+        ("open", PREVISTO),
         ("closed", COMPROMETIDO),
         ("partially_paid", COMPROMETIDO),
         ("paid", REALIZADO),
@@ -446,6 +451,95 @@ def test_closed_unpaid_card_invoice_contributes_to_forecast_as_committed() -> No
         )
         assert total_card_invoices_projected == Decimal("777.00")
         assert Decimal(str(rows[0]["card_invoices"])) == Decimal("777.00")
+
+
+def test_dashboard_commitments_match_obligations_and_card_invoices_sources() -> None:
+    """October Go-Live Slice 3, Round 2 of PR #91's review (DoD: "Dashboard/
+    forecast/report ponta a ponta"): `GET /dashboard`'s
+    `noncanonical.commitments` totals must equal exactly what
+    `GET /obligations` and `GET /forecast` (backed by the same
+    `_forecast_card_invoices` `GET /card-invoices` totals are derived from)
+    already report -- no second obligations/card-invoice calculation."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        created = client.post(
+            "/api/obligations",
+            json={"name": "Conta a pagar", "due_date": "2026-08-10", "amount": "321.00"},
+        )
+        assert created.status_code == 201, created.text
+
+        with session_factory() as db:
+            household_id = db.scalar(select(Household)).id
+        account_id = _card_account(session_factory, household_id=household_id, name="Cartão Dashboard")
+        _card_invoice(
+            session_factory,
+            household_id=household_id,
+            account_id=account_id,
+            competence="2026-07",
+            status="closed",
+            computed_total="777.00",
+            due_date=date(2026, 7, 17),
+        )
+
+        obligations = client.get("/api/obligations").json()
+        expected_obligations_total = sum(
+            Decimal(str(item["amount"])) for item in obligations if item["financial_state"] == COMPROMETIDO
+        )
+
+        dashboard = client.get("/api/dashboard")
+        assert dashboard.status_code == 200
+        commitments = dashboard.json()["noncanonical"]["commitments"]
+        assert commitments["obligations_pending"]["value"] == float(expected_obligations_total)
+        assert commitments["obligations_pending"]["financial_state"] == COMPROMETIDO
+        assert commitments["card_invoices_outstanding"]["value"] == 777.0
+        assert commitments["card_invoices_outstanding"]["financial_state"] == COMPROMETIDO
+        assert commitments["total"]["value"] == float(expected_obligations_total) + 777.0
+
+
+def test_reports_never_count_pending_commitments_as_realized_spending() -> None:
+    """October Go-Live Slice 3, Round 2 of PR #91's review (DoD: "Dashboard/
+    forecast/report ponta a ponta"): `GET /reports` is inherently
+    REALIZADO-only -- every figure it publishes comes from
+    `build_snapshot`, which only ever reads booked `Transaction` rows,
+    never `Obligation`/`CardInvoice` tables directly. A COMPROMETIDO
+    obligation or an open/closed card invoice with no corresponding
+    `Transaction` yet must contribute exactly zero to `spending`/`cash_out`
+    for the month -- proving there is no second, report-only calculation
+    that could leak an unrealized commitment into a realized total."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        before = client.get("/api/reports?months=1&end_month=2026-08")
+        assert before.status_code == 200
+        before_spending = before.json()["monthly"][0]["spending"]
+        before_cash_out = before.json()["monthly"][0]["cash_out"]
+
+        created = client.post(
+            "/api/obligations",
+            json={"name": "Conta a pagar", "due_date": "2026-08-10", "amount": "321.00"},
+        )
+        assert created.status_code == 201, created.text
+
+        with session_factory() as db:
+            household_id = db.scalar(select(Household)).id
+        account_id = _card_account(session_factory, household_id=household_id, name="Cartão Relatório")
+        _card_invoice(
+            session_factory,
+            household_id=household_id,
+            account_id=account_id,
+            competence="2026-08",
+            status="closed",
+            computed_total="777.00",
+            due_date=date(2026, 8, 17),
+        )
+
+        after = client.get("/api/reports?months=1&end_month=2026-08")
+        assert after.status_code == 200
+        assert after.json()["monthly"][0]["spending"] == before_spending
+        assert after.json()["monthly"][0]["cash_out"] == before_cash_out
 
 
 def test_pay_obligation_rejects_amount_mismatched_transaction_link() -> None:
