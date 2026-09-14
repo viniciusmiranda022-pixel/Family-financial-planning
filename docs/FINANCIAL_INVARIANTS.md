@@ -1,6 +1,6 @@
 # Contrato de invariantes financeiros
 
-**Versão das regras:** `2026.10.1`
+**Versão das regras:** `2026.10.3`
 **Status:** normativo
 
 **Controle de mudança (2026-10, October Go-Live Slice 1, P0 #87):** INV-005,
@@ -33,8 +33,88 @@ integrar `INVARIANT_REGISTRY` (`app/services/invariant_registry.py`,
 — um resultado `fail` aborta a requisição em vez de persistir silenciosamente
 um estado que o próprio motor provou violar uma regra `BLOCK`/`CRITICAL`.
 Ver `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_2.md`.
+
+**Controle de mudança (2026-10, October Go-Live Slice 3, P0 #87):** INV-029 e
+INV-030 foram adicionadas para a separação REALIZADO/COMPROMETIDO/PREVISTO de
+obrigações e projeção (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md`): uma
+`Commission` já marcada como recebida (`received_date` preenchido via
+`POST /commissions/{id}/receive`) nunca volta a ser projetada como PREVISTO,
+e o salário recorrente configurado (`FinancialProfile.monthly_salary_net`)
+usa o valor de um crédito real já reconciliado
+(`app.services.recurring_income.reconcile_recurring_income`) em vez de somar
+o valor previsto ao valor real do mesmo período. Nenhuma coluna nova foi
+persistida para `financial_state`: o rótulo REALIZADO/COMPROMETIDO/PREVISTO é
+sempre computado na camada de serialização (`app.services.financial_state`)
+a partir de um fato que já é autoritativo por si só (`Obligation.status`,
+`CardInvoice.status`, a origem `Transaction`/projeção) — ver
+`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.3. Ambas são avaliadas em tempo
+real por `GET /forecast` e `POST /monthly-closes/{period}/run`
+(`app.api._build_projection_gate_checks`), o mesmo ponto único que já avalia
+INV-005/006/018/022/023/024. `_forecast_obligations` e a nova
+`_forecast_card_invoices` também passaram a receber o `start_month` da
+projeção: uma `Obligation` vencida e ainda não paga, ou uma `CardInvoice`
+`closed`/`partially_paid` cujo vencimento já passou, deixam de desaparecer
+silenciosamente da projeção (rebaseline §7, "atraso não vira gasto duplicado
+nem desaparece da projeção") — ambas passam a ser somadas ao primeiro mês
+que a projeção efetivamente exibe, nunca em um mês que o cursor da projeção
+não visita. `app.services.projection_engine`/`projection_validator` ganharam
+o termo `card_invoices` e a resolução de `monthly_salary_overrides` em
+paralelo (INV-018 continua provando que engine e validador concordam com a
+nova fórmula); `PROJECTION_CALCULATION_VERSION` avançou de `2026.09.2` para
+`2026.10.1`. Ver `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md`.
+
+**Controle de mudança (2026-10, October Go-Live Slice 3, Round 2 de revisão
+do PR #91, P0 #87):** a revisão do engenheiro responsável bloqueou o head
+anterior por três violações materiais que INV-029/INV-030 sozinhas não
+cobriam. Correções e nova invariante:
+
+1. **INV-031 (nova).** `_build_projection_gate_checks` parava de somar uma
+   `Commission` só depois de recebida (INV-029) — mas continuava somando
+   *toda* comissão não recebida e não cancelada em `ForecastInput.commissions`
+   antes disso, violando diretamente o rebaseline §8.3 ("Comissões nunca
+   entram como receita PREVISTA automaticamente"). Corrigido: o construtor do
+   `ForecastInput` canônico nunca mais deriva `commissions` de `Commission`
+   — o campo é sempre uma tupla vazia. INV-031 prova isso contra a saída real
+   de `build_projection` (soma de `commission_expected`/`commission_delayed`
+   em todas as linhas é sempre zero), não apenas contra a construção do
+   input. `GET /commissions` continua expondo `financial_state`
+   REALIZADO/PREVISTO por linha — um rótulo descritivo que nunca alimenta
+   nenhum total projetado.
+2. **`app.services.recurring_income.reconcile_recurring_income` (alterado,
+   sem nova invariante de registry).** Corrigia apenas por valor +
+   competência: uma `Transaction` de renda qualquer, do mesmo valor e mês,
+   sem nenhum vínculo real com o salário, podia ser promovida a REALIZADO por
+   coincidência — violando "hipótese não vira fato silenciosamente". Agora
+   exige evidência adicional de identidade: um `owner_label` explícito (a
+   própria consulta já restringe a uma pessoa) ou um marcador de descrição
+   plausível de folha de pagamento (`SALARY_DESCRIPTION_MARKERS`). Quando
+   mais de um candidato identificado existe para o mesmo período, o resultado
+   permanece PREVISTO e a ambiguidade é exposta (`ambiguous=True`,
+   `GET /forecast` ganha `salary_reconciliation_ambiguous` por linha) — nunca
+   mais um desempate silencioso ("não escolher `best` por tie-break e tratar
+   como fato").
+3. **`app.services.card_invoice_lifecycle.invoice_financial_state`
+   (alterado, sem nova invariante de registry).** Rotulava uma `CardInvoice`
+   `open` como REALIZADO só porque as compras dentro dela já são REALIZADO —
+   conflando o estado da fatura-como-obrigação com o estado das compras que a
+   compõem. Uma fatura `open` ainda não fechou (rebaseline §6.2, "o total é
+   consolidado" só no fechamento), então seu total corrente é uma estimativa,
+   não uma obrigação rígida nem um fato liquidado: passa a ser PREVISTO. Uma
+   fatura `paid` continua REALIZADO (liquidação real); `closed`/
+   `partially_paid` continuam COMPROMETIDO.
+4. **`GET /dashboard` (alterado, sem nova invariante de registry).** Ganhou
+   `noncanonical.commitments` (`obligations_pending` +
+   `card_invoices_outstanding`, ambos COMPROMETIDO), respondendo
+   explicitamente rebaseline §44 ("o que tenho para pagar", "quanto devo nos
+   cartões") a partir das mesmas fontes canônicas que `GET /obligations` e
+   `GET /forecast` já usam (`_obligation_rows`/`_forecast_card_invoices`) —
+   nenhum segundo motor de cálculo.
+
+Ver a revisão de engenharia em PR #91 (2026-09-14) e
+`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_3.md`.
+
 **Implementação executável:** `app/services/invariant_registry.py` (INV-001
-a INV-028).
+a INV-031).
 
 Este documento define as condições que precisam permanecer verdadeiras em importações,
 fechamentos, projeções, snapshots, dashboards, relatórios e contextos enviados ao Advisor.
@@ -516,6 +596,79 @@ que também confirma em runtime que a própria chamada não criou nenhuma `Trans
 `tests/test_card_invoice_lifecycle.py::test_divergence_explained_by_unlinked_refund_in_cycle`,
 `tests/test_financial_invariants.py::test_card_invoice_divergence_never_silently_adjusted`,
 `tests/test_card_invoice_lifecycle.py::test_close_pay_and_divergence_endpoints_run_financial_integrity_checks`.
+
+## INV-029 — Comissão recebida sai da projeção
+
+**Escopo:** PREVISTO (`Commission`, `app.api._build_projection_gate_checks`).
+**Título:** Comissão recebida sai da projeção
+**Descrição:** Uma `Commission` já marcada como recebida (`received_date` preenchido via
+`POST /commissions/{id}/receive`) nunca é incluída novamente como PREVISTO em nenhum cenário de
+projeção. O crédito real já existe como fato (registrado pelo fluxo normal de renda); projetar a
+mesma comissão de novo duplicaria renda.
+**Motivação:** Rebaseline §8.3; `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §2.4/§4.
+**Entradas:** `received_commission_ids` (todas as comissões da família com `received_date`
+preenchido), `projected_commission_ids` (as efetivamente incluídas em `ForecastInput.commissions`).
+**Resultado esperado:** interseção vazia entre `received_commission_ids` e `projected_commission_ids`.
+**Severidade se violado:** `CRITICAL`.
+**Implementação executável:** `app/services/invariant_registry.py`
+(`validate_received_commission_excluded_from_projection`). Avaliada em tempo real por
+`GET /forecast` e `POST /monthly-closes/{period}/run` (`app.api._build_projection_gate_checks`).
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_received_commission_excluded_from_projection_pass_and_fail`,
+`tests/test_commission_lifecycle_slice3.py::test_received_commission_still_excluded_from_forecast_projection`,
+`tests/test_commission_lifecycle_slice3.py::test_commission_receive_endpoint_marks_received_and_sets_date`.
+
+## INV-030 — Renda recorrente reconciliada não duplica
+
+**Escopo:** PREVISTO/REALIZADO (`FinancialProfile.monthly_salary_net`,
+`app.services.recurring_income.reconcile_recurring_income`).
+**Título:** Renda recorrente reconciliada não duplica
+**Descrição:** Quando existe evidência de um crédito real (`Transaction` de renda) para o salário
+recorrente configurado em um período, a projeção desse período usa exclusivamente o valor do
+crédito real -- nunca soma o valor real ao valor previsto do mesmo período.
+**Motivação:** Rebaseline §8.4 -- "Quando o crédito real chegar: PREVISTO -> REALIZADO. A
+conciliação não pode criar uma segunda receita."
+**Entradas:** `has_recurring_income_evidence`, `expected_amount`, `reconciled_amount`,
+`projected_amount` (todos referentes ao primeiro mês que a projeção exibe).
+**Resultado esperado:** `projected_amount` igual a `reconciled_amount` quando há evidência, ou a
+`expected_amount` caso contrário -- nunca a soma dos dois.
+**Severidade se violado:** `CRITICAL`.
+**Implementação executável:** `app/services/invariant_registry.py`
+(`validate_recurring_income_no_duplicate`). Avaliada em tempo real por `GET /forecast` e
+`POST /monthly-closes/{period}/run` (`app.api._build_projection_gate_checks`).
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_recurring_income_no_duplicate_pass_and_fail`,
+`tests/test_recurring_income_reconciliation.py`,
+`tests/test_commission_lifecycle_slice3.py::test_forecast_uses_realized_salary_amount_when_reconciled`.
+
+## INV-031 — Comissão não recebida nunca infla a projeção
+
+**Escopo:** PREVISTO (`Commission`, `app.api._build_projection_gate_checks`).
+**Título:** Comissão não recebida nunca infla a projeção
+**Descrição:** Nenhuma `Commission` pendente/não recebida e não cancelada contribui
+automaticamente para nenhum cenário projetado (`no_commission`/`delayed`/`expected`). Mais amplo
+que INV-029 (que só protege uma comissão *já recebida* de reentrar): este cobre a proibição
+primária do rebaseline -- uma comissão nunca entra como receita PREVISTA automaticamente, recebida
+ou não.
+**Motivação:** Rebaseline §8.3 -- "Comissões nunca entram como receita PREVISTA automaticamente
+... não deve inflar projeções futuras por expectativa." Adicionada na revisão de engenharia
+(2026-09-14, `BLOCKING CHANGES REQUIRED`, PR #91, Round 2): o head anterior só protegia contra
+reentrada de comissão recebida, não contra a inclusão automática da não recebida.
+**Entradas:** `total_projected_commission` (soma de `commission_expected` + `commission_delayed`
+em todas as linhas que `GET /forecast`/`POST /monthly-closes/{period}/run` efetivamente
+retornam), `unreceived_commission_count` (quantas `Commission` pendentes existem, apenas para
+contexto da mensagem).
+**Resultado esperado:** `total_projected_commission == 0`, independentemente de quantas comissões
+pendentes existam.
+**Severidade se violado:** `CRITICAL`.
+**Implementação executável:** `app/services/invariant_registry.py`
+(`validate_no_automatic_unreceived_commission_in_projection`). Avaliada em tempo real por
+`GET /forecast` e `POST /monthly-closes/{period}/run` (`app.api._build_projection_gate_checks`),
+verificada contra a saída real de `build_projection` -- não apenas contra a construção do
+`ForecastInput`.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_no_automatic_unreceived_commission_in_projection_pass_and_fail`,
+`tests/test_commission_lifecycle_slice3.py::test_unreceived_commission_never_enters_forecast_projection`.
 
 ## Controle de mudança
 

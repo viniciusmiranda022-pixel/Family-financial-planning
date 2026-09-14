@@ -7,7 +7,7 @@ from decimal import Decimal
 from app.services.finance import ForecastInput, add_months, money, month_key
 from app.services.financial_engine import settle_liquidity_projection
 
-PROJECTION_CALCULATION_VERSION = "2026.09.2"
+PROJECTION_CALCULATION_VERSION = "2026.10.1"
 SCENARIOS = ("no_commission", "delayed", "expected")
 
 
@@ -35,10 +35,15 @@ def build_projection(data: ForecastInput) -> list[dict[str, Decimal | str]]:
     end = data.end_month.replace(day=1)
     while cursor <= end:
         period = month_key(cursor)
-        salary = money(data.monthly_salary)
+        # October Go-Live Slice 3: a period already reconciled against a real
+        # income Transaction (`app.services.recurring_income.
+        # reconcile_recurring_income`) uses that confirmed amount instead of
+        # the flat PREVISTO estimate -- never both (rebaseline §8.4).
+        salary = money(data.monthly_salary_overrides.get(period, data.monthly_salary))
         extras = money(data.payroll_extras.get(period, Decimal("0")))
         obligations = money(data.obligations.get(period, Decimal("0")))
         installments = money(data.installments.get(period, Decimal("0")))
+        card_invoices = money(data.card_invoices.get(period, Decimal("0")))
         cash_cap = money(data.monthly_cash_cap)
         expected_commission = money(expected_commissions.get(period, Decimal("0")))
         delayed_commission = money(delayed_commissions.get(period, Decimal("0")))
@@ -50,6 +55,7 @@ def build_projection(data: ForecastInput) -> list[dict[str, Decimal | str]]:
             "commission_delayed": delayed_commission,
             "obligations": obligations,
             "installments": installments,
+            "card_invoices": card_invoices,
             "cash_cap": cash_cap,
         }
         for scenario, commission in (
@@ -63,7 +69,7 @@ def build_projection(data: ForecastInput) -> list[dict[str, Decimal | str]]:
                 opening * data.monthly_investment_rate if opening_debt == 0 else 0
             )
             income = money(salary + extras + commission)
-            expenses = money(obligations + installments + cash_cap)
+            expenses = money(obligations + installments + card_invoices + cash_cap)
             result = money(income - expenses)
             transition = settle_liquidity_projection(
                 opening_balance=opening,

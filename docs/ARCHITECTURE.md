@@ -329,6 +329,117 @@ fatura) e, sem uma, publica `unreconciled_unexplained` para revisão humana.
 - **Downgrade de `0015` deixa de ser destrutivo silencioso.** Recusa (levanta `RuntimeError`) quando
   existe algum `refund_of_transaction_id` confirmado -- ver `alembic/versions/0015_card_invoice_lifecycle.py`.
 
+## Obrigações e projeção REALIZADO/COMPROMETIDO/PREVISTO (October Go-Live Slice 3, P0 #87)
+
+`app.services.financial_state` (`REALIZADO`/`COMPROMETIDO`/`PREVISTO`) é o único vocabulário que
+qualquer superfície pode usar para rotular um fato/compromisso/hipótese financeira -- rebaseline §3.
+Nenhuma coluna nova é persistida: seguindo a recomendação de
+`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.3, o rótulo é sempre computado na camada de
+serialização a partir de um dado que já é autoritativo por si só -- nunca um segundo classificador
+que poderia divergir da fonte:
+
+- `Obligation.status == "paid"` -> REALIZADO; `"pending"` -> COMPROMETIDO, inclusive vencida
+  (`app.api._obligation_rows`);
+- `CardInvoice.status == "paid"` -> REALIZADO (liquidação real); `closed`/`partially_paid` ->
+  COMPROMETIDO (total consolidado, desembolso ainda não ocorrido -- rebaseline §6.2); `open` ->
+  PREVISTO (`app.services.card_invoice_lifecycle.invoice_financial_state`, usado por
+  `serialize_card_invoice`) -- este rótulo descreve a fatura *como objeto de liquidação*, nunca as
+  compras dentro dela (que já são, individualmente, REALIZADO desde que lançadas, rebaseline §6.1,
+  independentemente do estado da fatura). Uma fatura `open` ainda não fechou -- "o total é
+  consolidado" só no fechamento (rebaseline §6.2) -- então seu total corrente é uma estimativa que
+  ainda pode crescer, não uma obrigação rígida nem um fato liquidado (revisão de engenharia,
+  2026-09-14, Round 2 de PR #91: a versão anterior rotulava `open` como REALIZADO só porque as
+  compras subjacentes já eram REALIZADO, conflando os dois conceitos);
+- `Commission.received_date` preenchido -> REALIZADO; ausente -> PREVISTO
+  (`GET /commissions`, `app.api._build_projection_gate_checks`) -- rótulo puramente descritivo, ver
+  abaixo por que uma comissão PREVISTA nunca contribui para nenhum total projetado;
+- toda linha de `GET /forecast` -> PREVISTO (a projeção inteira é hipótese, rebaseline §3/§13.1),
+  com `salary_financial_state`/`salary_reconciled_transaction_id` isolando o único componente que
+  este slice promove a REALIZADO quando há evidência (ver reconciliação abaixo).
+
+**Sem desaparecimento silencioso da projeção (rebaseline §7, "atraso não vira gasto duplicado nem
+desaparece da projeção").** Antes deste slice, `_forecast_obligations` bucketava cada ocorrência
+pela sua própria data de vencimento; uma obrigação vencida cujo mês já ficou no passado nunca era
+revisitada pelo cursor somente-para-frente de `build_projection` (que começa em `start_month`,
+sempre o próximo mês) -- o valor simplesmente nunca aparecia em nenhuma linha da projeção. Faturas de
+cartão fechadas/parcialmente pagas (`CardInvoice`) tinham o mesmo problema, mas de outra forma: nunca
+entravam em `ForecastInput` de forma alguma. Ambas as funções agora recebem `start_month` e dobram
+(`clamp`) qualquer vencimento anterior a ele para dentro do próprio `start_month` -- o compromisso
+aparece exatamente uma vez, no mês mais próximo que a projeção realmente exibe, nunca em um mês que o
+cursor não visita:
+
+- `app.api._forecast_obligations(items, start_month=None)` -- `start_month` opcional preserva o
+  comportamento anterior byte a byte para quem não o passa (ex.: `tests/test_plan_workbook.py`);
+- `app.api._forecast_card_invoices(db, household_id, start_month)` -- soma `outstanding_balance` de
+  toda `CardInvoice` `closed`/`partially_paid` da família, nunca `open`/`paid`.
+
+`ForecastInput` (`app.services.finance.py`) ganhou dois campos aditivos, ambos com default vazio
+(zero regressão para todo chamador existente):
+
+- `card_invoices: dict[str, Decimal]` -- soma-se a `obligations`/`installments` na fórmula de
+  despesas de `build_projection`/`independently_calculate` (INV-018 continua provando que motor e
+  validador concordam com a fórmula estendida); `PROJECTION_CALCULATION_VERSION` avançou de
+  `2026.09.2` para `2026.10.1`;
+- `monthly_salary_overrides: dict[str, Decimal]` -- ver reconciliação de renda recorrente abaixo.
+
+**Reconciliação de renda recorrente (`app.services.recurring_income.reconcile_recurring_income`,
+rebaseline §8.4).** O salário recorrente configurado (`FinancialProfile.monthly_salary_net`) é
+aplicado linearmente em todo mês futuro como PREVISTO. Quando já existe uma `Transaction` real de
+renda para a mesma competência dentro da tolerância monetária padrão (`MONEY_TOLERANCE`) **e**
+identidade material suficiente, essa competência passa a usar o valor real em vez do valor previsto
+-- nunca a soma dos dois ("PREVISTO -> REALIZADO... a conciliação não pode criar uma segunda
+receita"). A função nunca cria, edita ou apaga `Transaction`; uma competência sem correspondência
+simplesmente permanece PREVISTO. Não fixa nenhum nome de pessoa no código -- `owner_label` é um
+filtro opcional, o salário recorrente pertence a quem quer que o perfil tenha configurado.
+
+*Identidade material (revisão de engenharia, 2026-09-14, Round 2 de PR #91).* Valor + competência
+sozinhos não são evidência suficiente -- qualquer renda de valor parecido no mesmo mês (reembolso,
+recebimento avulso) podia ser promovida a REALIZADO por coincidência. Agora, sem `owner_label`
+explícito (que já restringe a consulta a uma pessoa -- identidade por si só), cada candidato precisa
+carregar um marcador de descrição plausível de folha de pagamento
+(`recurring_income.SALARY_DESCRIPTION_MARKERS`). Quando mais de um candidato identificado existe
+para o mesmo período, o resultado permanece PREVISTO com `ambiguous=True` em vez de escolher um por
+desempate -- "não escolher `best` por tie-break e tratar como fato". `app.api.
+_build_projection_gate_checks` chama essa função uma vez por mês do horizonte de projeção e monta
+`monthly_salary_overrides`; o mesmo mapa alimenta os campos informativos
+`salary_financial_state`/`salary_reconciled_transaction_id`/`salary_reconciliation_ambiguous` de
+cada linha de `/forecast`.
+
+**Comissão nunca infla a projeção automaticamente (rebaseline §8.3).** "Comissões nunca entram como
+receita PREVISTA automaticamente ... não deve inflar projeções futuras por expectativa." O
+`ForecastInput.commissions` que `_build_projection_gate_checks` monta para o gate canônico
+(`GET /forecast`, `POST /monthly-closes/{period}/run`) é **sempre uma tupla vazia** -- nenhuma
+`Commission`, recebida ou não, é derivada automaticamente para essa lista (revisão de engenharia,
+2026-09-14, Round 2 de PR #91: a primeira versão deste slice só excluía uma comissão *já recebida*
+de reentrar -- INV-029 -- mas continuava somando toda comissão pendente antes disso, violando a regra
+primária). `POST /commissions/{id}/receive` (ato explícito e humano-confirmado que marca
+`Commission.status = "received"`/`Commission.received_date`; nunca cria, edita ou apaga nenhuma
+`Transaction`) só muda o rótulo `financial_state` de `GET /commissions`, de PREVISTO para REALIZADO
+-- fecha a lacuna que `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §2.4 documentava desde o Slice 0
+(`Commission.received_date` existia no modelo desde a migração original mas nunca era lido em lugar
+algum). A engine (`app.services.projection_engine.build_projection`) continua sabendo somar um
+`ForecastCommission` explícito quando recebido -- essa capacidade é preservada para um futuro
+mecanismo de opt-in explícito e auditável (ainda não implementado); apenas o gate canônico nunca a
+aciona sozinho.
+
+**INV-029/INV-030/INV-031 (`app/services/invariant_registry.py`).** Todas avaliadas em tempo real
+por `GET /forecast` e `POST /monthly-closes/{period}/run`
+(`app.api._build_projection_gate_checks`), o mesmo ponto único que já avalia
+INV-005/006/018/022/023/024: INV-029 prova que nenhuma comissão já recebida está entre as
+efetivamente projetadas (defesa em profundidade -- estruturalmente garantido por INV-031 também);
+INV-030 prova que o primeiro mês exibido pela projeção usa exclusivamente um valor para o salário
+recorrente -- o real quando há evidência, o previsto caso contrário -- nunca a soma dos dois; INV-031
+prova, contra a saída real de `build_projection` (não apenas contra a construção do input), que
+nenhuma comissão pendente contribui automaticamente para nenhum cenário projetado.
+
+**`GET /dashboard` — commitments (revisão de engenharia, 2026-09-14, Round 2 de PR #91).**
+`noncanonical.commitments` responde rebaseline §44 ("o que tenho para pagar", "quanto devo nos
+cartões") com dois totais COMPROMETIDO -- `obligations_pending` (soma de `app.api._obligation_rows`)
+e `card_invoices_outstanding` (soma de `app.api._forecast_card_invoices`) -- as mesmas fontes
+canônicas que `GET /obligations` e `GET /forecast` já usam, nunca um segundo motor de cálculo.
+`GET /reports` permanece inerentemente REALIZADO-only (toda cifra vem de `build_snapshot`, que só lê
+`Transaction` já lançada) -- não há COMPROMETIDO/PREVISTO ali para separar.
+
 ## Comparação visual de cenários de compra (Fase 3)
 
 `POST /api/purchases/scenario-comparison` (`app/api.py::compare_purchase_scenarios`) compara duas a

@@ -45,7 +45,7 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
     with TestClient(app) as client:
         health = client.get("/health")
         assert health.status_code == 200
-        assert health.json()["financial_rules_version"] == "2026.10.1"
+        assert health.json()["financial_rules_version"] == "2026.10.3"
 
         setup = client.post(
             "/api/auth/setup",
@@ -637,7 +637,12 @@ def test_complete_local_financial_flow(monkeypatch) -> None:
         assert by_month["2026-09"]["installments"] == 31.9
         assert by_month["2026-10"]["installments"] == 31.9
         assert by_month["2026-11"]["installments"] == 31.9
-        assert by_month["2027-03"]["commission_delayed"] == 9400.0
+        # October Go-Live Slice 3, Round 2 of PR #91's review (rebaseline
+        # §8.3): a commission never automatically inflates any projected
+        # scenario -- not even the "delayed" one -- unless/until it is
+        # explicitly marked received. INV-031 proves this generally; this
+        # asserts it end-to-end for the exact commission registered above.
+        assert by_month["2027-03"]["commission_delayed"] == 0.0
 
         # `trusted_for_projection` must reflect genuine, persisted coverage of
         # every invariant the projection gate requires (INV-005, INV-006,

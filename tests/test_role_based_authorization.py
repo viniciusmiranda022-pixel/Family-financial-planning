@@ -534,6 +534,7 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             },
         ),
         ("commission delete", "delete", "/api/commissions/missing", {}),
+        ("commission receive", "post", "/api/commissions/missing/receive", {"json": {}}),
         (
             "payroll create",
             "post",

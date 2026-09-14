@@ -180,6 +180,17 @@ class CommissionRequest(BaseModel):
     delay_days: int = Field(default=60, ge=0, le=365)
 
 
+class CommissionReceiveRequest(BaseModel):
+    """October Go-Live Slice 3: explicit, human-confirmed act of marking a
+    `Commission` receivable as actually received (rebaseline §8.3 -- a
+    commission only enters the financial picture "quando efetivamente
+    registrada/recebida"). Never creates or edits any `Transaction`; the
+    real credit is expected to already exist as one, registered through the
+    normal income flow. `received_date` defaults to today when omitted."""
+
+    received_date: date | None = None
+
+
 class PayrollRequest(BaseModel):
     person_name: str = Field(min_length=2, max_length=120)
     competence: date

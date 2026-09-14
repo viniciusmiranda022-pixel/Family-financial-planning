@@ -27,11 +27,14 @@ from app.services.financial_invariants import (
     validate_investment_application,
     validate_investment_redemption,
     validate_lineage,
+    validate_no_automatic_unreceived_commission_in_projection,
     validate_non_negative_liquidity,
     validate_payroll_loan,
     validate_probable_duplicate,
     validate_projection_consistency,
     validate_realized_liquidity_requires_evidence,
+    validate_received_commission_excluded_from_projection,
+    validate_recurring_income_no_duplicate,
     validate_refund,
     validate_report_consistency,
     validate_safety_floor_is_reference,
@@ -416,6 +419,56 @@ _DEFINITIONS = (
         severity=IntegritySeverity.CRITICAL,
         required_facts=("divergence_status", "synthetic_adjustment_created"),
         validator=validate_card_invoice_divergence_not_silently_adjusted,
+    ),
+    InvariantDefinition(
+        id="INV-029",
+        name="received_commission_excluded_from_projection",
+        title="Comissão recebida sai da projeção",
+        description=(
+            "October Go-Live Slice 3: uma comissão já marcada como recebida "
+            "(Commission.received_date preenchido) nunca é incluída novamente "
+            "como PREVISTO em nenhum cenário de projeção -- o crédito real já "
+            "existe como fato; incluí-la de novo duplicaria renda."
+        ),
+        severity=IntegritySeverity.CRITICAL,
+        required_facts=("received_commission_ids", "projected_commission_ids"),
+        validator=validate_received_commission_excluded_from_projection,
+    ),
+    InvariantDefinition(
+        id="INV-030",
+        name="recurring_income_no_duplicate",
+        title="Renda recorrente reconciliada não duplica",
+        description=(
+            "October Go-Live Slice 3: quando existe evidência de crédito real "
+            "para o salário recorrente configurado em um período "
+            "(reconcile_recurring_income), a projeção desse período usa "
+            "exclusivamente o valor do crédito real -- nunca soma o valor real "
+            "ao valor previsto do mesmo período."
+        ),
+        severity=IntegritySeverity.CRITICAL,
+        required_facts=(
+            "has_recurring_income_evidence",
+            "expected_amount",
+            "reconciled_amount",
+            "projected_amount",
+        ),
+        validator=validate_recurring_income_no_duplicate,
+    ),
+    InvariantDefinition(
+        id="INV-031",
+        name="no_automatic_unreceived_commission_in_projection",
+        title="Comissão não recebida nunca infla a projeção",
+        description=(
+            "October Go-Live Slice 3 (Round 2): rebaseline §8.3 -- 'Comissões "
+            "nunca entram como receita PREVISTA automaticamente'. Mais amplo "
+            "que INV-029 (que só protege uma comissão já recebida de "
+            "reentrar): prova que nenhuma comissão pendente/não recebida "
+            "contribui para nenhum cenário de projeção automaticamente, "
+            "verificado contra a saída real de `build_projection`."
+        ),
+        severity=IntegritySeverity.CRITICAL,
+        required_facts=("total_projected_commission", "unreceived_commission_count"),
+        validator=validate_no_automatic_unreceived_commission_in_projection,
     ),
 )
 

@@ -71,6 +71,7 @@ from app.schemas import (
     CardPaymentUnlinkRequest,
     ClassificationRuleDeactivateRequest,
     ClassificationRuleEditRequest,
+    CommissionReceiveRequest,
     CommissionRequest,
     DuplicateResolutionRequest,
     FindingLifecycleRequest,
@@ -135,6 +136,7 @@ from app.services.card_invoice_lifecycle import (
     invoice_purchase_lines,
     link_refund,
     linked_refund_total_for,
+    outstanding_balance,
     pay_invoice,
     serialize_card_invoice,
     serialize_invoice_divergence,
@@ -217,6 +219,7 @@ from app.services.financial_snapshots import (
     serialize_snapshot,
     snapshot_lineage_facts,
 )
+from app.services.financial_state import COMPROMETIDO, PREVISTO, REALIZADO
 from app.services.importer import (
     PARSER_CONTRACT_VERSION,
     ParsedTransaction,
@@ -244,6 +247,7 @@ from app.services.reconciliation import (
     serialize_reconciliation,
     unknown_reconciliation,
 )
+from app.services.recurring_income import reconcile_recurring_income
 from app.services.report_export import (
     REPORT_EXPORT_MEDIA_TYPES,
     build_report_pdf,
@@ -647,6 +651,15 @@ def _obligation_rows(
                 "occurrence_count": item.occurrence_count,
                 "category": item.category,
                 "status": item.status,
+                # October Go-Live Slice 3 (P0 #87): computed, never persisted
+                # -- derived one-to-one from `item.status`, the already
+                # authoritative fact (docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md
+                # §3.3). A paid obligation is a liquidated fact (REALIZADO);
+                # a pending one is a contracted commitment not yet liquidated
+                # (COMPROMETIDO) -- including when overdue, which never
+                # removes it from either this list or the projection (see
+                # `_forecast_obligations`).
+                "financial_state": REALIZADO if item.status == "paid" else COMPROMETIDO,
                 "paid_at": item.paid_at,
                 "paid_transaction_id": item.paid_transaction_id,
                 "payment_transaction_created": item.payment_transaction_created,
@@ -6658,6 +6671,18 @@ def commissions(user: User = Depends(get_current_user), db: Session = Depends(ge
                 "net": decimal_value(net),
                 "delay_days": item.delay_days,
                 "status": item.status,
+                "received_date": item.received_date,
+                # October Go-Live Slice 3: a received commission is REALIZADO
+                # (the real credit already exists as a fact). An unreceived
+                # one is labelled PREVISTO here purely descriptively -- rebaseline
+                # §23's generic definition ("estimativa futura, sem obrigação
+                # rígida") fits a not-yet-received commission -- but per §8.3
+                # this label is never summed into any projected total:
+                # `_build_projection_gate_checks` never feeds an unreceived
+                # `Commission` into `ForecastInput.commissions` at all (INV-031
+                # proves it against the projection's real output, not just
+                # this endpoint).
+                "financial_state": REALIZADO if item.received_date is not None else PREVISTO,
             }
         )
     return result
@@ -6675,6 +6700,61 @@ def create_commission(
     audit(db, user, "commission.create", "commission", item.id, payload.model_dump())
     db.commit()
     return {"id": item.id, "tax": decimal_value(tax), "net": decimal_value(net)}
+
+
+@router.post("/commissions/{commission_id}/receive")
+def receive_commission(
+    commission_id: str,
+    payload: CommissionReceiveRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """October Go-Live Slice 3 (P0 #87): the explicit, human-confirmed act
+    that closes rebaseline §8.3's loop -- "a comissão passa à realidade
+    financeira quando for explicitamente registrada/recebida". Never
+    creates, edits or deletes any `Transaction`: the real credit is expected
+    to already be registered through the normal income flow. This only
+    stops the receivable from being projected again as PREVISTO
+    (`docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §2.4/§4, INV-029)."""
+
+    _require_admin(user)
+    item = db.scalar(
+        select(Commission).where(
+            Commission.id == commission_id,
+            Commission.household_id == user.household_id,
+        )
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Comissão não encontrada")
+    if item.received_date is not None:
+        raise HTTPException(status_code=409, detail="Esta comissão já está marcada como recebida")
+    if item.status == "cancelled":
+        raise HTTPException(
+            status_code=409, detail="Uma comissão cancelada não pode ser marcada como recebida"
+        )
+    received_date = payload.received_date or date.today()
+    before_state = {"status": item.status, "received_date": None}
+    item.status = "received"
+    item.received_date = received_date
+    audit(
+        db,
+        user,
+        "commission.receive",
+        "commission",
+        item.id,
+        {"received_date": received_date.isoformat()},
+        before_state=before_state,
+        after_state={"status": item.status, "received_date": received_date.isoformat()},
+        reason="Comissão confirmada como recebida pelo usuário",
+        source="commission_reconciliation",
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "commission_id": item.id,
+        "status": item.status,
+        "received_date": item.received_date,
+    }
 
 
 @router.delete("/commissions/{commission_id}")
@@ -7636,7 +7716,9 @@ def update_profile(
     }
 
 
-def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
+def _forecast_obligations(
+    items: list[Obligation], start_month: date | None = None
+) -> dict[str, Decimal]:
     values: dict[str, Decimal] = {}
     for item in items:
         # FAMILY_FINANCE_OBLIGATION_PAYMENT_V8
@@ -7645,10 +7727,63 @@ def _forecast_obligations(items: list[Obligation]) -> dict[str, Decimal]:
             continue
         for occurrence in range(item.occurrence_count):
             due = add_months(item.due_date.replace(day=1), occurrence * item.recurrence_months)
+            if start_month is not None and due < start_month:
+                # October Go-Live Slice 3 (P0 #87): an overdue-but-unpaid
+                # obligation is still a live COMPROMETIDO commitment
+                # (rebaseline §7 -- "atraso não vira gasto duplicado nem
+                # desaparece da projeção"). Without this clamp, `due`'s own
+                # past month is a key `build_projection`'s forward-only
+                # cursor (starting at `start_month`) never visits, and the
+                # amount silently never appears in any projected month.
+                # Folding it into `start_month` keeps it visible in the
+                # nearest month the projection actually shows, exactly once.
+                due = start_month
             key = month_key(due)
             values[key] = values.get(key, Decimal("0")) + item.amount
             if item.recurrence_months == 0:
                 break
+    return values
+
+
+def _forecast_card_invoices(
+    db: Session, household_id: str, start_month: date
+) -> dict[str, Decimal]:
+    """`CardInvoice` rows already `closed`/`partially_paid` still owe
+    `outstanding_balance` -- a real COMPROMETIDO commitment, exactly like an
+    `Obligation` (rebaseline §6.2/§7). An `open` invoice is still accruing
+    (its purchases are already covered by `_future_installments` for the
+    months still to come, and by the household's own spending totals for
+    what already happened) and a `paid` one has nothing left owed, so only
+    `closed`/`partially_paid` ever contribute here.
+
+    October Go-Live Slice 3 (P0 #87): without this, a real unpaid bill
+    silently never entered `/forecast` at all -- money already committed
+    would look uncommitted in every projected scenario. Mirrors
+    `_forecast_obligations`'s own overdue clamp: an invoice whose `due_date`
+    has already passed is folded into `start_month` instead of a past month
+    the projection's forward-only cursor never visits.
+    """
+
+    rows = db.scalars(
+        select(CardInvoice).where(
+            CardInvoice.household_id == household_id,
+            CardInvoice.status.in_(("closed", "partially_paid")),
+        )
+    ).all()
+    values: dict[str, Decimal] = {}
+    for invoice in rows:
+        owed = outstanding_balance(invoice)
+        if owed <= 0:
+            continue
+        due = invoice.due_date or invoice.closes_at
+        if due is None:
+            year, month = (int(part) for part in invoice.competence.split("-"))
+            due = date(year, month, 1)
+        due = due.replace(day=1)
+        if due < start_month:
+            due = start_month
+        key = month_key(due)
+        values[key] = values.get(key, Decimal("0")) + owed
     return values
 
 
@@ -7865,11 +8000,37 @@ def _build_projection_gate_checks(
     obligations_rows = db.scalars(
         select(Obligation).where(Obligation.household_id == household_id, Obligation.active.is_(True))
     ).all()
-    commission_rows = db.scalars(
-        select(Commission).where(
-            Commission.household_id == household_id, Commission.status != "cancelled"
-        )
+    # October Go-Live Rebaseline §8.3: "Comissões nunca entram como receita
+    # PREVISTA automaticamente ... não deve inflar projeções futuras por
+    # expectativa." Round 2 of the Slice 3 review (PR #91) found that the
+    # first cut of this slice still violated this literally: every
+    # non-cancelled, not-yet-received `Commission` was fed into
+    # `ForecastInput.commissions` below and therefore did inflate the
+    # "expected"/"delayed" projection scenarios purely from the row's
+    # existence -- the only guard that existed (INV-029) protected an
+    # *already-received* commission from re-entering, never the primary
+    # prohibition against an unreceived one entering at all. `commissions`
+    # is fixed empty below: the canonical projection gate never auto-derives
+    # commission income from `Commission` rows. `all_commission_rows` /
+    # `received_commission_ids` / `unreceived_commission_rows` are kept only
+    # to feed INV-029 (still meaningful: it proves a received commission id
+    # never appears in what *would* be projected) and the new INV-031, which
+    # proves the primary prohibition directly against this function's own
+    # output (`rows`) rather than merely trusting that this call site forgot
+    # nothing. A future, explicit, human-confirmed opt-in mechanism for
+    # commission scenarios belongs in its own auditable typed action, not in
+    # inferring intent from a `Commission` row's mere existence.
+    all_commission_rows = db.scalars(
+        select(Commission).where(Commission.household_id == household_id)
     ).all()
+    received_commission_ids = [
+        item.id for item in all_commission_rows if item.received_date is not None
+    ]
+    unreceived_commission_rows = [
+        item
+        for item in all_commission_rows
+        if item.status != "cancelled" and item.received_date is None
+    ]
     payroll_rows = db.scalars(
         select(PayrollRecord).where(
             PayrollRecord.household_id == household_id, PayrollRecord.payroll_kind != "regular"
@@ -7879,15 +8040,42 @@ def _build_projection_gate_checks(
     for item in payroll_rows:
         key = month_key(item.payment_date)
         payroll_extras[key] = payroll_extras.get(key, Decimal("0")) + item.net_amount
-    commissions_input = []
-    for item in commission_rows:
-        _, net = commission_net(item.gross_amount, item.tax_rate)
-        commissions_input.append(ForecastCommission(item.expected_date, net, item.delay_days))
+    # Deliberately empty -- see the comment above. `commission_net` stays
+    # imported/used elsewhere (`GET /commissions`, receivable display) so a
+    # user can still see what a commission is *worth* without that figure
+    # ever reaching a projected balance on its own.
+    commissions_input: list[ForecastCommission] = []
     rate = monthly_net_rate(profile.investment_gross_annual_rate, profile.investment_income_tax_rate)
     installments = dict(_future_installments(db, household_id))
     if extra_installments:
         for key, value in extra_installments.items():
             installments[key] = installments.get(key, Decimal("0")) + value
+    card_invoices = _forecast_card_invoices(db, household_id, start_month.replace(day=1))
+
+    # October Go-Live Slice 3 (rebaseline §8.4): reconcile the configured
+    # recurring salary against a real income Transaction for every period
+    # this projection will actually show, so a period already backed by a
+    # real credit uses that confirmed amount instead of the flat PREVISTO
+    # estimate -- never both. `reconcile_recurring_income` never invents a
+    # match; a period with no evidence simply keeps the flat estimate.
+    salary_reconciliations: dict[str, object] = {}
+    monthly_salary_overrides: dict[str, Decimal] = {}
+    if profile.monthly_salary_net > 0:
+        cursor = start_month.replace(day=1)
+        horizon_end = end_month.replace(day=1)
+        while cursor <= horizon_end:
+            period = month_key(cursor)
+            reconciliation = reconcile_recurring_income(
+                db,
+                household_id=household_id,
+                period=period,
+                expected_amount=profile.monthly_salary_net,
+            )
+            salary_reconciliations[period] = reconciliation
+            if reconciliation.financial_state == REALIZADO and reconciliation.matched_amount is not None:
+                monthly_salary_overrides[period] = reconciliation.matched_amount
+            cursor = add_months(cursor, 1)
+
     projection_input = ForecastInput(
         start_month=start_month,
         end_month=end_month,
@@ -7895,15 +8083,51 @@ def _build_projection_gate_checks(
         monthly_salary=profile.monthly_salary_net,
         monthly_cash_cap=profile.monthly_cash_cap,
         monthly_investment_rate=rate,
-        obligations=_forecast_obligations(list(obligations_rows)),
+        obligations=_forecast_obligations(list(obligations_rows), start_month.replace(day=1)),
         installments=installments,
         payroll_extras=payroll_extras,
         commissions=tuple(commissions_input),
         starting_uncovered_deficit=Decimal(snapshot.closing_uncovered_deficit),
         safety_floor=Decimal(profile.emergency_floor),
+        card_invoices=card_invoices,
+        monthly_salary_overrides=monthly_salary_overrides,
     )
     rows = build_forecast(projection_input)
+    # October Go-Live Slice 3: every row of a forward projection is
+    # inherently PREVISTO (rebaseline §3/§13.1) even though some of its
+    # components (`obligations`, `installments`, `card_invoices`) are
+    # themselves COMPROMETIDO facts feeding the same hypothesis -- the label
+    # here describes the row as a whole (a forecasted month), not each
+    # component. `salary_financial_state`/`salary_reconciled_transaction_id`
+    # single out the one line item this slice can actually promote to
+    # REALIZADO when evidence exists, without ever double-counting it.
+    for row in rows:
+        row["financial_state"] = PREVISTO
+        reconciliation = salary_reconciliations.get(str(row["month"]))
+        if reconciliation is not None and reconciliation.financial_state == REALIZADO:
+            row["salary_financial_state"] = REALIZADO
+            row["salary_reconciled_transaction_id"] = reconciliation.matched_transaction_id
+            row["salary_reconciliation_ambiguous"] = False
+        else:
+            row["salary_financial_state"] = PREVISTO
+            row["salary_reconciled_transaction_id"] = None
+            # October Go-Live Slice 3, Round 2: "ausência de evidência não
+            # significa sucesso" -- when `reconcile_recurring_income` found
+            # more than one equally-plausible candidate for this period, that
+            # ambiguity must stay visible instead of silently looking
+            # identical to "no candidate found at all".
+            row["salary_reconciliation_ambiguous"] = bool(
+                reconciliation is not None and reconciliation.ambiguous
+            )
     validation = validate_projection(projection_input, rows)
+    # INV-031 evidence: proves the §8.3 prohibition against this function's
+    # own *output*, not merely against the input it built -- a future
+    # refactor of `projection_engine.build_projection` that re-derives
+    # commission income from somewhere else would still be caught here.
+    total_projected_commission = money(
+        sum((Decimal(str(row.get("commission_expected", 0))) for row in rows), Decimal("0"))
+        + sum((Decimal(str(row.get("commission_delayed", 0))) for row in rows), Decimal("0"))
+    )
     # `rows[0]` is the first projected month, seeded from `snapshot`'s
     # REALIZADO closing balance -- INV-005/006 must always have at least one
     # row here because `start_month <= end_month` by construction at every
@@ -7913,6 +8137,23 @@ def _build_projection_gate_checks(
     lineage_facts = snapshot_lineage_facts(db, snapshot)
     realized_liquidity_facts = realized_liquidity_evidence_facts(snapshot)
     realized_sovereignty_facts = realized_balance_sovereignty_facts(snapshot)
+    first_row_period = str(rows[0]["month"]) if rows else None
+    first_row_reconciliation = (
+        salary_reconciliations.get(first_row_period) if first_row_period else None
+    )
+    first_row_has_recurring_evidence = bool(
+        first_row_reconciliation is not None and first_row_reconciliation.financial_state == REALIZADO
+    )
+    recurring_income_facts = {
+        "has_recurring_income_evidence": first_row_has_recurring_evidence,
+        "expected_amount": Decimal(profile.monthly_salary_net),
+        "reconciled_amount": (
+            Decimal(first_row_reconciliation.matched_amount)
+            if first_row_has_recurring_evidence and first_row_reconciliation.matched_amount is not None
+            else Decimal("0")
+        ),
+        "projected_amount": Decimal(rows[0]["salary"]) if rows else Decimal("0"),
+    }
     checks = (
         IntegrityCheck(
             "INV-018",
@@ -7973,6 +8214,51 @@ def _build_projection_gate_checks(
             InvariantContext(
                 facts=realized_sovereignty_facts,
                 scope=InvariantScope.PERIOD,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-029",
+            InvariantContext(
+                facts={
+                    "received_commission_ids": received_commission_ids,
+                    # October Go-Live Slice 3, Round 2: reflects what is
+                    # actually fed into `ForecastInput.commissions` (always
+                    # empty -- see INV-031), not merely "every unreceived
+                    # commission row on file". A received commission id can
+                    # therefore never appear here by construction; the
+                    # invariant is kept as a defensive regression guard
+                    # rather than removed, so a future reintroduction of
+                    # automatic commission inclusion is caught by both
+                    # INV-029 (received) and INV-031 (unreceived) at once.
+                    "projected_commission_ids": [],
+                },
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-031",
+            InvariantContext(
+                facts={
+                    "total_projected_commission": total_projected_commission,
+                    "unreceived_commission_count": len(unreceived_commission_rows),
+                },
+                scope=InvariantScope.PROJECTION,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                period=check_period,
+            ),
+        ),
+        IntegrityCheck(
+            "INV-030",
+            InvariantContext(
+                facts=recurring_income_facts,
+                scope=InvariantScope.PROJECTION,
                 entity_type=entity_type,
                 entity_id=entity_id,
                 period=check_period,
@@ -8864,9 +9150,23 @@ def dashboard(
                 "trusted": True,
             }
 
-    obligation_alerts = [
-        item for item in _obligation_rows(db, user.household_id) if item["days_until_due"] <= 30
-    ][:5]
+    pending_obligation_rows = _obligation_rows(db, user.household_id)
+    obligation_alerts = [item for item in pending_obligation_rows if item["days_until_due"] <= 30][:5]
+    # October Go-Live Slice 3, Round 2 of PR #91's review (DoD: "Dashboard/
+    # forecast/report ponta a ponta"): rebaseline §44 requires the Dashboard
+    # to answer "o que tenho para pagar" / "quanto devo nos cartões" -- both
+    # COMPROMETIDO totals that previously had no representation here at all
+    # (only `obligation_alerts`' next-30-days *list* existed). Both figures
+    # below are sums over the *exact* canonical helpers `GET /obligations`
+    # and `GET /forecast` already use (`_obligation_rows`,
+    # `_forecast_card_invoices`) -- never a second calculation -- so a
+    # regression in either source surfaces here too.
+    pending_obligations_total = money(
+        sum((Decimal(str(item["amount"])) for item in pending_obligation_rows), Decimal("0"))
+    )
+    card_invoices_outstanding_total = money(
+        sum(_forecast_card_invoices(db, user.household_id, start).values(), Decimal("0"))
+    )
     db.commit()
     # `dashboard_monetary_publication` is the exact function INV-019 reads to
     # verify this response -- see its docstring and
@@ -8953,6 +9253,34 @@ def dashboard(
                 "freshness": "live",
                 "certified_by": None,
                 "as_of": datetime.now(UTC).isoformat(),
+            },
+            # October Go-Live Slice 3, Round 2: COMPROMETIDO totals -- a
+            # live sum of already-canonical, already-computed figures, not a
+            # snapshot-fixed fact, so `noncanonical` (like the two entries
+            # above) rather than folded into `publication`/INV-019. Answers
+            # rebaseline §44's "o que tenho para pagar" / "quanto devo nos
+            # cartões" without a second obligations/card-invoice engine.
+            "commitments": {
+                "obligations_pending": {
+                    "value": decimal_value(pending_obligations_total),
+                    "financial_state": COMPROMETIDO,
+                    "source": "obligation_rows",
+                    "freshness": "live",
+                    "certified_by": None,
+                    "as_of": datetime.now(UTC).isoformat(),
+                },
+                "card_invoices_outstanding": {
+                    "value": decimal_value(card_invoices_outstanding_total),
+                    "financial_state": COMPROMETIDO,
+                    "source": "card_invoice_outstanding_balance",
+                    "freshness": "live",
+                    "certified_by": None,
+                    "as_of": datetime.now(UTC).isoformat(),
+                },
+                "total": {
+                    "value": decimal_value(money(pending_obligations_total + card_invoices_outstanding_total)),
+                    "financial_state": COMPROMETIDO,
+                },
             },
         },
         "obligation_alerts": obligation_alerts,
