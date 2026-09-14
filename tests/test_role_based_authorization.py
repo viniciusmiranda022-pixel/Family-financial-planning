@@ -606,19 +606,7 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             "assistant execute",
             "post",
             "/api/assistant/execute",
-            {
-                "json": {
-                    "typed_action": "create_expense",
-                    "payload": {
-                        "booked_at": "2026-08-01",
-                        "description": "Combustível",
-                        "amount": "100.00",
-                        "account_id": "missing-account-id",
-                    },
-                    "original_message": "Gastei 100 de combustível",
-                    "trace_id": "consulta-denial-check",
-                }
-            },
+            {"json": {"proposal_id": "missing-proposal-id"}},
         ),
         ("assistant undo", "post", "/api/assistant/actions/missing/undo", {"json": reason}),
         (

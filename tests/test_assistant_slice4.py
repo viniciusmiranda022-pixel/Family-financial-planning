@@ -18,7 +18,7 @@ pattern -- covering the Work Order's "Testes obrigatórios" list.
 
 import os
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from cryptography.fernet import Fernet
@@ -40,18 +40,22 @@ from app.main import app  # noqa: E402
 from app.models import (  # noqa: E402
     Account,
     AssistantActionEvent,
+    AssistantActionProposal,
     AuditEvent,
     Category,
     Household,
     Obligation,
     Transaction,
+    User,
 )
 from app.services.assistant_actions import (  # noqa: E402
     AssistantActionError,
+    DuplicateResolution,
     build_typed_action_proposal,
     execute_typed_action,
     parse_amount_text,
     parse_date_text,
+    persist_action_proposal,
 )
 from app.services.assistant_interpreter import StructuredInterpretation  # noqa: E402
 from app.services.card_invoice_lifecycle import get_or_sync_invoice  # noqa: E402
@@ -317,31 +321,79 @@ def _setup_household(client, *, username="admin-assistant-slice4"):
     complete_mfa_enrollment(client)
 
 
+def _propose_and_persist(
+    session_factory,
+    *,
+    household_id: str,
+    message: str,
+    interpretation: StructuredInterpretation,
+    trace_id: str | None = None,
+    duplicate_resolution: DuplicateResolution | None = None,
+):
+    """Mirrors exactly what `POST /assistant/interpret` does server-side --
+    `build_typed_action_proposal` then, only when it can execute,
+    `persist_action_proposal` -- without needing a configured Codex sidecar
+    (unavailable in this test process, exactly like Section 1's
+    `_interpretation()` already bypasses it by constructing a
+    `StructuredInterpretation` by hand). This lets `POST /assistant/execute`
+    be exercised against its real, unmodified HTTP contract (engineering
+    review of PR #92, blocker 1): the proposal id this returns is the only
+    thing a test ever hands to that endpoint, exactly like a real client
+    would receive it from a real `POST /assistant/interpret` call.
+
+    Returns `(proposal_id_or_None, proposal, trace_id)` -- `proposal_id` is
+    `None` when the proposal still needs disambiguation (nothing to
+    execute, and nothing was persisted)."""
+
+    trace_id = trace_id or str(uuid.uuid4())
+    with session_factory() as db:
+        user_id = db.scalar(select(User.id))
+        proposal = build_typed_action_proposal(
+            db,
+            household_id=household_id,
+            interpretation=interpretation,
+            duplicate_resolution=duplicate_resolution,
+        )
+        if not proposal.can_execute:
+            return None, proposal, trace_id
+        proposal_id = persist_action_proposal(
+            db,
+            household_id=household_id,
+            user_id=user_id,
+            trace_id=trace_id,
+            original_message=message,
+            structured_interpretation=interpretation.to_dict(),
+            proposal=proposal,
+        )
+    return proposal_id, proposal, trace_id
+
+
+def _household_id(session_factory) -> str:
+    with session_factory() as db:
+        return db.scalar(select(Household.id))
+
+
 def test_execute_create_expense_writes_exactly_once_and_is_fully_audited() -> None:
     client, session_factory = _client()
     with client:
         _setup_household(client)
         account = client.post("/api/accounts", json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17})
         assert account.status_code == 201, account.text
-        account_id = account.json()["id"]
 
-        trace_id = str(uuid.uuid4())
-        execute = client.post(
-            "/api/assistant/execute",
-            json={
-                "typed_action": "create_expense",
-                "payload": {
-                    "booked_at": "2026-09-01",
-                    "description": "Combustível",
-                    "amount": "300.00",
-                    "account_id": account_id,
-                    "category_name": "Transporte",
-                },
-                "original_message": "Gastei 300 de combustível no Nubank",
-                "structured_interpretation": {"intent": "create_expense", "confidence": 0.95},
-                "trace_id": trace_id,
-            },
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "create_expense", amount_text="300", description="Combustível", account_hint="Nubank",
+            category_hint="Transporte",
         )
+        proposal_id, proposal, trace_id = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="Gastei 300 de combustível no Nubank",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+
+        execute = client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
         assert execute.status_code == 201, execute.text
         body = execute.json()
         assert body["idempotent_replay"] is False
@@ -361,25 +413,20 @@ def test_execute_create_expense_writes_exactly_once_and_is_fully_audited() -> No
             assert action_event.typed_action == "create_expense"
             assert action_event.target_entity_ids == [transaction_id]
             assert action_event.undoable is True
+            # A create has no prior state to capture (engineering review of
+            # PR #92, blocker 2: "para create, before_state=None é aceitável").
+            assert action_event.before_state is None
             assert audit_event.trace_id == trace_id
             assert audit_event.event_type == "assistant.execute"
 
-        # Retry with the same trace_id: idempotent replay, no second write.
-        retry = client.post(
-            "/api/assistant/execute",
-            json={
-                "typed_action": "create_expense",
-                "payload": {
-                    "booked_at": "2026-09-01",
-                    "description": "Combustível",
-                    "amount": "300.00",
-                    "account_id": account_id,
-                    "category_name": "Transporte",
-                },
-                "original_message": "Gastei 300 de combustível no Nubank",
-                "trace_id": trace_id,
-            },
-        )
+            proposal_row = db.get(AssistantActionProposal, proposal_id)
+            assert proposal_row.consumed_at is not None
+            assert proposal_row.consumed_action_event_id == action_id
+
+        # Retry with the same, already-consumed proposal_id: idempotent
+        # replay, no second write -- the proposal itself is the idempotency
+        # key now (blocker 1), not a client-supplied trace_id.
+        retry = client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
         assert retry.status_code == 201, retry.text
         assert retry.json()["idempotent_replay"] is True
 
@@ -401,21 +448,23 @@ def test_execute_internal_transfer_creates_zero_income_or_expense() -> None:
         assert privilege.status_code == 201
         assert checking.status_code == 201
 
-        execute = client.post(
-            "/api/assistant/execute",
-            json={
-                "typed_action": "create_internal_transfer",
-                "payload": {
-                    "booked_at": "2026-09-01",
-                    "description": "Resgate para pagamento",
-                    "amount": "500.00",
-                    "from_account_id": privilege.json()["id"],
-                    "to_account_id": checking.json()["id"],
-                },
-                "original_message": "Resgatei 500 do Privilège para a conta corrente",
-                "trace_id": str(uuid.uuid4()),
-            },
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "create_internal_transfer",
+            amount_text="500",
+            account_hint="Privilège DI",
+            target_hint="Conta Corrente",
+            description="Resgate para pagamento",
         )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="Resgatei 500 do Privilège para a conta corrente",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+
+        execute = client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
         assert execute.status_code == 201, execute.text
 
         with session_factory() as db:
@@ -431,7 +480,6 @@ def test_execute_pay_obligation_via_assistant_matches_manual_contract_no_double_
         _setup_household(client)
         account = client.post("/api/accounts", json={"name": "Conta Corrente", "account_type": "checking"})
         assert account.status_code == 201
-        account_id = account.json()["id"]
 
         created = client.post(
             "/api/obligations",
@@ -440,20 +488,24 @@ def test_execute_pay_obligation_via_assistant_matches_manual_contract_no_double_
         assert created.status_code == 201, created.text
         obligation_id = created.json()["id"]
 
-        execute = client.post(
-            "/api/assistant/execute",
-            json={
-                "typed_action": "pay_obligation",
-                "payload": {
-                    "account_id": account_id,
-                    "paid_at": "2026-08-09",
-                    "funding_source": "account",
-                },
-                "path_params": {"obligation_id": obligation_id},
-                "original_message": "Paguei a parcela da chácara",
-                "trace_id": str(uuid.uuid4()),
-            },
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "pay_obligation",
+            target_hint="Parcela chácara",
+            funding_source_hint="account",
+            account_hint="Conta Corrente",
+            date_text="2026-08-09",
         )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="Paguei a parcela da chácara",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+        assert proposal.path_params == {"obligation_id": obligation_id}
+
+        execute = client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
         assert execute.status_code == 201, execute.text
         action_id = execute.json()["action"]["id"]
 
@@ -464,6 +516,19 @@ def test_execute_pay_obligation_via_assistant_matches_manual_contract_no_double_
                 db.scalars(select(Transaction).where(Transaction.transaction_type == "expense"))
             )
             assert len(expenses) == 1
+
+            # Blocker 2: a mutation on an *existing* entity (unlike a
+            # create) must capture the canonical before/after the domain
+            # endpoint itself already computed -- copied verbatim, not
+            # recomputed.
+            action_event = db.get(AssistantActionEvent, action_id)
+            assert action_event.before_state == {
+                "status": "pending",
+                "paid_at": None,
+                "paid_transaction_id": None,
+            }
+            assert action_event.after_state["status"] == "paid"
+            assert action_event.after_state["paid_transaction_id"] == expenses[0].id
 
         undo = client.post(
             f"/api/assistant/actions/{action_id}/undo",
@@ -477,6 +542,10 @@ def test_execute_pay_obligation_via_assistant_matches_manual_contract_no_double_
             action_event = db.get(AssistantActionEvent, action_id)
             assert action_event.undone_at is not None
             assert action_event.undone_by is not None
+            # The undo itself is a real domain write (`_unpay_obligation_impl`)
+            # -- deleted the transaction the payment created -- so it must
+            # not have vanished from `transactions` either.
+            assert db.scalar(select(Transaction).where(Transaction.id == expenses[0].id)) is None
 
 
 def test_undo_pay_card_invoice_is_refused_as_non_reversible_with_explicit_reason() -> None:
@@ -490,7 +559,7 @@ def test_undo_pay_card_invoice_is_refused_as_non_reversible_with_explicit_reason
         checking = client.post("/api/accounts", json={"name": "Conta Corrente", "account_type": "checking"})
         assert card.status_code == 201
         assert checking.status_code == 201
-        card_id, checking_id = card.json()["id"], checking.json()["id"]
+        card_id = card.json()["id"]
 
         with session_factory() as db:
             household_id = db.scalar(select(Household)).id
@@ -519,31 +588,34 @@ def test_undo_pay_card_invoice_is_refused_as_non_reversible_with_explicit_reason
 
         with session_factory() as db:
             account = db.get(Account, card_id)
-            invoice = get_or_sync_invoice(
+            get_or_sync_invoice(
                 db, household_id=household_id, account=account, competence="2026-09", as_of=date(2026, 9, 11)
             )
             db.commit()
-            invoice_id = invoice.id
 
-        execute = client.post(
-            "/api/assistant/execute",
-            json={
-                "typed_action": "pay_card_invoice",
-                "payload": {
-                    "paying_account_id": checking_id,
-                    "amount": "1000.00",
-                    "booked_at": "2026-09-15",
-                    "description": "Pagamento fatura",
-                    "confirmed": True,
-                },
-                "path_params": {"invoice_id": invoice_id},
-                "original_message": "Paguei a fatura do cartão",
-                "trace_id": str(uuid.uuid4()),
-            },
+        interpretation = _interpretation(
+            "pay_card_invoice",
+            account_hint="Cartão",
+            target_hint="Conta Corrente",
+            amount_text="1000",
+            date_text="2026-09-15",
         )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="Paguei a fatura do cartão",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+
+        execute = client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
         assert execute.status_code == 201, execute.text
         action_id = execute.json()["action"]["id"]
         assert execute.json()["action"]["undoable"] is False
+        # Blocker 2, mutation-on-existing-entity: the invoice's own
+        # before/after must be captured too, not just left `None`.
+        assert execute.json()["action"]["before_state"]["status"] == "closed"
+        assert execute.json()["action"]["after_state"]["status"] == "paid"
 
         undo = client.post(
             f"/api/assistant/actions/{action_id}/undo", json={"reason": "Quero desfazer"}
@@ -552,34 +624,82 @@ def test_undo_pay_card_invoice_is_refused_as_non_reversible_with_explicit_reason
         assert "reversão" in undo.json()["detail"] or "revers" in undo.json()["detail"]
 
 
-def test_execute_with_missing_required_field_never_writes() -> None:
+def test_incomplete_interpretation_never_persists_a_proposal_and_writes_nothing() -> None:
     """Work Order invariant: "Nenhuma ação ambígua é executada
-    automaticamente" -- an incomplete payload is rejected before any row is
-    created, not silently completed with a guess."""
+    automaticamente" -- an incomplete message never becomes an executable,
+    persisted proposal, so there is never a `proposal_id` an HTTP call
+    could even reference to write anything."""
 
     client, session_factory = _client()
     with client:
         _setup_household(client)
-        execute = client.post(
-            "/api/assistant/execute",
-            json={
-                "typed_action": "create_expense",
-                "payload": {"booked_at": "2026-09-01", "description": "Combustível", "amount": "300.00"},
-                "original_message": "Gastei 300 de combustível",
-                "trace_id": str(uuid.uuid4()),
-            },
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "create_expense", amount_text="300", description="Combustível"
         )
-        assert execute.status_code == 422
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory, household_id=household_id, message="Gastei 300 de combustível", interpretation=interpretation
+        )
+        assert proposal.can_execute is False
+        assert proposal_id is None
+
         with session_factory() as db:
             assert db.scalar(select(Transaction)) is None
+            assert db.scalar(select(AssistantActionProposal)) is None
 
 
-def test_assistant_actions_are_isolated_between_households() -> None:
-    client_a, _ = _client()
-    with client_a:
-        _setup_household(client_a, username="assistant-household-a")
-        account = client_a.post("/api/accounts", json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17})
-        execute = client_a.post(
+def test_persist_action_proposal_refuses_a_non_executable_proposal() -> None:
+    """Defensive guard on `persist_action_proposal` itself -- even if a
+    caller mistakenly tried to persist a still-ambiguous proposal, it must
+    refuse rather than silently store something `execute_typed_action`
+    could later dispatch without ever having been resolved."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    with session_factory() as db:
+        interpretation = _interpretation("create_expense", amount_text="300")
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+        assert proposal.can_execute is False
+        try:
+            persist_action_proposal(
+                db,
+                household_id=household_id,
+                user_id="does-not-matter",
+                trace_id=str(uuid.uuid4()),
+                original_message="Gastei 300",
+                structured_interpretation=interpretation.to_dict(),
+                proposal=proposal,
+            )
+            raised = False
+        except ValueError:
+            raised = True
+        assert raised
+
+
+def test_execute_rejects_unknown_proposal_id() -> None:
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        execute = client.post("/api/assistant/execute", json={"proposal_id": str(uuid.uuid4())})
+        assert execute.status_code == 404
+
+
+def test_execute_rejects_the_old_client_supplied_typed_action_contract() -> None:
+    """Regression test for the exact vulnerability engineering review of PR
+    #92 (blocker 1) flagged: a client can no longer skip `POST
+    /assistant/interpret` and hand-craft `typed_action`/`payload` directly
+    -- `AssistantExecuteRequest` no longer has those fields at all, so
+    Pydantic itself rejects the old-shaped request before any code in
+    `execute_typed_action` ever runs."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        account = client.post(
+            "/api/accounts",
+            json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17},
+        )
+        execute = client.post(
             "/api/assistant/execute",
             json={
                 "typed_action": "create_expense",
@@ -590,10 +710,310 @@ def test_assistant_actions_are_isolated_between_households() -> None:
                     "account_id": account.json()["id"],
                     "category_name": "Transporte",
                 },
-                "original_message": "Gastei 300 de combustível",
+                "original_message": "mensagem forjada sem passar por /assistant/interpret",
+                "structured_interpretation": {"intent": "create_expense", "confidence": 0.99},
                 "trace_id": str(uuid.uuid4()),
             },
         )
+        assert execute.status_code == 422
+        with session_factory() as db:
+            assert db.scalar(select(Transaction)) is None
+
+
+def test_execute_rejects_a_proposal_from_another_household() -> None:
+    """`execute_typed_action` scopes its `AssistantActionProposal` lookup by
+    `household_id`, exactly like every other Slice 1-4 query -- a proposal
+    id leaked or guessed from another household's session must not be
+    executable here."""
+
+    client_a, session_factory_a = _client()
+    with client_a:
+        _setup_household(client_a, username="assistant-proposal-household-a")
+        assert (
+            client_a.post(
+                "/api/accounts",
+                json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17},
+            ).status_code
+            == 201
+        )
+        household_a_id = _household_id(session_factory_a)
+        interpretation = _interpretation(
+            "create_expense", amount_text="300", description="Combustível", account_hint="Nubank",
+            category_hint="Transporte",
+        )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory_a,
+            household_id=household_a_id,
+            message="Gastei 300 de combustível",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+
+    client_b, _ = _client()
+    with client_b:
+        _setup_household(client_b, username="assistant-proposal-household-b")
+        execute = client_b.post("/api/assistant/execute", json={"proposal_id": proposal_id})
+        assert execute.status_code == 404
+
+
+def test_execute_typed_action_function_rejects_unknown_action_directly() -> None:
+    """Defense in depth: even a hand-corrupted `AssistantActionProposal` row
+    (a value `build_typed_action_proposal` itself could never produce) is
+    rejected by `execute_typed_action`'s own `TYPED_ACTIONS` check, not
+    trusted just because it made it into the table."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    with session_factory() as db:
+        household = db.get(Household, household_id)
+        user = User(household_id=household.id, name="Corrupt", username="corrupt-proposal-user", password_hash="x")
+        db.add(user)
+        db.flush()
+        row = AssistantActionProposal(
+            household_id=household_id,
+            user_id=user.id,
+            trace_id=str(uuid.uuid4()),
+            original_message="x",
+            typed_action="not_a_real_action",
+            payload={},
+            path_params={},
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        db.add(row)
+        db.commit()
+        proposal_id = row.id
+
+        try:
+            execute_typed_action(db, user=user, proposal_id=proposal_id)
+            raised = False
+        except AssistantActionError:
+            raised = True
+        assert raised
+
+
+def test_execute_rejects_an_expired_proposal() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    with session_factory() as db:
+        household = db.get(Household, household_id)
+        user = User(household_id=household.id, name="Expired", username="expired-proposal-user", password_hash="x")
+        db.add(user)
+        db.flush()
+        row = AssistantActionProposal(
+            household_id=household_id,
+            user_id=user.id,
+            trace_id=str(uuid.uuid4()),
+            original_message="x",
+            typed_action="create_expense",
+            payload={},
+            path_params={},
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+        db.add(row)
+        db.commit()
+        proposal_id = row.id
+
+        try:
+            execute_typed_action(db, user=user, proposal_id=proposal_id)
+            raised = False
+        except AssistantActionError as exc:
+            raised = "expirou" in str(exc)
+        assert raised
+
+
+def test_execute_typed_action_is_atomic_on_a_failure_after_the_domain_write() -> None:
+    """Engineering review of PR #92, blocker 5: if anything fails between
+    the dispatched `_impl`'s own domain write and this module's own
+    `AssistantActionEvent`/proposal-consumption write, the whole thing must
+    roll back together -- never a financial fact persisted without its
+    Assistant audit trail. Forces that exact failure window by making the
+    *first* `db.flush()` after dispatch (the one building the
+    Assistant-specific `AuditEvent`) raise, then proves in a *fresh*
+    session that the obligation's payment was fully undone, not just left
+    uncommitted in the original session's identity map."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        account = client.post("/api/accounts", json={"name": "Conta Corrente", "account_type": "checking"})
+        assert account.status_code == 201
+
+        created = client.post(
+            "/api/obligations",
+            json={"name": "Parcela chácara", "due_date": "2026-08-10", "amount": "500.00"},
+        )
+        assert created.status_code == 201, created.text
+        obligation_id = created.json()["id"]
+
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "pay_obligation",
+            target_hint="Parcela chácara",
+            funding_source_hint="account",
+            account_hint="Conta Corrente",
+            date_text="2026-08-09",
+        )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="Paguei a parcela da chácara",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+
+        with session_factory() as db:
+            user = db.scalar(select(User))
+            real_flush = db.flush
+            calls = {"n": 0}
+
+            def _boom_flush(*args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    # The domain write (`_pay_obligation_impl`, `commit=False`)
+                    # has already happened in this same session by the time
+                    # `execute_typed_action` reaches its own first flush.
+                    raise RuntimeError("simulated failure between domain write and assistant audit")
+                return real_flush(*args, **kwargs)
+
+            db.flush = _boom_flush
+            try:
+                execute_typed_action(db, user=user, proposal_id=proposal_id)
+                raised = False
+            except RuntimeError:
+                raised = True
+            assert raised
+
+        # A completely fresh session/connection -- not the one the failure
+        # happened in -- must show the obligation still pending and no
+        # payment transaction, proving a real rollback, not merely an
+        # uncommitted change in one session's identity map.
+        with session_factory() as db:
+            obligation = db.get(Obligation, obligation_id)
+            assert obligation.status == "pending"
+            assert obligation.paid_transaction_id is None
+            assert db.scalar(select(Transaction)) is None
+            proposal_row = db.get(AssistantActionProposal, proposal_id)
+            assert proposal_row.consumed_at is None
+
+
+def test_possible_duplicate_offers_three_human_choices_never_auto_resolves() -> None:
+    """Work Order "deduplicação provável com as três escolhas humanas"
+    (engineering review of PR #92, blocker 4): a probable duplicate must be
+    presented with the existing lançamento and never silently merged,
+    skipped or imported without an explicit human decision."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        account = client.post("/api/accounts", json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17})
+        assert account.status_code == 201
+
+        first = client.post(
+            "/api/transactions",
+            json={
+                "booked_at": "2026-09-05",
+                "description": "Posto Ipiranga",
+                "amount": "300.00",
+                "movement_type": "expense",
+                "account_id": account.json()["id"],
+                "category_name": "Combustível",
+            },
+        )
+        assert first.status_code == 201, first.text
+        existing_transaction_id = first.json()["id"]
+
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "create_expense",
+            amount_text="300",
+            description="Posto Ipiranga",
+            account_hint="Nubank",
+            date_text="2026-09-05",
+            category_hint="Combustível",
+        )
+
+        # Step 1: no decision yet -> warning, zero writes, three choices
+        # implied by the question text.
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory, household_id=household_id, message="Gastei 300 no posto de novo", interpretation=interpretation
+        )
+        assert proposal_id is None
+        assert proposal.can_execute is False
+        assert proposal.candidate_kind == "possible_duplicate"
+        assert proposal.candidates[0]["id"] == existing_transaction_id
+        assert "pular" in proposal.clarifying_question.lower()
+        assert "importar" in proposal.clarifying_question.lower()
+
+        with session_factory() as db:
+            assert (
+                db.scalar(select(Transaction).where(Transaction.id != existing_transaction_id)) is None
+            )
+
+        # Step 2: "skip" -> still zero writes, no proposal persisted.
+        skip_resolution = DuplicateResolution(decision="skip", transaction_id=existing_transaction_id)
+        skip_proposal_id, skip_proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="Gastei 300 no posto de novo",
+            interpretation=interpretation,
+            duplicate_resolution=skip_resolution,
+        )
+        assert skip_proposal_id is None
+        assert skip_proposal.can_execute is False
+        with session_factory() as db:
+            assert (
+                db.scalar(select(Transaction).where(Transaction.id != existing_transaction_id)) is None
+            )
+
+        # Step 3: "import_anyway" -> now resolves to a normal executable
+        # proposal; the post-create pass (`register_transaction_duplicates`)
+        # still flags it for human review, exactly like manual entry does.
+        import_resolution = DuplicateResolution(decision="import_anyway", transaction_id=existing_transaction_id)
+        import_proposal_id, import_proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="Gastei 300 no posto de novo",
+            interpretation=interpretation,
+            duplicate_resolution=import_resolution,
+        )
+        assert import_proposal.can_execute is True
+
+        execute = client.post("/api/assistant/execute", json={"proposal_id": import_proposal_id})
+        assert execute.status_code == 201, execute.text
+
+        with session_factory() as db:
+            expenses = list(
+                db.scalars(select(Transaction).where(Transaction.transaction_type == "expense"))
+            )
+            assert len(expenses) == 2
+            new_transaction = next(item for item in expenses if item.id != existing_transaction_id)
+            assert new_transaction.reviewed is False
+
+
+def test_assistant_actions_are_isolated_between_households() -> None:
+    client_a, session_factory_a = _client()
+    with client_a:
+        _setup_household(client_a, username="assistant-household-a")
+        assert (
+            client_a.post(
+                "/api/accounts",
+                json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17},
+            ).status_code
+            == 201
+        )
+        household_id = _household_id(session_factory_a)
+        interpretation = _interpretation(
+            "create_expense", amount_text="300", description="Combustível", account_hint="Nubank",
+            category_hint="Transporte",
+        )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory_a,
+            household_id=household_id,
+            message="Gastei 300 de combustível",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+        execute = client_a.post("/api/assistant/execute", json={"proposal_id": proposal_id})
         action_id = execute.json()["action"]["id"]
 
     client_b, _ = _client()
@@ -606,67 +1026,30 @@ def test_assistant_actions_are_isolated_between_households() -> None:
         assert client_b.get("/api/assistant/actions").json() == []
 
 
-def test_execute_rejects_unknown_typed_action() -> None:
-    """`AssistantExecuteRequest.typed_action` is a closed, pattern-validated
-    vocabulary -- FastAPI/Pydantic itself rejects anything outside
-    `app.services.assistant_actions.TYPED_ACTIONS` before this ever reaches
-    `execute_typed_action`."""
-
-    client, _ = _client()
-    with client:
-        _setup_household(client)
-        execute = client.post(
-            "/api/assistant/execute",
-            json={
-                "typed_action": "delete_everything",
-                "payload": {},
-                "original_message": "tente algo indevido",
-                "trace_id": str(uuid.uuid4()),
-            },
-        )
-        assert execute.status_code == 422
-
-
-def test_execute_typed_action_function_rejects_unknown_action_directly() -> None:
-    session_factory = _session_factory()
-    with session_factory() as db:
-        try:
-            execute_typed_action(
-                db,
-                user=None,
-                typed_action="not_a_real_action",
-                payload={},
-                original_message="x",
-                structured_interpretation=None,
-                disambiguation_qa=None,
-                trace_id=str(uuid.uuid4()),
-            )
-            raised = False
-        except AssistantActionError:
-            raised = True
-        assert raised
-
-
 def test_undo_already_undone_action_is_refused() -> None:
-    client, _ = _client()
+    client, session_factory = _client()
     with client:
         _setup_household(client)
-        account = client.post("/api/accounts", json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17})
-        execute = client.post(
-            "/api/assistant/execute",
-            json={
-                "typed_action": "create_expense",
-                "payload": {
-                    "booked_at": "2026-09-01",
-                    "description": "Combustível",
-                    "amount": "300.00",
-                    "account_id": account.json()["id"],
-                    "category_name": "Transporte",
-                },
-                "original_message": "Gastei 300 de combustível",
-                "trace_id": str(uuid.uuid4()),
-            },
+        assert (
+            client.post(
+                "/api/accounts",
+                json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17},
+            ).status_code
+            == 201
         )
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "create_expense", amount_text="300", description="Combustível", account_hint="Nubank",
+            category_hint="Transporte",
+        )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="Gastei 300 de combustível",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+        execute = client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
         action_id = execute.json()["action"]["id"]
 
         first_undo = client.post(
