@@ -685,3 +685,77 @@ Nenhuma migration nova; nenhum dado real alterado. `FINANCIAL_RULES_VERSION` ava
 para `2026.10.3`. Ver `docs/FINANCIAL_INVARIANTS.md` (Controle de mudança, Slice 3 Round 2) e
 `docs/ARCHITECTURE.md` ("Obrigações e projeção REALIZADO/COMPROMETIDO/PREVISTO") para o detalhamento
 técnico completo.
+
+## 12. Status pós-implementação — Slice 4 (2026-09-14)
+
+**Slice 4** (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_4.md`) implementou o plano do §3.5/§3.6/§4
+essencialmente como proposto:
+
+- Sidecar ganhou o quarto contrato consultivo `POST /v1/interpret`
+  (`advisor/server.mjs`/`advisor/interpret-schema.json`), mesmo padrão estrutural sem campo de
+  autoridade de `/v1/classify`/`/v1/analyze`/`/v1/audit`.
+- `app/services/assistant_interpreter.py` (`interpret_message`/`StructuredInterpretation`) espelha
+  `app.services.codex_audit` -- fail-safe, lê só cinco chaves da resposta do sidecar.
+- `app/services/assistant_sanitizer.py` (`build_interpret_payload`) espelha `audit_sanitizer` --
+  envia só mensagem/histórico/vocabulário de intenções, nunca um dado financeiro do household.
+- `app/services/assistant_actions.py`: `build_typed_action_proposal` (resolução determinística de
+  indícios contra dados reais, nunca uma inferência silenciosa) e `execute_typed_action`/
+  `undo_assistant_action` (despacho para os endpoints já existentes e revisados dos Slices 1-3 --
+  `create_manual_transaction`, `create_manual_transfer`, `pay_obligation`,
+  `pay_card_invoice_lifecycle`, `link_refund_transaction`, `unpay_obligation`,
+  `unlink_refund_transaction`, `delete_manual_transaction`).
+- Novos endpoints: `POST /assistant/interpret`, `POST /assistant/execute`, `GET /assistant/actions`,
+  `POST /assistant/actions/{id}/undo`.
+- `app/services/entry_type_templates.py` + `POST /entry-type-templates`,
+  `POST /entry-type-templates/{id}/activate`, `POST /entry-type-templates/{id}/deactivate`,
+  `GET /entry-type-templates` -- ciclo de vida idêntico a `classification_rules` (§3.6).
+- Migrations `0016` (`assistant_action_events`, FK 1:1 com `audit_events`) e `0017`
+  (`entry_type_templates`) -- ambas puramente aditivas, com downgrade seguro (nenhuma é fato
+  financeiro irrecuperável, ao contrário de `refund_of_transaction_id` na migração `0015`).
+- INV-032 (ação do Assistente sempre auditável) e INV-033 (undo nunca apaga histórico) registradas
+  em `app/services/invariant_registry.py`/`docs/FINANCIAL_INVARIANTS.md`. `FINANCIAL_RULES_VERSION`
+  avançou de `2026.10.3` para `2026.10.4` (nenhuma regra financeira anterior foi alterada; o
+  conjunto de invariantes deste contrato mudou).
+
+**Desvios deliberados do §4 (refinamento de implementação, não Technical Challenge):**
+
+1. `POST /liquidity/confirm-movement` e as typed actions de patrimônio
+   (`UPDATE_ASSET_VALUE`/`REGISTER_ASSET_CONTRIBUTION`, `POST /investments/{id}/valuations`) **não
+   foram implementadas neste slice.** O modelo `Investment`/`InvestmentValuation` é escopo do Slice 6
+   (ainda não executado) -- expor uma typed action apontando para um endpoint que não existe
+   antecipararia funcionalidade fora de sequência (Work Order item 13, "não antecipar Slices
+   futuros"). O `funding_source="privilege"` para saída em caixa/cheque (rebaseline §4.4) já é
+   suportado diretamente por `ManualTransactionRequest`/`create_manual_transaction`
+   (Slice 1, `FAMILY_FINANCE_PRIVILEGE_FUNDING_V15`) e por `ObligationPaymentRequest`/
+   `pay_obligation` -- não há necessidade de um endpoint de confirmação de movimento separado para
+   os fluxos deste slice; a pergunta "Conta Corrente ou Privilège?" é feita e resolvida inteiramente
+   dentro de `build_typed_action_proposal`/`execute_typed_action`.
+2. `register_refund` espera que o lançamento de estorno já exista (importado ou criado
+   manualmente/via `create_expense` com `movement_type="refund"`) e só confirma o vínculo -- não é
+   uma ação composta "criar + vincular". Mantém cada typed action como um despacho de exatamente um
+   endpoint determinístico, evitando uma transação de dois efeitos dentro do dispatcher.
+3. `POST /captures/{id}/confirm` não foi adicionado como typed action: o fluxo de confirmação de
+   captura já tem sua própria tela de revisão editável (Central Inteligente); o Work Order não
+   exige expor esse fluxo especificamente através do Assistente neste slice, e os seis fluxos
+   obrigatórios (entrada, saída, transferência interna, obrigação paga, compra/cartão via
+   `create_expense`, estorno) já estão cobertos.
+4. Nenhuma mudança de frontend/navegação: o Slice 5 é o dono da UX/navegação alvo (rebaseline §19).
+   Este slice entrega o contrato de API completo e testado (interpretação, proposta, execução,
+   auditoria, undo, aprendizado), pronto para a tela "Assistente Financeiro" consumir.
+
+**Testes:** `tests/test_assistant_slice4.py` (proposta determinística + suíte funcional HTTP de
+execute/undo/idempotência/isolamento de household), `tests/test_assistant_interpreter.py`,
+`tests/test_assistant_sanitizer.py`, `tests/test_entry_type_templates.py`, casos novos em
+`tests/test_financial_invariants.py` (INV-032/INV-033) e `tests/test_role_based_authorization.py`
+(todas as novas rotas mutantes rejeitadas para o perfil consulta). Migrations validadas offline
+(SQLite) e contra PostgreSQL 16 real (`tests/test_postgresql_integration.py`,
+`tests/test_migrations.py`). Suíte completa (769 testes SQLite + 11 PostgreSQL), `ruff check .` e
+`node --test advisor/test/*.test.mjs` verificados verdes localmente antes da entrega.
+
+**Pendência/decisão consciente fora de escopo:** o `advisor/Dockerfile` precisou de um ajuste
+mínimo (adicionar `interpret-schema.json` à lista `COPY`) para que o novo contrato funcione na
+imagem de produção -- corrigido neste PR. O build real das imagens Docker (`docker-build`,
+`advisor` Docker build, Docker Compose validation) não pôde ser executado neste ambiente de execução
+(daemon Docker indisponível na sandbox); `node --check`/`npm test` no sidecar e a suíte Python
+completa foram verificados como proxy, mas o engenheiro responsável deve confirmar os gates Docker
+no CI real antes do merge.

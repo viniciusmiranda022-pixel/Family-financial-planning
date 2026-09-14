@@ -116,6 +116,67 @@ class AdvisorRequest(BaseModel):
     history: list[AdvisorHistoryItem] = Field(default_factory=list, max_length=8)
 
 
+class AssistantInterpretRequest(BaseModel):
+    """`POST /assistant/interpret` -- P0 #87, October Go-Live Slice 4.
+
+    Read-only: this endpoint calls the Codex sidecar for natural-language
+    understanding and deterministically resolves the result against real
+    household data, but never writes anything. `trace_id` is optional and,
+    when supplied, is only threaded through so a later `POST
+    /assistant/execute` in the same conversational turn can reuse it for
+    idempotent retry -- see `app.services.assistant_actions`.
+    """
+
+    message: str = Field(min_length=1, max_length=1000)
+    history: list[AdvisorHistoryItem] = Field(default_factory=list, max_length=8)
+    trace_id: str | None = Field(default=None, max_length=64)
+
+
+class AssistantExecuteRequest(BaseModel):
+    """`POST /assistant/execute` -- only accepts a `typed_action` from the
+    closed vocabulary in `app.services.assistant_actions.TYPED_ACTIONS`,
+    with `payload` fields that must validate against that action's own
+    existing request schema (`ManualTransactionRequest`, `TransferRequest`,
+    `ObligationPaymentRequest`, `CardInvoicePayRequest`,
+    `RefundLinkRequest`) -- never a free-form write. `trace_id` is required
+    and is the idempotency key: a retry with the same `trace_id` for this
+    household returns the original result instead of executing again.
+    """
+
+    typed_action: str = Field(
+        pattern="^(create_expense|create_income|create_internal_transfer|pay_obligation|"
+        "pay_card_invoice|register_refund)$"
+    )
+    payload: dict = Field(default_factory=dict)
+    path_params: dict = Field(default_factory=dict)
+    original_message: str = Field(min_length=1, max_length=1000)
+    structured_interpretation: dict | None = None
+    disambiguation_qa: list[dict] = Field(default_factory=list, max_length=20)
+    trace_id: str = Field(min_length=1, max_length=64)
+
+
+class AssistantUndoRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class EntryTypeTemplateDeactivateRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class EntryTypeTemplateCreateRequest(BaseModel):
+    """Records one confirmed use of a custom "Outra entrada"/"Outra saída"
+    label against an already-existing transaction -- never creates or
+    edits any `Transaction` itself (`transaction_id` must already exist and
+    belong to this household). See
+    `app.services.entry_type_templates.record_observed_entry`.
+    """
+
+    movement_type: str = Field(pattern="^(income|expense)$")
+    label: str = Field(min_length=2, max_length=100)
+    category_id: str | None = Field(default=None, max_length=36)
+    transaction_id: str = Field(min_length=1, max_length=36)
+
+
 class CaptureItemRequest(BaseModel):
     kind: str = Field(pattern="^(transaction|obligation|payroll)$")
     selected: bool = True

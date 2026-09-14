@@ -596,6 +596,50 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             {"json": {"audit_type": "period_review"}},
         ),
         ("advisor chat", "post", "/api/advisor/chat", {"json": {"message": "Como está meu mês?"}}),
+        (
+            "assistant interpret",
+            "post",
+            "/api/assistant/interpret",
+            {"json": {"message": "Gastei 300 de combustível no Nubank"}},
+        ),
+        (
+            "assistant execute",
+            "post",
+            "/api/assistant/execute",
+            {
+                "json": {
+                    "typed_action": "create_expense",
+                    "payload": {
+                        "booked_at": "2026-08-01",
+                        "description": "Combustível",
+                        "amount": "100.00",
+                        "account_id": "missing-account-id",
+                    },
+                    "original_message": "Gastei 100 de combustível",
+                    "trace_id": "consulta-denial-check",
+                }
+            },
+        ),
+        ("assistant undo", "post", "/api/assistant/actions/missing/undo", {"json": reason}),
+        (
+            "entry type template create",
+            "post",
+            "/api/entry-type-templates",
+            {
+                "json": {
+                    "movement_type": "expense",
+                    "label": "Outro tipo",
+                    "transaction_id": "missing-transaction-id",
+                }
+            },
+        ),
+        ("entry type template activate", "post", "/api/entry-type-templates/missing/activate", {}),
+        (
+            "entry type template deactivate",
+            "post",
+            "/api/entry-type-templates/missing/deactivate",
+            {"json": reason},
+        ),
     ]
 
 

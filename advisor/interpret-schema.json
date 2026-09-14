@@ -1,0 +1,53 @@
+{
+  "$comment": "Output contract for POST /v1/interpret (P0 #87, October Go-Live Slice 4). Same structural boundary as advisor-schema.json/audit-schema.json: there is no field here that could authorize a mutation -- no account/category/obligation/invoice id, no amount adjustment, no status. This is Natural-Language-Understanding only: an `intent` from a closed vocabulary plus free-text `extracted_fields` values the deterministic backend re-resolves and re-validates against real household data before anything is proposed for execution (`app.services.assistant_interpreter`/`app.services.assistant_actions`). `additionalProperties: false` throughout means an attempt to smuggle an authority-shaped field (e.g. `account_id`, `confirmed`) is a schema violation, not a warning.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "intent": {
+      "type": "string",
+      "enum": [
+        "create_expense",
+        "create_income",
+        "create_internal_transfer",
+        "pay_obligation",
+        "pay_card_invoice",
+        "register_refund",
+        "query",
+        "unknown"
+      ]
+    },
+    "extracted_fields": {
+      "type": "object",
+      "properties": {
+        "amount_text": { "type": "string", "maxLength": 60 },
+        "description": { "type": "string", "maxLength": 300 },
+        "account_hint": { "type": "string", "maxLength": 120 },
+        "counterparty_hint": { "type": "string", "maxLength": 300 },
+        "category_hint": { "type": "string", "maxLength": 120 },
+        "date_text": { "type": "string", "maxLength": 60 },
+        "funding_source_hint": {
+          "type": "string",
+          "enum": ["account", "privilege", "unspecified"]
+        },
+        "target_hint": { "type": "string", "maxLength": 300 }
+      },
+      "additionalProperties": false
+    },
+    "missing_fields": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 60 },
+      "maxItems": 8
+    },
+    "clarifying_question": { "type": ["string", "null"], "maxLength": 300 },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "required": [
+    "schema_version",
+    "intent",
+    "extracted_fields",
+    "missing_fields",
+    "clarifying_question",
+    "confidence"
+  ],
+  "additionalProperties": false
+}

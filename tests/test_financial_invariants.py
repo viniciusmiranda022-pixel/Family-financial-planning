@@ -41,15 +41,16 @@ ZERO_OPERATING_EFFECTS = {
 
 
 def test_registry_contains_all_permanent_invariants_once() -> None:
-    assert FINANCIAL_RULES_VERSION == "2026.10.3"
+    assert FINANCIAL_RULES_VERSION == "2026.10.4"
     # October Go-Live Slice 3 (P0 #87): INV-029/INV-030 join the registry,
     # guarding the forecast against a received Commission or a reconciled
     # recurring income being counted twice. Round 2 of the PR #91 review adds
     # INV-031, guarding the broader rebaseline §8.3 rule that no unreceived
     # commission may ever inflate the projection in the first place
-    # (docs/FINANCIAL_INVARIANTS.md).
-    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 32))
-    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 31
+    # (docs/FINANCIAL_INVARIANTS.md). October Go-Live Slice 4 adds INV-032/
+    # INV-033, guarding the Assistente Financeiro's audit/undo trail.
+    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 34))
+    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 33
     assert all(item.required_facts for item in INVARIANT_REGISTRY.values())
 
 
@@ -752,3 +753,53 @@ def test_no_automatic_unreceived_commission_in_projection_pass_and_fail() -> Non
     assert leaked.status is InvariantStatus.FAIL
     assert leaked.difference == Decimal("10000.00")
     assert leaked.severity.value == "critical"
+
+
+def test_assistant_action_always_audited_pass_and_fail() -> None:
+    complete = _evaluate(
+        "INV-032",
+        has_audit_event=True,
+        has_action_event=True,
+        original_message_present=True,
+    )
+    missing_message = _evaluate(
+        "INV-032",
+        has_audit_event=True,
+        has_action_event=True,
+        original_message_present=False,
+    )
+    missing_audit = _evaluate(
+        "INV-032",
+        has_audit_event=False,
+        has_action_event=True,
+        original_message_present=True,
+    )
+    assert complete.status is InvariantStatus.PASS
+    assert missing_message.status is InvariantStatus.FAIL
+    assert missing_audit.status is InvariantStatus.FAIL
+    assert complete.severity.value == "block"
+
+
+def test_assistant_undo_preserves_history_pass_and_fail() -> None:
+    complete = _evaluate(
+        "INV-033",
+        original_action_preserved=True,
+        undo_audit_event_created=True,
+        undone_at_recorded=True,
+    )
+    deleted_original = _evaluate(
+        "INV-033",
+        original_action_preserved=False,
+        undo_audit_event_created=True,
+        undone_at_recorded=True,
+    )
+    no_undo_audit = _evaluate(
+        "INV-033",
+        original_action_preserved=True,
+        undo_audit_event_created=False,
+        undone_at_recorded=True,
+    )
+    assert complete.status is InvariantStatus.PASS
+    assert deleted_original.status is InvariantStatus.FAIL
+    assert no_undo_audit.status is InvariantStatus.FAIL
+    assert complete.severity.value == "block"

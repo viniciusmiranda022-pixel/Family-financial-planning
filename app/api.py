@@ -60,6 +60,9 @@ from app.schemas import (
     AccountBalanceObservationRequest,
     AccountRequest,
     AdvisorRequest,
+    AssistantExecuteRequest,
+    AssistantInterpretRequest,
+    AssistantUndoRequest,
     CaptureConfirmRequest,
     CardCompetenceRepairApplyRequest,
     CardCompetenceRepairRollbackRequest,
@@ -74,6 +77,8 @@ from app.schemas import (
     CommissionReceiveRequest,
     CommissionRequest,
     DuplicateResolutionRequest,
+    EntryTypeTemplateCreateRequest,
+    EntryTypeTemplateDeactivateRequest,
     FindingLifecycleRequest,
     IntegrityRunRequest,
     LoginRequest,
@@ -114,6 +119,14 @@ from app.security import (
 )
 from app.services import capture_worker
 from app.services import mfa as mfa_service
+from app.services.assistant_actions import (
+    AssistantActionError,
+    build_typed_action_proposal,
+    execute_typed_action,
+    list_assistant_actions,
+    undo_assistant_action,
+)
+from app.services.assistant_interpreter import interpret_message
 from app.services.card_competence import (
     card_invoice_competence,
     resolve_expense_competence,
@@ -173,6 +186,14 @@ from app.services.duplicates import (
     resolve_duplicate_group,
     serialize_duplicate_group,
     source_priority,
+)
+from app.services.entry_type_templates import (
+    EntryTypeTemplateError,
+    accept_entry_type_template,
+    deactivate_entry_type_template,
+    list_entry_type_templates,
+    record_observed_entry,
+    serialize_entry_type_template,
 )
 from app.services.finance import (
     ForecastCommission,
@@ -10126,6 +10147,199 @@ def advisor_chat(
         "snapshot_checksum": summary["snapshot_checksum"],
         "integrity_status": summary["integrity_status"],
     }
+
+
+# P0 #87, October Go-Live Slice 4 (`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_4.md`):
+# the Assistente Financeiro's typed-action contract. `interpret` is
+# read-only (never writes); `execute` only accepts a `typed_action` whose
+# payload validates against an already-existing endpoint's own request
+# schema, dispatched in-process to that exact endpoint function -- see
+# `app.services.assistant_actions` for the full architecture note.
+@router.post("/assistant/interpret")
+def assistant_interpret(
+    payload: AssistantInterpretRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    interpretation = interpret_message(
+        message=payload.message, history=payload.history, trace_id=payload.trace_id
+    )
+    proposal = build_typed_action_proposal(
+        db, household_id=user.household_id, interpretation=interpretation
+    )
+    return {"interpretation": interpretation.to_dict(), "proposal": proposal.to_dict()}
+
+
+@router.post("/assistant/execute", status_code=status.HTTP_201_CREATED)
+def assistant_execute(
+    payload: AssistantExecuteRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return execute_typed_action(
+            db,
+            user=user,
+            typed_action=payload.typed_action,
+            payload=payload.payload,
+            path_params=payload.path_params,
+            original_message=payload.original_message,
+            structured_interpretation=payload.structured_interpretation,
+            disambiguation_qa=payload.disambiguation_qa,
+            trace_id=payload.trace_id,
+        )
+    except AssistantActionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/assistant/actions")
+def assistant_actions_list(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    return list_assistant_actions(db, user=user)
+
+
+@router.post("/assistant/actions/{action_id}/undo")
+def assistant_action_undo(
+    action_id: str,
+    payload: AssistantUndoRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        return undo_assistant_action(db, user=user, action_id=action_id, reason=payload.reason)
+    except AssistantActionError as exc:
+        message = str(exc)
+        if message == "Ação do Assistente não encontrada":
+            raise HTTPException(status_code=404, detail=message) from exc
+        raise HTTPException(status_code=409, detail=message) from exc
+
+
+@router.post("/entry-type-templates", status_code=status.HTTP_201_CREATED)
+def create_entry_type_template(
+    payload: EntryTypeTemplateCreateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Records one confirmed use of a custom "Outra entrada"/"Outra saída"
+    label -- rebaseline §8.2/§9, Work Order item 8. Mirrors
+    `record_confirmed_correction` (classification learning): evidence
+    accumulates here, activation is a separate, admin-only step
+    (`POST /entry-type-templates/{id}/activate`)."""
+
+    _require_admin(user)
+    transaction = db.scalar(
+        select(Transaction).where(
+            Transaction.id == payload.transaction_id, Transaction.household_id == user.household_id
+        )
+    )
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Lançamento não encontrado")
+    try:
+        recorded = record_observed_entry(
+            db,
+            household_id=user.household_id,
+            movement_type=payload.movement_type,
+            label=payload.label,
+            category_id=payload.category_id,
+            transaction_id=transaction.id,
+        )
+    except EntryTypeTemplateError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "entry_type_template.observe",
+        "entry_type_template",
+        recorded.template_id,
+        {"movement_type": payload.movement_type, "label": payload.label, "transaction_id": transaction.id},
+        source="entry_type_templates",
+    )
+    db.commit()
+    return {
+        "id": recorded.template_id,
+        "status": recorded.status,
+        "confirmation_count": recorded.confirmation_count,
+        "active": recorded.active,
+    }
+
+
+@router.get("/entry-type-templates")
+def entry_type_templates_list(
+    movement_type: str | None = Query(default=None, pattern="^(income|expense)$"),
+    active_only: bool = Query(default=False),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    templates = list_entry_type_templates(
+        db, household_id=user.household_id, movement_type=movement_type, active_only=active_only
+    )
+    return [serialize_entry_type_template(template) for template in templates]
+
+
+@router.post("/entry-type-templates/{template_id}/activate")
+def activate_entry_type_template(
+    template_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        template = accept_entry_type_template(
+            db, household_id=user.household_id, template_id=template_id, user_id=user.id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Tipo aprendido não encontrado") from exc
+    except EntryTypeTemplateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "entry_type_template.activate",
+        "entry_type_template",
+        template.id,
+        {"confirmation_count": template.confirmation_count},
+        before_state={"status": "pending_acceptance", "active": False},
+        after_state={"status": template.status, "active": template.active},
+        reason="Aceite explícito de tipo aprendido após três confirmações consistentes",
+        source="entry_type_templates",
+    )
+    db.commit()
+    return serialize_entry_type_template(template)
+
+
+@router.post("/entry-type-templates/{template_id}/deactivate")
+def deactivate_entry_type_template_endpoint(
+    template_id: str,
+    payload: EntryTypeTemplateDeactivateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        template = deactivate_entry_type_template(db, household_id=user.household_id, template_id=template_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Tipo aprendido não encontrado") from exc
+    except EntryTypeTemplateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "entry_type_template.deactivate",
+        "entry_type_template",
+        template.id,
+        {},
+        before_state={"status": "active", "active": True},
+        after_state={"status": template.status, "active": template.active},
+        reason=payload.reason,
+        source="entry_type_templates",
+    )
+    db.commit()
+    return serialize_entry_type_template(template)
+
 
 # FAMILY_FINANCE_CURRENT_CONFIRMED_LIQUIDITY_V16_1
 @router.get("/liquidity/current-confirmed")

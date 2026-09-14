@@ -106,3 +106,14 @@ class CodexAdvisorClient:
         """
 
         return self._request("/v1/audit", payload)
+
+    def interpret(self, payload: dict) -> CodexResult:
+        """Call the dedicated `/v1/interpret` contract (P0 #87, October
+        Go-Live Slice 4): natural-language -> {intent, extracted_fields,
+        missing_fields, clarifying_question, confidence}. Same
+        authority-free structural boundary as `/v1/classify`/`/v1/analyze`
+        -- see `app.services.assistant_interpreter` for the Python-side
+        allowlist re-validation of the response.
+        """
+
+        return self._request("/v1/interpret", payload)

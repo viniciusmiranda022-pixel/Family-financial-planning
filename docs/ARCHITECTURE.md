@@ -440,6 +440,86 @@ canônicas que `GET /obligations` e `GET /forecast` já usam, nunca um segundo m
 `GET /reports` permanece inerentemente REALIZADO-only (toda cifra vem de `build_snapshot`, que só lê
 `Transaction` já lançada) -- não há COMPROMETIDO/PREVISTO ali para separar.
 
+## Assistente Financeiro operacional — typed actions (October Go-Live Slice 4, P0 #87)
+
+`docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_4.md`, `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.5/§4.
+Transforma o Assistente de um chat consultivo (`/advisor/chat`, já existente, inalterado) em uma
+interface operacional: linguagem natural -> interpretação estruturada -> ação tipada de backend ->
+resultado persistido, sem nunca deixar a interpretação do Codex virar fato por si só.
+
+**Quarto contrato consultivo do sidecar: `POST /v1/interpret`.** Mesmo padrão estrutural de
+`/v1/classify`/`/v1/analyze`/`/v1/audit` (`advisor/server.mjs`, `advisor/interpret-schema.json`):
+schema de saída sem nenhum campo de autoridade -- apenas `intent` (vocabulário fechado),
+`extracted_fields` (texto livre, nunca um id), `missing_fields`, `clarifying_question` e
+`confidence`. O sidecar não recebe nenhum dado financeiro do household -- apenas a mensagem e um
+histórico curto (`app.services.assistant_sanitizer.build_interpret_payload`).
+
+**Fronteira de autoridade em Python:** `app.services.assistant_interpreter.interpret_message`
+espelha exatamente `app.services.codex_audit.run_semantic_audit` -- `StructuredInterpretation` é
+fail-safe (`available=False` cobre Codex desabilitado/indisponível/timeout/schema inválido) e
+`_coerce_interpretation` é a única função autorizada a ler a resposta do sidecar, lendo somente as
+cinco chaves do contrato.
+
+**Resolução determinística, nunca uma segunda interpretação por IA:**
+`app.services.assistant_actions.build_typed_action_proposal` resolve cada `extracted_fields` (nome
+de conta/cartão, obrigação, fatura, compra original de estorno) contra os dados reais do household
+com consultas SQL simples e explícitas -- nunca um palpite. Quando um indício não resolve a
+exatamente um candidato, ou falta um campo materialmente necessário (origem do recurso para saída
+em caixa/cheque, rebaseline §4.4/§11.1), a função devolve uma pergunta de desambiguação (e,
+quando aplicável, a lista de candidatos) em vez de uma proposta executável -- nunca uma ação
+ambígua passa para execução automática.
+
+**Execução: sempre uma chamada real a um endpoint determinístico já existente.**
+`POST /assistant/execute` (`app.services.assistant_actions.execute_typed_action`) nunca reimplementa
+lógica financeira: dado um `typed_action` do vocabulário fechado (`create_expense`, `create_income`,
+`create_internal_transfer`, `pay_obligation`, `pay_card_invoice`, `register_refund`), valida o
+`payload` contra o *mesmo* schema Pydantic (`ManualTransactionRequest`, `TransferRequest`,
+`ObligationPaymentRequest`, `CardInvoicePayRequest`, `RefundLinkRequest`) e despacha, em processo
+(import tardio de `app.api`, evitando import circular), para a *mesma* função de endpoint que o
+formulário manual já chama -- `create_manual_transaction`, `create_manual_transfer`, `pay_obligation`,
+`pay_card_invoice_lifecycle`, `link_refund_transaction`. Household isolation, `_require_admin`,
+confirmação de valor elevado, deduplicação e o `AuditEvent` do fato financeiro em si já são impostos
+exatamente pelo mesmo código que o caminho humano exercita -- este módulo não amplia essa superfície,
+apenas a narra.
+
+**Auditoria: `AssistantActionEvent`, 1:1 com `AuditEvent` (migração `0016`).** Cada execução grava
+um segundo `AuditEvent` (`event_type="assistant.execute"`) e um `AssistantActionEvent` pareado com
+mensagem original, interpretação estruturada, perguntas/respostas de desambiguação, ids
+criados/alterados e estado após a ação. Idempotência: uma repetição com o mesmo `trace_id` (chave do
+cliente) devolve o resultado já persistido em vez de executar de novo -- convivendo com, nunca
+substituindo, a proteção de duplicidade por fingerprint que cada endpoint já possui.
+
+**Undo: nunca apaga a trilha.** `POST /assistant/actions/{id}/undo`
+(`app.services.assistant_actions.undo_assistant_action`) despacha para a reversão determinística já
+existente de cada ação (`delete_manual_transaction`, `unpay_obligation`, `unlink_refund_transaction`)
+e grava um *novo* `AuditEvent` da reversão -- nunca deleta o `AssistantActionEvent` original, apenas
+marca `undone_at`/`undone_by`. `pay_card_invoice` é declarado `undoable=False`: não existe reversão
+determinística para um pagamento de fatura já liquidado nesta versão (rebaseline: "quando uma
+operação não puder ser revertida com segurança, a API deve declarar isso de forma explícita").
+INV-032/INV-033 (`docs/FINANCIAL_INVARIANTS.md`) registram estruturalmente essas duas garantias.
+
+**Aprendizado — `entry_type_templates` (migração `0017`).** Copia o ciclo de vida já comprovado de
+`classification_rules` (`observed -> suggested -> pending_acceptance -> active`,
+`app.services.entry_type_templates`) para rótulos de "Outra entrada"/"Outra saída": evidência
+acumula em `POST /entry-type-templates`, ativação exige três confirmações e é restrita a
+administrador (`POST /entry-type-templates/{id}/activate`, mesma barreira de
+`POST /classification-rules/{id}/activate`). A deduplicação usa o mesmo normalizador de texto já
+usado para comerciantes, então "Aluguel"/"Recebi aluguel"/"Aluguel recebido" colapsam no mesmo
+template quando normalizam igual.
+
+**Decisões de escopo deste slice (não são Technical Challenge -- refinamento de implementação):**
+
+- Nenhuma ação tipada de patrimônio/investimento (`UPDATE_ASSET_VALUE`/
+  `REGISTER_ASSET_CONTRIBUTION`) é exposta: o modelo `Investment` ainda não existe (October Go-Live
+  Slice 6, não implementado). Antecipar essas ações apontaria para um contrato que não existe.
+- `register_refund` espera que o lançamento de estorno já exista (importado ou criado manualmente/
+  via `create_expense` com `movement_type="refund"`) e apenas confirma o vínculo -- não cria e
+  vincula em uma única ação composta. Mantém `execute_typed_action` como despachante puro de um
+  único endpoint por ação tipada, sem introduzir uma transação composta de dois efeitos.
+- Nenhuma UI nova: o Slice 5 é o dono da navegação/apresentação alvo
+  (`docs/OCTOBER_GO_LIVE_REBASELINE.md` §19 Slice 5); este slice entrega o contrato de API completo
+  e testado, pronto para a tela "Assistente Financeiro" consumir.
+
 ## Comparação visual de cenários de compra (Fase 3)
 
 `POST /api/purchases/scenario-comparison` (`app/api.py::compare_purchase_scenarios`) compara duas a
