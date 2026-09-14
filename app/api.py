@@ -48,6 +48,8 @@ from app.models import (
     Household,
     IntegrityFinding,
     IntegrityRun,
+    Investment,
+    InvestmentValuation,
     MfaFactor,
     MfaRecoveryCode,
     Obligation,
@@ -81,6 +83,10 @@ from app.schemas import (
     EntryTypeTemplateDeactivateRequest,
     FindingLifecycleRequest,
     IntegrityRunRequest,
+    InvestmentContributionRequest,
+    InvestmentCreateRequest,
+    InvestmentValuationRequest,
+    InvestmentValuationUndoRequest,
     LoginRequest,
     ManualTransactionRequest,
     MfaChallengeRequest,
@@ -252,6 +258,7 @@ from app.services.importer import (
     transaction_fingerprint,
 )
 from app.services.invariant_registry import evaluate_invariant
+from app.services.investments import net_worth_summary
 from app.services.monthly_close import (
     MonthlyCloseGateError,
     MonthlyCloseStateError,
@@ -7756,6 +7763,537 @@ def delete_obligation(
     return {"ok": True}
 
 
+def _get_household_investment(
+    db: Session, *, household_id: str, investment_id: str, active_only: bool = True
+) -> Investment:
+    query = select(Investment).where(
+        Investment.id == investment_id, Investment.household_id == household_id
+    )
+    if active_only:
+        query = query.where(Investment.active.is_(True))
+    item = db.scalar(query)
+    if not item:
+        raise HTTPException(status_code=404, detail="Investimento não encontrado")
+    return item
+
+
+def _serialize_investment_valuation(row: InvestmentValuation) -> dict:
+    return {
+        "id": row.id,
+        "investment_id": row.investment_id,
+        "valuation_date": row.valuation_date,
+        "historical_cost": decimal_value(row.historical_cost),
+        "current_value": decimal_value(row.current_value),
+        "expected_receivable_value": decimal_value(row.expected_receivable_value)
+        if row.expected_receivable_value is not None
+        else None,
+        "contribution_amount": decimal_value(row.contribution_amount)
+        if row.contribution_amount is not None
+        else None,
+        "funding_transaction_id": row.funding_transaction_id,
+        "source": row.source,
+        "recorded_by": row.recorded_by,
+        "note": row.note,
+        "invalidated_at": row.invalidated_at.isoformat() if row.invalidated_at else None,
+        "invalidation_reason": row.invalidation_reason,
+        "created_at": row.created_at.isoformat(),
+    }
+
+
+@router.get("/investments")
+def investments(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    """Rebaseline §16 -- canonical patrimony/investments read, including the
+    Studio. Spreads `app.services.investments.net_worth_summary` verbatim
+    (only the uniform `decimal_value()` cast applied) so the Dashboard's own
+    `noncanonical.net_worth`/`noncanonical.investments` block and this
+    endpoint can never diverge -- both call this exact function, never a
+    second sum."""
+
+    summary = net_worth_summary(db, household_id=user.household_id)
+    return {
+        "total_current_value": decimal_value(summary["total_current_value"]),
+        "investments": [
+            {
+                **{
+                    key: decimal_value(value) if isinstance(value, Decimal) else value
+                    for key, value in row.items()
+                },
+            }
+            for row in summary["investments"]
+        ],
+    }
+
+
+@router.post("/investments", status_code=201)
+def create_investment(
+    payload: InvestmentCreateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _create_investment_impl(payload, user, db)
+
+
+def _create_investment_impl(
+    payload: InvestmentCreateRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Body of `create_investment`. A new `Investment` always appends its
+    first `InvestmentValuation` snapshot (source `manual_confirmed`) so
+    history is complete from the moment the asset is created -- rebaseline
+    "manter histórico de avaliações/aportes" applies from day one, not only
+    from the first later edit. `historical_cost` doubles as the initial
+    contribution when positive (e.g. the Studio's cost so far)."""
+
+    _require_admin(user)
+    item = Investment(
+        household_id=user.household_id,
+        name=" ".join(payload.name.split()),
+        historical_cost=money(payload.historical_cost),
+        current_value=money(payload.current_value),
+        expected_receivable_value=money(payload.expected_receivable_value)
+        if payload.expected_receivable_value is not None
+        else None,
+        last_updated_at=payload.valuation_date,
+        expected_receipt_date=payload.expected_receipt_date,
+        notes=payload.notes,
+    )
+    db.add(item)
+    db.flush()
+    trace_id = str(uuid.uuid4())
+    valuation = InvestmentValuation(
+        household_id=user.household_id,
+        investment_id=item.id,
+        valuation_date=payload.valuation_date,
+        historical_cost=item.historical_cost,
+        current_value=item.current_value,
+        expected_receivable_value=item.expected_receivable_value,
+        contribution_amount=item.historical_cost if item.historical_cost > 0 else None,
+        source="manual_confirmed",
+        recorded_by=user.id,
+        note=payload.notes,
+        trace_id=trace_id,
+    )
+    db.add(valuation)
+    db.flush()
+    audit(
+        db,
+        user,
+        "investment.create",
+        "investment",
+        item.id,
+        {
+            "name": item.name,
+            "historical_cost": str(item.historical_cost),
+            "current_value": str(item.current_value),
+        },
+        after_state={
+            "historical_cost": str(item.historical_cost),
+            "current_value": str(item.current_value),
+            "expected_receivable_value": str(item.expected_receivable_value)
+            if item.expected_receivable_value is not None
+            else None,
+        },
+        reason="Investimento cadastrado",
+        trace_id=trace_id,
+        source="investment",
+    )
+    if commit:
+        db.commit()
+    return {"id": item.id, "valuation_id": valuation.id}
+
+
+@router.get("/investments/{investment_id}/valuations")
+def list_investment_valuations(
+    investment_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    item = _get_household_investment(
+        db, household_id=user.household_id, investment_id=investment_id, active_only=False
+    )
+    rows = list(
+        db.scalars(
+            select(InvestmentValuation)
+            .where(InvestmentValuation.investment_id == item.id)
+            .order_by(InvestmentValuation.valuation_date.desc(), InvestmentValuation.created_at.desc())
+        )
+    )
+    return [_serialize_investment_valuation(row) for row in rows]
+
+
+@router.post("/investments/{investment_id}/valuations", status_code=201)
+def update_investment_value(
+    investment_id: str,
+    payload: InvestmentValuationRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _update_investment_value_impl(investment_id, payload, user, db)
+
+
+def _update_investment_value_impl(
+    investment_id: str,
+    payload: InvestmentValuationRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+    domain_audit_sink: list[AuditEvent] | None = None,
+) -> dict:
+    """Body of `update_investment_value` -- see `_pay_obligation_impl`'s
+    docstring for why this is factored out (reused by
+    `app.services.assistant_actions` for the `update_asset_value` typed
+    action). Rebaseline §16.2/§16.3: touches `current_value` and/or
+    `expected_receivable_value` only -- never `historical_cost` -- and the
+    appended `InvestmentValuation` snapshot preserves the prior state for
+    audit/undo, exactly like `_pay_obligation_impl` preserves the prior
+    `Obligation` state in `before_state`."""
+
+    _require_admin(user)
+    item = _get_household_investment(
+        db, household_id=user.household_id, investment_id=investment_id
+    )
+    before_state = {
+        "current_value": str(item.current_value),
+        "expected_receivable_value": str(item.expected_receivable_value)
+        if item.expected_receivable_value is not None
+        else None,
+        "last_updated_at": item.last_updated_at.isoformat(),
+    }
+    new_current_value = (
+        money(payload.current_value) if payload.current_value is not None else item.current_value
+    )
+    new_expected_receivable_value = (
+        money(payload.expected_receivable_value)
+        if payload.expected_receivable_value is not None
+        else item.expected_receivable_value
+    )
+    item.current_value = new_current_value
+    item.expected_receivable_value = new_expected_receivable_value
+    item.last_updated_at = payload.valuation_date
+
+    trace_id = str(uuid.uuid4())
+    valuation = InvestmentValuation(
+        household_id=user.household_id,
+        investment_id=item.id,
+        valuation_date=payload.valuation_date,
+        historical_cost=item.historical_cost,
+        current_value=item.current_value,
+        expected_receivable_value=item.expected_receivable_value,
+        source="manual_confirmed",
+        recorded_by=user.id,
+        note=payload.note,
+        trace_id=trace_id,
+    )
+    db.add(valuation)
+    db.flush()
+
+    domain_audit_event = audit(
+        db,
+        user,
+        "investment.update_value",
+        "investment",
+        item.id,
+        {"valuation_id": valuation.id, "valuation_date": payload.valuation_date.isoformat()},
+        before_state=before_state,
+        after_state={
+            "current_value": str(item.current_value),
+            "expected_receivable_value": str(item.expected_receivable_value)
+            if item.expected_receivable_value is not None
+            else None,
+            "last_updated_at": item.last_updated_at.isoformat(),
+        },
+        reason="Atualização de valor confirmada pelo usuário",
+        trace_id=trace_id,
+        source="investment",
+    )
+    if domain_audit_sink is not None:
+        domain_audit_sink.append(domain_audit_event)
+    if commit:
+        db.commit()
+    return {
+        "ok": True,
+        "investment_id": item.id,
+        "valuation_id": valuation.id,
+        "current_value": decimal_value(item.current_value),
+        "expected_receivable_value": decimal_value(item.expected_receivable_value)
+        if item.expected_receivable_value is not None
+        else None,
+    }
+
+
+@router.post("/investments/{investment_id}/contributions", status_code=201)
+def register_investment_contribution(
+    investment_id: str,
+    payload: InvestmentContributionRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _register_investment_contribution_impl(investment_id, payload, user, db)
+
+
+def _register_investment_contribution_impl(
+    investment_id: str,
+    payload: InvestmentContributionRequest,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+    domain_audit_sink: list[AuditEvent] | None = None,
+) -> dict:
+    """Body of `register_investment_contribution` -- see
+    `_pay_obligation_impl`'s docstring for why this is factored out (reused
+    by `app.services.assistant_actions` for the `register_asset_contribution`
+    typed action). Rebaseline §16.2/§16.3: a contribution increases
+    `historical_cost` only -- it never touches `current_value` (that is
+    exclusively `_update_investment_value_impl`'s job) and it never
+    fabricates the cash movement: `funding_transaction_id`, when given,
+    only *links* to an already-existing `Transaction` (Work Order "sem
+    fabricar gasto econômico ou origem de caixa"), exactly like
+    `_link_refund_transaction_impl` only links an already-existing refund.
+    """
+
+    _require_admin(user)
+    item = _get_household_investment(
+        db, household_id=user.household_id, investment_id=investment_id
+    )
+
+    funding_transaction: Transaction | None = None
+    if payload.funding_transaction_id:
+        funding_transaction = db.scalar(
+            select(Transaction).where(
+                Transaction.id == payload.funding_transaction_id,
+                Transaction.household_id == user.household_id,
+            )
+        )
+        if funding_transaction is None:
+            raise HTTPException(status_code=404, detail="Lançamento de origem do aporte não encontrado")
+        category = db.get(Category, funding_transaction.category_id) if funding_transaction.category_id else None
+        if (
+            funding_transaction.transaction_type != "transfer"
+            or funding_transaction.amount >= 0
+            or category is None
+            or category.name != _LEDGER_PATRIMONIAL_CATEGORY_NAME
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "O lançamento indicado não é uma saída de \"Transferência patrimonial\" válida "
+                    "para financiar este aporte"
+                ),
+            )
+        if money(abs(funding_transaction.amount)) != money(payload.contribution_amount):
+            raise HTTPException(
+                status_code=422,
+                detail="O valor do lançamento de origem não corresponde ao valor do aporte",
+            )
+        already_linked = db.scalar(
+            select(InvestmentValuation).where(
+                InvestmentValuation.household_id == user.household_id,
+                InvestmentValuation.funding_transaction_id == funding_transaction.id,
+                InvestmentValuation.invalidated_at.is_(None),
+            )
+        )
+        if already_linked is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Este lançamento já está vinculado a outro aporte",
+            )
+
+    before_state = {
+        "historical_cost": str(item.historical_cost),
+        "last_updated_at": item.last_updated_at.isoformat(),
+    }
+    item.historical_cost = money(item.historical_cost + payload.contribution_amount)
+    item.last_updated_at = payload.valuation_date
+
+    trace_id = funding_transaction.trace_id if funding_transaction is not None else str(uuid.uuid4())
+    valuation = InvestmentValuation(
+        household_id=user.household_id,
+        investment_id=item.id,
+        valuation_date=payload.valuation_date,
+        historical_cost=item.historical_cost,
+        current_value=item.current_value,
+        expected_receivable_value=item.expected_receivable_value,
+        contribution_amount=money(payload.contribution_amount),
+        funding_transaction_id=funding_transaction.id if funding_transaction is not None else None,
+        source="manual_confirmed",
+        recorded_by=user.id,
+        note=payload.note,
+        trace_id=trace_id,
+    )
+    db.add(valuation)
+    db.flush()
+
+    domain_audit_event = audit(
+        db,
+        user,
+        "investment.contribute",
+        "investment",
+        item.id,
+        {
+            "valuation_id": valuation.id,
+            "contribution_amount": str(money(payload.contribution_amount)),
+            "funding_transaction_id": funding_transaction.id if funding_transaction is not None else None,
+        },
+        before_state=before_state,
+        after_state={
+            "historical_cost": str(item.historical_cost),
+            "last_updated_at": item.last_updated_at.isoformat(),
+        },
+        reason="Aporte confirmado pelo usuário",
+        trace_id=trace_id,
+        source="investment",
+    )
+    if domain_audit_sink is not None:
+        domain_audit_sink.append(domain_audit_event)
+    if commit:
+        db.commit()
+    return {
+        "ok": True,
+        "investment_id": item.id,
+        "valuation_id": valuation.id,
+        "historical_cost": decimal_value(item.historical_cost),
+        "funding_transaction_id": funding_transaction.id if funding_transaction is not None else None,
+    }
+
+
+@router.post("/investments/{investment_id}/valuations/{valuation_id}/undo")
+def undo_investment_valuation(
+    investment_id: str,
+    valuation_id: str,
+    payload: InvestmentValuationUndoRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _undo_investment_valuation_impl(
+        investment_id, valuation_id, payload.reason, user, db
+    )
+
+
+def _undo_investment_valuation_impl(
+    investment_id: str,
+    valuation_id: str,
+    reason: str,
+    user: User,
+    db: Session,
+    *,
+    commit: bool = True,
+) -> dict:
+    """Reverses exactly one valuation/contribution event: invalidates the
+    `InvestmentValuation` row (never deleted -- rebaseline "não apagar
+    histórico") and restores the parent `Investment` to the exact prior
+    state recorded when that event was created. Refuses (409) when a later,
+    still-valid valuation exists for the same investment -- undoing a
+    stale, superseded event would silently discard whatever happened after
+    it, the same guard `_undo_obligation_privilege_funding` already applies
+    to a Privilège-funded obligation payment."""
+
+    _require_admin(user)
+    item = _get_household_investment(
+        db, household_id=user.household_id, investment_id=investment_id, active_only=False
+    )
+    valuation = db.scalar(
+        select(InvestmentValuation).where(
+            InvestmentValuation.id == valuation_id,
+            InvestmentValuation.investment_id == item.id,
+            InvestmentValuation.household_id == user.household_id,
+        )
+    )
+    if valuation is None:
+        raise HTTPException(status_code=404, detail="Avaliação/aporte não encontrado")
+    if valuation.invalidated_at is not None:
+        raise HTTPException(status_code=409, detail="Esta avaliação/aporte já foi desfeita")
+
+    later_valid = db.scalar(
+        select(InvestmentValuation)
+        .where(
+            InvestmentValuation.investment_id == item.id,
+            InvestmentValuation.invalidated_at.is_(None),
+            InvestmentValuation.id != valuation.id,
+            or_(
+                InvestmentValuation.valuation_date > valuation.valuation_date,
+                and_(
+                    InvestmentValuation.valuation_date == valuation.valuation_date,
+                    InvestmentValuation.created_at > valuation.created_at,
+                ),
+            ),
+        )
+        .limit(1)
+    )
+    if later_valid is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Há uma avaliação/aporte mais recente confirmado depois deste; "
+                "não é seguro desfazer automaticamente."
+            ),
+        )
+
+    previous_valid = db.scalar(
+        select(InvestmentValuation)
+        .where(
+            InvestmentValuation.investment_id == item.id,
+            InvestmentValuation.invalidated_at.is_(None),
+            InvestmentValuation.id != valuation.id,
+        )
+        .order_by(InvestmentValuation.valuation_date.desc(), InvestmentValuation.created_at.desc())
+        .limit(1)
+    )
+
+    before_state = {
+        "historical_cost": str(item.historical_cost),
+        "current_value": str(item.current_value),
+        "expected_receivable_value": str(item.expected_receivable_value)
+        if item.expected_receivable_value is not None
+        else None,
+        "last_updated_at": item.last_updated_at.isoformat(),
+    }
+    if previous_valid is not None:
+        item.historical_cost = previous_valid.historical_cost
+        item.current_value = previous_valid.current_value
+        item.expected_receivable_value = previous_valid.expected_receivable_value
+        item.last_updated_at = previous_valid.valuation_date
+    else:
+        # No earlier event survives: this was the investment's very first
+        # recorded state. Restore the zeroed pre-creation baseline rather
+        # than guessing -- an investment with no valid valuation left is
+        # exactly the state `_create_investment_impl` would have produced
+        # for `historical_cost=0`/`current_value=0`.
+        item.historical_cost = Decimal("0.00")
+        item.current_value = Decimal("0.00")
+        item.expected_receivable_value = None
+
+    valuation.invalidated_at = datetime.now(UTC)
+    valuation.invalidated_by = user.id
+    valuation.invalidation_reason = reason
+
+    audit(
+        db,
+        user,
+        "investment.undo_valuation",
+        "investment",
+        item.id,
+        {"valuation_id": valuation.id},
+        before_state=before_state,
+        after_state={
+            "historical_cost": str(item.historical_cost),
+            "current_value": str(item.current_value),
+            "expected_receivable_value": str(item.expected_receivable_value)
+            if item.expected_receivable_value is not None
+            else None,
+        },
+        reason=reason,
+        source="investment",
+    )
+    if commit:
+        db.commit()
+    return {"ok": True, "investment_id": item.id, "valuation_id": valuation.id}
+
+
 @router.get("/profile")
 def get_profile(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     item = profile_for(db, user.household_id)
@@ -9360,6 +9898,10 @@ def dashboard(
     card_invoices_outstanding_total = money(
         sum(_forecast_card_invoices(db, user.household_id, start).values(), Decimal("0"))
     )
+    # October Go-Live Slice 6: the exact same function `GET /investments`
+    # calls -- see the comment on `noncanonical.net_worth` below for why
+    # this is a live query, not a snapshot column.
+    investment_net_worth = net_worth_summary(db, household_id=user.household_id)
     db.commit()
     # `dashboard_monetary_publication` is the exact function INV-019 reads to
     # verify this response -- see its docstring and
@@ -9475,6 +10017,32 @@ def dashboard(
                     "financial_state": COMPROMETIDO,
                 },
             },
+            # October Go-Live Slice 6 (P0 #87): patrimônio/investimentos,
+            # incluindo o Studio -- rebaseline §13.1 item 4 ("Patrimônio --
+            # valor líquido atual dos ativos/caixa") e §16. Live query
+            # (current `Investment.current_value` rows), not a
+            # `FinancialSnapshot` column, so `noncanonical` like every other
+            # entry in this block -- see the comment above `future_commission`.
+            # `app.services.investments.net_worth_summary` is the single
+            # function this dict and `GET /investments` both call, so the
+            # Dashboard and a future Slice 7 report can never diverge on
+            # this number (rebaseline "nenhum cálculo patrimonial duplicado
+            # no frontend"). Sums `current_value` only -- never
+            # `historical_cost`/`expected_receivable_value` -- INV-034.
+            "net_worth": {
+                "value": decimal_value(investment_net_worth["total_current_value"]),
+                "source": "net_worth_summary",
+                "freshness": "live",
+                "certified_by": None,
+                "as_of": datetime.now(UTC).isoformat(),
+            },
+            "investments": [
+                {
+                    key: decimal_value(value) if isinstance(value, Decimal) else value
+                    for key, value in row.items()
+                }
+                for row in investment_net_worth["investments"]
+            ],
         },
         "obligation_alerts": obligation_alerts,
     }
