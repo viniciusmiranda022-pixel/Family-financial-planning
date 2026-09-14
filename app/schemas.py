@@ -116,43 +116,62 @@ class AdvisorRequest(BaseModel):
     history: list[AdvisorHistoryItem] = Field(default_factory=list, max_length=8)
 
 
+class AssistantDuplicateResolution(BaseModel):
+    """An explicit, discrete answer to a possible-duplicate warning a prior
+    `POST /assistant/interpret` call already returned
+    (`proposal.candidate_kind == "possible_duplicate"`) -- Work Order
+    "deduplicação provável com as três escolhas humanas", engineering
+    review of PR #92 (blocker 4). `transaction_id` must name the exact
+    candidate that warning showed; a decision that no longer matches the
+    current duplicate scan is never honored silently."""
+
+    decision: str = Field(pattern="^(skip|import_anyway|view_existing)$")
+    transaction_id: str = Field(min_length=1, max_length=64)
+
+
 class AssistantInterpretRequest(BaseModel):
     """`POST /assistant/interpret` -- P0 #87, October Go-Live Slice 4.
 
-    Read-only: this endpoint calls the Codex sidecar for natural-language
-    understanding and deterministically resolves the result against real
-    household data, but never writes anything. `trace_id` is optional and,
-    when supplied, is only threaded through so a later `POST
-    /assistant/execute` in the same conversational turn can reuse it for
-    idempotent retry -- see `app.services.assistant_actions`.
+    Calls the Codex sidecar for natural-language understanding and
+    deterministically resolves the result against real household data.
+    Never creates/edits/deletes a financial-fact row -- but, when the
+    resolution is already materially complete and unambiguous
+    (`proposal.can_execute = true`), it does persist one single-use
+    `AssistantActionProposal` row (engineering review of PR #92, blocker 1)
+    so a later `POST /assistant/execute` can be bound to exactly this
+    resolution instead of trusting anything the HTTP caller resupplies --
+    see `app.services.assistant_actions.persist_action_proposal`.
+    `trace_id` is optional and, when supplied, is only threaded through for
+    correlation with other audit entries; when omitted the backend
+    generates one. `duplicate_resolution` answers a possible-duplicate
+    warning a prior call in the same conversational turn already returned.
     """
 
     message: str = Field(min_length=1, max_length=1000)
     history: list[AdvisorHistoryItem] = Field(default_factory=list, max_length=8)
     trace_id: str | None = Field(default=None, max_length=64)
+    duplicate_resolution: AssistantDuplicateResolution | None = None
 
 
 class AssistantExecuteRequest(BaseModel):
-    """`POST /assistant/execute` -- only accepts a `typed_action` from the
-    closed vocabulary in `app.services.assistant_actions.TYPED_ACTIONS`,
-    with `payload` fields that must validate against that action's own
+    """`POST /assistant/execute` -- accepts only a `proposal_id` returned by
+    a prior `POST /assistant/interpret` call whose response had
+    `proposal.can_execute = true` (engineering review of PR #92, blocker
+    1). The client can never supply `typed_action`/`payload`/
+    `path_params`/`structured_interpretation` directly: every one of those
+    fields is read back, unmodified, from the persisted
+    `AssistantActionProposal` the interpret step already resolved
+    deterministically against the closed vocabulary in
+    `app.services.assistant_actions.TYPED_ACTIONS` and that action's own
     existing request schema (`ManualTransactionRequest`, `TransferRequest`,
     `ObligationPaymentRequest`, `CardInvoicePayRequest`,
-    `RefundLinkRequest`) -- never a free-form write. `trace_id` is required
-    and is the idempotency key: a retry with the same `trace_id` for this
-    household returns the original result instead of executing again.
+    `RefundLinkRequest`) -- never a free-form write. `proposal_id` is
+    itself the idempotency key: a retry with the same, already-consumed
+    `proposal_id` returns the original result instead of executing again.
     """
 
-    typed_action: str = Field(
-        pattern="^(create_expense|create_income|create_internal_transfer|pay_obligation|"
-        "pay_card_invoice|register_refund)$"
-    )
-    payload: dict = Field(default_factory=dict)
-    path_params: dict = Field(default_factory=dict)
-    original_message: str = Field(min_length=1, max_length=1000)
-    structured_interpretation: dict | None = None
+    proposal_id: str = Field(min_length=1, max_length=64)
     disambiguation_qa: list[dict] = Field(default_factory=list, max_length=20)
-    trace_id: str = Field(min_length=1, max_length=64)
 
 
 class AssistantUndoRequest(BaseModel):

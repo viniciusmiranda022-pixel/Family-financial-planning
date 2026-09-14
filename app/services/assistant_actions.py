@@ -20,24 +20,50 @@ escrita/cálculo determinístico"):
   `create_manual_transaction` to resolve at execute time, exactly the same
   way a human typing a new category name in the manual-entry form already
   works -- see its own docstring below.
+- Autoridade de execução (engineering review of PR #92, blocker 1):
+  `POST /assistant/interpret` calls `build_typed_action_proposal` and, only
+  when the result has `can_execute=True`, persists it via
+  `persist_action_proposal` as an `AssistantActionProposal` row -- the
+  single source of truth for what may be executed. `POST /assistant/execute`
+  never accepts a `typed_action`/`payload`/`path_params`/
+  `structured_interpretation` from the HTTP caller: `execute_typed_action`
+  takes only a `proposal_id`, loads that row (household-scoped), and reads
+  every one of those fields back from it. A client can therefore never skip
+  `/assistant/interpret` and hand-execute a fabricated or spoofed
+  interpretation for a message that was actually ambiguous -- there is no
+  code path from an HTTP request straight into `TYPED_ACTIONS` dispatch
+  that does not pass through the deterministic resolution in this module
+  first. A proposal is single-use (`consumed_at`/`consumed_action_event_id`)
+  and time-boxed (`expires_at`, `_PROPOSAL_TTL_MINUTES`).
 - `execute_typed_action` never re-implements financial logic: every typed
-  action is a direct, in-process call into the exact same endpoint function
-  (`app.api.create_manual_transaction`, `.create_manual_transfer`,
-  `.pay_obligation`, `.pay_card_invoice_lifecycle`,
-  `.link_refund_transaction`) that a human's manual-entry form already
-  calls over HTTP -- imported locally to avoid a circular import (`app.api`
-  will import this module to expose `/assistant/*`). Household isolation,
-  `_require_admin`, large-amount confirmation, duplicate detection and the
-  underlying `AuditEvent` are therefore all enforced exactly once, by the
-  same code a human path already exercises -- this module adds nothing to
-  that authorization surface, it only narrates the call in
-  `AssistantActionEvent`.
+  action is a direct, in-process call into the exact same endpoint
+  function's body (`app.api._create_manual_transaction_impl`,
+  `._create_manual_transfer_impl`, `._pay_obligation_impl`,
+  `._pay_card_invoice_lifecycle_impl`, `._link_refund_transaction_impl` --
+  the underlying implementation `create_manual_transaction`/etc. themselves
+  thinly wrap for the public HTTP contract) that a human's manual-entry
+  form already calls over HTTP -- imported locally to avoid a circular
+  import (`app.api` will import this module to expose `/assistant/*`).
+  Household isolation, `_require_admin`, large-amount confirmation,
+  duplicate detection and the underlying domain `AuditEvent` are therefore
+  all enforced exactly once, by the same code a human path already
+  exercises -- this module adds nothing to that authorization surface, it
+  only narrates the call in `AssistantActionEvent`.
+- Atomicidade (engineering review of PR #92, blocker 5): the dispatched
+  `_impl` function is called with `commit=False`, so its own domain write
+  and this module's own `AssistantActionEvent`/proposal-consumption write
+  land in one open transaction; `execute_typed_action` issues the single
+  `db.commit()` that finalizes both together, and rolls back the whole
+  thing on any failure in between -- there is no window where the domain
+  fact is durably persisted but the Assistant's own audit/undo trail is
+  not (Work Order invariant "Nenhuma ação do Assistente fica sem audit
+  trail/trace").
 - `undo_assistant_action` never deletes audit history: it calls the
-  existing deterministic reversal (`unpay_obligation`, `unlink_refund`, or
-  the transaction-delete guard already used by manual entries) and records
-  a brand new `AuditEvent` for the reversal, marking the original
-  `AssistantActionEvent` as undone -- it never rewrites or removes the
-  original row.
+  existing deterministic reversal's `_impl` (`_unpay_obligation_impl`,
+  `_unlink_refund_transaction_impl`, or `_delete_manual_transaction_impl`,
+  same `commit=False` atomicity as above) and records a brand new
+  `AuditEvent` for the reversal, marking the original `AssistantActionEvent`
+  as undone -- it never rewrites or removes the original row.
 """
 
 from __future__ import annotations
@@ -84,6 +110,16 @@ _INTENT_TO_TYPED_ACTION = {
 
 MAX_CANDIDATES = 5
 
+# Blocker 1 (proposal binding): how long a resolved, ready-to-execute
+# proposal stays eligible for `POST /assistant/execute` after `POST
+# /assistant/interpret` persisted it. Long enough for a human to read a
+# confirmation and tap once; short enough that a stale proposal cannot
+# execute against household data that has since materially changed (an
+# account closed, an obligation already paid another way).
+PROPOSAL_TTL_MINUTES = 30
+
+_DUPLICATE_DECISIONS = ("skip", "import_anyway", "view_existing")
+
 
 def _json_safe(value: Any) -> Any:
     """Round-trip `value` through `json.dumps(default=str)`/`json.loads` so
@@ -105,6 +141,21 @@ class AssistantActionError(ValueError):
     HTTP 404/409/422 at the API layer, mirroring every other service-level
     `ValueError` subclass in this project (`TransferError`,
     `CardInvoiceError`)."""
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateResolution:
+    """An explicit, discrete human decision on a possible-duplicate warning
+    a prior `build_typed_action_proposal` call already surfaced (Work Order
+    "deduplicação provável com as três escolhas humanas" -- engineering
+    review of PR #92, blocker 4). `transaction_id` must name the exact
+    candidate the warning showed; a decision that no longer matches the
+    current duplicate scan (household data changed, or the candidate is
+    stale) is never honored silently -- the caller falls back to asking
+    again, never to skipping the check."""
+
+    decision: str
+    transaction_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +380,95 @@ def _candidate_refund_transactions(db: Session, *, household_id: str, hint: str)
     return candidates[:MAX_CANDIDATES]
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingTransaction:
+    """The minimal shape `app.services.duplicates.assess_duplicate` needs
+    (`.fingerprint`/`.amount`/`.booked_at`/`.description`/`.account_id`/
+    `.installment_current`/`.installment_total`/`.document_id`), for a
+    manual expense/income the Assistant has not created yet. Never has a
+    `fingerprint` (the real one is only computed by
+    `create_manual_transaction` itself at write time), so `exact_fingerprint`
+    is always `False` here -- a pre-flight scan can only ever find a
+    *probable* match, never re-detect an idempotent replay of a fingerprint
+    that does not exist yet."""
+
+    amount: Decimal
+    booked_at: date
+    description: str
+    account_id: str
+    installment_current: int | None = None
+    installment_total: int | None = None
+    document_id: str | None = None
+    fingerprint: str | None = None
+    competence: str | None = None
+
+
+def _check_possible_duplicate(
+    db: Session,
+    *,
+    household_id: str,
+    account_id: str,
+    signed_amount: Decimal,
+    booked_at: date,
+    description: str,
+) -> dict[str, Any] | None:
+    """Read-only pre-flight probable-duplicate scan for a not-yet-created
+    manual expense/income (Work Order "deduplicação provável com as três
+    escolhas humanas" -- engineering review of PR #92, blocker 4).
+
+    Reuses `app.services.duplicates.assess_duplicate` -- the exact same
+    scoring rule `register_transaction_duplicates` already applies after
+    the fact for the manual-entry form -- against real, already-persisted
+    transactions in the same +/-3-day window that function already scans.
+    Never writes anything (no `DuplicateGroup`, no flag on any row) before
+    the human has chosen: the post-create pass
+    (`register_transaction_duplicates`, unchanged) still runs once the
+    human picks "importar mesmo assim", exactly like the manual-entry form
+    already does, so the derived evidence a human resolves later in
+    `GET /duplicate-groups` is unaffected either way.
+
+    Returns `None` when no existing transaction reaches the "probable"
+    confidence band; otherwise a small dict describing the strongest match,
+    for `TypedActionProposal.candidates`."""
+
+    from app.models import Transaction
+    from app.services.duplicates import PROBABLE_THRESHOLD, assess_duplicate
+
+    window_start = booked_at - timedelta(days=3)
+    window_end = booked_at + timedelta(days=3)
+    pending = _PendingTransaction(
+        amount=signed_amount,
+        booked_at=booked_at,
+        description=description,
+        account_id=account_id,
+    )
+    existing_rows = list(
+        db.scalars(
+            select(Transaction).where(
+                Transaction.household_id == household_id,
+                Transaction.booked_at >= window_start,
+                Transaction.booked_at <= window_end,
+                Transaction.amount.between(signed_amount - Decimal("0.01"), signed_amount + Decimal("0.01")),
+            )
+        )
+    )
+    best_row = None
+    best_assessment = None
+    for row in existing_rows:
+        assessment = assess_duplicate(pending, row)
+        if assessment.confidence < PROBABLE_THRESHOLD:
+            continue
+        if best_assessment is None or assessment.confidence > best_assessment.confidence:
+            best_row, best_assessment = row, assessment
+    if best_row is None or best_assessment is None:
+        return None
+    return {
+        "transaction": _serialize_candidate(best_row, "transaction"),
+        "band": best_assessment.band,
+        "confidence": str(best_assessment.confidence),
+    }
+
+
 def _serialize_candidate(entity: Any, kind: str) -> dict[str, Any]:
     if kind == "account":
         return {"id": entity.id, "label": f"{entity.name} ({entity.account_type})"}
@@ -383,6 +523,7 @@ def build_typed_action_proposal(
     *,
     household_id: str,
     interpretation: StructuredInterpretation,
+    duplicate_resolution: DuplicateResolution | None = None,
 ) -> TypedActionProposal:
     """Deterministically resolve a Codex interpretation into either a
     ready-to-confirm typed-action proposal or a clarifying question.
@@ -392,7 +533,9 @@ def build_typed_action_proposal(
     fields the matching `app.schemas` request model requires -- but
     `execute_typed_action` re-validates and re-authorizes all of it from
     scratch; nothing here is trusted at execute time just because it was
-    proposed here.
+    proposed here. `duplicate_resolution`, when given, answers a possible-
+    duplicate warning a *prior* call already returned (`candidate_kind ==
+    "possible_duplicate"`) -- see `_propose_create_transaction`.
     """
 
     if not interpretation.available:
@@ -412,7 +555,13 @@ def build_typed_action_proposal(
 
     fields = interpretation.extracted_fields
     if typed_action in ("create_expense", "create_income"):
-        return _propose_create_transaction(db, household_id=household_id, typed_action=typed_action, fields=fields)
+        return _propose_create_transaction(
+            db,
+            household_id=household_id,
+            typed_action=typed_action,
+            fields=fields,
+            duplicate_resolution=duplicate_resolution,
+        )
     if typed_action == "create_internal_transfer":
         return _propose_internal_transfer(db, household_id=household_id, fields=fields)
     if typed_action == "pay_obligation":
@@ -425,7 +574,12 @@ def build_typed_action_proposal(
 
 
 def _propose_create_transaction(
-    db: Session, *, household_id: str, typed_action: str, fields: dict[str, str]
+    db: Session,
+    *,
+    household_id: str,
+    typed_action: str,
+    fields: dict[str, str],
+    duplicate_resolution: DuplicateResolution | None = None,
 ) -> TypedActionProposal:
     amount = parse_amount_text(fields.get("amount_text"))
     missing = []
@@ -476,6 +630,60 @@ def _propose_create_transaction(
         )
 
     booked_at = parse_date_text(fields.get("date_text")) or date.today()
+
+    # Pre-flight probable-duplicate check (Work Order "deduplicação
+    # provável com as três escolhas humanas" -- engineering review of PR
+    # #92, blocker 4). Only for `create_expense`/`create_income`: the
+    # underlying `register_transaction_duplicates` engine this reuses
+    # scores `Transaction` rows, and every other typed action already has
+    # its own equivalent-or-stronger fail-safe guard before writing --
+    # `pay_obligation`'s same-account/near-date collision 409,
+    # `pay_card_invoice`'s exact-match idempotent-replay short-circuit, and
+    # `register_refund`'s own linkage invariants (INV-027) -- so this pass
+    # is not duplicated there.
+    signed_amount = -amount if typed_action == "create_expense" else amount
+    duplicate = _check_possible_duplicate(
+        db,
+        household_id=household_id,
+        account_id=accounts[0].id,
+        signed_amount=signed_amount,
+        booked_at=booked_at,
+        description=description,
+    )
+    if duplicate is not None:
+        duplicate_transaction_id = duplicate["transaction"]["id"]
+        resolved = (
+            duplicate_resolution is not None
+            and duplicate_resolution.transaction_id == duplicate_transaction_id
+            and duplicate_resolution.decision in _DUPLICATE_DECISIONS
+        )
+        if not resolved:
+            return TypedActionProposal(
+                can_execute=False,
+                clarifying_question=(
+                    f'Encontrei um lançamento parecido já registrado: "{duplicate["transaction"]["label"]}". '
+                    "Quer pular, importar mesmo assim, ou ver o existente?"
+                ),
+                candidates=(duplicate["transaction"],),
+                candidate_kind="possible_duplicate",
+            )
+        if duplicate_resolution.decision == "skip":
+            return TypedActionProposal(
+                can_execute=False,
+                clarifying_question="Ok, não registrei esse lançamento.",
+            )
+        if duplicate_resolution.decision == "view_existing":
+            return TypedActionProposal(
+                can_execute=False,
+                clarifying_question="Aqui está o lançamento existente.",
+                candidates=(duplicate["transaction"],),
+                candidate_kind="possible_duplicate",
+            )
+        # decision == "import_anyway": fall through and build the normal
+        # executable proposal below. `register_transaction_duplicates`
+        # still runs at execute time and still flags/reviews it, exactly
+        # like the manual-entry form already does.
+
     payload: dict[str, Any] = {
         "booked_at": booked_at.isoformat(),
         "description": description[:500],
@@ -675,19 +883,31 @@ class _TypedActionSpec:
 
 
 _TYPED_ACTION_SPECS: dict[str, _TypedActionSpec] = {
-    "create_expense": _TypedActionSpec("ManualTransactionRequest", "create_manual_transaction"),
-    "create_income": _TypedActionSpec("ManualTransactionRequest", "create_manual_transaction"),
-    "create_internal_transfer": _TypedActionSpec("TransferRequest", "create_manual_transfer"),
+    "create_expense": _TypedActionSpec("ManualTransactionRequest", "_create_manual_transaction_impl"),
+    "create_income": _TypedActionSpec("ManualTransactionRequest", "_create_manual_transaction_impl"),
+    "create_internal_transfer": _TypedActionSpec("TransferRequest", "_create_manual_transfer_impl"),
     "pay_obligation": _TypedActionSpec(
-        "ObligationPaymentRequest", "pay_obligation", ("obligation_id",), entity_type="obligation"
+        "ObligationPaymentRequest", "_pay_obligation_impl", ("obligation_id",), entity_type="obligation"
     ),
     "pay_card_invoice": _TypedActionSpec(
-        "CardInvoicePayRequest", "pay_card_invoice_lifecycle", ("invoice_id",), entity_type="card_invoice"
+        "CardInvoicePayRequest",
+        "_pay_card_invoice_lifecycle_impl",
+        ("invoice_id",),
+        entity_type="card_invoice",
     ),
     "register_refund": _TypedActionSpec(
-        "RefundLinkRequest", "link_refund_transaction", ("transaction_id",)
+        "RefundLinkRequest", "_link_refund_transaction_impl", ("transaction_id",)
     ),
 }
+
+# Typed actions whose dispatched `_impl` mutates an *existing* entity and
+# therefore accepts `domain_audit_sink` so `execute_typed_action` can copy
+# its canonical before/after state -- see `_pay_obligation_impl`'s
+# docstring and blocker 2 of the engineering review of PR #92. The other
+# three typed actions *create* a new row (`before_state=None` is the
+# accepted shape for a create, per that same review) and their `_impl`s do
+# not accept the parameter at all.
+_ENTITY_MUTATION_TYPED_ACTIONS = frozenset({"pay_obligation", "pay_card_invoice", "register_refund"})
 
 
 def _target_entity_ids(typed_action: str, response: dict[str, Any], path_params: dict[str, str]) -> list[str]:
@@ -709,16 +929,6 @@ def _target_entity_ids(typed_action: str, response: dict[str, Any], path_params:
     return []
 
 
-def _find_existing_action_by_trace(db: Session, *, household_id: str, trace_id: str) -> Any | None:
-    from app.models import AssistantActionEvent, AuditEvent
-
-    return db.scalar(
-        select(AssistantActionEvent)
-        .join(AuditEvent, AuditEvent.id == AssistantActionEvent.audit_event_id)
-        .where(AuditEvent.household_id == household_id, AuditEvent.trace_id == trace_id)
-    )
-
-
 def _serialize_action_event(event: Any, *, audit_event: Any) -> dict[str, Any]:
     return {
         "id": event.id,
@@ -735,55 +945,131 @@ def _serialize_action_event(event: Any, *, audit_event: Any) -> dict[str, Any]:
     }
 
 
+def persist_action_proposal(
+    db: Session,
+    *,
+    household_id: str,
+    user_id: str,
+    trace_id: str,
+    original_message: str,
+    structured_interpretation: dict[str, Any],
+    proposal: TypedActionProposal,
+) -> str:
+    """Persists a ready-to-execute proposal so `execute_typed_action` can
+    later dispatch it without trusting any `typed_action`/`payload`/
+    `path_params`/`structured_interpretation` the HTTP caller resupplies --
+    engineering review of PR #92, blocker 1; see module docstring
+    "Autoridade de execução". Called by `POST /assistant/interpret` only
+    when `proposal.can_execute` is true: a proposal still needing
+    disambiguation carries nothing `execute_typed_action` could ever
+    dispatch, so there is nothing to protect by persisting it. Commits on
+    its own -- this is the one thing `/assistant/interpret` writes."""
+
+    if not proposal.can_execute or proposal.typed_action is None:
+        raise ValueError("Somente uma proposta pronta para executar pode ser persistida")
+
+    from app.models import AssistantActionProposal
+
+    row = AssistantActionProposal(
+        household_id=household_id,
+        user_id=user_id,
+        trace_id=trace_id,
+        original_message=original_message[:2000],
+        structured_interpretation=_json_safe(structured_interpretation),
+        typed_action=proposal.typed_action,
+        payload=_json_safe(proposal.payload) or {},
+        path_params=_json_safe(proposal.path_params) or {},
+        expires_at=datetime.now(UTC) + timedelta(minutes=PROPOSAL_TTL_MINUTES),
+    )
+    db.add(row)
+    db.commit()
+    return row.id
+
+
 def execute_typed_action(
     db: Session,
     *,
     user: Any,
-    typed_action: str,
-    payload: dict[str, Any],
-    path_params: dict[str, str] | None = None,
-    original_message: str,
-    structured_interpretation: dict[str, Any] | None,
-    disambiguation_qa: list[dict[str, Any]] | None,
-    trace_id: str,
+    proposal_id: str,
+    disambiguation_qa: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Validate, dispatch and audit one typed action.
+    """Dispatch and audit the one typed action `proposal_id` names.
 
-    Idempotency: a retry with the same `trace_id` (already scoped to this
-    household through the `AuditEvent` join) returns the original result
-    without executing anything a second time -- see module docstring. This
-    is a convenience layer on top of, never a replacement for, each
-    underlying endpoint's own duplicate-detection/fingerprint guard, which
-    still applies unconditionally.
+    Every mutation-relevant field (`typed_action`/`payload`/`path_params`/
+    `original_message`/`structured_interpretation`/`trace_id`) is read back
+    from the `AssistantActionProposal` row `POST /assistant/interpret`
+    already persisted -- never from an argument the HTTP caller could
+    supply directly (engineering review of PR #92, blocker 1).
+
+    Idempotency: a proposal is single-use. A retry with the same
+    `proposal_id` after it was already consumed returns the original
+    result without executing anything a second time -- a stronger,
+    unambiguous key than a client-supplied `trace_id`. This is a
+    convenience layer on top of, never a replacement for, each underlying
+    endpoint's own duplicate-detection/fingerprint guard, which still
+    applies unconditionally.
+
+    Atomicity (blocker 5): the dispatched `_impl` is called with
+    `commit=False`, so its domain write and this function's own
+    `AssistantActionEvent`/proposal-consumption write share one open
+    transaction, finalized by the single `db.commit()` at the end; any
+    failure anywhere in between rolls back the whole thing, so a financial
+    fact can never end up persisted without its Assistant audit trail.
     """
 
     import app.api as api
     import app.schemas as schemas
     from app.models import AssistantActionEvent
+    from app.models import AssistantActionProposal as AssistantActionProposalModel
+    from app.models import AuditEvent as AuditEventModel
 
+    proposal_row = db.scalar(
+        select(AssistantActionProposalModel).where(
+            AssistantActionProposalModel.id == proposal_id,
+            AssistantActionProposalModel.household_id == user.household_id,
+        )
+    )
+    if proposal_row is None:
+        raise AssistantActionError("Proposta do Assistente não encontrada")
+
+    if proposal_row.consumed_at is not None:
+        if proposal_row.consumed_action_event_id is None:
+            raise AssistantActionError("Esta proposta já foi utilizada")
+        action_event = db.get(AssistantActionEvent, proposal_row.consumed_action_event_id)
+        audit_event = db.get(AuditEventModel, action_event.audit_event_id)
+        return {
+            "idempotent_replay": True,
+            "action": _serialize_action_event(action_event, audit_event=audit_event),
+        }
+
+    now = datetime.now(UTC)
+    expires_at = proposal_row.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at is not None and expires_at < now:
+        raise AssistantActionError(
+            "Esta proposta expirou. Peça a ação novamente para gerar uma nova interpretação."
+        )
+
+    typed_action = proposal_row.typed_action
     if typed_action not in TYPED_ACTIONS:
         raise AssistantActionError(f"Ação tipada desconhecida: {typed_action}")
 
-    existing = _find_existing_action_by_trace(db, household_id=user.household_id, trace_id=trace_id)
-    if existing is not None:
-        from app.models import AuditEvent
-
-        audit_event = db.get(AuditEvent, existing.audit_event_id)
-        return {"idempotent_replay": True, "action": _serialize_action_event(existing, audit_event=audit_event)}
+    payload = dict(proposal_row.payload or {})
+    path_params = dict(proposal_row.path_params or {})
+    trace_id = proposal_row.trace_id
 
     spec = _TYPED_ACTION_SPECS[typed_action]
     schema_cls = getattr(schemas, spec.schema_name)
-    path_params = path_params or {}
     missing_path_params = [name for name in spec.path_param_names if name not in path_params]
     if missing_path_params:
         raise AssistantActionError(f"Parâmetros obrigatórios ausentes: {', '.join(missing_path_params)}")
 
     if typed_action in ("create_expense", "create_income"):
-        # Never trust the caller's `movement_type` (if any slipped into
-        # `payload`) over the `typed_action` the caller separately declared
-        # and this function already validated against `TYPED_ACTIONS` --
-        # deriving it here again, unconditionally, means a mismatched
-        # payload can never smuggle `movement_type="income"` under
+        # Never trust anything but the `typed_action` this proposal was
+        # persisted under to decide `movement_type` -- deriving it here
+        # again, unconditionally, means a corrupted/tampered payload can
+        # never smuggle `movement_type="income"` under
         # `typed_action="create_expense"` or vice-versa.
         payload = {**payload, "movement_type": "expense" if typed_action == "create_expense" else "income"}
     try:
@@ -797,54 +1083,81 @@ def execute_typed_action(
         raise AssistantActionError(f"Dados incompletos ou inválidos para {typed_action}: {exc}") from exc
     dispatcher = getattr(api, spec.dispatcher_name)
 
-    if typed_action == "pay_obligation":
-        response = dispatcher(path_params["obligation_id"], request_payload, user, db)
-    elif typed_action == "pay_card_invoice":
-        response = dispatcher(path_params["invoice_id"], request_payload, user, db)
-    elif typed_action == "register_refund":
-        response = dispatcher(path_params["transaction_id"], request_payload, user, db)
-    else:
-        response = dispatcher(request_payload, user, db)
+    domain_audit_sink: list[Any] = []
+    dispatch_kwargs: dict[str, Any] = {"commit": False}
+    if typed_action in _ENTITY_MUTATION_TYPED_ACTIONS:
+        dispatch_kwargs["domain_audit_sink"] = domain_audit_sink
+
+    try:
+        if typed_action == "pay_obligation":
+            response = dispatcher(path_params["obligation_id"], request_payload, user, db, **dispatch_kwargs)
+        elif typed_action == "pay_card_invoice":
+            response = dispatcher(path_params["invoice_id"], request_payload, user, db, **dispatch_kwargs)
+        elif typed_action == "register_refund":
+            response = dispatcher(path_params["transaction_id"], request_payload, user, db, **dispatch_kwargs)
+        else:
+            response = dispatcher(request_payload, user, db, **dispatch_kwargs)
+    except Exception:
+        db.rollback()
+        raise
 
     target_entity_ids = _target_entity_ids(typed_action, response, path_params)
     undoable, non_reversible_reason = _undo_capability(typed_action)
 
-    # A second, distinct `AuditEvent` from the one the dispatched endpoint
-    # already recorded for the financial fact itself (e.g.
-    # `create_manual_transaction`'s own `"transaction.create_manual"`
-    # event) -- this one narrates that the Assistant, specifically,
-    # originated the call, and is what `AssistantActionEvent` is 1:1 with.
-    # Built directly (not through `app.api.audit()`, which returns `None`)
-    # because this function needs the row's generated id immediately.
-    from app.models import AuditEvent as AuditEventModel
+    if domain_audit_sink:
+        # The exact before/after the domain endpoint itself already
+        # computed for its own `AuditEvent` -- never recomputed or guessed
+        # a second time (engineering review of PR #92, blocker 2).
+        domain_event = domain_audit_sink[0]
+        before_state = domain_event.before_state
+        after_state = domain_event.after_state
+    else:
+        before_state = None
+        after_state = _json_safe(response)
 
-    audit_event_row = AuditEventModel(
-        household_id=user.household_id,
-        user_id=user.id,
-        event_type="assistant.execute",
-        entity_type=spec.entity_type,
-        entity_id=target_entity_ids[0] if target_entity_ids else None,
-        details=json.dumps({"typed_action": typed_action, "response": response}, ensure_ascii=False, default=str),
-        trace_id=trace_id,
-        source="assistant",
-    )
-    db.add(audit_event_row)
-    db.flush()
-    action_event = AssistantActionEvent(
-        audit_event_id=audit_event_row.id,
-        original_message=original_message[:2000],
-        structured_interpretation=structured_interpretation,
-        disambiguation_qa=disambiguation_qa or [],
-        typed_action=typed_action,
-        target_entity_type=spec.entity_type,
-        target_entity_ids=target_entity_ids,
-        before_state=None,
-        after_state=_json_safe(response),
-        undoable=undoable,
-        non_reversible_reason=non_reversible_reason,
-    )
-    db.add(action_event)
-    db.commit()
+    try:
+        # A second, distinct `AuditEvent` from the one the dispatched
+        # `_impl` already recorded for the financial fact itself (e.g.
+        # `_create_manual_transaction_impl`'s own
+        # `"transaction.create_manual"` event) -- this one narrates that
+        # the Assistant, specifically, originated the call, and is what
+        # `AssistantActionEvent` is 1:1 with.
+        audit_event_row = AuditEventModel(
+            household_id=user.household_id,
+            user_id=user.id,
+            event_type="assistant.execute",
+            entity_type=spec.entity_type,
+            entity_id=target_entity_ids[0] if target_entity_ids else None,
+            details=json.dumps(
+                {"typed_action": typed_action, "response": response}, ensure_ascii=False, default=str
+            ),
+            trace_id=trace_id,
+            source="assistant",
+        )
+        db.add(audit_event_row)
+        db.flush()
+        action_event = AssistantActionEvent(
+            audit_event_id=audit_event_row.id,
+            original_message=proposal_row.original_message,
+            structured_interpretation=proposal_row.structured_interpretation,
+            disambiguation_qa=disambiguation_qa or [],
+            typed_action=typed_action,
+            target_entity_type=spec.entity_type,
+            target_entity_ids=target_entity_ids,
+            before_state=before_state,
+            after_state=after_state,
+            undoable=undoable,
+            non_reversible_reason=non_reversible_reason,
+        )
+        db.add(action_event)
+        db.flush()
+        proposal_row.consumed_at = now
+        proposal_row.consumed_action_event_id = action_event.id
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
     return {
         "idempotent_replay": False,
         "response": response,
@@ -885,52 +1198,67 @@ def undo_assistant_action(
     typed_action = action_event.typed_action
     target_ids = action_event.target_entity_ids or []
 
-    if typed_action in ("create_expense", "create_income", "create_internal_transfer"):
-        if not target_ids:
-            raise AssistantActionError("Não há lançamento para desfazer")
-        api.delete_manual_transaction(target_ids[0], user, db)
-    elif typed_action == "pay_obligation":
-        if not target_ids:
-            raise AssistantActionError("Não há obrigação para desfazer")
-        api.unpay_obligation(
-            target_ids[0], schemas.ObligationPaymentUndoRequest(reason=reason), user, db
-        )
-    elif typed_action == "register_refund":
-        if not target_ids:
-            raise AssistantActionError("Não há vínculo de estorno para desfazer")
-        api.unlink_refund_transaction(
-            target_ids[0], schemas.RefundUnlinkRequest(refund_transaction_id=target_ids[0], reason=reason), user, db
-        )
-    else:
-        raise AssistantActionError(
-            action_event.non_reversible_reason or "Esta ação não pode ser desfeita automaticamente"
-        )
+    # `commit=False` on every reversal `_impl` call below -- same
+    # atomicity contract as `execute_typed_action` (blocker 5): the
+    # reversal's own domain write and this function's own undo
+    # bookkeeping/`AuditEvent` are one transaction, finalized by the single
+    # `db.commit()` at the end.
+    try:
+        if typed_action in ("create_expense", "create_income", "create_internal_transfer"):
+            if not target_ids:
+                raise AssistantActionError("Não há lançamento para desfazer")
+            api._delete_manual_transaction_impl(target_ids[0], user, db, commit=False)
+        elif typed_action == "pay_obligation":
+            if not target_ids:
+                raise AssistantActionError("Não há obrigação para desfazer")
+            api._unpay_obligation_impl(
+                target_ids[0], schemas.ObligationPaymentUndoRequest(reason=reason), user, db, commit=False
+            )
+        elif typed_action == "register_refund":
+            if not target_ids:
+                raise AssistantActionError("Não há vínculo de estorno para desfazer")
+            api._unlink_refund_transaction_impl(
+                target_ids[0],
+                schemas.RefundUnlinkRequest(refund_transaction_id=target_ids[0], reason=reason),
+                user,
+                db,
+                commit=False,
+            )
+        else:
+            raise AssistantActionError(
+                action_event.non_reversible_reason or "Esta ação não pode ser desfeita automaticamente"
+            )
 
-    # A distinct `AuditEvent` for the reversal itself -- in addition to
-    # whichever event the reversal endpoint above already recorded for its
-    # own domain (`"obligation.unpay"`, `"refund.unlink"`,
-    # `"transaction.delete_manual"`/`"transfer.delete"`). Never overwrites
-    # or deletes the original `assistant.execute` event: the trail grows,
-    # it never shrinks.
-    from app.models import AuditEvent as AuditEventModel
+        # A distinct `AuditEvent` for the reversal itself -- in addition to
+        # whichever event the reversal `_impl` above already recorded for
+        # its own domain (`"obligation.unpay"`, `"refund.unlink"`,
+        # `"transaction.delete_manual"`/`"transfer.delete"`). Never
+        # overwrites or deletes the original `assistant.execute` event: the
+        # trail grows, it never shrinks.
+        from app.models import AuditEvent as AuditEventModel
 
-    undo_audit_event = AuditEventModel(
-        household_id=user.household_id,
-        user_id=user.id,
-        event_type="assistant.undo",
-        entity_type=action_event.target_entity_type,
-        entity_id=target_ids[0] if target_ids else None,
-        details=json.dumps({"typed_action": typed_action, "action_event_id": action_event.id}, ensure_ascii=False),
-        reason=reason,
-        source="assistant",
-    )
-    db.add(undo_audit_event)
-    db.flush()
+        undo_audit_event = AuditEventModel(
+            household_id=user.household_id,
+            user_id=user.id,
+            event_type="assistant.undo",
+            entity_type=action_event.target_entity_type,
+            entity_id=target_ids[0] if target_ids else None,
+            details=json.dumps(
+                {"typed_action": typed_action, "action_event_id": action_event.id}, ensure_ascii=False
+            ),
+            reason=reason,
+            source="assistant",
+        )
+        db.add(undo_audit_event)
+        db.flush()
 
-    action_event.undone_at = datetime.now(UTC)
-    action_event.undone_by = user.id
-    action_event.undo_audit_event_id = undo_audit_event.id
-    db.commit()
+        action_event.undone_at = datetime.now(UTC)
+        action_event.undone_by = user.id
+        action_event.undo_audit_event_id = undo_audit_event.id
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {"ok": True, "action_id": action_event.id, "typed_action": typed_action}
 
 
