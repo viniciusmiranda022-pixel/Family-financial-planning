@@ -1,6 +1,6 @@
 # Smoke Real de Go-Live -- October Go-Live Slice 8
 
-Gerado em: 2026-09-14T21:29:04.534553+00:00
+Gerado em: 2026-09-14T23:13:30.173927+00:00
 
 Dados sintéticos (rebaseline/Work Order permitem "datasets sintéticos equivalentes" para este E2E automatizado). O smoke manual com dados reais da família é um passo humano separado, fora do alcance desta sessão.
 
@@ -29,18 +29,18 @@ Resultado: TODOS OS PASSOS PASSARAM
 
 ## Passo 4 -- Assistente: frase completa executa ação tipada [✅ OK]
 
-- **Entrada:** "Paguei a parcela da chácara" (com origem/data resolvidas)
-- **Ação:** build_typed_action_proposal -> POST /api/assistant/execute
-- **Resultado esperado:** proposal.can_execute=True; execute 201; obrigação paga
-- **Resultado observado:** can_execute=True; execute=201
-- **Evidência:** {'action_id': '12895d67-f736-4c4a-a7fa-a295cde934fa'}
+- **Entrada:** "Paguei a parcela da chácara" (Codex resolve conta/data; smoke stuba só o transporte do sidecar)
+- **Ação:** POST /api/assistant/interpret -> POST /api/assistant/execute
+- **Resultado esperado:** interpret 200; proposal.can_execute=True; execute 201; obrigação paga
+- **Resultado observado:** interpret=200; can_execute=True; execute=201
+- **Evidência:** {'action_id': '0cd5e031-10dd-4624-b758-bd87fee66069'}
 
 ## Passo 5 -- Assistente: frase ambígua pede informação [✅ OK]
 
 - **Entrada:** "Gastei 300 de combustível" (sem conta/cartão)
-- **Ação:** build_typed_action_proposal
-- **Resultado esperado:** can_execute=False; pergunta de esclarecimento; nada persistido
-- **Resultado observado:** can_execute=False; question='Preciso de mais informação: valor, conta/cartão e o que foi.'
+- **Ação:** POST /api/assistant/interpret
+- **Resultado esperado:** 200; can_execute=False; pergunta de esclarecimento; nada persistido (proposal_id nulo)
+- **Resultado observado:** interpret=200; can_execute=False; proposal_id=None; question='Preciso de mais informação: valor, conta/cartão e o que foi.'
 
 ## Passo 6 -- Criação/consulta de obrigação [✅ OK]
 
@@ -66,16 +66,16 @@ Resultado: TODOS OS PASSOS PASSARAM
 ## Passo 9 -- Transferência interna Conta Corrente <-> Privilège [✅ OK]
 
 - **Entrada:** Resgate R$500,00 do Reserva DI para Conta Corrente
-- **Ação:** POST /api/transfers; GET /api/reports (internal_transfers)
-- **Resultado esperado:** 201; transferência não conta como renda/despesa
-- **Resultado observado:** transfer=201; internal_transfers_total=1000.0
+- **Ação:** POST /api/transfers; GET /api/reports antes/depois (total_spending, total_cash_in, internal_transfers_total)
+- **Resultado esperado:** 201; total_spending e total_cash_in inalterados (transferência não vira renda/despesa); internal_transfers_total sobe R$1.000,00 (soma bruta das duas pernas de R$500,00, não valor econômico)
+- **Resultado observado:** transfer=201; total_spending 150.0 -> 150.0; total_cash_in 4500.0 -> 4500.0; internal_transfers_total 0.0 -> 1000.0
 
 ## Passo 10 -- Saldo confirmado e reconciliação [✅ OK]
 
 - **Entrada:** Observação confirmada R$12.000,00 em 2026-09-12 no Reserva DI
 - **Ação:** POST /api/account-balances; GET /api/dashboard
 - **Resultado esperado:** 201; dashboard publica o saldo confirmado como soberano
-- **Resultado observado:** obs=201; observed_value={'value': 12000.0, 'as_of_date': '2026-09-12', 'account_id': '5f054bfa-eeeb-4fca-981d-b6d524887ba6', 'source': 'account_balance_observation', 'freshness': 'point_in_time', 'certified_by': 'manual_confirmed', 'trusted': True}
+- **Resultado observado:** obs=201; observed_value={'value': 12000.0, 'as_of_date': '2026-09-12', 'account_id': '972b8d79-9877-44a5-8438-0f4247677d98', 'source': 'account_balance_observation', 'freshness': 'point_in_time', 'certified_by': 'manual_confirmed', 'trusted': True}
 
 ## Passo 11 -- Patrimônio/Studio [✅ OK]
 
@@ -93,7 +93,7 @@ Resultado: TODOS OS PASSOS PASSARAM
 
 ## Passo 13 -- Undo de ação do Assistente [✅ OK]
 
-- **Entrada:** Desfazer a ação 12895d67-f736-4c4a-a7fa-a295cde934fa (pagamento da chácara pelo Assistente)
+- **Entrada:** Desfazer a ação 0cd5e031-10dd-4624-b758-bd87fee66069 (pagamento da chácara pelo Assistente)
 - **Ação:** POST /api/assistant/actions/{id}/undo
 - **Resultado esperado:** 200; obrigação volta a pending; trilha de auditoria preservada
 - **Resultado observado:** undo=200; obligation_status=pending
@@ -101,6 +101,6 @@ Resultado: TODOS OS PASSOS PASSARAM
 ## Passo 14 -- Provável duplicidade sem decisão destrutiva automática [✅ OK]
 
 - **Entrada:** "Gastei 300 no posto de novo" (mesmo valor/categoria/data de um lançamento existente)
-- **Ação:** build_typed_action_proposal (sem duplicate_resolution)
-- **Resultado esperado:** can_execute=False; candidate_kind=possible_duplicate; nada é criado/apagado automaticamente
-- **Resultado observado:** existing=201; can_execute=False; kind=possible_duplicate; fuel_rows=1
+- **Ação:** POST /api/assistant/interpret (sem duplicate_resolution)
+- **Resultado esperado:** 200; can_execute=False; candidate_kind=possible_duplicate; proposal_id nulo; nada é criado/apagado automaticamente
+- **Resultado observado:** existing=201; interpret=200; can_execute=False; kind=possible_duplicate; fuel_rows=1

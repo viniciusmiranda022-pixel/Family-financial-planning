@@ -21,6 +21,20 @@ separate, human step the Work Order also requires and this file cannot
 perform on its own -- there is no real family data available to this
 session).
 
+Steps 4, 5 and 14 (the Assistant flows) drive the real `POST
+/api/assistant/interpret` HTTP endpoint -- `interpret_message` ->
+`_coerce_interpretation` -> `build_typed_action_proposal` all run
+unstubbed -- and stub only the Advisor sidecar *transport*
+(`_StubCodexAdvisorClient`, replacing `CodexAdvisorClient`) with one
+canned, schema-shaped `/v1/interpret` response per message. Engineering
+review of this PR, Round 1, blocker 1: an earlier version of this file
+built a `StructuredInterpretation` by hand and called
+`build_typed_action_proposal`/`persist_action_proposal` directly, which
+skipped exactly the interpretation layer the Work Order requires this
+smoke to prove (a materially complete phrase executes; an ambiguous one
+asks; a Codex hypothesis never becomes a fact without confirmation). No
+real network call happens in CI.
+
 `run_go_live_smoke()` returns the ordered list of step results (input,
 action, expected, observed, evidence) so this same flow can also produce
 the Work Order's required smoke-results document without duplicating the
@@ -33,6 +47,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from unittest import mock
 
 from cryptography.fernet import Fernet
 
@@ -48,9 +63,8 @@ from sqlalchemy.pool import StaticPool  # noqa: E402
 
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Household, Transaction, User  # noqa: E402
-from app.services.assistant_actions import build_typed_action_proposal, persist_action_proposal  # noqa: E402
-from app.services.assistant_interpreter import StructuredInterpretation  # noqa: E402
+from app.models import Household, Transaction  # noqa: E402
+from app.services.codex_client import CodexResult  # noqa: E402
 from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 TARGET_NAV_VIEWS = (
@@ -94,16 +108,52 @@ def _client() -> tuple[TestClient, sessionmaker]:
     return TestClient(app), session_factory
 
 
-def _interpretation(intent: str, **fields: str) -> StructuredInterpretation:
-    return StructuredInterpretation(
-        available=True,
-        reason=None,
-        intent=intent,
-        extracted_fields=fields,
-        missing_fields=(),
-        clarifying_question=None,
-        confidence=0.9,
-    )
+@dataclass(slots=True)
+class _StubCodexAdvisorClient:
+    """Deterministic stand-in for `app.services.codex_client.CodexAdvisorClient`,
+    scoped to this smoke's three `/api/assistant/interpret` calls (steps 4,
+    5, 14).
+
+    Engineering review of this PR (Round 1, blocker 1): the smoke must
+    exercise the real HTTP/service interpretation contract end to end --
+    `POST /api/assistant/interpret` -> `interpret_message` ->
+    `_coerce_interpretation` -> `build_typed_action_proposal` -- not a
+    `StructuredInterpretation` hand-built inside the test and fed straight
+    to `build_typed_action_proposal`/`persist_action_proposal`, which skips
+    exactly the interpretation layer the Work Order requires this smoke to
+    validate. Stubbing only the sidecar *transport* (this class, standing
+    in for `CodexAdvisorClient`) keeps the smoke deterministic and free of
+    any real network call in CI -- matching the discipline
+    `app.services.assistant_interpreter` already documents for every other
+    caller -- while every other step of the real contract (schema
+    revalidation, household-data resolution, disambiguation, duplicate
+    detection, persistence) runs for real, unstubbed.
+    """
+
+    responses: dict[str, dict]
+
+    @property
+    def configured(self) -> bool:
+        return True
+
+    def interpret(self, payload: dict) -> CodexResult:
+        message = payload.get("message")
+        response = self.responses.get(message)
+        if response is None:
+            raise AssertionError(f"go-live smoke: unexpected /v1/interpret call for message={message!r}")
+        return CodexResult(payload=dict(response))
+
+
+def _interpret(client: TestClient, message: str, response: dict):
+    """POST /api/assistant/interpret through the real HTTP/service
+    contract, stubbing only the Advisor sidecar transport with one canned,
+    schema-shaped `/v1/interpret` response keyed to this exact message."""
+
+    with mock.patch(
+        "app.services.assistant_interpreter.CodexAdvisorClient",
+        return_value=_StubCodexAdvisorClient(responses={message: response}),
+    ):
+        return client.post("/api/assistant/interpret", json={"message": message})
 
 
 def run_go_live_smoke(client: TestClient, session_factory) -> list[SmokeStep]:  # noqa: PLR0915
@@ -203,29 +253,6 @@ def run_go_live_smoke(client: TestClient, session_factory) -> list[SmokeStep]:  
     with session_factory() as db:
         household_id = db.scalar(select(Household.id))
 
-    def _propose_and_persist(*, message, interpretation, duplicate_resolution=None):
-        trace_id = str(uuid.uuid4())
-        with session_factory() as db:
-            user_id = db.scalar(select(User.id))
-            proposal = build_typed_action_proposal(
-                db,
-                household_id=household_id,
-                interpretation=interpretation,
-                duplicate_resolution=duplicate_resolution,
-            )
-            if not proposal.can_execute:
-                return None, proposal
-            proposal_id = persist_action_proposal(
-                db,
-                household_id=household_id,
-                user_id=user_id,
-                trace_id=trace_id,
-                original_message=message,
-                structured_interpretation=interpretation.to_dict(),
-                proposal=proposal,
-            )
-        return proposal_id, proposal
-
     # -- 6. Criação/consulta de obrigação (created before step 4 uses it) ---
     obligation = client.post(
         "/api/obligations", json={"name": "Parcela chácara", "due_date": "2026-08-10", "amount": "500.00"}
@@ -245,16 +272,29 @@ def run_go_live_smoke(client: TestClient, session_factory) -> list[SmokeStep]:  
     )
 
     # -- 4. Lançamento pelo Assistente com ação tipada (paga a obrigação) ---
-    pay_interpretation = _interpretation(
-        "pay_obligation",
-        target_hint="Parcela chácara",
-        funding_source_hint="account",
-        account_hint="Conta Corrente",
-        date_text="2026-08-09",
-    )
-    proposal_id, proposal = _propose_and_persist(
-        message="Paguei a parcela da chácara", interpretation=pay_interpretation
-    )
+    # Engineering review of this PR (Round 1, blocker 1): goes through the
+    # real `POST /api/assistant/interpret` HTTP/service contract -- only the
+    # Advisor sidecar transport is stubbed (`_interpret`/`_StubCodexAdvisorClient`
+    # above); `interpret_message`, `_coerce_interpretation`, and
+    # `build_typed_action_proposal`'s household-data resolution all run for
+    # real, unstubbed.
+    pay_response = {
+        "intent": "pay_obligation",
+        "extracted_fields": {
+            "target_hint": "Parcela chácara",
+            "funding_source_hint": "account",
+            "account_hint": "Conta Corrente",
+            "date_text": "2026-08-09",
+        },
+        "missing_fields": [],
+        "clarifying_question": None,
+        "confidence": 0.92,
+        "model": "stub-codex-smoke",
+    }
+    interpret_pay = _interpret(client, "Paguei a parcela da chácara", pay_response)
+    interpret_pay_json = interpret_pay.json()
+    proposal_id = interpret_pay_json.get("proposal_id")
+    pay_can_execute = interpret_pay_json["proposal"]["can_execute"]
     execute = (
         client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
         if proposal_id
@@ -264,29 +304,48 @@ def run_go_live_smoke(client: TestClient, session_factory) -> list[SmokeStep]:  
     _record(
         4,
         "Assistente: frase completa executa ação tipada",
-        input_='"Paguei a parcela da chácara" (com origem/data resolvidas)',
-        action="build_typed_action_proposal -> POST /api/assistant/execute",
-        expected="proposal.can_execute=True; execute 201; obrigação paga",
-        observed=f"can_execute={proposal.can_execute}; execute={execute.status_code if execute else None}",
-        ok=bool(proposal.can_execute and execute is not None and execute.status_code == 201),
+        input_='"Paguei a parcela da chácara" (Codex resolve conta/data; smoke stuba só o transporte do sidecar)',
+        action="POST /api/assistant/interpret -> POST /api/assistant/execute",
+        expected="interpret 200; proposal.can_execute=True; execute 201; obrigação paga",
+        observed=f"interpret={interpret_pay.status_code}; can_execute={pay_can_execute}; execute={execute.status_code if execute else None}",
+        ok=bool(
+            interpret_pay.status_code == 200
+            and pay_can_execute
+            and execute is not None
+            and execute.status_code == 201
+        ),
         evidence={"action_id": action_id},
     )
 
     # -- 5. Caso ambíguo no Assistente exigindo pergunta ---------------------
-    ambiguous_interpretation = _interpretation(
-        "create_expense", amount_text="300", description="Combustível"
-    )
-    ambiguous_id, ambiguous_proposal = _propose_and_persist(
-        message="Gastei 300 de combustível", interpretation=ambiguous_interpretation
-    )
+    ambiguous_response = {
+        "intent": "create_expense",
+        "extracted_fields": {"amount_text": "300", "description": "Combustível"},
+        "missing_fields": ["account_hint", "funding_source_hint"],
+        "clarifying_question": "De qual conta ou cartão saiu esse gasto?",
+        "confidence": 0.55,
+        "model": "stub-codex-smoke",
+    }
+    interpret_ambiguous = _interpret(client, "Gastei 300 de combustível", ambiguous_response)
+    ambiguous_json = interpret_ambiguous.json()
     _record(
         5,
         "Assistente: frase ambígua pede informação",
         input_='"Gastei 300 de combustível" (sem conta/cartão)',
-        action="build_typed_action_proposal",
-        expected="can_execute=False; pergunta de esclarecimento; nada persistido",
-        observed=f"can_execute={ambiguous_proposal.can_execute}; question={ambiguous_proposal.clarifying_question!r}",
-        ok=(ambiguous_id is None and ambiguous_proposal.can_execute is False and bool(ambiguous_proposal.clarifying_question)),
+        action="POST /api/assistant/interpret",
+        expected="200; can_execute=False; pergunta de esclarecimento; nada persistido (proposal_id nulo)",
+        observed=(
+            f"interpret={interpret_ambiguous.status_code}; "
+            f"can_execute={ambiguous_json['proposal']['can_execute']}; "
+            f"proposal_id={ambiguous_json.get('proposal_id')}; "
+            f"question={ambiguous_json['proposal'].get('clarifying_question')!r}"
+        ),
+        ok=(
+            interpret_ambiguous.status_code == 200
+            and ambiguous_json.get("proposal_id") is None
+            and ambiguous_json["proposal"]["can_execute"] is False
+            and bool(ambiguous_json["proposal"].get("clarifying_question"))
+        ),
     )
 
     # -- 7. Compra em cartão e consulta da fatura ----------------------------
@@ -352,6 +411,17 @@ def run_go_live_smoke(client: TestClient, session_factory) -> list[SmokeStep]:  
     )
 
     # -- 9. Transferência interna Conta Corrente <-> Privilège --------------
+    # Engineering review of this PR (Round 1, blocker 4): `from_transaction_id
+    # != to_transaction_id` alone only proves the transfer wrote two distinct
+    # rows -- it does not prove the rebaseline §4.2/§14 property that a
+    # transfer never becomes renda/despesa. Compare `summary.total_spending`/
+    # `total_cash_in` before and after the transfer instead: both must be
+    # bit-for-bit unchanged. `internal_transfers_total` is documented here
+    # deliberately as the *gross* sum of both legs (R$500,00 out of Reserva
+    # DI + R$500,00 into Conta Corrente = R$1.000,00), never the economic
+    # value of the transfer -- reading it as "R$1.000,00 of spending or
+    # income" would be exactly the misreading rebaseline §16 forbids.
+    report_before_transfer = client.get("/api/reports?end_month=2026-09&months=1").json()
     transfer = client.post(
         "/api/transfers",
         json={
@@ -363,14 +433,30 @@ def run_go_live_smoke(client: TestClient, session_factory) -> list[SmokeStep]:  
         },
     )
     report_after_transfer = client.get("/api/reports?end_month=2026-09&months=1").json()
+    summary_before = report_before_transfer["summary"]
+    summary_after = report_after_transfer["summary"]
     _record(
         9,
         "Transferência interna Conta Corrente <-> Privilège",
         input_="Resgate R$500,00 do Reserva DI para Conta Corrente",
-        action="POST /api/transfers; GET /api/reports (internal_transfers)",
-        expected="201; transferência não conta como renda/despesa",
-        observed=f"transfer={transfer.status_code}; internal_transfers_total={report_after_transfer.get('summary', {}).get('internal_transfers_total')}",
-        ok=(transfer.status_code == 201 and transfer.json()["from_transaction_id"] != transfer.json()["to_transaction_id"]),
+        action="POST /api/transfers; GET /api/reports antes/depois (total_spending, total_cash_in, internal_transfers_total)",
+        expected=(
+            "201; total_spending e total_cash_in inalterados (transferência não vira renda/despesa); "
+            "internal_transfers_total sobe R$1.000,00 (soma bruta das duas pernas de R$500,00, não valor econômico)"
+        ),
+        observed=(
+            f"transfer={transfer.status_code}; "
+            f"total_spending {summary_before['total_spending']} -> {summary_after['total_spending']}; "
+            f"total_cash_in {summary_before['total_cash_in']} -> {summary_after['total_cash_in']}; "
+            f"internal_transfers_total {summary_before['internal_transfers_total']} -> {summary_after['internal_transfers_total']}"
+        ),
+        ok=(
+            transfer.status_code == 201
+            and transfer.json()["from_transaction_id"] != transfer.json()["to_transaction_id"]
+            and summary_after["total_spending"] == summary_before["total_spending"]
+            and summary_after["total_cash_in"] == summary_before["total_cash_in"]
+            and summary_after["internal_transfers_total"] == summary_before["internal_transfers_total"] + 1000.0
+        ),
     )
 
     # -- 10. Saldo confirmado e reconciliação --------------------------------
@@ -465,18 +551,23 @@ def run_go_live_smoke(client: TestClient, session_factory) -> list[SmokeStep]:  
             "category_name": "Combustível",
         },
     )
-    duplicate_interpretation = _interpretation(
-        "create_expense",
-        amount_text="300",
-        description="Posto Ipiranga",
-        account_hint="Conta Corrente",
-        date_text="2026-09-05",
-        category_hint="Combustível",
-        funding_source_hint="account",
-    )
-    duplicate_id, duplicate_proposal = _propose_and_persist(
-        message="Gastei 300 no posto de novo", interpretation=duplicate_interpretation
-    )
+    duplicate_response = {
+        "intent": "create_expense",
+        "extracted_fields": {
+            "amount_text": "300",
+            "description": "Posto Ipiranga",
+            "account_hint": "Conta Corrente",
+            "date_text": "2026-09-05",
+            "category_hint": "Combustível",
+            "funding_source_hint": "account",
+        },
+        "missing_fields": [],
+        "clarifying_question": None,
+        "confidence": 0.88,
+        "model": "stub-codex-smoke",
+    }
+    interpret_duplicate = _interpret(client, "Gastei 300 no posto de novo", duplicate_response)
+    duplicate_json = interpret_duplicate.json()
     with session_factory() as db:
         fuel_expense_count = len(
             list(
@@ -492,14 +583,19 @@ def run_go_live_smoke(client: TestClient, session_factory) -> list[SmokeStep]:  
         14,
         "Provável duplicidade sem decisão destrutiva automática",
         input_='"Gastei 300 no posto de novo" (mesmo valor/categoria/data de um lançamento existente)',
-        action="build_typed_action_proposal (sem duplicate_resolution)",
-        expected="can_execute=False; candidate_kind=possible_duplicate; nada é criado/apagado automaticamente",
-        observed=f"existing={existing_fuel.status_code}; can_execute={duplicate_proposal.can_execute}; kind={duplicate_proposal.candidate_kind}; fuel_rows={fuel_expense_count}",
+        action="POST /api/assistant/interpret (sem duplicate_resolution)",
+        expected="200; can_execute=False; candidate_kind=possible_duplicate; proposal_id nulo; nada é criado/apagado automaticamente",
+        observed=(
+            f"existing={existing_fuel.status_code}; interpret={interpret_duplicate.status_code}; "
+            f"can_execute={duplicate_json['proposal']['can_execute']}; "
+            f"kind={duplicate_json['proposal'].get('candidate_kind')}; fuel_rows={fuel_expense_count}"
+        ),
         ok=(
             existing_fuel.status_code == 201
-            and duplicate_id is None
-            and duplicate_proposal.can_execute is False
-            and duplicate_proposal.candidate_kind == "possible_duplicate"
+            and interpret_duplicate.status_code == 200
+            and duplicate_json.get("proposal_id") is None
+            and duplicate_json["proposal"]["can_execute"] is False
+            and duplicate_json["proposal"].get("candidate_kind") == "possible_duplicate"
             and fuel_expense_count == 1
         ),
     )
