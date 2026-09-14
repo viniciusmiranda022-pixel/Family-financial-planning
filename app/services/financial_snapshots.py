@@ -544,6 +544,20 @@ def _collect(
             "bank_cash_out",
             "card_spend",
             "refunds",
+            # October Go-Live Slice 7 engineering review (PR #95, Round 1,
+            # item 3 -- "fluxo de caixa por conta inclui débito físico
+            # apropriado sem alterar gasto econômico"): the checking-side
+            # debit leg of a card invoice payment (`metric == "card_payments"`
+            # above) is a real physical outflow from that account -- the
+            # rebaseline's own "Quanto saiu desta conta?" question (§16
+            # "incluindo pagamento de fatura e transferências") -- and must
+            # be visible in `account_cash_flow_rows`/`GET /reports`'
+            # `accounts`, exactly like `Dashboard`'s own per-account view.
+            # This branch never touches `totals["expenses"]`/`categories`
+            # (only the `card_payments` branch above does, and it never
+            # does), so the invoice payment still never counts as a second
+            # gasto -- only as cash physically leaving the account.
+            "card_payments",
         }:
             key = transaction.account_id or "unidentified"
             account = accounts.setdefault(

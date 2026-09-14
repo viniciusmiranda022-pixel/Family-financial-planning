@@ -650,14 +650,26 @@ def _obligation_rows(
     reference: date | None = None,
     *,
     include_paid: bool = False,
+    due_before: date | None = None,
 ) -> list[dict]:
     # FAMILY_FINANCE_OBLIGATION_PAYMENT_V8
+    #
+    # October Go-Live Slice 7 engineering review (PR #95, Round 1, item 1):
+    # `due_before` anchors this list to a caller-chosen instant -- e.g.
+    # `GET /reports`' own `end_month` -- so a historical report never lets an
+    # obligation contracted/due *after* the period it is reporting on
+    # silently inflate that period's COMPROMETIDO. `None` (every existing
+    # caller: the Dashboard, `GET /obligations`, the Assistant) keeps the
+    # unfiltered "everything currently pending" behaviour unchanged -- this
+    # is opt-in, not a change to what those call sites already return.
     query = select(Obligation).where(
         Obligation.household_id == household_id,
         Obligation.active.is_(True),
     )
     if not include_paid:
         query = query.where(Obligation.status == "pending")
+    if due_before is not None:
+        query = query.where(Obligation.due_date < due_before)
     rows = db.scalars(query.order_by(Obligation.due_date)).all()
 
     result = []
@@ -10509,22 +10521,65 @@ def _build_report_payload(db: Session, user: User, *, end_month: str | None, mon
         cash_position=patrimony_cash_position,
         investments_total=report_investments["total_current_value"],
     )
-    report_obligations = _obligation_rows(db, user.household_id)
+    # October Go-Live Slice 7 engineering review (PR #95, Round 1, item 1):
+    # `due_before=end` anchors COMPROMETIDO to *this report's own*
+    # `end_month` -- an obligation due after the window's last month has not
+    # happened "as of" the instant this report describes and must not
+    # contaminate a historical period's reading. `end` is the first day of
+    # the month right after `last_month`, so `due_date < end` keeps every
+    # obligation due on or before `last_month`'s last day, regardless of
+    # whether it was already overdue before `start` (still a real pending
+    # commitment as of `end_month`, so it must still count).
+    report_obligations = _obligation_rows(db, user.household_id, due_before=end)
     report_obligations_pending_total = money(
         sum((Decimal(str(item["amount"])) for item in report_obligations if item["status"] == "pending"), Decimal("0"))
     )
+    household_card_invoices = list_card_invoices(db, household_id=user.household_id)
     report_card_invoices = [
         serialize_card_invoice(invoice)
-        for invoice in list_card_invoices(db, household_id=user.household_id)
+        for invoice in household_card_invoices
         if month_key(last_month) >= invoice.competence >= month_key(start)
     ]
+    # Same anchor as `report_obligations` above, applied to card invoices:
+    # unlike the displayed `report_card_invoices` list (bounded on *both*
+    # ends to the requested window), the outstanding total looks back past
+    # `start` too -- an invoice from before the window that is still
+    # `closed`/`partially_paid` still owes money as of `end_month` and must
+    # keep counting -- but never past `last_month`'s own competence, or a
+    # future invoice would leak into a historical period's COMPROMETIDO the
+    # same way an unanchored obligation would (PR #95 review).
+    #
+    # Independently found while implementing that anchor: `outstanding_balance`'s
+    # own docstring says an invoice's total is "this cycle's purchases plus
+    # whatever principal it inherited" -- `principal_carried_in` mirrors the
+    # *immediately preceding* competence's own outstanding balance
+    # (`get_or_sync_invoice`), so a balance left unpaid across two or more
+    # consecutive cycles is folded into every later cycle's own total. Naively
+    # summing `outstanding_balance()` across *every* eligible invoice of the
+    # same card would therefore count that carried balance once per cycle it
+    # survived -- exactly the "não pode ser somada duas vezes na mesma
+    # métrica" this Work Order (§ Relatórios) forbids. The correct "owed on
+    # this card right now" figure is only the *single latest* (highest-
+    # competence) eligible invoice per account -- its own total already
+    # includes every earlier unpaid cycle. (`GET /dashboard`'s
+    # `_forecast_card_invoices` has this same latent double-count for a
+    # household with 2+ consecutive unpaid cycles on one card; its own
+    # per-month due-date bucketing for `GET /forecast`'s projection is a
+    # materially different Slice 1/3 change and is flagged as a Technical
+    # Challenge in the PR rather than fixed here, out of this Work Order's
+    # Slice 7 scope.)
+    latest_outstanding_invoice_by_account: dict[str, CardInvoice] = {}
+    for invoice in household_card_invoices:
+        if invoice.status not in ("closed", "partially_paid"):
+            continue
+        if invoice.competence > month_key(last_month):
+            continue
+        current = latest_outstanding_invoice_by_account.get(invoice.account_id)
+        if current is None or invoice.competence > current.competence:
+            latest_outstanding_invoice_by_account[invoice.account_id] = invoice
     report_card_invoices_outstanding_total = money(
         sum(
-            (
-                outstanding_balance(invoice)
-                for invoice in list_card_invoices(db, household_id=user.household_id)
-                if invoice.status in ("closed", "partially_paid")
-            ),
+            (outstanding_balance(invoice) for invoice in latest_outstanding_invoice_by_account.values()),
             Decimal("0"),
         )
     )
@@ -10948,6 +11003,15 @@ def spending_economy(
             "summary": report["summary"],
             "categories": report["categories"],
             "monthly": report["monthly"],
+            # October Go-Live Slice 7 engineering review (PR #95, Round 1,
+            # item 2): the Work Order's obligatory "origem por conta/cartão"
+            # dimension for `Gastos & Economia` -- the exact per-account rows
+            # `GET /reports`' own `accounts` already publishes (cash_out/
+            # bank_cash_out/card_spending/refunds/net), never a second
+            # calculation. Explanatory only: it shows *where* the spending
+            # happened, it never changes `categories`/`summary`'s own concept
+            # of gasto above.
+            "origem_por_conta_cartao": report["accounts"],
         },
         "tendencias": trends,
         "oportunidades_economia": opportunities,

@@ -727,6 +727,17 @@
           </article>
         </div>
 
+        <!-- October Go-Live Slice 7 engineering review (PR #95, Round 1,
+             item 2): origem por conta/cartão -- dimensão obrigatória do
+             Work Order, lida verbatim de GET /spending-economy's
+             seus_dados.origem_por_conta_cartao (o mesmo `accounts` que
+             GET /reports já publica); explicativa apenas, nunca redefine
+             o conceito de gasto acima. -->
+        <article class="panel">
+          <div class="panel-heading"><div><span class="step-label">ORIGEM</span><h2>Onde o gasto aconteceu (conta/cartão)</h2><small>Mostra onde o consumo ocorreu -- não muda o conceito de gasto acima.</small></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Conta</th><th>Tipo</th><th class="right">Gasto no cartão</th><th class="right">Débito físico</th></tr></thead><tbody id="spending-economy-origin-table"></tbody></table></div>
+        </article>
+
         <article class="panel" id="spending-economy-analysis-panel">
           <div class="panel-heading"><div><span class="step-label">ANÁLISE CODEX</span><h2>Seus dados, análise e recomendação</h2><small>O Codex nunca inventa fato: só interpreta os números já calculados abaixo.</small></div></div>
           <div class="codex-analysis-grid">

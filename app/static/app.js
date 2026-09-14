@@ -2309,6 +2309,16 @@ async function loadSpendingEconomy() {
   document.querySelector("#spending-economy-seus-dados").textContent =
     `Gasto total no período: ${money.format(data.seus_dados.summary.total_spending)}. Categoria com maior variação: ${opportunities[0] ? opportunities[0].category : "nenhuma acima do limite configurado"}.`;
 
+  // October Go-Live Slice 7 engineering review (PR #95, Round 1, item 2):
+  // "origem por conta/cartão" -- read verbatim from
+  // `seus_dados.origem_por_conta_cartao` (the same `accounts` rows
+  // `GET /reports` already publishes); this table never sums anything on
+  // its own.
+  const origins = data.seus_dados.origem_por_conta_cartao || [];
+  document.querySelector("#spending-economy-origin-table").innerHTML = origins.length
+    ? origins.map((item) => `<tr><td><strong>${escapeHtml(item.account)}</strong></td><td>${escapeHtml(accountTypeLabels[item.account_type] || item.account_type)}</td><td class="right amount-expense">${money.format(item.card_spending)}</td><td class="right amount-expense">${money.format(item.bank_cash_out)}</td></tr>`).join("")
+    : emptyRow(4, "Sem movimentação no período");
+
   const externalReferences = data.referencias_externas || [];
   document.querySelector("#spending-economy-referencias-externas").textContent = externalReferences.length
     ? externalReferences.join(" ")
