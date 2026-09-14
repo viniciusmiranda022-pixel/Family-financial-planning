@@ -124,6 +124,29 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+// October Go-Live Slice 5, engineering review blocker #2: the REALIZADO /
+// COMPROMETIDO / PREVISTO labels are already canonical, backend-computed
+// facts (`app.services.financial_state`, reused by `GET /obligations`'
+// `financial_state` and `serialize_card_invoice`'s `financial_state`) --
+// this only renders the string the backend already returns, never derives
+// or infers it client-side, and never mixes it with `alert_label`/`status`
+// (those describe due-date urgency and cycle/settlement status, a
+// different concept -- rebaseline §23).
+const FINANCIAL_STATE_LABELS = { REALIZADO: "Realizado", COMPROMETIDO: "Comprometido", PREVISTO: "Previsto" };
+const FINANCIAL_STATE_HINTS = {
+  REALIZADO: "Já aconteceu de fato -- evento de caixa confirmado.",
+  COMPROMETIDO: "Já é obrigação contratada; o desembolso ainda vai ocorrer.",
+  PREVISTO: "Estimativa futura, sem obrigação rígida ainda.",
+};
+
+function financialStateChip(state) {
+  const known = Object.prototype.hasOwnProperty.call(FINANCIAL_STATE_LABELS, state) ? state : null;
+  const label = known ? FINANCIAL_STATE_LABELS[known] : (state || "—");
+  const cssClass = known ? known.toLowerCase() : "muted";
+  const hint = known ? FINANCIAL_STATE_HINTS[known] : "";
+  return `<span class="status-chip financial-state-${cssClass}" title="${escapeHtml(hint)}">${escapeHtml(label)}</span>`;
+}
+
 function toast(message, error = false) {
   const item = document.querySelector("#toast");
   item.textContent = message;
@@ -1130,7 +1153,7 @@ async function loadMovementEntries({ month, type, tableSelector, columns, column
 // one observation per confirmed submission; it never activates/deactivates
 // a template itself. A chip only prefills Descrição -- the entry is still
 // only registered when the human submits the form below.
-async function renderTypeTemplateChips(movementType, containerSelector, formSelector) {
+async function renderTypeTemplateChips(movementType, containerSelector, formSelector, saveAsTypeSelector) {
   const container = document.querySelector(containerSelector);
   if (!container) return;
   try {
@@ -1152,6 +1175,12 @@ async function renderTypeTemplateChips(movementType, containerSelector, formSele
         form.elements.category_id.dispatchEvent(new Event("change"));
       }
       form.elements.description?.focus();
+      // October Go-Live Slice 5, engineering review blocker #3: reusing an
+      // already-learned type is itself the explicit confirmation -- check
+      // the opt-in box so the reinforcement observation still fires on
+      // submit, without treating every free-text description the same way.
+      const saveAsType = saveAsTypeSelector && document.querySelector(saveAsTypeSelector);
+      if (saveAsType) saveAsType.checked = true;
     }));
   } catch (_) {
     // Best-effort suggestion only -- the structured form still works
@@ -1204,7 +1233,7 @@ async function loadEntradas() {
       `,
     }),
     loadIncome(),
-    renderTypeTemplateChips("income", "#income-type-chips", "#income-entry-form"),
+    renderTypeTemplateChips("income", "#income-type-chips", "#income-entry-form", "#income-save-as-type"),
   ]);
 }
 
@@ -1225,7 +1254,7 @@ async function loadSaidas() {
         <td class="right amount-expense">${money.format(item.amount)}</td>
       `,
     }),
-    renderTypeTemplateChips("expense", "#expense-type-chips", "#expense-entry-form"),
+    renderTypeTemplateChips("expense", "#expense-type-chips", "#expense-entry-form", "#expense-save-as-type"),
   ]);
 }
 
@@ -1460,6 +1489,7 @@ function payablesObligationRow(item) {
       <td>${escapeHtml(item.category)}</td>
       <td>${item.recurrence_months ? `A cada ${item.recurrence_months} mês(es) • ${item.occurrence_count} vez(es)` : "Pagamento único"}</td>
       <td><span class="status-chip obligation-${escapeHtml(item.alert_level)}">${escapeHtml(item.alert_label)}</span></td>
+      <td>${financialStateChip(item.financial_state)}</td>
       <td class="right ${item.status === "paid" ? "amount-income" : "amount-expense"}">${money.format(item.amount)}</td>
       <td class="right"><div class="obligation-row-actions">${paymentAction}${deleteAction}</div></td>
     </tr>
@@ -1487,7 +1517,7 @@ async function loadPayables() {
   state.obligations = obligations;
   document.querySelector("#payables-obligations-table").innerHTML = obligations.length
     ? obligations.map(payablesObligationRow).join("")
-    : emptyRow(7, "Nenhuma obrigação cadastrada.");
+    : emptyRow(8, "Nenhuma obrigação cadastrada.");
   bindObligationPaymentActions();
   document.querySelectorAll(".delete-obligation").forEach((button) => button.addEventListener("click", async () => {
     if (!window.confirm("Excluir este compromisso das projeções futuras?")) return;
@@ -1565,13 +1595,14 @@ async function loadCardInvoices() {
         <td>${escapeHtml(account ? (account.institution ? `${account.institution} • ${account.name}` : account.name) : "")}</td>
         <td>${escapeHtml(item.competence)}</td>
         <td>${cardInvoiceStatusLabels[item.status] || escapeHtml(item.status)}</td>
+        <td>${financialStateChip(item.financial_state)}</td>
         <td class="right">${money.format(total)}</td>
         <td class="right">${money.format(Number(item.outstanding_balance))}</td>
         <td>${item.due_date ? dateFormat.format(new Date(`${item.due_date}T00:00:00Z`)) : ""}</td>
         <td class="right">${action}</td>
       </tr>
     `;
-  }).join("") : emptyRow(7, "Nenhuma fatura de cartão sincronizada ainda");
+  }).join("") : emptyRow(8, "Nenhuma fatura de cartão sincronizada ainda");
 
   document.querySelectorAll(".pay-card-invoice").forEach((button) => {
     button.addEventListener("click", () => openCardInvoicePayment(button.dataset.id));
@@ -4020,7 +4051,14 @@ document.querySelector("#income-entry-form").addEventListener("submit", async (e
     if (!largeConfirmation.allowed) return toast("Lançamento cancelado; use o Consultor para simulações", true);
     payload.confirmed_large_amount = largeConfirmation.confirmed;
     const created = await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
-    await recordEntryTypeObservation("income", created.id, payload.description, null);
+    // October Go-Live Slice 5, engineering review blocker #3: a regular
+    // entry never becomes template-learning evidence -- only the explicit,
+    // opt-in "Outra entrada" checkbox does (rebaseline §8.2/§9: tipo,
+    // categoria e descrição são conceitos diferentes; toda descrição comum
+    // não pode virar candidato a tipo).
+    if (document.querySelector("#income-save-as-type")?.checked) {
+      await recordEntryTypeObservation("income", created.id, payload.description, null);
+    }
     const month = payload.booked_at.slice(0, 7);
     event.target.reset();
     event.target.elements.booked_at.value = currentDateKey();
@@ -4044,7 +4082,11 @@ document.querySelector("#expense-entry-form").addEventListener("submit", async (
     if (!largeConfirmation.allowed) return toast("Lançamento cancelado; use o Consultor para simulações", true);
     payload.confirmed_large_amount = largeConfirmation.confirmed;
     const created = await api("/transactions", { method: "POST", body: JSON.stringify(payload) });
-    await recordEntryTypeObservation("expense", created.id, payload.description, payload.category_id);
+    // October Go-Live Slice 5, engineering review blocker #3: see the
+    // equivalent income guard above.
+    if (document.querySelector("#expense-save-as-type")?.checked) {
+      await recordEntryTypeObservation("expense", created.id, payload.description, payload.category_id);
+    }
     const month = payload.booked_at.slice(0, 7);
     event.target.reset();
     event.target.elements.booked_at.value = currentDateKey();
@@ -4057,6 +4099,21 @@ document.querySelector("#expense-entry-form").addEventListener("submit", async (
     await loadDashboard();
     toast("Saída registrada");
   } catch (error) { toast(error.message, true); }
+});
+
+// October Go-Live Slice 5, engineering review blocker #3: the "Outra
+// entrada"/"Outra saída" opt-in checkbox above only stays checked while the
+// description still matches what the user explicitly confirmed (a chip
+// click auto-checks it) -- any manual retyping means the label is no longer
+// confirmed, so the box resets and the next submit goes back to not
+// recording template evidence unless the user opts in again.
+document.querySelector("#income-entry-form").elements.description.addEventListener("input", () => {
+  const box = document.querySelector("#income-save-as-type");
+  if (box) box.checked = false;
+});
+document.querySelector("#expense-entry-form").elements.description.addEventListener("input", () => {
+  const box = document.querySelector("#expense-save-as-type");
+  if (box) box.checked = false;
 });
 
 document.querySelector("#account-form").addEventListener("submit", async (event) => {

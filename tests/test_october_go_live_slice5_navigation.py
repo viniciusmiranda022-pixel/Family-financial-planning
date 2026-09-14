@@ -285,6 +285,131 @@ def test_entry_type_template_chips_only_prefill_never_auto_submit() -> None:
     assert "form.elements.description.value" in handler_source or "form.elements.description" in handler_source
 
 
+def test_privilege_settings_copy_never_teaches_synthetic_deficit_surplus_rule() -> None:
+    """Engineering review of PR #93 (2026-09-14): `#view-settings` explained
+    Privilège as "recebe a sobra do mês e cobre o déficit quando salário e
+    outras receitas não bastam" -- teaching the exact forbidden rule from
+    `docs/OCTOBER_GO_LIVE_REBASELINE.md` §4.3
+    (`resultado_operacional < 0 -> fabricar liquidity_withdrawal`, and its
+    surplus mirror). Slice 5 is the final UX pass; visible copy must match
+    the normative semantics (§4.2/§4.3), not the legacy one."""
+    card = re.search(
+        r"<strong>Como o Privilège DI funciona no sistema</strong>(.*?)</div>",
+        _index_html(),
+        re.S,
+    )
+    assert card, "Privilège explanation card not found in #view-settings"
+    copy = card.group(1)
+    forbidden_phrases = (
+        "recebe a sobra do mês",
+        "cobre o déficit",
+        "déficit superar o saldo",
+    )
+    for phrase in forbidden_phrases:
+        assert phrase not in copy, (
+            f"Privilège settings copy must not teach the forbidden rebaseline §4.3 rule "
+            f"(resultado operacional -> aplicação/resgate sintético): found {phrase!r}"
+        )
+    for required_phrase in ("movimento bancário observado", "não é prova de resgate"):
+        assert required_phrase in copy, (
+            f"Privilège settings copy must state the normative §4.2/§4.3 rule explicitly: "
+            f"missing {required_phrase!r}"
+        )
+
+
+def test_payables_shows_realizado_comprometido_previsto_without_mixing() -> None:
+    """Engineering review of PR #93 (2026-09-14), blocker #2: Contas a pagar
+    must surface the already-canonical REALIZADO/COMPROMETIDO/PREVISTO facts
+    the backend already computes (`app.services.financial_state`, reused by
+    `GET /obligations`'s `financial_state` and
+    `card_invoice_lifecycle.serialize_card_invoice`'s `financial_state`) --
+    not just due-date urgency (`alert_label`) or cycle status (`status`) --
+    and never invent a second, frontend-derived state or merge the three
+    labels together (Work Order #5 test 5 / rebaseline §23)."""
+    source = _app_js()
+    chip_body = _function_body(source, "financialStateChip")
+    assert "FINANCIAL_STATE_LABELS" in chip_body
+    labels_match = re.search(r"const FINANCIAL_STATE_LABELS\s*=\s*\{([^}]*)\}", source)
+    assert labels_match, "FINANCIAL_STATE_LABELS constant not found in app/static/app.js"
+    for state in ("REALIZADO", "COMPROMETIDO", "PREVISTO"):
+        assert state in labels_match.group(1), f"FINANCIAL_STATE_LABELS must map the canonical {state!r} label"
+
+    obligation_row = _function_body(source, "payablesObligationRow")
+    assert "financialStateChip(item.financial_state)" in obligation_row, (
+        "payablesObligationRow() must render the backend's own financial_state, not just "
+        "alert_label/status"
+    )
+
+    invoices_body = _function_body(source, "loadCardInvoices")
+    assert "financialStateChip(item.financial_state)" in invoices_body, (
+        "the card-invoices table must render the backend's own financial_state, not just cycle "
+        "status"
+    )
+
+    # Distinct CSS -- proof the three states are styled (and therefore
+    # rendered) as three different things, never collapsed into one.
+    css = Path("app/static/styles.css").read_text(encoding="utf-8")
+    for suffix in ("realizado", "comprometido", "previsto"):
+        assert f"financial-state-{suffix}" in css, f"missing distinct styling for financial-state-{suffix}"
+
+
+def test_entry_type_observation_is_gated_by_explicit_outra_entrada_saida_opt_in() -> None:
+    """Engineering review of PR #93 (2026-09-14), blocker #3:
+    `recordEntryTypeObservation()` must not fire for every regular entry
+    (e.g. "Supermercado", "Combustível posto X") -- only when the user
+    explicitly opted into the "Outra entrada"/"Outra saída" reusable-type
+    flow via an unchecked-by-default checkbox that carries no `name` (so it
+    can never be serialized into the `POST /transactions` payload). Tipo,
+    categoria e descrição continuam conceitos diferentes (rebaseline §8.2/§9)
+    -- toda descrição comum não pode virar candidato a tipo."""
+    html = _index_html()
+    for checkbox_id in ("income-save-as-type", "expense-save-as-type"):
+        tag_match = re.search(rf'<input type="checkbox" id="{checkbox_id}"[^>]*>', html)
+        assert tag_match, f"checkbox #{checkbox_id} not found in app/templates/index.html"
+        assert "name=" not in tag_match.group(0), (
+            f"#{checkbox_id} must have no name attribute -- it is UI-only and must never be "
+            "serialized into POST /transactions by formJson()/FormData"
+        )
+
+    source = _app_js()
+    income_handler = re.search(
+        r'document\.querySelector\("#income-entry-form"\)\.addEventListener\("submit".*?\n\}\);',
+        source,
+        re.S,
+    )
+    expense_handler = re.search(
+        r'document\.querySelector\("#expense-entry-form"\)\.addEventListener\("submit".*?\n\}\);',
+        source,
+        re.S,
+    )
+    assert income_handler and expense_handler
+    for name, handler, checkbox_id in (
+        ("income", income_handler.group(0), "income-save-as-type"),
+        ("expense", expense_handler.group(0), "expense-save-as-type"),
+    ):
+        guard = re.search(
+            rf'if\s*\(document\.querySelector\("#{re.escape(checkbox_id)}"\)\?\.checked\)\s*\{{\s*'
+            r"(?:await )?recordEntryTypeObservation\(",
+            handler,
+        )
+        assert guard, (
+            f"{name}-entry-form must only call recordEntryTypeObservation() when "
+            f"#{checkbox_id} is explicitly checked -- a regular entry must never become "
+            "template-learning evidence on its own"
+        )
+
+
+def test_type_template_chip_click_checks_the_explicit_save_as_type_box() -> None:
+    """Reusing an already-learned type via a chip is itself the user's
+    explicit confirmation that this label applies again -- clicking one
+    checks the same opt-in box the free-text flow uses, so the
+    reinforcement observation still fires without a second, parallel
+    learning path."""
+    chips_body = _function_body(_app_js(), "renderTypeTemplateChips")
+    assert "saveAsTypeSelector" in chips_body
+    assert "saveAsType.checked = true" in chips_body
+
+
 def test_entry_type_observation_is_recorded_only_after_the_transaction_exists() -> None:
     source = _app_js()
     # Non-greedy up to the handler's own top-level closing `});` (column 0)

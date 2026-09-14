@@ -418,6 +418,12 @@
             <label class="full-on-mobile">Descrição<input name="description" required placeholder="Ex.: Salário de agosto" maxlength="500"></label>
             <label>Valor<input type="number" name="amount" step="0.01" min="0.01" required></label>
             <label>Conta<select name="account_id" id="income-entry-account" required></select></label>
+            <!-- October Go-Live Slice 5, engineering review blocker #3: a
+                 typed action here is "Outra entrada" (rebaseline §36) --
+                 opt-in and explicit, never every description. No `name`
+                 attribute on purpose: this must never be serialized into the
+                 POST /transactions payload (`formJson()` reads FormData). -->
+            <label class="full"><input type="checkbox" id="income-save-as-type"> Repito este tipo com frequência — salvar/reforçar como tipo reutilizável (Outra entrada)</label>
             <button class="primary" type="submit">Registrar entrada</button>
           </form>
         </article>
@@ -486,6 +492,9 @@
             <label>Parcela atual (se parcelada)<input type="number" name="installment_current" id="expense-entry-installment-current" min="1" max="999" step="1"></label>
             <label>Total de parcelas (se parcelada)<input type="number" name="installment_total" id="expense-entry-installment-total" min="1" max="999" step="1"></label>
             <div id="expense-entry-installment-preview" class="capture-notes full hidden"></div>
+            <!-- October Go-Live Slice 5, engineering review blocker #3: see
+                 the equivalent income checkbox above -- opt-in, no `name`. -->
+            <label class="full"><input type="checkbox" id="expense-save-as-type"> Repito este tipo com frequência — salvar/reforçar como tipo reutilizável (Outra saída)</label>
             <button class="primary" type="submit">Registrar saída</button>
           </form>
         </article>
@@ -515,7 +524,7 @@
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">COMPROMISSOS ATIVOS</span><h2>Obrigações cadastradas</h2><small>A vencer, próximas do vencimento ou vencidas, conforme fatos já registrados. Alertas automáticos aparecem 30 dias antes do próximo vencimento.</small></div></div>
-          <div class="table-wrap"><table><thead><tr><th>Próximo vencimento</th><th>Nome</th><th>Grupo</th><th>Repetição</th><th>Status</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="payables-obligations-table"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Próximo vencimento</th><th>Nome</th><th>Grupo</th><th>Repetição</th><th>Status</th><th>Estado financeiro</th><th class="right">Valor</th><th class="right">Ações</th></tr></thead><tbody id="payables-obligations-table"></tbody></table></div>
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">FATURAS PENDENTES</span><h2>Faturas de cartão aguardando pagamento</h2><small>Só aparecem aqui faturas já importadas (linha de pagamento recebido do próprio extrato/PDF). Escolha "Pagar" para iniciar a quitação a partir da fatura.</small></div></div>
@@ -523,7 +532,7 @@
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">CICLO COMPLETO</span><h2>Faturas de cartão</h2><small>Ciclo aberta → fechada → parcialmente paga → paga (October Go-Live Slice 2). "Conferir e pagar" aparece assim que a fatura fecha; pagamento parcial é aceito e o saldo restante é transportado como principal, nunca como novo gasto.</small></div></div>
-          <div class="table-wrap"><table><thead><tr><th>Cartão</th><th>Competência</th><th>Status</th><th class="right">Total da fatura</th><th class="right">Saldo em aberto</th><th>Vencimento</th><th class="right">Ações</th></tr></thead><tbody id="card-invoices-table"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Cartão</th><th>Competência</th><th>Status</th><th>Estado financeiro</th><th class="right">Total da fatura</th><th class="right">Saldo em aberto</th><th>Vencimento</th><th class="right">Ações</th></tr></thead><tbody id="card-invoices-table"></tbody></table></div>
         </article>
         <article class="panel">
           <div class="panel-heading"><div><span class="step-label">PAGAMENTO DE FATURA</span><h2>Registrar pagamento manual</h2><small>Pagamento de fatura é conciliação, nunca uma nova despesa (INV-002); as compras da fatura continuam sendo os fatos de despesa. Origem dos recursos, conta pagadora e fatura são sempre confirmadas por você.</small></div></div>
@@ -779,7 +788,7 @@
             <label>Projetar até<input type="date" name="projection_end" required></label>
             <div class="form-action"><button class="primary" type="submit">Salvar premissas</button></div>
           </form>
-          <div class="security-note"><strong>Como o Privilège DI funciona no sistema</strong><p>Ele é a conta central de liquidez da família: recebe a sobra do mês e cobre o déficit quando salário e outras receitas não bastam. Se o déficit superar o saldo, o Privilège zera e o restante aparece como dívida sem cobertura. O piso é uma meta de alerta, não dinheiro bloqueado.</p></div>
+          <div class="security-note"><strong>Como o Privilège DI funciona no sistema</strong><p>Ele é o caixa operacional remunerado da família: o dinheiro fica ali rendendo e é resgatado para a Conta Corrente quando for efetivamente usado. Aplicação e resgate só acontecem por movimento bancário observado/importado ou por confirmação explícita sua — o sistema nunca aplica a sobra do mês nem resgata automaticamente para cobrir déficit. Um resultado operacional negativo ou positivo é apenas o resultado econômico do período; sozinho, ele não é prova de resgate nem de aplicação. O piso é uma meta de alerta, não dinheiro bloqueado.</p></div>
         </article>
         <!-- October Go-Live Slice 5: "Importações" absorvida aqui -- a tela
              view-imports continua existindo sem alteração, só o ponto de
