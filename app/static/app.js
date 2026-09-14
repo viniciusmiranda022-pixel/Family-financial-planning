@@ -653,8 +653,18 @@ async function loadDashboard() {
   // for a future selected month) -- the dashboard's compact projection
   // panel below reuses this exact same response, never a second
   // computation of the same projection Gastos & Economia shows.
-  const [summary, transactions, cutPlan, pulse, forecast] = await Promise.all([
-    api(`/dashboard?month=${encodeURIComponent(selectedMonth)}`),
+  //
+  // `/dashboard`, `/forecast` and (below) `/credit-cards/summary` each call
+  // `build_snapshot()` (app/services/financial_snapshots.py) as a get-or-
+  // create for the same household/period -- firing them concurrently opens
+  // a TOCTOU race where two requests both see "no snapshot yet" and both
+  // try to insert, the second failing financial_snapshots' UNIQUE
+  // constraint (household_id, period, snapshot_kind, version). `/dashboard`
+  // runs first, alone, so its build_snapshot() call commits the row before
+  // anything else asks for it; /transactions, /cut-plan and /reports never
+  // touch financial_snapshots, so they stay concurrent with /forecast.
+  const summary = await api(`/dashboard?month=${encodeURIComponent(selectedMonth)}`);
+  const [transactions, cutPlan, pulse, forecast] = await Promise.all([
     api(`/transactions?limit=8&month=${encodeURIComponent(selectedMonth)}`),
     api(`/cut-plan?month=${encodeURIComponent(selectedMonth)}`),
     api(`/reports?end_month=${encodeURIComponent(selectedMonth)}&months=6`),
