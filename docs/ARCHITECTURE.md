@@ -467,36 +467,70 @@ com consultas SQL simples e explícitas -- nunca um palpite. Quando um indício 
 exatamente um candidato, ou falta um campo materialmente necessário (origem do recurso para saída
 em caixa/cheque, rebaseline §4.4/§11.1), a função devolve uma pergunta de desambiguação (e,
 quando aplicável, a lista de candidatos) em vez de uma proposta executável -- nunca uma ação
-ambígua passa para execução automática.
+ambígua passa para execução automática. Inclui uma checagem prévia de duplicidade provável
+(`_check_possible_duplicate`, reusando `app.services.duplicates.assess_duplicate` -- a mesma regra
+de pontuação, nunca um segundo motor) para `create_expense`/`create_income`: quando o lançamento
+ainda não existe mas é parecido com um já registrado, a proposta devolve `candidate_kind ==
+"possible_duplicate"` com as três escolhas humanas (pular/importar mesmo assim/ver existente) em vez
+de seguir direto para uma proposta executável -- ver "Revisão de engenharia" abaixo.
 
-**Execução: sempre uma chamada real a um endpoint determinístico já existente.**
-`POST /assistant/execute` (`app.services.assistant_actions.execute_typed_action`) nunca reimplementa
-lógica financeira: dado um `typed_action` do vocabulário fechado (`create_expense`, `create_income`,
-`create_internal_transfer`, `pay_obligation`, `pay_card_invoice`, `register_refund`), valida o
-`payload` contra o *mesmo* schema Pydantic (`ManualTransactionRequest`, `TransferRequest`,
-`ObligationPaymentRequest`, `CardInvoicePayRequest`, `RefundLinkRequest`) e despacha, em processo
-(import tardio de `app.api`, evitando import circular), para a *mesma* função de endpoint que o
-formulário manual já chama -- `create_manual_transaction`, `create_manual_transfer`, `pay_obligation`,
-`pay_card_invoice_lifecycle`, `link_refund_transaction`. Household isolation, `_require_admin`,
+**Autoridade de execução: proposta persistida pelo servidor, nunca um payload que o cliente
+resupra.** `POST /assistant/interpret` (`app.services.assistant_actions.persist_action_proposal`)
+persiste, *somente* quando `build_typed_action_proposal` devolve `can_execute=True`, um
+`AssistantActionProposal` (migração `0018`) de uso único e com validade (`expires_at`, 30 minutos)
+contendo `typed_action`/`payload`/`path_params`/`original_message`/`structured_interpretation`
+exatamente como resolvidos -- e devolve apenas o `proposal_id` gerado. `POST /assistant/execute`
+(`AssistantExecuteRequest`) não aceita mais nenhum desses campos do cliente: aceita só `proposal_id`
+(mais `disambiguation_qa`, informativo). `execute_typed_action` carrega a proposta pelo id
+(household-scoped), rejeita se não encontrada/expirada/já consumida, e só então despacha -- fechando
+o caminho que antes permitia a um cliente pular `/assistant/interpret` e executar um `typed_action`/
+`payload` fabricado à mão, mesmo para uma mensagem originalmente ambígua.
+
+**Execução: sempre uma chamada real ao *corpo* de um endpoint determinístico já existente.**
+`execute_typed_action` nunca reimplementa lógica financeira: dado o `typed_action` do vocabulário
+fechado (`create_expense`, `create_income`, `create_internal_transfer`, `pay_obligation`,
+`pay_card_invoice`, `register_refund`) lido da proposta, valida o `payload` contra o *mesmo* schema
+Pydantic (`ManualTransactionRequest`, `TransferRequest`, `ObligationPaymentRequest`,
+`CardInvoicePayRequest`, `RefundLinkRequest`) e despacha, em processo (import tardio de `app.api`,
+evitando import circular), para a *mesma* implementação que o endpoint HTTP manual já chama --
+`_create_manual_transaction_impl`, `_create_manual_transfer_impl`, `_pay_obligation_impl`,
+`_pay_card_invoice_lifecycle_impl`, `_link_refund_transaction_impl` (cada rota pública
+correspondente, ex. `create_manual_transaction`, é hoje um wrapper fino que chama o `_impl` com
+`commit=True`; o contrato HTTP/schema de cada rota não mudou). Household isolation, `_require_admin`,
 confirmação de valor elevado, deduplicação e o `AuditEvent` do fato financeiro em si já são impostos
 exatamente pelo mesmo código que o caminho humano exercita -- este módulo não amplia essa superfície,
 apenas a narra.
 
+**Atomicidade: mutação de domínio e trilha do Assistente em uma única transação.** Cada `_impl`
+aceita `commit: bool = True`; `execute_typed_action` despacha com `commit=False` e só então grava o
+segundo `AuditEvent` (`assistant.execute`) e o `AssistantActionEvent`, consumindo a proposta -- um
+único `db.commit()` finaliza tudo junto, e qualquer falha entre o despacho e esse commit é revertida
+por inteiro (`db.rollback()`), nunca deixando o fato financeiro persistido sem a trilha do Assistente
+(revisão de engenharia do PR #92, bloqueio 5). `undo_assistant_action` segue o mesmo padrão com a
+reversão (`_unpay_obligation_impl`/`_unlink_refund_transaction_impl`/`_delete_manual_transaction_impl`,
+`commit=False`) e seu próprio `AuditEvent` de estorno.
+
 **Auditoria: `AssistantActionEvent`, 1:1 com `AuditEvent` (migração `0016`).** Cada execução grava
 um segundo `AuditEvent` (`event_type="assistant.execute"`) e um `AssistantActionEvent` pareado com
 mensagem original, interpretação estruturada, perguntas/respostas de desambiguação, ids
-criados/alterados e estado após a ação. Idempotência: uma repetição com o mesmo `trace_id` (chave do
-cliente) devolve o resultado já persistido em vez de executar de novo -- convivendo com, nunca
-substituindo, a proteção de duplicidade por fingerprint que cada endpoint já possui.
+criados/alterados e `before_state`/`after_state`. Para uma mutação sobre entidade *existente*
+(`pay_obligation`/`pay_card_invoice`/`register_refund`), `before_state`/`after_state` são copiados
+verbatim do próprio `AuditEvent` de domínio que o `_impl` já grava (parâmetro `domain_audit_sink`) --
+nunca recalculados uma segunda vez; para uma criação, `before_state=None` é o formato aceito (nada
+existia antes). Idempotência: a proposta é de uso único -- uma repetição com o mesmo `proposal_id`
+já consumido devolve o resultado já persistido em vez de executar de novo (chave mais forte que um
+`trace_id` fornecido pelo cliente) -- convivendo com, nunca substituindo, a proteção de duplicidade
+por fingerprint que cada endpoint já possui.
 
 **Undo: nunca apaga a trilha.** `POST /assistant/actions/{id}/undo`
 (`app.services.assistant_actions.undo_assistant_action`) despacha para a reversão determinística já
-existente de cada ação (`delete_manual_transaction`, `unpay_obligation`, `unlink_refund_transaction`)
-e grava um *novo* `AuditEvent` da reversão -- nunca deleta o `AssistantActionEvent` original, apenas
-marca `undone_at`/`undone_by`. `pay_card_invoice` é declarado `undoable=False`: não existe reversão
-determinística para um pagamento de fatura já liquidado nesta versão (rebaseline: "quando uma
-operação não puder ser revertida com segurança, a API deve declarar isso de forma explícita").
-INV-032/INV-033 (`docs/FINANCIAL_INVARIANTS.md`) registram estruturalmente essas duas garantias.
+existente de cada ação (`_delete_manual_transaction_impl`, `_unpay_obligation_impl`,
+`_unlink_refund_transaction_impl`) e grava um *novo* `AuditEvent` da reversão -- nunca deleta o
+`AssistantActionEvent` original, apenas marca `undone_at`/`undone_by`. `pay_card_invoice` é declarado
+`undoable=False`: não existe reversão determinística para um pagamento de fatura já liquidado nesta
+versão (rebaseline: "quando uma operação não puder ser revertida com segurança, a API deve declarar
+isso de forma explícita"). INV-032/INV-033 (`docs/FINANCIAL_INVARIANTS.md`) registram
+estruturalmente essas duas garantias.
 
 **Aprendizado — `entry_type_templates` (migração `0017`).** Copia o ciclo de vida já comprovado de
 `classification_rules` (`observed -> suggested -> pending_acceptance -> active`,
@@ -519,6 +553,14 @@ template quando normalizam igual.
 - Nenhuma UI nova: o Slice 5 é o dono da navegação/apresentação alvo
   (`docs/OCTOBER_GO_LIVE_REBASELINE.md` §19 Slice 5); este slice entrega o contrato de API completo
   e testado, pronto para a tela "Assistente Financeiro" consumir.
+- A checagem prévia de duplicidade provável (bloqueio 4 da revisão de engenharia do PR #92) só se
+  aplica a `create_expense`/`create_income`: é o único par de ações tipadas que cria uma
+  `Transaction` do zero através do motor de duplicidade genérico
+  (`app.services.duplicates.assess_duplicate`). `pay_obligation` já recusa (409) uma saída bancária
+  compatível na mesma conta/janela de datas antes de criar qualquer lançamento;
+  `pay_card_invoice` já detecta e reutiliza um pagamento idêntico (`idempotent_replay`) via
+  `app.services.card_invoice_lifecycle.pay_invoice`; `register_refund` depende das próprias
+  invariantes de vínculo (INV-027). Nenhuma dessas três precisa de uma segunda checagem redundante.
 
 ## Comparação visual de cenários de compra (Fase 3)
 

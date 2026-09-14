@@ -690,10 +690,18 @@ verificada contra a saída real de `build_projection` -- não apenas contra a co
 **Implementação executável:** `app/services/invariant_registry.py`
 (`validate_assistant_action_always_audited`). Estrutural por construção -- `execute_typed_action`
 é o único caminho de escrita para `AssistantActionEvent`, e sempre cria os três juntos antes do
-commit; não há um segundo caminho de execução que possa pular a auditoria.
+commit. **Correção de revisão (2026-09-14, revisão de engenharia do PR #92, bloqueio 5):** até essa
+revisão, o `_impl` do endpoint despachado ainda commitava sua própria escrita de domínio *antes* de
+`execute_typed_action` gravar `AssistantActionEvent`/segundo `AuditEvent` -- uma falha nessa janela
+deixaria o fato financeiro persistido sem trilha do Assistente, contradizendo a alegação de
+"estrutural por construção" feita aqui. Corrigido despachando com `commit=False` e finalizando
+mutação de domínio + trilha do Assistente num único `db.commit()`; qualquer falha entre os dois
+reverte ambos via `db.rollback()`. A alegação estrutural acima só é verdadeira a partir dessa
+correção.
 **Teste automatizado associado:**
 `tests/test_financial_invariants.py::test_assistant_action_always_audited_pass_and_fail`,
-`tests/test_assistant_slice4.py::test_execute_create_expense_writes_exactly_once_and_is_fully_audited`.
+`tests/test_assistant_slice4.py::test_execute_create_expense_writes_exactly_once_and_is_fully_audited`,
+`tests/test_assistant_slice4.py::test_execute_typed_action_is_atomic_on_a_failure_after_the_domain_write`.
 
 ## INV-033 — Undo do Assistente nunca apaga histórico
 

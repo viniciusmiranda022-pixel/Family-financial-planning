@@ -246,6 +246,35 @@ A execução em si nunca é um motor novo: `typed_action` sempre corresponde a u
 endpoint/serviço determinístico já existente ou proposto no §4 (`pay_obligation`,
 `POST /card-invoices/{id}/pay`, `POST /captures/{id}/confirm`, etc.).
 
+**Correção de revisão (2026-09-14, revisão de engenharia do PR #92, bloqueio 1):** a versão original
+deste slice fazia `POST /assistant/execute` aceitar `typed_action`/`payload`/`path_params`/
+`structured_interpretation` diretamente do cliente HTTP, sem vínculo verificável a uma chamada prévia
+de `POST /assistant/interpret` -- permitindo, em tese, pular a desambiguação e executar uma ação
+tipada com uma interpretação fabricada. Corrigido com uma tabela adicional,
+`assistant_action_proposals` (migração `0018`):
+
+```text
+id UUID PK
+household_id FK -> households.id
+user_id FK -> users.id nullable
+trace_id String
+original_message Text
+structured_interpretation JSONB nullable
+typed_action String
+payload JSONB
+path_params JSONB
+created_at DateTime
+expires_at DateTime
+consumed_at DateTime nullable
+consumed_action_event_id FK -> assistant_action_events.id nullable
+```
+
+`POST /assistant/interpret` persiste uma linha aqui *somente* quando a proposta resolvida já pode
+executar (`can_execute=True`) e devolve apenas o `id` gerado; `POST /assistant/execute` aceita só esse
+`proposal_id` -- nunca mais um `typed_action`/`payload` que o cliente possa fabricar. Proposta de
+uso único (`consumed_at`/`consumed_action_event_id`) e com validade de 30 minutos (`expires_at`). Ver
+`docs/ARCHITECTURE.md` ("Assistente Financeiro operacional — typed actions") para o fluxo completo.
+
 ### 3.6 Templates dinâmicos de Entrada/Saída (Slice 4; apresentação UX-only no Slice 5)
 
 **Correção de revisão (2026-09-11):** a atribuição original ("Slice 8, ou incremental 3-5") era
@@ -699,19 +728,27 @@ essencialmente como proposto:
 - `app/services/assistant_sanitizer.py` (`build_interpret_payload`) espelha `audit_sanitizer` --
   envia só mensagem/histórico/vocabulário de intenções, nunca um dado financeiro do household.
 - `app/services/assistant_actions.py`: `build_typed_action_proposal` (resolução determinística de
-  indícios contra dados reais, nunca uma inferência silenciosa) e `execute_typed_action`/
-  `undo_assistant_action` (despacho para os endpoints já existentes e revisados dos Slices 1-3 --
-  `create_manual_transaction`, `create_manual_transfer`, `pay_obligation`,
-  `pay_card_invoice_lifecycle`, `link_refund_transaction`, `unpay_obligation`,
-  `unlink_refund_transaction`, `delete_manual_transaction`).
+  indícios contra dados reais, nunca uma inferência silenciosa), `persist_action_proposal` (única
+  escrita de `POST /assistant/interpret`, só quando a proposta já pode executar) e
+  `execute_typed_action`/`undo_assistant_action` (despacho, com `commit=False`, para o *corpo* dos
+  endpoints já existentes e revisados dos Slices 1-3 -- `_create_manual_transaction_impl`,
+  `_create_manual_transfer_impl`, `_pay_obligation_impl`, `_pay_card_invoice_lifecycle_impl`,
+  `_link_refund_transaction_impl`, `_unpay_obligation_impl`, `_unlink_refund_transaction_impl`,
+  `_delete_manual_transaction_impl`; cada rota HTTP pública correspondente é hoje um wrapper fino
+  chamando o `_impl` com `commit=True`, sem mudança de contrato).
 - Novos endpoints: `POST /assistant/interpret`, `POST /assistant/execute`, `GET /assistant/actions`,
   `POST /assistant/actions/{id}/undo`.
 - `app/services/entry_type_templates.py` + `POST /entry-type-templates`,
   `POST /entry-type-templates/{id}/activate`, `POST /entry-type-templates/{id}/deactivate`,
   `GET /entry-type-templates` -- ciclo de vida idêntico a `classification_rules` (§3.6).
-- Migrations `0016` (`assistant_action_events`, FK 1:1 com `audit_events`) e `0017`
-  (`entry_type_templates`) -- ambas puramente aditivas, com downgrade seguro (nenhuma é fato
-  financeiro irrecuperável, ao contrário de `refund_of_transaction_id` na migração `0015`).
+- Migrations `0016` (`assistant_action_events`, FK 1:1 com `audit_events`), `0017`
+  (`entry_type_templates`) e `0018` (`assistant_action_proposals`, §3.5 "Correção de revisão
+  2026-09-14") -- todas puramente aditivas. `0017`/`0018` têm downgrade seguro e incondicional
+  (nenhuma é fato financeiro irrecuperável); `0016` teve seu downgrade corrigido na mesma revisão
+  para recusar (não apagar silenciosamente) quando existir ao menos uma linha -- a alegação original
+  de que a tabela seria sempre reconstruível a partir de `audit_events` era falsa (`original_message`/
+  `structured_interpretation`/`disambiguation_qa`/bookkeeping de undo só existem ali), mesmo padrão
+  de guarda já usado por `refund_of_transaction_id` na migração `0015`.
 - INV-032 (ação do Assistente sempre auditável) e INV-033 (undo nunca apaga histórico) registradas
   em `app/services/invariant_registry.py`/`docs/FINANCIAL_INVARIANTS.md`. `FINANCIAL_RULES_VERSION`
   avançou de `2026.10.3` para `2026.10.4` (nenhuma regra financeira anterior foi alterada; o
