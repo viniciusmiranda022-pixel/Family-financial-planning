@@ -399,6 +399,16 @@ tr:last-child td { border-bottom: 0; }
 .report-kpi.sky { --report-accent: var(--sky); --report-soft: #e4f4fb; }
 .report-kpi.sunshine { --report-accent: #d99b16; --report-soft: #fff3cf; }
 .report-kpi.teal { --report-accent: var(--teal); --report-soft: #e1f5f1; }
+.report-kpi.bad { --report-accent: var(--red); --report-soft: #fee7e5; }
+
+/* October Go-Live Slice 7: "Gastos & Economia" Codex analysis panel --
+   four equal-weight columns (Seus dados / Referências externas / Análise /
+   Recomendação), rebaseline §14. */
+.codex-analysis-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+.codex-analysis-grid h3 { margin: 0 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
+.codex-analysis-grid p { margin: 0; font-size: 14px; line-height: 1.5; }
+@media (max-width: 900px) { .codex-analysis-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 560px) { .codex-analysis-grid { grid-template-columns: 1fr; } }
 .report-kpi span, .report-kpi small { display: block; color: var(--muted); font-size: 10px; font-weight: 700; }
 .report-kpi strong { display: block; margin: 16px 0 7px; color: var(--navy); font-size: 22px; letter-spacing: -.04em; }
 .report-analysis-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, .65fr); gap: 17px; }
