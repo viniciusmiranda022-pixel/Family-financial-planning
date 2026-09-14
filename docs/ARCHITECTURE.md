@@ -670,6 +670,48 @@ formulário é enviado. Depois que `POST /transactions` confirma a criação,
 nunca bloqueia nem reverte o lançamento já persistido). Nenhuma lógica de aprendizado nova: ativação
 (três confirmações + administrador) continua inteiramente no Slice 4/backend.
 
+### Correções da revisão de engenharia (PR #93, 2026-09-14)
+
+A revisão técnica do engenheiro responsável bloqueou o head inicial deste slice em três pontos
+normativos; os três foram corrigidos no mesmo PR, sem migration e sem segundo motor:
+
+1. **Cópia legada do Privilège em `#view-settings`.** O texto explicativo do Privilège ainda dizia
+   "recebe a sobra do mês e cobre o déficit quando salário e outras receitas não bastam" --
+   ensinando exatamente a regra proibida do rebaseline §4.3
+   (`resultado_operacional < 0 -> fabricar liquidity_withdrawal`, e o espelho de sobra/aplicação).
+   O texto foi reescrito para afirmar a semântica normativa (§4.2/§4.3): aplicação/resgate só por
+   movimento bancário observado/importado ou confirmação explícita, nunca por sobra/déficit do
+   período. Regressão:
+   `test_privilege_settings_copy_never_teaches_synthetic_deficit_surplus_rule`
+   (`tests/test_october_go_live_slice5_navigation.py`), que falha se qualquer uma das frases
+   proibidas voltar a aparecer no cartão.
+
+2. **`Contas a pagar` não expunha REALIZADO/COMPROMETIDO/PREVISTO.** O backend já calculava esse
+   estado canônico havia um slice inteiro (`GET /obligations`'s `financial_state`, Slice 3;
+   `card_invoice_lifecycle.serialize_card_invoice`'s `financial_state`, Slice 2/3) mas o frontend
+   nunca o lia -- só `alert_label` (urgência de vencimento) e `status`/cycle. `financialStateChip()`
+   (novo, `app/static/app.js`) renderiza literalmente o que o backend já devolve, sem nenhum cálculo
+   ou inferência no cliente, em uma coluna "Estado financeiro" própria (nunca misturada com
+   `alert_label`/`status`) tanto em `payablesObligationRow` quanto na tabela de faturas de cartão.
+   Três classes CSS distintas (`financial-state-realizado/comprometido/previsto`) provam que os três
+   estados nunca colapsam em um único rótulo. Regressão:
+   `test_payables_shows_realizado_comprometido_previsto_without_mixing`.
+
+3. **Aprendizado de tipo observava toda descrição, não só o fluxo "Outra".** Todo
+   `POST /transactions` (mesmo "Supermercado", "Combustível posto X") chamava
+   `recordEntryTypeObservation` incondicionalmente, tratando qualquer descrição livre como candidata
+   a virar um tipo reutilizável -- exatamente o que o rebaseline §8.2/§9 proíbe (tipo, categoria e
+   descrição são conceitos diferentes). Adicionado um checkbox opt-in, desmarcado por padrão, sem
+   atributo `name` (nunca serializado no payload de `/transactions`): `#income-save-as-type`/
+   `#expense-save-as-type`, "Repito este tipo com frequência -- salvar/reforçar como tipo
+   reutilizável". `recordEntryTypeObservation` só é chamado quando o checkbox está marcado. Clicar em
+   um chip de tipo já aprendido marca o checkbox automaticamente (reusar um tipo confirmado já é a
+   confirmação explícita); editar a Descrição manualmente desmarca (o rótulo não é mais o que foi
+   confirmado). Nenhuma lógica de aprendizado nova -- mesmo `record_observed_entry`/contrato do
+   Slice 4, só o gatilho do cliente ficou explícito. Regressão:
+   `test_entry_type_observation_is_gated_by_explicit_outra_entrada_saida_opt_in`,
+   `test_type_template_chip_click_checks_the_explicit_save_as_type_box`.
+
 ## Comparação visual de cenários de compra (Fase 3)
 
 `POST /api/purchases/scenario-comparison` (`app/api.py::compare_purchase_scenarios`) compara duas a
