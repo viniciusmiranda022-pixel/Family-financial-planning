@@ -901,3 +901,93 @@ def test_pay_obligation_rejects_amount_mismatched_transaction_link() -> None:
             json={"transaction_id": transaction_id},
         )
         assert pay.status_code == 422, pay.text
+
+
+def test_pay_obligation_links_existing_bank_transaction_without_creating_a_new_expense() -> None:
+    """Work Order Slice 8 gap: rebaseline §7 ("não cria despesa duplicada se
+    já houver fato bancário") and Work Order Slice 8 §"Obrigações" require a
+    *positive*-path proof, not just the mismatch-rejection regression above
+    -- when the household already has a matching bank expense for this
+    obligation (same amount, a real `Transaction` row), linking it via
+    `transaction_id` must convert the obligation to REALIZADO without ever
+    inserting a second `Transaction`."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        account = client.post("/api/accounts", json={"name": "Conta Corrente", "account_type": "checking"})
+        account_id = account.json()["id"]
+        created = client.post(
+            "/api/obligations",
+            json={"name": "Parcela chácara", "due_date": "2026-08-10", "amount": "500.00"},
+        )
+        obligation_id = created.json()["id"]
+
+        with session_factory() as db:
+            household_id = db.scalar(select(Household)).id
+            category = Category(household_id=household_id, name="Compromissos")
+            db.add(category)
+            db.flush()
+            txn = Transaction(
+                household_id=household_id,
+                account_id=account_id,
+                category_id=category.id,
+                booked_at=date(2026, 8, 9),
+                occurred_at=date(2026, 8, 9),
+                competence="2026-08",
+                description="Pagamento chácara via PIX",
+                normalized_description="PAGAMENTO CHACARA VIA PIX",
+                amount=Decimal("-500.00"),
+                transaction_type="expense",
+                fingerprint=f"realbank{uuid.uuid4().hex}".ljust(64, "0")[:64],
+                source_priority=50,
+                confidence=Decimal("1"),
+                reviewed=True,
+            )
+            db.add(txn)
+            db.commit()
+            transaction_id = txn.id
+
+        expense_count_before = None
+        with session_factory() as db:
+            expense_count_before = db.scalar(
+                select(func.count())
+                .select_from(Transaction)
+                .where(Transaction.household_id == household_id, Transaction.transaction_type == "expense")
+            )
+        assert expense_count_before == 1
+
+        pay = client.post(
+            f"/api/obligations/{obligation_id}/pay",
+            json={"transaction_id": transaction_id},
+        )
+        assert pay.status_code == 200, pay.text
+        body = pay.json()
+        assert body["status"] == "paid"
+        assert body["transaction_id"] == transaction_id
+        assert body["transaction_created"] is False
+
+        # Nothing new was inserted: the bank fact already existed and was
+        # only linked, never duplicated -- the obligation is REALIZADO
+        # through the same pre-existing `Transaction`.
+        with session_factory() as db:
+            expense_count_after = db.scalar(
+                select(func.count())
+                .select_from(Transaction)
+                .where(Transaction.household_id == household_id, Transaction.transaction_type == "expense")
+            )
+            assert expense_count_after == expense_count_before
+
+            obligation = db.get(Obligation, obligation_id)
+            assert obligation.status == "paid"
+            assert obligation.paid_transaction_id == transaction_id
+            assert obligation.payment_transaction_created is False
+
+            linked_transaction = db.get(Transaction, transaction_id)
+            assert linked_transaction is not None
+            assert linked_transaction.amount == Decimal("-500.00")
+
+        with session_factory() as db:
+            rows = _obligation_rows(db, household_id, include_paid=True)
+            paid_row = next(row for row in rows if row["id"] == obligation_id)
+            assert paid_row["financial_state"] == REALIZADO
