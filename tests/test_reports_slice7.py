@@ -831,6 +831,50 @@ def test_spending_economy_exposes_origem_por_conta_cartao_dimension() -> None:
         app.dependency_overrides.pop(get_db, None)
 
 
+def test_spending_economy_dashboard_and_report_agree_on_total_spending_same_fact() -> None:
+    """Work Order Slice 8 gap: the rebaseline (§15 "a mesma movimentação
+    ... nunca ser somada duas vezes na mesma métrica") and Work Order Slice
+    8 §"Gastos & Economia/Relatórios" ("Dashboard, Forecast, Relatórios e
+    Gastos & Economia concordam para o mesmo fato/contexto") require the
+    three-way agreement already proven between `/dashboard` and `/reports`
+    (`test_report_confirmed_liquidity_balance_matches_dashboard_same_context`)
+    to extend to `/spending-economy` as well -- for the *same* household,
+    same month, same underlying purchases -- not just structurally (`
+    seus_dados.summary` is `report["summary"]` reused verbatim), but as an
+    explicit end-to-end regression that would fail if that reuse were ever
+    replaced by a second calculation."""
+
+    client, session_factory = _client()
+    try:
+        with client:
+            _setup_household(client, session_factory, household_name="Família Convergência", username="admin-convergencia")
+            checking = _create_account(client, name="Conta Corrente")
+            card = _create_account(
+                client, name="Cartão", account_type="credit_card", card_closing_day=10, card_due_day=17
+            )
+            _add_income(client, account_id=checking["id"], booked_at="2026-08-05", amount="4500.00", description="Salário")
+            _add_expense(client, account_id=checking["id"], booked_at="2026-08-06", amount="150.00", description="Farmácia")
+            _add_expense(client, account_id=card["id"], booked_at="2026-08-07", amount="300.00", description="Compra cartão")
+
+            dashboard = client.get("/api/dashboard?month=2026-08").json()
+            report = client.get("/api/reports?end_month=2026-08&months=1").json()
+            economy = client.get("/api/spending-economy?end_month=2026-08&months=1").json()
+
+            # Nunca dupla contagem: 150 (banco) + 300 (cartão) = 450, uma
+            # única vez, nas três superfícies.
+            assert dashboard["spending"] == 450.0
+            assert report["summary"]["total_spending"] == 450.0
+            assert economy["seus_dados"]["summary"]["total_spending"] == 450.0
+
+            # Mesmo fato, não um segundo cálculo: `seus_dados.summary` é o
+            # `report["summary"]` publicado verbatim.
+            assert economy["seus_dados"]["summary"] == report["summary"]
+            assert dashboard["spending"] == report["summary"]["total_spending"]
+            assert dashboard["spending"] == economy["seus_dados"]["summary"]["total_spending"]
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
 def test_spending_economy_flags_category_trending_above_average() -> None:
     client, session_factory = _client()
     try:

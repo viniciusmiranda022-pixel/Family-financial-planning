@@ -42,6 +42,7 @@ from app.models import Account, Category, Household, Transaction, User  # noqa: 
 from app.security import hash_password  # noqa: E402
 from app.services.card_competence import card_invoice_competence, card_invoice_window  # noqa: E402
 from app.services.card_invoice_lifecycle import (  # noqa: E402
+    FINANCE_CHARGE_CATEGORY_NAME,
     CardInvoiceError,
     close_invoice,
     get_or_sync_invoice,
@@ -822,6 +823,67 @@ def test_divergence_explained_by_unlinked_refund_in_cycle() -> None:
         assert divergence.status == "unreconciled_explained"
         assert divergence.explanations[0]["cause"] == "estorno_nao_vinculado_no_ciclo"
         assert divergence.explanations[0]["amount"] == "30.00"
+
+
+def test_divergence_explained_by_unclaimed_finance_charge_in_cycle_window() -> None:
+    """Work Order Slice 8 gap: rebaseline §6.4/6.5 requires juros/IOF/tarifa
+    to be surfaced as a *separate*, evidenced explanation for a fatura
+    divergence -- never silently folded into the principal and never
+    fabricated. `invoice_divergence` looks for an `expense` `Transaction`
+    categorized `FINANCE_CHARGE_CATEGORY_NAME`, booked inside the invoice's
+    own `opens_at..closes_at` window, that is still unclaimed
+    (`card_invoice_id is None`). `get_or_sync_invoice` only ever claims by
+    exact `competence` match, so a finance-charge transaction whose booked
+    date falls inside this window but whose own `competence` tag points
+    elsewhere (e.g. an IOF line the source document booked a cycle early)
+    stays unclaimed and is exactly the real-world case this path exists
+    for -- never counted twice, never merged into the principal."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    card_id = _account(session_factory, household_id=household_id, name="Cartão", account_type="credit_card", closing_day=10, due_day=17)
+    category_id = _category(session_factory, household_id=household_id)
+    finance_category_id = _category(session_factory, household_id=household_id, name=FINANCE_CHARGE_CATEGORY_NAME)
+    _purchase(session_factory, household_id=household_id, account_id=card_id, amount="500.00", booked_at=date(2026, 9, 3), competence="2026-09", category_id=category_id)
+    # Booked inside the 2026-09 invoice's window (2026-08-11..2026-09-10)
+    # but tagged with a *different* competence, so `get_or_sync_invoice`'s
+    # exact-competence claiming query never claims it.
+    charge_id = _purchase(
+        session_factory, household_id=household_id, account_id=card_id, amount="45.00",
+        booked_at=date(2026, 9, 6), competence="2026-08", category_id=finance_category_id,
+        description="IOF financiamento",
+    )
+    _declared_invoice_line(session_factory, household_id=household_id, account_id=card_id, amount="545.00", competence="2026-09")
+
+    with session_factory() as db:
+        account = db.get(Account, card_id)
+        invoice = get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-09", as_of=date(2026, 9, 5))
+        db.commit()
+        invoice_id = invoice.id
+        # The finance charge never enters `computed_total` -- it belongs to
+        # a different competence and was never claimed by this invoice.
+        assert invoice.computed_total == Decimal("500.00")
+
+    with session_factory() as db:
+        charge = db.get(Transaction, charge_id)
+        assert charge.card_invoice_id is None
+
+    with session_factory() as db:
+        divergence = invoice_divergence(db, household_id=household_id, invoice_id=invoice_id)
+        db.commit()
+        assert divergence.status == "unreconciled_explained"
+        assert divergence.difference == Decimal("45.00")
+        assert len(divergence.explanations) == 1
+        assert divergence.explanations[0]["cause"] == "juros_iof_tarifa"
+        assert divergence.explanations[0]["transaction_id"] == charge_id
+        assert divergence.explanations[0]["amount"] == "45.00"
+
+    # The finance charge is a *new*, separately evidenced expense -- never
+    # silently merged into the principal already carried/claimed above.
+    with session_factory() as db:
+        charge = db.get(Transaction, charge_id)
+        assert charge.card_invoice_id is None
+        assert charge.category_id == finance_category_id
 
 
 def test_household_isolation_of_lifecycle_functions() -> None:
