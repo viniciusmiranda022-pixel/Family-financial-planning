@@ -477,6 +477,30 @@ EXPECTED_INVESTMENT_VALUATION_COLUMNS = {
     "created_at",
 }
 
+EXPECTED_0020_TABLES = {"notification_settings", "notification_recipients"}
+
+EXPECTED_NOTIFICATION_SETTINGS_COLUMNS = {
+    "id",
+    "household_id",
+    "enabled",
+    "send_time_local",
+    "timezone",
+    "created_at",
+    "updated_at",
+}
+
+EXPECTED_NOTIFICATION_RECIPIENT_COLUMNS = {
+    "id",
+    "household_id",
+    "email",
+    "normalized_email",
+    "active",
+    "notify_d1",
+    "notify_d0",
+    "created_at",
+    "updated_at",
+}
+
 
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
@@ -532,6 +556,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0017_TABLES,
             *EXPECTED_0018_TABLES,
             *EXPECTED_0019_TABLES,
+            *EXPECTED_0020_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -945,6 +970,76 @@ def test_downgrade_from_0019_refuses_to_discard_investment_valuations(monkeypatc
     get_settings.cache_clear()
 
 
+def test_downgrade_from_0020_refuses_to_discard_notification_recipients(monkeypatch, tmp_path) -> None:
+    """MAIL-00: a `notification_recipients` row is the household's only
+    record of who asked to be alerted and how -- not reconstructible from
+    anything else in the schema. Same guarded-downgrade pattern as
+    0015/0016/0019."""
+
+    from sqlalchemy.orm import sessionmaker
+
+    database_url = f"sqlite:///{tmp_path / 'migrations-notification-guard.sqlite'}"
+    config = _alembic_config(monkeypatch, database_url)
+
+    from app.models import Household, NotificationRecipient, NotificationSettings
+
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        household = Household(name="Família Downgrade Alertas")
+        db.add(household)
+        db.flush()
+        db.add(
+            NotificationRecipient(
+                household_id=household.id, email="kelly@exemplo.com", normalized_email="kelly@exemplo.com"
+            )
+        )
+        db.commit()
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="notification_recipients"):
+        command.downgrade(config, "0019")
+
+    engine, inspector = _inspect(database_url)
+    assert "notification_recipients" in inspector.get_table_names()
+    assert "notification_settings" in inspector.get_table_names()
+    engine.dispose()
+
+    # Clearing recipients alone still leaves a real `notification_settings`
+    # row behind (enabled/send_time_local/timezone the household configured)
+    # -- the downgrade must refuse a second time, now naming
+    # `notification_settings` instead.
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM notification_recipients")
+    engine.dispose()
+
+    engine = create_engine(database_url)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        household_id = db.scalar(select(Household.id))
+        db.add(NotificationSettings(household_id=household_id, enabled=True))
+        db.commit()
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="notification_settings"):
+        command.downgrade(config, "0019")
+
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM notification_settings")
+    engine.dispose()
+
+    command.downgrade(config, "0019")
+    engine, inspector = _inspect(database_url)
+    assert "notification_settings" not in inspector.get_table_names()
+    assert "notification_recipients" not in inspector.get_table_names()
+    engine.dispose()
+    get_settings.cache_clear()
+
+
 def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     output = StringIO()
     config = _alembic_config(
@@ -1025,7 +1120,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0019"
+        ).scalar_one() == "0020"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -1051,6 +1146,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0019"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0020"
     engine.dispose()
     get_settings.cache_clear()
