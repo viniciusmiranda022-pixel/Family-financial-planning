@@ -333,6 +333,31 @@ class ProfileRequest(BaseModel):
     projection_end: date
 
 
+class NotificationSettingsUpdateRequest(BaseModel):
+    """MAIL-00 (`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`). Format/range
+    validation for `send_time_local`/`timezone` happens in
+    `app.services.notification_settings` (needs household-independent
+    constants, not per-field pydantic validators)."""
+
+    enabled: bool
+    send_time_local: str = Field(min_length=5, max_length=5)
+    timezone: str = Field(min_length=2, max_length=64)
+
+
+class NotificationRecipientCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    active: bool = True
+    notify_d1: bool = True
+    notify_d0: bool = True
+
+
+class NotificationRecipientUpdateRequest(BaseModel):
+    email: str | None = Field(default=None, min_length=3, max_length=254)
+    active: bool | None = None
+    notify_d1: bool | None = None
+    notify_d0: bool | None = None
+
+
 class IntegrityRunRequest(BaseModel):
     scope: str = Field(pattern="^(entity|period|global)$")
     period: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
