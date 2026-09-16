@@ -2276,6 +2276,56 @@ async function loadProfile() {
   form.querySelector('button[type="submit"]').classList.toggle("hidden", !isAdmin());
   renderDueNotificationsSettings();
   await renderMfaSettings();
+  await loadNotificationSettings();
+}
+
+// MAIL-00 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #67): reads/
+// renders `GET /notification-settings`. `PUT /notification-settings` and
+// every `/notification-recipients` mutation already 403 server-side for a
+// consulta user (`app.api._require_admin`) -- disabling the form/hiding
+// action buttons here is UX only, never the real boundary.
+async function loadNotificationSettings() {
+  const data = await api("/notification-settings");
+  const form = document.querySelector("#notification-settings-form");
+  form.elements.enabled.value = String(Boolean(data.enabled));
+  form.elements.send_time_local.value = data.send_time_local;
+  form.elements.timezone.value = data.timezone;
+  Array.from(form.elements).forEach((element) => { if (element.type !== "submit") element.disabled = !isAdmin(); });
+  form.querySelector('button[type="submit"]').classList.toggle("hidden", !isAdmin());
+
+  const recipientForm = document.querySelector("#notification-recipient-form");
+  recipientForm.classList.toggle("hidden", !isAdmin());
+
+  renderNotificationRecipients(data.recipients || []);
+}
+
+function renderNotificationRecipients(recipients) {
+  const admin = isAdmin();
+  document.querySelector("#notification-recipients-table").innerHTML = recipients.length
+    ? recipients.map((item) => `
+    <tr>
+      <td>${escapeHtml(item.email)}</td>
+      <td><input type="checkbox" class="notification-recipient-toggle" data-id="${escapeHtml(item.id)}" data-field="notify_d1" ${item.notify_d1 ? "checked" : ""} ${admin ? "" : "disabled"}></td>
+      <td><input type="checkbox" class="notification-recipient-toggle" data-id="${escapeHtml(item.id)}" data-field="notify_d0" ${item.notify_d0 ? "checked" : ""} ${admin ? "" : "disabled"}></td>
+      <td><input type="checkbox" class="notification-recipient-toggle" data-id="${escapeHtml(item.id)}" data-field="active" ${item.active ? "checked" : ""} ${admin ? "" : "disabled"}></td>
+      <td class="right">${admin ? `<button class="danger-button notification-recipient-delete" data-id="${escapeHtml(item.id)}">Remover</button>` : ""}</td>
+    </tr>`).join("")
+    : emptyRow(5, "Nenhum destinatário cadastrado");
+
+  document.querySelectorAll(".notification-recipient-toggle").forEach((input) => input.addEventListener("change", async () => {
+    try {
+      await api(`/notification-recipients/${input.dataset.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ [input.dataset.field]: input.checked }),
+      });
+      await loadNotificationSettings();
+    } catch (error) { toast(error.message, true); await loadNotificationSettings(); }
+  }));
+  document.querySelectorAll(".notification-recipient-delete").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("Remover este destinatário de alertas de vencimento?")) return;
+    try { await api(`/notification-recipients/${button.dataset.id}`, { method: "DELETE" }); await loadNotificationSettings(); toast("Destinatário removido"); }
+    catch (error) { toast(error.message, true); }
+  }));
 }
 
 // October Go-Live Slice 7 (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_7.md,
@@ -4584,6 +4634,31 @@ document.querySelector("#profile-form").addEventListener("submit", async (event)
   const numeric = ["monthly_salary_net", "monthly_cash_cap", "emergency_floor", "food_allowance", "meal_allowance_daily", "workdays_month", "investment_balance", "investment_gross_annual_rate", "investment_income_tax_rate"];
   try { await api("/profile", { method: "PUT", body: JSON.stringify(formJson(event.target, numeric)) }); toast("Premissas salvas"); await loadDashboard(); }
   catch (error) { toast(error.message, true); }
+});
+document.querySelector("#notification-settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = formJson(event.target);
+  payload.enabled = payload.enabled === "true";
+  try {
+    await api("/notification-settings", { method: "PUT", body: JSON.stringify(payload) });
+    toast("Preferências de alerta salvas");
+    await loadNotificationSettings();
+  } catch (error) { toast(error.message, true); }
+});
+document.querySelector("#notification-recipient-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const payload = {
+    email: form.elements.email.value.trim(),
+    notify_d1: form.elements.notify_d1.checked,
+    notify_d0: form.elements.notify_d0.checked,
+  };
+  try {
+    await api("/notification-recipients", { method: "POST", body: JSON.stringify(payload) });
+    form.reset();
+    toast("Destinatário adicionado");
+    await loadNotificationSettings();
+  } catch (error) { toast(error.message, true); }
 });
 document.querySelectorAll('#integrity-banner [data-view="integrity"]').forEach((button) => button.addEventListener("click", () => navigate("integrity")));
 document.querySelector("#integrity-run-full").addEventListener("click", async () => {

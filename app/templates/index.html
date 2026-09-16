@@ -965,6 +965,51 @@
             <button id="due-notifications-disable" class="secondary hidden" type="button">Desativar neste navegador</button>
           </div>
         </article>
+        <!-- MAIL-00 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #67):
+             configuration only in this slice -- no scheduler runs yet
+             (MAIL-02) and no e-mail is actually sent yet (MAIL-01). The
+             Gmail sender credential never appears here or anywhere in the
+             UI; only destinatários/preferências are exposed, per Work
+             Order "Decisão de produto solicitada". -->
+        <article class="panel settings-panel" id="notification-settings-panel">
+          <div class="panel-heading"><div><span class="step-label">ALERTAS POR E-MAIL</span><h2>Alertas de vencimento por e-mail</h2></div></div>
+          <p class="muted-copy">Avisa por e-mail um dia antes (D-1) e no dia do vencimento (D0) de contas/obrigações cadastradas. O envio real ainda não está ativo nesta etapa — aqui você só configura destinatários e preferências.</p>
+          <form id="notification-settings-form" class="form-grid three">
+            <label>Ativo<select name="enabled"><option value="false">Não</option><option value="true">Sim</option></select></label>
+            <label>Horário<input type="time" name="send_time_local" required></label>
+            <label>Fuso horário<select name="timezone">
+              <option value="America/Sao_Paulo">America/Sao_Paulo</option>
+              <option value="America/Manaus">America/Manaus</option>
+              <option value="America/Rio_Branco">America/Rio_Branco</option>
+              <option value="America/Noronha">America/Noronha</option>
+              <option value="America/Cuiaba">America/Cuiaba</option>
+              <option value="America/Campo_Grande">America/Campo_Grande</option>
+              <option value="America/Belem">America/Belem</option>
+              <option value="America/Fortaleza">America/Fortaleza</option>
+              <option value="America/Recife">America/Recife</option>
+              <option value="America/Bahia">America/Bahia</option>
+              <option value="America/Maceio">America/Maceio</option>
+              <option value="America/Araguaina">America/Araguaina</option>
+              <option value="America/Boa_Vista">America/Boa_Vista</option>
+              <option value="America/Porto_Velho">America/Porto_Velho</option>
+              <option value="America/Eirunepe">America/Eirunepe</option>
+              <option value="UTC">UTC</option>
+            </select></label>
+            <div class="form-action"><button class="primary" type="submit">Salvar preferências de alerta</button></div>
+          </form>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>E-mail</th><th>D-1</th><th>D0</th><th>Ativo</th><th class="right">Ações</th></tr></thead>
+              <tbody id="notification-recipients-table"></tbody>
+            </table>
+          </div>
+          <form id="notification-recipient-form" class="form-grid">
+            <label>Novo destinatário<input type="email" name="email" required placeholder="familia@exemplo.com"></label>
+            <label>D-1<input type="checkbox" name="notify_d1" checked></label>
+            <label>D0<input type="checkbox" name="notify_d0" checked></label>
+            <button class="secondary" type="submit">Adicionar destinatário</button>
+          </form>
+        </article>
       </section>
     </main>
   </div>
