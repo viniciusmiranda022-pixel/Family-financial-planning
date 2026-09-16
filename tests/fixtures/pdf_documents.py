@@ -268,6 +268,116 @@ def nubank_bank_statement_pdf_zero_movement() -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Nubank -- extrato de conta, real `pdfplumber` inline-amount layout. Layout
+# per `docs/WORK_ORDER_NUBANK_BANK_STATEMENT_PDFPLUMBER_LAYOUT.md`'s "Synthetic
+# shape" section: the amount sits at the *end* of the transaction's own
+# description line (never on a bare line by itself), and counterparty/bank
+# metadata for that same transaction continues on the line(s) that follow
+# it, up to the next day/section header. This is the Work Order's own
+# example text verbatim, pinned as its own fixture/test so the exact case
+# the Work Order specifies is regression-proof, independent of any other
+# fixture.
+# ---------------------------------------------------------------------------
+
+NUBANK_BANK_STATEMENT_INLINE_AMOUNT_LINES = (
+    "Nubank",
+    "01 DE AGOSTO DE 2026 a 31 DE AGOSTO DE 2026",
+    "Saldo inicial R$ 1.000,00",
+    "Total de entradas R$ 300,00",
+    "Total de saidas R$ 300,00",
+    "Saldo final do periodo R$ 1.000,00",
+    "14 AGO 2026 Total de entradas + 300,00",
+    "Transferência recebida pelo Pix Pessoa Exemplo - 300,00",
+    "BANCO EXEMPLO S.A. Agência: 1 Conta: 0000",
+    "Total de saídas - 300,00",
+    "Transferência enviada pelo Pix Pessoa Exemplo - BANCO DESTINO 300,00",
+    "Agência: 2 Conta: 1111",
+)
+
+
+def nubank_bank_statement_pdf_inline_amount() -> bytes:
+    return render_single_column_pdf(NUBANK_BANK_STATEMENT_INLINE_AMOUNT_LINES)
+
+
+# A second inline-amount fixture exercising the cases the Work Order's own
+# example does not: two transactions inline in the *same* section with no
+# metadata continuation between them (must not be concatenated into one),
+# and issuer footer/disclaimer boilerplate after the last transaction
+# (must never be appended to it and must never become a transaction of its
+# own, even though nothing here ends in a money value that would make it
+# look like one anyway). Declared balances make this statement reconcile
+# exactly, exercising `reconcile_parsed_document` against the new layout.
+NUBANK_BANK_STATEMENT_INLINE_MULTIPLE_LINES = (
+    "Nubank",
+    "01 DE AGOSTO DE 2026 a 31 DE AGOSTO DE 2026",
+    "Saldo inicial R$ 1.000,00",
+    "Total de entradas R$ 150,00",
+    "Total de saidas R$ 0,00",
+    "Saldo final do periodo R$ 1.150,00",
+    "20 AGO 2026 Total de entradas + 150,00",
+    "Recebimento Pix Fulano de Tal 50,00",
+    "Recebimento Pix Ciclano da Silva 100,00",
+    "Central de Atendimento 0800 000 0000",
+    "Ouvidoria 0800 000 0001",
+    "Nu Pagamentos S.A. CNPJ 00.000.000/0000-00",
+)
+
+
+def nubank_bank_statement_pdf_inline_amount_multiple_and_footer() -> bytes:
+    return render_single_column_pdf(NUBANK_BANK_STATEMENT_INLINE_MULTIPLE_LINES)
+
+
+# A fourth inline-amount fixture isolating the combination the "multiple"
+# fixture above deliberately leaves out: two inline transactions in the
+# *same* section where the first is followed by a metadata continuation
+# line before the second transaction's own inline-amount line. The
+# continuation must attach to the first transaction, never leak into the
+# second's description (BLOQUEIO DE MERGE, PR #57: metadata continuation
+# was being prepended to the wrong -- following -- transaction).
+NUBANK_BANK_STATEMENT_INLINE_METADATA_THEN_SECOND_LINES = (
+    "Nubank",
+    "01 DE AGOSTO DE 2026 a 31 DE AGOSTO DE 2026",
+    "Saldo inicial R$ 1.000,00",
+    "Total de entradas R$ 150,00",
+    "Total de saidas R$ 0,00",
+    "Saldo final do periodo R$ 1.150,00",
+    "20 AGO 2026 Total de entradas + 150,00",
+    "Recebimento Pix Fulano de Tal 50,00",
+    "BANCO EXEMPLO S.A. Agência: 1 Conta: 0000",
+    "Recebimento Pix Ciclano da Silva 100,00",
+)
+
+
+def nubank_bank_statement_pdf_inline_amount_metadata_then_second() -> bytes:
+    return render_single_column_pdf(NUBANK_BANK_STATEMENT_INLINE_METADATA_THEN_SECOND_LINES)
+
+
+# A third inline-amount fixture isolating the day-header flush case: a
+# transaction's trailing metadata continuation line is followed directly by
+# a *new day* header (no intervening "Total de ..." section switch). The
+# metadata must attach to the day-14 transaction that precedes it, and the
+# day-20 transaction that follows the header must start with a clean
+# description and the updated `booked_at`.
+NUBANK_BANK_STATEMENT_INLINE_DAY_HEADER_FLUSH_LINES = (
+    "Nubank",
+    "01 DE AGOSTO DE 2026 a 31 DE AGOSTO DE 2026",
+    "Saldo inicial R$ 1.000,00",
+    "Total de entradas R$ 150,00",
+    "Total de saidas R$ 0,00",
+    "Saldo final do periodo R$ 1.150,00",
+    "14 AGO 2026 Total de entradas + 100,00",
+    "Recebimento Pix Fulano de Tal 100,00",
+    "Agencia 1 Conta 0000",
+    "20 AGO 2026 Total de entradas + 50,00",
+    "Recebimento Pix Ciclano da Silva 50,00",
+)
+
+
+def nubank_bank_statement_pdf_inline_amount_day_header_flush() -> bytes:
+    return render_single_column_pdf(NUBANK_BANK_STATEMENT_INLINE_DAY_HEADER_FLUSH_LINES)
+
+
+# ---------------------------------------------------------------------------
 # Mercado Pago -- fatura (credit card). Layout per the Work Order's
 # "Mercado Pago — fatura PDF" section: "Vencimento: dd/mm/yyyy", a summary
 # block whose bare "Total R$ valor" line is the only one this parser reads

@@ -16,7 +16,7 @@ from app.services.classifier import (
     normalize_description,
 )
 
-PARSER_CONTRACT_VERSION = "2026.09.3"
+PARSER_CONTRACT_VERSION = "2026.09.4"
 
 
 @dataclass(frozen=True)
@@ -508,34 +508,93 @@ def _parse_nubank_credit_card_pdf(text: str) -> list[ParsedTransaction]:
     return parsed
 
 
-# Real extracted Nubank bank-statement text (confirmed against the actual
-# August 2026 statement behind this Work Order's baseline -- see PR #41
-# engineer review on `bcd003e`) does not look like a per-transaction
-# "description ... +R$ value" line. Instead:
+# Real extracted Nubank bank-statement text (reproduced against the actual
+# PDFs behind the 2026-09-09 initial-load dry-run, outside Git -- see
+# `docs/WORK_ORDER_NUBANK_BANK_STATEMENT_PDFPLUMBER_LAYOUT.md`) does not put
+# each transaction's amount on its own bare line the way the PR #41 baseline
+# assumed. `pdfplumber` instead extracts the amount at the *end* of the
+# transaction's own description line, and any further counterparty/bank
+# metadata for that same transaction (agency, account, second bank name)
+# keeps extracting on the line(s) that follow it, e.g.:
 #
-#   14 AGO 2026 Total de entradas + 3.044,80
-#   Transferência recebida pelo Pix ...
-#   (description may continue for several lines)
-#   3.044,80
-#   Total de saídas - 3.044,80
-#   Transferência enviada pelo Pix ...
-#   3.044,80
+#   14 AGO 2026 Total de entradas + 300,00
+#   Transferência recebida pelo Pix Pessoa Exemplo - 300,00
+#   BANCO EXEMPLO S.A. Agência: 1 Conta: 0000
+#   Total de saídas - 300,00
+#   Transferência enviada pelo Pix Pessoa Exemplo - BANCO DESTINO 300,00
+#   Agência: 2 Conta: 1111
 #
-# The day header and the *first* section aggregate for that day share one
-# line; a later section switch within the same day (entradas -> saídas or
-# the reverse) repeats only the bare "Total de ..." aggregate, not the date.
-# Each individual transaction is then a run of description lines terminated
-# by a bare amount line -- no "R$", no sign; direction comes only from which
-# aggregate section is currently open, never from the amount line or the
-# description text (Work Order requirement: do not infer sign from
-# description). The aggregate line itself is always discarded, never a
-# transaction, so per-day/period totals can never leak into the ledger.
+# A minority of statements (and the fixture pinned by PR #41's regression
+# test) still wrap the description across several lines and terminate with a
+# bare amount line instead -- that shape is real too and must keep working
+# unchanged. Both shapes are therefore supported by the same state machine:
+#
+# - the day header and the *first* section aggregate for that day share one
+#   line; a later section switch within the same day (entradas -> saídas or
+#   the reverse) repeats only the bare "Total de ..." aggregate, never the
+#   date;
+# - a line that is *only* an amount closes the transaction accumulated so
+#   far (the legacy bare-amount-line shape);
+# - a line that *ends* in an amount closes a transaction built from that
+#   line's own leading text plus whatever was accumulated before it (the
+#   real inline-amount shape); either way, direction always comes from
+#   whichever aggregate section is currently open, never from the amount's
+#   own sign or the description text (Work Order requirement: never infer
+#   direction from the transaction line);
+# - once a transaction has been emitted this way, any further plain-text
+#   lines before the next boundary (a new day/section header, a "Saldo"/
+#   "Rendimento" line, a footer/disclaimer marker, or another line ending in
+#   an amount) are trailing metadata for that *same* transaction, appended
+#   to its description -- never fabricated into a transaction of their own,
+#   and never merged into the transaction that follows a header/footer
+#   boundary;
+# - footer/disclaimer text (issuer contact/ombudsman/CNPJ boilerplate) is
+#   recognized and discarded outright: it is never appended as metadata and
+#   can never become a transaction even if it happens to end in a
+#   money-shaped value.
+#
+# The aggregate line itself is always discarded, never a transaction, so
+# per-day/period totals can never leak into the ledger.
 _NUBANK_DAY_SECTION_HEADER = re.compile(
     r"^(\d{2})\s+([A-ZÇ]{3})\s+(\d{4})\s+TOTAL DE (ENTRADAS|SA[IÍ]DAS)\b", re.IGNORECASE
 )
 _NUBANK_SECTION_HEADER = re.compile(r"^TOTAL DE (ENTRADAS|SA[IÍ]DAS)\b", re.IGNORECASE)
 _NUBANK_BARE_AMOUNT = re.compile(r"^-?[\d.]+,\d{2}$")
-_NUBANK_INLINE_AMOUNT = re.compile(r"^(.*?)\s+(-?[\d.]+,\d{2})$")
+# A transaction line in the real inline-amount layout: arbitrary leading
+# text (the description, and possibly a trailing "-" the document uses as a
+# plain separator, never a sign -- direction always comes from the current
+# section) followed by the amount at the very end of the line. No "R$", no
+# currency symbol: Nubank's bank-statement lines never carry one, unlike its
+# credit-card invoice lines (`_NUBANK_CARD_TAIL`).
+_NUBANK_INLINE_AMOUNT_TAIL = re.compile(r"^(.*\S)\s+([\d.]+,\d{2})$")
+# Issuer contact/ombudsman/corporate boilerplate observed on real Nubank
+# statement footers. Content-based, like `_detect_pdf_issuer`: matched
+# against the same accent-/punctuation-stripped `normalize_description`
+# text every other classification in this module already uses, never a
+# filename or document position. Deliberately narrow -- a false negative
+# only means a footer line is kept as harmless trailing metadata text (it
+# still can never *become* a transaction, since it has no money value of
+# its own), while a false positive would silently drop real transaction
+# metadata, which is the worse failure mode.
+_NUBANK_STATEMENT_FOOTER = re.compile(
+    r"\bOUVIDORIA\b|\bSAC\b|CENTRAL DE ATENDIMENTO|ATENDIMENTO AO CLIENTE|"
+    r"NU PAGAMENTOS|\bCNPJ\b"
+)
+
+
+def _strip_trailing_separator(text: str) -> str:
+    """Drop a bare trailing "-" the inline-amount layout leaves behind.
+
+    `_NUBANK_INLINE_AMOUNT_TAIL` cannot tell a "-" that sits directly before
+    the amount (formatting punctuation the document itself never intends as
+    a sign -- see the module comment above) from one that is genuinely part
+    of the description text, because both look identical once the amount is
+    stripped off. Only a "-" at the very end of the assembled description is
+    unambiguous filler; a "-" anywhere else (e.g. "Pessoa Exemplo - BANCO
+    DESTINO") is real content and is left untouched.
+    """
+
+    return text.rstrip(" -").strip()
 
 
 def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
@@ -543,17 +602,56 @@ def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
     current_day: date | None = None
     current_sign: int | None = None
     pending_parts: list[str] = []
+    # True once an inline-amount transaction has been emitted and no
+    # transaction-closing line has resolved since: any text accumulated in
+    # `pending_parts` while this holds is trailing metadata continuation for
+    # that already-emitted transaction (Work Order requirement 5), never the
+    # start of the *next* transaction's own description. False means
+    # `pending_parts` (if any) is instead a description still being built
+    # for a not-yet-closed bare-amount-line transaction (legacy layout), so
+    # it belongs to whichever line closes it next. Reset to False by
+    # `attach_trailing_metadata()` (whatever was pending has been resolved)
+    # and after a bare-format emit; set True after an inline emit.
+    pending_is_trailing_metadata = False
+
+    def attach_trailing_metadata() -> None:
+        # Text accumulated since the last emitted transaction that never
+        # resolved into an amount of its own: the real layout continues a
+        # transaction's counterparty/bank metadata on lines *after* the one
+        # carrying its inline amount (Work Order requirement 5). Attach it
+        # to the transaction just emitted instead of discarding it or
+        # fabricating a second, amount-less transaction from it. If nothing
+        # has been emitted yet, there is nothing to attach it to and it is
+        # simply dropped -- never turned into a fabricated transaction.
+        nonlocal pending_parts, pending_is_trailing_metadata
+        extra = " ".join(part for part in pending_parts if part).strip()
+        pending_parts = []
+        pending_is_trailing_metadata = False
+        if not extra or not parsed:
+            return
+        last = parsed[-1]
+        parsed[-1] = ParsedTransaction(
+            last.booked_at,
+            f"{last.description} {extra}".strip(),
+            last.amount,
+            last.source_line,
+            last.card_last_four,
+            last.installment_current,
+            last.installment_total,
+            last.occurred_at,
+        )
+
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
             continue
         day_section = _NUBANK_DAY_SECTION_HEADER.match(line)
         if day_section:
+            attach_trailing_metadata()
             day, month_abbr, year, direction = day_section.groups()
             month = MONTHS_PT_ABBR.get(month_abbr.upper())
             current_day = date(int(year), month, int(day)) if month else None
             current_sign = 1 if direction.upper().startswith("ENTRADA") else -1
-            pending_parts = []
             continue
         if current_day is None:
             # Everything before the first per-day block -- the period-level
@@ -563,47 +661,48 @@ def _parse_nubank_bank_statement_pdf(text: str) -> list[ParsedTransaction]:
             continue
         section = _NUBANK_SECTION_HEADER.match(line)
         if section:
+            attach_trailing_metadata()
             current_sign = 1 if section.group(1).upper().startswith("ENTRADA") else -1
-            pending_parts = []
             continue
         normalized = normalize_description(line)
         if normalized.startswith("SALDO") or normalized.startswith("RENDIMENTO"):
-            pending_parts = []
+            attach_trailing_metadata()
             continue
-        # Nubank has at least two textual extraction shapes in real PDFs:
-        #
-        # 1) description on one/more lines followed by a bare amount line;
-        # 2) the final description line already ends with the transaction amount,
-        #    while counterparty/bank metadata may continue on following lines.
-        #
-        # Direction is still determined ONLY by the current ENTRADAS/SAIDAS
-        # section. The numeric token itself never decides the sign.
-        inline = _NUBANK_INLINE_AMOUNT.match(line)
-        if inline and not _NUBANK_BARE_AMOUNT.fullmatch(line):
-            description_tail, raw_value = inline.groups()
-            description = " ".join([*pending_parts, description_tail.strip()]).strip()
-            pending_parts = []
-            if not description or _NON_TRANSACTION_TEXT.search(normalize_description(description)):
-                continue
-            if current_sign is None:
-                continue
-            value = abs(parse_decimal(raw_value))
-            amount = value if current_sign > 0 else -value
-            parsed.append(ParsedTransaction(current_day, description, amount, line_number))
+        if _NUBANK_STATEMENT_FOOTER.search(normalized):
+            # Footer/disclaimer text is discarded outright: never trailing
+            # metadata for the previous transaction, never a transaction of
+            # its own, regardless of what it ends with.
             continue
-
-        if not _NUBANK_BARE_AMOUNT.fullmatch(line):
+        bare = _NUBANK_BARE_AMOUNT.match(line)
+        inline = None if bare else _NUBANK_INLINE_AMOUNT_TAIL.match(line)
+        if not bare and not inline:
             pending_parts.append(line)
             continue
-        description = " ".join(pending_parts).strip()
+        if pending_is_trailing_metadata:
+            # `pending_parts` belongs to the transaction already emitted,
+            # not to this new one (Work Order requirement 7: multiple
+            # transactions in the same section stay separate even when a
+            # metadata continuation line sits between two inline amounts).
+            # Flush it there first so this line starts a clean description.
+            attach_trailing_metadata()
+        if bare:
+            description = _strip_trailing_separator(" ".join(pending_parts))
+            raw_amount = line
+        else:
+            tail, raw_amount = inline.groups()
+            description = _strip_trailing_separator(" ".join([*pending_parts, tail]))
         pending_parts = []
         if not description or _NON_TRANSACTION_TEXT.search(normalize_description(description)):
+            pending_is_trailing_metadata = False
             continue
         if current_sign is None:
+            pending_is_trailing_metadata = False
             continue
-        value = abs(parse_decimal(line))
+        value = abs(parse_decimal(raw_amount))
         amount = value if current_sign > 0 else -value
         parsed.append(ParsedTransaction(current_day, description, amount, line_number))
+        pending_is_trailing_metadata = bool(inline)
+    attach_trailing_metadata()
     if not parsed:
         raise ValueError("Extrato Nubank sem lançamentos textuais reconhecíveis; encaminhado para revisão")
     return parsed
