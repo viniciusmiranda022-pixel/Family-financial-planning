@@ -636,6 +636,29 @@ class InvestmentValuationUndoRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 
 
+# Issue #85 (docs/WORK_ORDER_PRIVILEGE_DI_CVM.md): CVM daily fund valuation
+# position evidence. `fund_cnpj` accepts either the formatted
+# ("26.199.519/0001-34") or digits-only form -- `app.services.privilege_valuation`
+# normalizes either way before persisting/matching (see
+# `app.services.cvm_client.normalize_fund_cnpj`).
+class FundPositionSnapshotRequest(BaseModel):
+    fund_cnpj: str = Field(min_length=11, max_length=20)
+    units_held: Decimal = Field(ge=0)
+    effective_date: date
+    evidence_type: str = Field(pattern="^(statement_position|confirmed_balance_reconciliation)$")
+    evidence_document_id: str | None = Field(default=None, min_length=1, max_length=36)
+    evidence_balance_observation_id: str | None = Field(default=None, min_length=1, max_length=36)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class FundPositionMovementRequest(BaseModel):
+    fund_cnpj: str = Field(min_length=11, max_length=20)
+    delta_units: Decimal
+    effective_date: date
+    evidence_type: str = Field(pattern="^(application|redemption)$")
+    note: str | None = Field(default=None, max_length=2000)
+
+
 class ClassificationRuleEditRequest(BaseModel):
     """Admin-only edit of an eligible local merchant rule's category.
 

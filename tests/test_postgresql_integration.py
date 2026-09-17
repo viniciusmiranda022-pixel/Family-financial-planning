@@ -135,7 +135,7 @@ def test_upgrade_empty_postgresql_database_to_head() -> None:
     }.issubset(tables)
     with engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0022"
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0023"
         )
     engine.dispose()
 
@@ -156,7 +156,7 @@ def test_upgrade_from_legacy_0002_baseline_preserves_existing_rows() -> None:
 
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0022"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0023"
         preserved_name = connection.execute(
             text("SELECT name FROM households WHERE id = :id"), {"id": household_id}
         ).scalar_one()
@@ -1330,6 +1330,173 @@ def test_investment_contribution_concurrent_same_funding_transaction_is_serializ
             ).all()
             assert len(linked) == 1, "exactly one contribution may ever link this funding transaction"
             assert linked[0].investment_id == investment_a_id
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_fund_reference_quote_concurrent_ingestion_is_serialized_to_a_single_row() -> None:
+    """Issue #85 (`docs/WORK_ORDER_PRIVILEGE_DI_CVM.md`): "Idempotent
+    reruns for the same fund/reference date must not create duplicate
+    financial facts." `app.services.privilege_valuation.ingest_latest_quote`
+    relies on `fund_reference_quotes`' unique `(fund_cnpj,
+    quota_reference_date)` constraint plus a `begin_nested()`/
+    `IntegrityError` retry -- the same pattern
+    `app.services.notification_scheduler.discover_due_deliveries` already
+    uses for its own unique-constraint race. Proves it under a real
+    two-connection PostgreSQL race: two threads, synchronized with a
+    `threading.Barrier` to maximize transaction overlap, both attempt to
+    ingest the exact same fund/date quote concurrently -- exactly one row
+    may exist afterward, and neither call may raise."""
+
+    from app.models import FundReferenceQuote
+    from app.services import privilege_valuation as pv
+    from app.services.cvm_client import CvmQuote, CvmResult
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        quote = CvmQuote(
+            fund_cnpj=pv.TRACKED_FUND_CNPJ,
+            quota_reference_date=date(2026, 9, 15),
+            quota_value=Decimal("28.1234567890"),
+            net_worth=Decimal("900000.00"),
+            source_url="http://fixture/inf_diario_fi_202609.csv",
+            ingestion_batch="202609",
+        )
+
+        class _FakeClient:
+            configured = True
+
+            def latest_quote(self, fund_cnpj, reference_month=None):
+                return CvmResult(quote)
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _ingest() -> None:
+            try:
+                thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(thread_engine) as db:
+                    barrier.wait(timeout=5.0)
+                    pv.ingest_latest_quote(db, fund_cnpj=pv.TRACKED_FUND_CNPJ, client=_FakeClient())
+                    db.commit()
+                thread_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=_ingest, daemon=True) for _ in range(2)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10.0)
+
+        assert not errors, f"concurrent ingestion must never raise: {errors}"
+        with Session(engine) as verify_db:
+            rows = verify_db.scalars(
+                select(FundReferenceQuote).where(
+                    FundReferenceQuote.fund_cnpj == pv.TRACKED_FUND_CNPJ,
+                    FundReferenceQuote.quota_reference_date == date(2026, 9, 15),
+                )
+            ).all()
+            assert len(rows) == 1, "concurrent ingestion of the same fund/date duplicated a quote row"
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_fund_valuation_concurrent_run_is_serialized_to_a_single_row() -> None:
+    """Same idempotency guarantee as the ingestion test above, one layer up:
+    two threads run `app.services.privilege_valuation.run_valuation_for_household`
+    for the same household/fund/reference-date concurrently. Exactly one
+    `FundValuation` row may exist afterward -- `fund_valuations`' unique
+    `(household_id, fund_cnpj, quota_reference_date)` constraint plus this
+    function's own `begin_nested()`/`IntegrityError` handling is what
+    guarantees it, never application-level discipline alone."""
+
+    from app.models import FundReferenceQuote, FundValuation
+    from app.services import privilege_valuation as pv
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as setup_db:
+            household = Household(name="Família Privilège CVM Concorrência")
+            setup_db.add(household)
+            setup_db.flush()
+            setup_db.add(
+                FundReferenceQuote(
+                    fund_cnpj=pv.TRACKED_FUND_CNPJ,
+                    quota_reference_date=date(2026, 9, 15),
+                    quota_value=Decimal("28.1234567890"),
+                    net_worth=Decimal("900000.00"),
+                    provider="cvm_dados_abertos",
+                    source_url="http://fixture/inf_diario_fi_202609.csv",
+                    ingestion_batch="202609",
+                    retrieved_at=datetime(2026, 9, 15, 8, 0, tzinfo=UTC),
+                )
+            )
+            household_id = household.id
+            account = Account(
+                household_id=household_id, name="Privilege DI", institution="Itau", account_type="investment"
+            )
+            setup_db.add(account)
+            setup_db.flush()
+            observation = AccountBalanceObservation(
+                household_id=household_id,
+                account_id=account.id,
+                amount=Decimal("40667.49"),
+                as_of_date=date(2026, 9, 11),
+                observation_type="point_in_time",
+                source="manual_confirmed",
+                confidence=Decimal("1.0000"),
+                trace_id="trace-fund-valuation-concurrency",
+            )
+            setup_db.add(observation)
+            setup_db.commit()
+            pv.record_position_snapshot(
+                setup_db,
+                household_id=household_id,
+                fund_cnpj=pv.TRACKED_FUND_CNPJ,
+                units_held=Decimal("1445.12345678"),
+                effective_date=date(2026, 9, 11),
+                evidence_type="confirmed_balance_reconciliation",
+                evidence_balance_observation_id=observation.id,
+            )
+            setup_db.commit()
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(thread_engine) as db:
+                    barrier.wait(timeout=5.0)
+                    pv.run_valuation_for_household(
+                        db, household_id=household_id, fund_cnpj=pv.TRACKED_FUND_CNPJ
+                    )
+                    db.commit()
+                thread_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=_run, daemon=True) for _ in range(2)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10.0)
+
+        assert not errors, f"concurrent valuation run must never raise: {errors}"
+        with Session(engine) as verify_db:
+            rows = verify_db.scalars(
+                select(FundValuation).where(
+                    FundValuation.household_id == household_id,
+                    FundValuation.fund_cnpj == pv.TRACKED_FUND_CNPJ,
+                    FundValuation.quota_reference_date == date(2026, 9, 15),
+                )
+            ).all()
+            assert len(rows) == 1, "concurrent valuation run duplicated a valuation row"
         engine.dispose()
     finally:
         get_settings.cache_clear()

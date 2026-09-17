@@ -964,6 +964,212 @@ class InvestmentValuation(Base):
     )
 
 
+class FundReferenceQuote(Base):
+    """One official CVM quota observation for one fund on one reference date
+    (issue #85, `docs/WORK_ORDER_PRIVILEGE_DI_CVM.md`). Global market data --
+    deliberately **not** `household_id`-scoped: the quota CVM publishes for a
+    fund/date is the same fact for every household that happens to hold that
+    fund, so ingesting it once (keyed only by `fund_cnpj`/
+    `quota_reference_date`) avoids re-downloading and re-parsing the same CVM
+    file once per household. Household isolation instead applies to *who can
+    see a valuation derived from this quote* (`FundValuation.household_id`
+    below), never to this row itself.
+
+    `app.services.cvm_client` is the only writer, via
+    `app.services.privilege_valuation`. `quota_value` uses `Numeric(20, 10)`
+    (not the `Numeric(14, 2)` cents precision every other monetary column in
+    this codebase uses) because a CVM quota routinely carries 6-8 significant
+    decimal digits -- rounding it to cents before persisting would silently
+    corrupt every downstream valuation computed from it (Work Order:
+    "arithmetic uses Decimal, never binary float", and implicitly, never
+    premature cent-rounding of a non-monetary quota either).
+
+    The unique constraint is the idempotency guarantee the Work Order
+    requires ("Idempotent reruns for the same fund/reference date must not
+    create duplicate financial facts"): a second ingestion for the same
+    `(fund_cnpj, quota_reference_date)` cannot insert a second row -- see
+    `app.services.cvm_client.ingest_latest_quote`'s `IntegrityError`-race
+    handling, the same `begin_nested()` discipline
+    `app.services.notification_scheduler` already established for its own
+    unique-constraint races."""
+
+    __tablename__ = "fund_reference_quotes"
+    __table_args__ = (
+        UniqueConstraint(
+            "fund_cnpj",
+            "quota_reference_date",
+            name="uq_fund_reference_quotes_cnpj_date",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    fund_cnpj: Mapped[str] = mapped_column(String(20), index=True)
+    quota_reference_date: Mapped[date] = mapped_column(Date)
+    quota_value: Mapped[Decimal] = mapped_column(Numeric(20, 10))
+    net_worth: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    provider: Mapped[str] = mapped_column(String(40))
+    source_url: Mapped[str] = mapped_column(String(500))
+    ingestion_batch: Mapped[str] = mapped_column(String(20))
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class FundUnitPosition(Base):
+    """Append-only evidence log of how many units of a fund a household
+    holds as of a given effective date (issue #85). Never rewritten --
+    exactly like `AccountBalanceObservation`/`InvestmentValuation`, a
+    correction or a new application/redemption event always *appends* a new
+    row; the most recent non-invalidated row (ordered by `effective_date`,
+    then `created_at`) is the current position.
+
+    This table exists precisely because the Work Order forbids inferring
+    `units_held` from a balance and a quota belonging to different
+    reference dates ("Never infer units... without explicit reconciliation")
+    and forbids the automated valuation job from fabricating a synthetic
+    application/redemption. Every row here must trace back to real evidence:
+    `evidence_type='statement_position'` (a bank/fund statement's stated
+    unit quantity, `evidence_document_id` set),
+    `evidence_type='confirmed_balance_reconciliation'` (a user-confirmed
+    balance matched against an official quota for the *same* reference date,
+    `evidence_balance_observation_id` set), or
+    `evidence_type='application'`/`'redemption'` (a known movement changing
+    the unit count, `delta_units` set, positive for an application, negative
+    for a redemption). There is deliberately no `evidence_type` value that
+    means "worker guessed it" -- `app.services.privilege_valuation` never
+    writes this table itself, only reads the latest row."""
+
+    __tablename__ = "fund_unit_positions"
+    __table_args__ = (
+        Index(
+            "ix_fund_unit_positions_household_fund_date",
+            "household_id",
+            "fund_cnpj",
+            "effective_date",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    fund_cnpj: Mapped[str] = mapped_column(String(20), index=True)
+    units_held: Mapped[Decimal] = mapped_column(Numeric(24, 8))
+    effective_date: Mapped[date] = mapped_column(Date)
+    evidence_type: Mapped[str] = mapped_column(String(40))
+    delta_units: Mapped[Decimal | None] = mapped_column(Numeric(24, 8), nullable=True)
+    evidence_document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    evidence_balance_observation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("account_balance_observations.id", ondelete="SET NULL"), nullable=True
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recorded_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    invalidation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class FundValuation(Base):
+    """One immutable, reproducible daily valuation of a household's fund
+    position (issue #85, `docs/WORK_ORDER_PRIVILEGE_DI_CVM.md`). Every field
+    the Work Order's "Data model / auditability" section requires for
+    reproducibility is denormalized onto this row (not just referenced via
+    FK) precisely so a valuation can be re-explained/re-audited later even
+    if the `FundReferenceQuote`/`FundUnitPosition` rows it was computed from
+    are themselves later invalidated for a data-quality reason unrelated to
+    this valuation.
+
+    **Deliberately never feeds `household_patrimony_summary`, never writes
+    `AccountBalanceObservation`, never writes `Investment`/
+    `InvestmentValuation`.** This is a scoped, additive, display/
+    reconciliation-only slice: rebaseline INV-024 ("saldo confirmado
+    soberano") means only a human-confirmed observation may be sovereign,
+    and the Privilège account already has its own confirmed-balance
+    mechanism (`AccountBalanceObservation` via `_privilege_account`/
+    `_latest_active_balance_observation` in `app.api`). An automated,
+    estimate-based valuation must stay visibly *distinct* from that
+    confirmed fact, never silently reinterpreted as or merged into it --
+    the Work Order's own words: "Do not silently overwrite an observed Itaú
+    balance with an estimate." `observed_balance`/`observed_balance_as_of`/
+    `reconciliation_diff` below are a read-only snapshot copied from the
+    confirmed observation at compute time purely for display and audit
+    trail; they are never written back into `AccountBalanceObservation`.
+    Whether/when a proven-accurate estimate should ever *feed* Patrimônio is
+    an explicit future-slice decision, not something this migration
+    resolves silently.
+
+    The unique constraint is this row's idempotency guarantee -- a rerun for
+    a household/fund/reference-date that already has a valuation updates
+    nothing and creates nothing new (Work Order: "Idempotent reruns... must
+    not create duplicate financial facts")."""
+
+    __tablename__ = "fund_valuations"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id",
+            "fund_cnpj",
+            "quota_reference_date",
+            name="uq_fund_valuations_household_fund_date",
+        ),
+        Index(
+            "ix_fund_valuations_household_fund_date",
+            "household_id",
+            "fund_cnpj",
+            "quota_reference_date",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    fund_cnpj: Mapped[str] = mapped_column(String(20), index=True)
+    account_id: Mapped[str | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    quote_id: Mapped[str | None] = mapped_column(
+        ForeignKey("fund_reference_quotes.id", ondelete="SET NULL"), nullable=True
+    )
+    position_id: Mapped[str | None] = mapped_column(
+        ForeignKey("fund_unit_positions.id", ondelete="SET NULL"), nullable=True
+    )
+    quota_reference_date: Mapped[date] = mapped_column(Date)
+    quota_value: Mapped[Decimal] = mapped_column(Numeric(20, 10))
+    units_held: Mapped[Decimal] = mapped_column(Numeric(24, 8))
+    gross_value: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    previous_gross_value: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    variation_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    variation_pct: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    observed_balance: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    observed_balance_as_of: Mapped[date | None] = mapped_column(Date, nullable=True)
+    reconciliation_diff: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    provider: Mapped[str] = mapped_column(String(40))
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    valuation_version: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20))
+    error_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    invalidation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class DuplicateGroup(Base, TimestampMixin):
     __tablename__ = "duplicate_groups"
     __table_args__ = (

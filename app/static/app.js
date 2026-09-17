@@ -876,6 +876,69 @@ async function loadDashboard() {
   await applyCurrentMonthConfirmedLiquidity(selectedMonth);
   await applyFutureMonthDashboardSemantics(summary, selectedMonth, selectedLabel);
   renderInvestments(summary);
+  await renderPrivilegeValuation();
+}
+
+// Issue #85 (docs/WORK_ORDER_PRIVILEGE_DI_CVM.md): reads GET
+// /privilege-di/valuation verbatim -- nothing here computes a gross value,
+// a variation or a reconciliation diff a second time;
+// app.services.privilege_valuation already did that deterministically.
+// The panel stays hidden whenever there is nothing worth showing yet (no
+// official quota ingested, or no units_held evidence recorded for this
+// household) -- an empty/placeholder card would only look like a bug.
+async function renderPrivilegeValuation() {
+  const panel = document.querySelector("#privilege-valuation-panel");
+  let status;
+  try {
+    status = await api("/privilege-di/valuation");
+  } catch (err) {
+    panel.hidden = true;
+    return;
+  }
+  if (status.status === "no_quote_available" || status.status === "no_position_evidence") {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+
+  document.querySelector("#privilege-valuation-estimated").textContent =
+    status.estimated_balance === null || status.estimated_balance === undefined
+      ? "--"
+      : money.format(status.estimated_balance);
+  document.querySelector("#privilege-valuation-quota").textContent =
+    status.latest_quota === null || status.latest_quota === undefined
+      ? "Cota oficial não disponível."
+      : `Cota de ${dateFormat.format(new Date(`${status.quota_reference_date}T00:00:00Z`))}: ${Number(status.latest_quota).toLocaleString("pt-BR", { maximumFractionDigits: 8 })}`;
+
+  const variationEl = document.querySelector("#privilege-valuation-variation");
+  const variationPctEl = document.querySelector("#privilege-valuation-variation-pct");
+  if (status.estimated_gain_loss === null || status.estimated_gain_loss === undefined) {
+    variationEl.textContent = "--";
+    variationPctEl.textContent = "Ainda não há cota anterior para comparar.";
+  } else {
+    variationEl.textContent = money.format(status.estimated_gain_loss);
+    variationEl.classList.toggle("amount-expense", status.estimated_gain_loss < 0);
+    variationEl.classList.toggle("amount-income", status.estimated_gain_loss >= 0);
+    variationPctEl.textContent = status.estimated_gain_loss_pct === null || status.estimated_gain_loss_pct === undefined
+      ? ""
+      : `${(status.estimated_gain_loss_pct * 100).toLocaleString("pt-BR", { maximumFractionDigits: 4 })}%`;
+  }
+
+  const observedEl = document.querySelector("#privilege-valuation-observed");
+  const diffEl = document.querySelector("#privilege-valuation-diff");
+  if (status.observed_balance === null || status.observed_balance === undefined) {
+    observedEl.textContent = "--";
+    diffEl.textContent = "Sem saldo confirmado ainda.";
+  } else {
+    observedEl.textContent = money.format(status.observed_balance);
+    diffEl.textContent = status.reconciliation_diff === null || status.reconciliation_diff === undefined
+      ? `Confirmado em ${dateFormat.format(new Date(`${status.observed_balance_as_of}T00:00:00Z`))}`
+      : `Diferença para o saldo estimado: ${money.format(status.reconciliation_diff)}`;
+  }
+
+  document.querySelector("#privilege-valuation-freshness").textContent = status.quote_retrieved_at
+    ? `Cota obtida via ${status.quote_provider || "CVM"} em ${dateFormat.format(new Date(status.quote_retrieved_at))}`
+    : "Sem dados ainda.";
 }
 
 // October Go-Live Slice 6: reads noncanonical.patrimony/noncanonical.investments_total/

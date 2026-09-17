@@ -41,7 +41,7 @@ ZERO_OPERATING_EFFECTS = {
 
 
 def test_registry_contains_all_permanent_invariants_once() -> None:
-    assert FINANCIAL_RULES_VERSION == "2026.10.5"
+    assert FINANCIAL_RULES_VERSION == "2026.10.6"
     # October Go-Live Slice 3 (P0 #87): INV-029/INV-030 join the registry,
     # guarding the forecast against a received Commission or a reconciled
     # recurring income being counted twice. Round 2 of the PR #91 review adds
@@ -50,9 +50,12 @@ def test_registry_contains_all_permanent_invariants_once() -> None:
     # (docs/FINANCIAL_INVARIANTS.md). October Go-Live Slice 4 adds INV-032/
     # INV-033, guarding the Assistente Financeiro's audit/undo trail. October
     # Go-Live Slice 6 adds INV-034, guarding that an investment/asset's net
-    # worth contribution is exactly its current value.
-    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 35))
-    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 34
+    # worth contribution is exactly its current value. Issue #85 adds
+    # INV-035, guarding that a CVM-quota-derived fund valuation never
+    # contributes to income, expense, budget usage, operating result or net
+    # worth.
+    assert tuple(INVARIANT_REGISTRY) == tuple(f"INV-{number:03d}" for number in range(1, 36))
+    assert len({item.name for item in INVARIANT_REGISTRY.values()}) == 35
     assert all(item.required_facts for item in INVARIANT_REGISTRY.values())
 
 
@@ -154,6 +157,30 @@ def test_net_worth_uses_current_value_only_pass_and_fail() -> None:
         net_worth_contribution=Decimal("35000.00"),
     )
     assert no_projection.status is InvariantStatus.PASS
+
+
+def test_fund_valuation_is_not_cash_flow_pass_and_fail() -> None:
+    # Issue #85: a CVM-quota-derived fund valuation must never touch
+    # income, expense, budget usage, operating result or net worth.
+    valid = _evaluate("INV-035", **ZERO_OPERATING_EFFECTS, net_worth_effect=Decimal("0"))
+    assert valid.status is InvariantStatus.PASS
+    assert valid.difference == Decimal("0.00")
+
+    counted_as_income = _evaluate(
+        "INV-035",
+        **{**ZERO_OPERATING_EFFECTS, "operating_income_effect": Decimal("110.61")},
+        net_worth_effect=Decimal("0"),
+    )
+    assert counted_as_income.status is InvariantStatus.FAIL
+    assert counted_as_income.difference == Decimal("110.61")
+
+    leaked_into_net_worth = _evaluate(
+        "INV-035",
+        **ZERO_OPERATING_EFFECTS,
+        net_worth_effect=Decimal("40641.87"),
+    )
+    assert leaked_into_net_worth.status is InvariantStatus.FAIL
+    assert leaked_into_net_worth.difference == Decimal("40641.87")
 
 
 def test_application_is_patrimonial_movement() -> None:
