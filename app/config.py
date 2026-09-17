@@ -139,6 +139,20 @@ class Settings(BaseSettings):
     # one genuinely public endpoint in this project, not a financial control.
     whatsapp_rate_limit_max_per_window: int = 30
     whatsapp_rate_limit_window_seconds: int = 60
+    # WA-03 (docs/WORK_ORDER_WA_03.md, issue #75): outbound send credentials
+    # for the real Meta Cloud API provider (`app.services.whatsapp_gateway.
+    # MetaCloudApiProvider`) -- absent by default, same "ships idle until an
+    # operator opts in" contract as every other WhatsApp setting above.
+    # `whatsapp_access_token` is the permanent/system-user access token;
+    # `whatsapp_phone_number_id` is the Cloud API sender identity replies are
+    # sent from (`POST /{phone_number_id}/messages`). Never reused for
+    # inbound verification -- those stay `whatsapp_app_secret`/
+    # `whatsapp_verify_token` above, a distinct credential pair for a
+    # distinct direction.
+    whatsapp_access_token: str = ""
+    whatsapp_phone_number_id: str = ""
+    whatsapp_api_base_url: str = "https://graph.facebook.com/v21.0"
+    whatsapp_send_timeout_seconds: int = 10
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

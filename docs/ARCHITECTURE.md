@@ -1441,11 +1441,11 @@ vez, nunca cria `AccountBalanceObservation`/`Transaction`/`Investment`/`Investme
 
 ## Gateway WhatsApp — transporte e autorização (WA-01, issue #73)
 
-`docs/WORK_ORDER_WA_01.md`, `docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md`. Escopo deliberadamente
-restrito a transporte/autenticação: recebe e valida o webhook, deduplica, aplica rate limit e
-resolve o remetente autorizado -- **não interpreta nem age sobre o conteúdo da mensagem** (a
-Orquestração/Tool Layer descritas na ADR são WA-02+, fora deste PR). Nenhuma `Transaction`/
-`Obligation`/tabela financeira é criada, lida ou alterada por este componente.
+`docs/WORK_ORDER_WA_01.md`, `docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md`. Escopo original
+deliberadamente restrito a transporte/autenticação: recebe e valida o webhook, deduplica, aplica
+rate limit e resolve o remetente autorizado. WA-03 (issue #75, seção abaixo) conecta uma mensagem
+de texto autorizada ao Tool Layer existente; este módulo em si continua sem cálculo financeiro
+próprio -- toda mutação passa pelo mesmo `execute_typed_action` que o Assistente web já usa.
 
 - **Processo isolado, não uma rota do `app`**: `app/whatsapp_gateway_app.py` é uma segunda
   aplicação FastAPI própria, montada apenas com `/health` e `/webhooks/whatsapp` -- a única
@@ -1476,18 +1476,68 @@ Orquestração/Tool Layer descritas na ADR são WA-02+, fora deste PR). Nenhuma 
   higiene de dados. Desativar preserva a linha (nunca hard-delete); um número pode ser revinculado
   depois como uma nova linha.
 - **`whatsapp_inbound_events`**: recibo mínimo por mensagem (idempotência por
-  `provider_message_id`, `status` `accepted`/`unauthorized`/`rate_limited`) -- nunca guarda texto da
-  mensagem nem o número do remetente em qualquer forma recuperável. `household_id`/`user_id` só são
-  preenchidos quando o remetente é resolvido; toda resposta HTTP é idêntica
-  (`{"status": "ok"}`) independentemente do motivo interno, para nunca revelar se um número/household
-  existe.
+  `provider_message_id`). `status` começa em `accepted` (autorizado, não duplicado) e, desde WA-03,
+  é atualizado uma vez para o desfecho do Tool Layer: `processed`, `needs_clarification`,
+  `unsupported_content` (mensagem sem texto extraível -- não-`"text"`, ou `"text"` sem `text.body`)
+  ou `error` (falha inesperada, fail-closed). `trace_id` (migração `0025`) correlaciona esta linha
+  com o `AuditEvent.trace_id` da mesma rodada de orquestração/execução -- ainda nunca guarda texto
+  da mensagem nem o número do remetente em qualquer forma recuperável. `household_id`/`user_id` só
+  são preenchidos quando o remetente é resolvido; toda resposta HTTP é idêntica (`{"status": "ok"}`)
+  independentemente do motivo interno, para nunca revelar se um número/household existe.
 - **`whatsapp_rate_limit_buckets`**: limitador de janela fixa por `phone_hash`, incrementado sob
   `SELECT ... FOR UPDATE` (mesmo idioma de trava de linha de `assistant_actions.py`) -- não uma
   contagem de `whatsapp_inbound_events` em tempo real, para ganhar atomicidade sob concorrência.
 - **Adapter desacoplado**: `normalize_inbound_messages`/`build_outbound_text_message` traduzem o
-  formato da WhatsApp Cloud API de/para uma forma mínima interna; `WhatsAppProvider` (protocolo) +
-  `FakeWhatsAppProvider` (testes) seguem o mesmo papel de `advisor/providers/fakeProvider.mjs` --
-  nenhum provider real/credencial Meta é implementado neste PR (fora de escopo do Work Order).
+  formato da WhatsApp Cloud API de/para uma forma mínima interna (desde WA-03, inclui o corpo de uma
+  mensagem `"text"`, truncado); `WhatsAppProvider` (protocolo) + `FakeWhatsAppProvider` (testes) +
+  `MetaCloudApiProvider` (WA-03, envio real via Cloud API, `urllib` no mesmo idioma de
+  `codex_client.py`) seguem o mesmo papel de `advisor/providers/fakeProvider.mjs`.
+
+### Fluxo WRITE — drafts, confirmação e idempotência (WA-03, issue #75)
+
+`docs/WORK_ORDER_WA_03.md`. Conecta o número autorizado ao mesmo `plan_and_execute` (WA-02) que o
+Assistente web (`POST /assistant/ask`) já chama -- nenhum parser/motor financeiro paralelo para o
+WhatsApp, nenhuma escrita SQL/ORM vinda do LLM.
+
+- **Ponto de entrada**: `app.whatsapp_gateway_app._run_assistant_reply`, chamado só depois que a
+  mensagem foi autorizada, deduplicada e o rate limit passou. Resolve o `User` real
+  (`WhatsAppAuthorizedNumber.user_id`) e chama `plan_and_execute(db, user=user, message=texto,
+  trace_id=trace_id)` -- `household_id`/autorização vêm sempre de `user`, nunca de qualquer campo do
+  payload do webhook.
+- **Duas transações separadas, não uma savepoint em volta de tudo**: reivindicar a idempotência da
+  mensagem (`record_inbound_event` + `db.commit()`) e rodar a orquestração são etapas sequenciais,
+  não aninhadas em `db.begin_nested()` -- `plan_and_execute`/`execute_typed_action`/
+  `persist_action_proposal` já fazem seus próprios `commit()` internos (mesmo contrato de
+  `POST /assistant/ask`), o que uma savepoint em volta não suporta com segurança. A barreira de
+  idempotência por mensagem (`uq_whatsapp_inbound_events_message_id`) continua igualmente forte; ver
+  o docstring do módulo para a análise completa de por que isso é seguro.
+- **`cancel_typed_action`** (novo tool, `assistant_tool_catalog.py`): cancela uma proposta pendente
+  sem executar nada -- reaproveita exatamente o par `consumed_at`/`consumed_action_event_id IS NULL`
+  que `execute_typed_action` já trata como "usada", então uma confirmação tardia de uma proposta
+  cancelada cai no mesmo branch de erro existente, sem novo estado no schema.
+- **Correção de concorrência descoberta por este slice** (`app.services.assistant_actions`,
+  `execute_typed_action`/`cancel_action_proposal`): como `_find_pending_proposal` (sem lock) sempre
+  roda antes, na mesma sessão, do `SELECT ... FOR UPDATE` dessas duas funções, o mapa de identidade
+  do SQLAlchemy devolvia o objeto Python já em cache (com `consumed_at` desatualizado) mesmo depois
+  do lock -- duas confirmações WhatsApp concorrentes da mesma proposta podiam gerar duas
+  `Transaction`s. Corrigido com `.execution_options(populate_existing=True)` nas duas consultas
+  travadas; reproduzido e coberto por
+  `tests/test_postgresql_integration.py::test_whatsapp_webhook_concurrent_confirm_from_two_messages_serializes_to_one_mutation`.
+  O caminho web (`POST /assistant/execute`) nunca chamava `_find_pending_proposal` na mesma sessão,
+  por isso o bug só se manifestava a partir de um tool que já resolve o proposal antes de executá-lo
+  (todo o Tool Layer WA-02+, não só WhatsApp).
+- **A mesma classe de bug existia em `undo_assistant_action`** (revisão de engenharia do PR #105,
+  comentário MERGE BLOCKED): `_tool_undo_typed_action` chama `_find_undoable_action` (sem lock) na
+  mesma sessão logo antes de `undo_assistant_action`, exatamente o mesmo formato de pré-leitura que
+  causava o bug acima. `undo_assistant_action` agora também trava a linha do
+  `AssistantActionEvent` com `SELECT ... FOR UPDATE OF assistant_action_events` +
+  `.execution_options(populate_existing=True)` no PostgreSQL, mantida até o `db.commit()` final --
+  duas mensagens "desfaz" concorrentes sobre a mesma ação produzem exatamente uma reversão; a
+  perdedora observa `undone_at` já preenchido e falha fechado com "Esta ação já foi desfeita" em vez
+  de desfazer uma segunda vez. Reproduzido e coberto por
+  `tests/test_postgresql_integration.py::test_whatsapp_webhook_concurrent_undo_from_two_messages_reverses_exactly_once`
+  (falha sem a correção: duas `AuditEvent` de reversão e um `DELETE` sem linha correspondente na
+  segunda tentativa).
 
 ## Evolução
 

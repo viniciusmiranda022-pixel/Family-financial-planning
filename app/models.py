@@ -1886,11 +1886,28 @@ class WhatsAppInboundEvent(Base):
     branch of the webhook handler returns a different HTTP status or body
     depending on `status` here (`app/whatsapp_gateway_app.py`).
 
-    `status` is one of: `accepted` (authorized, deduplicated, no further
-    processing implemented in this slice), `unauthorized`, `rate_limited`.
-    A redelivered `provider_message_id` never gets a second row -- the
-    existing row's presence *is* the dedup check (unique index below) --
-    so `duplicate` is a webhook-response outcome, not a stored `status`.
+    `status` was originally one of: `accepted` (authorized, deduplicated, no
+    further processing in WA-01), `unauthorized`, `rate_limited`. WA-03
+    (`docs/WORK_ORDER_WA_03.md`, issue #75) adds a second, later update to
+    this same column once the Tool Layer has actually run for an `accepted`
+    message with extractable text: `processed`, `needs_clarification`,
+    `unsupported_content` (authorized, but nothing this slice can interpret
+    -- a non-text message, or a text message with no body) or `error`
+    (orchestration raised/the model was unavailable, fail-closed). A
+    message that never had extractable text is left at `accepted` --
+    identical to WA-01's original terminal state -- rather than invented a
+    new value for it, so every WA-01 fixture/assertion of `status ==
+    "accepted"` is still exactly true. A redelivered `provider_message_id`
+    never gets a second row -- the existing row's presence *is* the dedup
+    check (unique index below) -- so `duplicate` is a webhook-response
+    outcome, not a stored `status`.
+
+    `trace_id` (WA-03) correlates this receipt with the
+    `assistant.orchestrate`/`assistant.execute`/`assistant.cancel`
+    `AuditEvent.trace_id` the same message's Tool Layer run produced --
+    nullable and populated only alongside a status update past `accepted`,
+    never itself a place message content or PII is stored (Work Order item
+    9: "sem persistir PII ou webhook bruto desnecessariamente").
     """
 
     __tablename__ = "whatsapp_inbound_events"
@@ -1909,7 +1926,8 @@ class WhatsAppInboundEvent(Base):
     user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
-    status: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(24))
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )

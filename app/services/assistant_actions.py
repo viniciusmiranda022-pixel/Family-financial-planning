@@ -1266,7 +1266,35 @@ def execute_typed_action(
         AssistantActionProposalModel.household_id == user.household_id,
     )
     if db.get_bind().dialect.name == "postgresql":
-        proposal_query = proposal_query.with_for_update()
+        # `populate_existing()` is not optional here (engineering review,
+        # WA-03 issue #75): the WA-02 Tool Layer's own
+        # `app.services.assistant_tools._find_pending_proposal` already ran
+        # an unlocked `SELECT` for this exact row, in this exact session,
+        # immediately before this call (`confirm_typed_action`) -- so this
+        # row is already present in `db`'s identity map with `consumed_at`
+        # cached from that earlier, unlocked read. Without
+        # `populate_existing()`, SQLAlchemy's identity map returns that
+        # *same Python object* for a repeat `SELECT` of the same primary
+        # key and does not overwrite its already-loaded attributes with the
+        # new query's row -- even though the row itself was just
+        # `SELECT ... FOR UPDATE`-locked and re-fetched from PostgreSQL.
+        # Reproduced directly: two sessions, A reads a row (cached
+        # `flag=False`), B updates+commits it, A re-`SELECT ... FOR UPDATE`s
+        # the same row and still sees the stale cached `False` without this
+        # option. Concretely here: two concurrent WhatsApp confirmations of
+        # the same proposal would otherwise both observe
+        # `consumed_at is None` on their locked read -- the second
+        # unblocking only to see its own session's stale pre-lock cache,
+        # not the first's just-committed `consumed_at` -- and both dispatch,
+        # producing two `Transaction`s from one proposal
+        # (`tests/test_postgresql_integration.py::test_whatsapp_webhook_concurrent_confirm_from_two_messages_serializes_to_one_mutation`
+        # reproduces exactly this without the fix). A direct call into this
+        # function alone (`POST /assistant/execute`, or the concurrency test
+        # above it in this file) never loaded the proposal earlier in the
+        # same session, so it never observed this -- the bug only surfaces
+        # once a caller (uniformly: every WA-02+ Tool Layer tool) looks the
+        # proposal up once before calling this.
+        proposal_query = proposal_query.with_for_update().execution_options(populate_existing=True)
     proposal_row = db.scalar(proposal_query)
     if proposal_row is None:
         raise AssistantActionError("Proposta do Assistente não encontrada")
@@ -1406,6 +1434,78 @@ def execute_typed_action(
     }
 
 
+def cancel_action_proposal(db: Session, *, user: Any, proposal_id: str) -> dict[str, Any]:
+    """WA-03 (`docs/WORK_ORDER_WA_03.md`, issue #75): explicit cancellation
+    of a still-pending proposal -- "cancelamento não executa draft" plus
+    "auditoria completa de ... cancelamento" (Work Order items 6/9). Not a
+    new authority surface: cancelling never dispatches `TYPED_ACTIONS`, it
+    only marks the proposal consumed-without-execution, the same
+    `consumed_at`/`consumed_action_event_id IS NULL` combination
+    `execute_typed_action`'s idempotent-replay branch already treats as
+    "already used" -- so a stale "confirmar" arriving after a cancel takes
+    that existing branch and raises the existing "Esta proposta já foi
+    utilizada" message rather than a new one, no dispatcher change needed.
+
+    Concurrency mirrors `execute_typed_action` exactly: `SELECT ... FOR
+    UPDATE` on PostgreSQL, held through the single `db.commit()` below, so a
+    confirm and a cancel racing on the same `proposal_id` can never both
+    succeed -- whichever gets the lock first commits `consumed_at`, the
+    second sees it already set and fails closed instead of double-acting on
+    one proposal (`AssistantActionError`, treated as an idempotent no-op by
+    callers, never a second write).
+
+    Never used for an already-executed proposal: a proposal is either
+    confirmed (a financial fact now exists) or cancelled (it never will) --
+    the two are mutually exclusive by construction, since both take the
+    same lock and check the same `consumed_at IS NULL` guard.
+    """
+
+    from app.models import AssistantActionProposal as AssistantActionProposalModel
+    from app.models import AuditEvent as AuditEventModel
+
+    proposal_query = select(AssistantActionProposalModel).where(
+        AssistantActionProposalModel.id == proposal_id,
+        AssistantActionProposalModel.household_id == user.household_id,
+    )
+    if db.get_bind().dialect.name == "postgresql":
+        # `populate_existing()`: same identity-map staleness fix as
+        # `execute_typed_action` above, and for the identical reason --
+        # `app.services.assistant_tools._find_pending_proposal` already ran
+        # an unlocked `SELECT` for this row, in this same session,
+        # immediately before this call (`cancel_typed_action`).
+        proposal_query = proposal_query.with_for_update().execution_options(populate_existing=True)
+    proposal_row = db.scalar(proposal_query)
+    if proposal_row is None:
+        raise AssistantActionError("Proposta do Assistente não encontrada")
+    if proposal_row.consumed_at is not None:
+        raise AssistantActionError("Esta proposta já foi utilizada ou cancelada")
+
+    try:
+        audit_event_row = AuditEventModel(
+            household_id=user.household_id,
+            user_id=user.id,
+            event_type="assistant.cancel",
+            entity_type=None,
+            entity_id=None,
+            details=json.dumps(
+                {"typed_action": proposal_row.typed_action, "proposal_id": proposal_row.id},
+                ensure_ascii=False,
+            ),
+            trace_id=proposal_row.trace_id,
+            source="assistant",
+        )
+        db.add(audit_event_row)
+        db.flush()
+        proposal_row.consumed_at = datetime.now(UTC)
+        proposal_row.consumed_action_event_id = None
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return {"cancelled": True, "typed_action": proposal_row.typed_action}
+
+
 def _undo_capability(typed_action: str) -> tuple[bool, str | None]:
     if typed_action == "pay_card_invoice":
         return False, (
@@ -1418,15 +1518,43 @@ def _undo_capability(typed_action: str) -> tuple[bool, str | None]:
 def undo_assistant_action(
     db: Session, *, user: Any, action_id: str, reason: str
 ) -> dict[str, Any]:
+    """Reverse the one typed action `action_id` names.
+
+    Concurrency (engineering review of PR #105, MERGE BLOCKED comment): same
+    contract as `execute_typed_action`/`cancel_action_proposal` above --
+    `SELECT ... FOR UPDATE` on PostgreSQL, held through the reversal's own
+    domain write and the final `db.commit()` below, so two concurrent undo
+    attempts on the same `action_id` (e.g. two WhatsApp "desfaz" messages
+    arriving together) can never both observe `undone_at IS NULL`: the
+    second blocks on the lock until the first commits or rolls back, then
+    its own locked read sees `undone_at` already set and fails closed with
+    "Esta ação já foi desfeita" instead of reversing a second time.
+
+    `populate_existing()` is required for the identical reason documented
+    on `execute_typed_action`'s locking `SELECT`: every caller here
+    (`app.services.assistant_tools._tool_undo_typed_action`) already ran an
+    unlocked `_find_undoable_action` `SELECT` for this exact row, in this
+    exact session, immediately before calling this function. Without
+    `populate_existing()`, SQLAlchemy's identity map would hand back that
+    same, pre-lock Python object -- with `undone_at` still cached as
+    `None` -- even after this `SELECT ... FOR UPDATE` re-fetches the row
+    from PostgreSQL and finds it already undone by the concurrent winner.
+    """
+
     import app.api as api
     import app.schemas as schemas
     from app.models import AssistantActionEvent, AuditEvent
 
-    action_event = db.scalar(
+    action_query = (
         select(AssistantActionEvent)
         .join(AuditEvent, AuditEvent.id == AssistantActionEvent.audit_event_id)
         .where(AssistantActionEvent.id == action_id, AuditEvent.household_id == user.household_id)
     )
+    if db.get_bind().dialect.name == "postgresql":
+        action_query = action_query.with_for_update(of=AssistantActionEvent).execution_options(
+            populate_existing=True
+        )
+    action_event = db.scalar(action_query)
     if action_event is None:
         raise AssistantActionError("Ação do Assistente não encontrada")
     if action_event.undone_at is not None:

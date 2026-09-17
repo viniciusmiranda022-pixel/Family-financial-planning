@@ -630,6 +630,7 @@ EXPECTED_WHATSAPP_INBOUND_EVENT_COLUMNS = {
     "user_id",
     "status",
     "received_at",
+    "trace_id",
 }
 
 EXPECTED_WHATSAPP_RATE_LIMIT_BUCKET_COLUMNS = {
@@ -1493,7 +1494,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0024"
+        ).scalar_one() == "0025"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -1519,6 +1520,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0024"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0025"
     engine.dispose()
     get_settings.cache_clear()

@@ -42,6 +42,7 @@ from sqlalchemy.orm import Session
 from app.services.assistant_actions import (
     AssistantActionError,
     build_typed_action_proposal,
+    cancel_action_proposal,
     execute_typed_action,
     persist_action_proposal,
     undo_assistant_action,
@@ -419,6 +420,27 @@ def _tool_confirm_typed_action(db: Session, *, user: Any, arguments: dict[str, s
     return ToolOutcome(ok=True, facts={"executed": True, "action": result.get("action")})
 
 
+def _tool_cancel_typed_action(db: Session, *, user: Any, arguments: dict[str, str]) -> ToolOutcome:
+    proposal = _find_pending_proposal(
+        db,
+        household_id=user.household_id,
+        user_id=user.id,
+        reference_text=arguments.get("reference_text"),
+    )
+    if proposal is None:
+        return ToolOutcome(
+            ok=True,
+            clarifying_question=(
+                "Não encontrei nenhuma proposta pendente para cancelar. Já foi confirmada ou expirou?"
+            ),
+        )
+    try:
+        cancel_action_proposal(db, user=user, proposal_id=proposal.id)
+    except AssistantActionError as exc:
+        return ToolOutcome(ok=True, clarifying_question=str(exc))
+    return ToolOutcome(ok=True, facts={"cancelled": True})
+
+
 def _find_undoable_action(
     db: Session, *, household_id: str, user_id: str, reference_text: str | None
 ) -> Any | None:
@@ -530,4 +552,6 @@ def run_tool(
         return _tool_confirm_typed_action(db, user=user, arguments=clean_arguments)
     if tool == "undo_typed_action":
         return _tool_undo_typed_action(db, user=user, arguments=clean_arguments)
+    if tool == "cancel_typed_action":
+        return _tool_cancel_typed_action(db, user=user, arguments=clean_arguments)
     return ToolOutcome(ok=False)  # pragma: no cover - unreachable, ALLOWED_TOOLS already checked above
