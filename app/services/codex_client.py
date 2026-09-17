@@ -117,3 +117,17 @@ class CodexAdvisorClient:
         """
 
         return self._request("/v1/interpret", payload)
+
+    def plan(self, payload: dict) -> CodexResult:
+        """Call the dedicated `/v1/plan` contract (WA-02, issue #74,
+        `docs/WORK_ORDER_WA_02.md`): natural-language -> an ordered list of
+        generic tool calls (`{schema_version, needs_clarification,
+        clarifying_question, steps: [{tool, arguments}]}`). Same
+        authority-free structural boundary as `/v1/interpret` -- the model
+        never returns an id, amount or SQL, only a tool name from a closed
+        vocabulary plus free-text arguments; see
+        `app.services.assistant_orchestrator` for the Python-side allowlist
+        re-validation and deterministic execution of the plan this returns.
+        """
+
+        return self._request("/v1/plan", payload)

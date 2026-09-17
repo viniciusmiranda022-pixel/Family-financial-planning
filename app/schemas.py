@@ -178,6 +178,22 @@ class AssistantUndoRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 
 
+class AssistantAskRequest(BaseModel):
+    """`POST /assistant/ask` -- WA-02 (`docs/WORK_ORDER_WA_02.md`, issue
+    #74) Tool Layer entry point: a free-text question or request that may
+    require composing multiple generic tools (queries, comparisons,
+    projections) or drafting/confirming/undoing a typed action, without a
+    closed phrase catalog. `trace_id` is optional, same convention as
+    `AssistantInterpretRequest`. This endpoint never accepts a tool name,
+    typed action or payload directly from the client -- only the message
+    and its own recent history; `app.services.assistant_orchestrator`
+    plans and resolves everything server-side."""
+
+    message: str = Field(min_length=1, max_length=1000)
+    history: list[AdvisorHistoryItem] = Field(default_factory=list, max_length=8)
+    trace_id: str | None = Field(default=None, max_length=64)
+
+
 class EntryTypeTemplateDeactivateRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 
