@@ -297,6 +297,7 @@ from app.services.notification_settings import (
     update_notification_settings,
 )
 from app.services.notification_templates import render_test_email
+from app.services.notification_worker_status import delivery_status_counts, heartbeat_snapshot
 from app.services.projection_engine import PROJECTION_CALCULATION_VERSION, projection_liquidity_facts
 from app.services.projection_validator import PROJECTION_TOLERANCE, validate_projection
 from app.services.reconciliation import (
@@ -12049,6 +12050,30 @@ def notification_settings_test_email(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=email_error_message(result.error_code)
         )
     return {"ok": True}
+
+
+# MAIL-03 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #70): the Work
+# Order's "Observabilidade" checklist -- envio desabilitado/sender não
+# configurado/mensagem pendente/enviada/falhou/última execução do worker/
+# último erro sanitizado -- as one read-only, household-scoped-where-it-
+# matters endpoint. Any authenticated household member can read it (same
+# boundary as `GET /notification-settings`): nothing here is a secret, a
+# recipient e-mail address, or a write. `sender_configured`/`worker` are
+# process-wide (one worker serves every household), `enabled` and
+# `deliveries` are this household's own state.
+@router.get("/notification-settings/status")
+def notification_settings_status(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    settings_row = get_or_create_notification_settings(db, household_id=user.household_id)
+    db.commit()
+    return {
+        "enabled": settings_row.enabled,
+        "sender_configured": SmtpEmailAdapter().configured,
+        "worker": heartbeat_snapshot(db),
+        "deliveries": delivery_status_counts(db, household_id=user.household_id),
+    }
 
 
 # FAMILY_FINANCE_CURRENT_CONFIRMED_LIQUIDITY_V16_1

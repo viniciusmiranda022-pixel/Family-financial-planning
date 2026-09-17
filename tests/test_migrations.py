@@ -523,6 +523,20 @@ EXPECTED_NOTIFICATION_DELIVERY_COLUMNS = {
     "updated_at",
 }
 
+EXPECTED_0022_TABLES = {"notification_worker_heartbeats"}
+
+EXPECTED_NOTIFICATION_WORKER_HEARTBEAT_COLUMNS = {
+    "id",
+    "worker_id",
+    "started_at",
+    "finished_at",
+    "ok",
+    "counts",
+    "last_error_code",
+    "created_at",
+    "updated_at",
+}
+
 
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
@@ -580,6 +594,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0019_TABLES,
             *EXPECTED_0020_TABLES,
             *EXPECTED_0021_TABLES,
+            *EXPECTED_0022_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -594,6 +609,9 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_notification_deliveries_household_id",
         "ix_notification_deliveries_status_next_attempt",
     }
+    assert {column["name"] for column in inspector.get_columns("notification_worker_heartbeats")} == (
+        EXPECTED_NOTIFICATION_WORKER_HEARTBEAT_COLUMNS
+    )
     assert {column["name"] for column in inspector.get_columns("integrity_runs")} == (
         EXPECTED_INTEGRITY_RUN_COLUMNS
     )
@@ -1150,7 +1168,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0021"
+        ).scalar_one() == "0022"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -1176,6 +1194,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0021"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0022"
     engine.dispose()
     get_settings.cache_clear()

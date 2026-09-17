@@ -1232,7 +1232,7 @@ D-1/D0 automaticamente é a seção "MAIL-02" logo abaixo.
 `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #69. Terceiro dos quatro slices: fecha o ciclo --
 D-1/D0 agora são de fato descobertos, enviados e reconciliados sem depender de nenhuma requisição
 HTTP nem do navegador aberto. Wiring do worker num serviço Docker/Compose/OCI dedicado, health
-check e runbook do Gmail continuam para o MAIL-03.
+check e runbook do Gmail são a seção MAIL-03 logo abaixo.
 
 - **`notification_deliveries`** (migração `0021`, `app.models.NotificationDelivery`): outbox/trilha
   de entrega, uma linha por evento lógico `(household_id, obligation_id, recipient_id,
@@ -1272,6 +1272,55 @@ check e runbook do Gmail continuam para o MAIL-03.
   (`source="notification_worker"`, `user_id=None` -- processo de sistema, não um household member)
   com `entity_type="notification_delivery"` e `details` contendo só ids/`alert_kind`/código de erro
   sanitizado, nunca o endereço de e-mail do destinatário nem texto bruto de SMTP.
+
+## Alertas de vencimento por e-mail — MAIL-03 (integração operacional e observabilidade)
+
+`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #70. Último dos quatro slices: fecha o "worker
+existe em código" do MAIL-02 com "worker roda sozinho em produção e um operador consegue ver se ele
+está saudável", sem tocar em nenhuma regra de elegibilidade/retry/D-1/D0 (essas continuam
+exclusivamente em `app.services.notification_scheduler`).
+
+- **`notification-worker` (`compose.yaml`)**: serviço dedicado, reusando a imagem/`Dockerfile` de
+  `app` com `command: ["worker"]` -- `scripts/entrypoint.sh` ramifica nesse argumento para
+  `exec python -m app.cli.notification_worker` (loop contínuo, nunca `--once`) em vez de
+  `alembic upgrade head` + `uvicorn`. `depends_on: app: condition: service_healthy` garante que a
+  migration (incluindo `0022`) já rodou antes deste serviço iniciar -- ele nunca roda `alembic`
+  por conta própria. `restart: unless-stopped` mais o estado inteiramente em
+  `notification_deliveries`/Postgres (nunca em memória do processo) é o que torna reinício/reboot
+  seguro sem depender do navegador aberto. Endurecimento: `read_only`, `tmpfs` só em `/tmp`,
+  `cap_drop: [ALL]` (mais restrito que `app`, que precisa bindar uma porta; este processo não
+  precisa de nenhuma capability), `no-new-privileges`; sem `ports:` e sem o volume
+  `document_data`. Redes `internal` (Postgres) + `lan` (egress SMTP para o Gmail), espelhando
+  `app`.
+- **`notification_worker_heartbeats`** (migração `0022`, `app.models.NotificationWorkerHeartbeat`):
+  linha única (chave primária fixa, não `new_id()` -- a própria unicidade da PK é a barreira contra
+  duas primeiras execuções concorrentes criarem duas linhas, não apenas disciplina de aplicação)
+  atualizada a cada passada de `run_once`: `started_at` no início, `finished_at`/`ok`/`counts`/
+  `last_error_code` no fim -- inclusive quando a passada lança uma exceção não tratada (`ok=False`,
+  `last_error_code="worker_pass_exception"`), via `try/finally` em `run_once`. Nunca acumula
+  histórico (isso já existe em `notification_deliveries`/`AuditEvent`); é sobrescrita a cada
+  passada de propósito. Nunca listada em `FINANCIAL_REVISION_MODELS`: registro operacional sobre um
+  processo, não fato financeiro.
+- **`app.services.notification_worker_status`**: único leitor/escritor do heartbeat
+  (`mark_run_started`/`mark_run_finished`/`heartbeat_snapshot`) e das contagens de entrega por
+  household (`delivery_status_counts`, agrupando `notification_deliveries.status` por
+  `household_id`).
+- **`GET /notification-settings/status`** (`app.api`): qualquer membro autenticado do household lê
+  (mesma fronteira de `GET /notification-settings`) -- nada na resposta é segredo ou endereço de
+  destinatário. Combina `enabled`/`sender_configured` (`SmtpEmailAdapter().configured`, já existente
+  desde MAIL-01) + `worker` (o heartbeat, `null` se nenhuma passada terminou ainda) + `deliveries`
+  (contagens `pending`/`sending`/`sent`/`failed`/`canceled` só deste household) -- exatamente o
+  checklist "Observabilidade" do Work Order.
+- **`app/cli/notification_worker_healthcheck.py`**: o `HEALTHCHECK` Docker do serviço
+  `notification-worker` (sem porta HTTP para sondar, ao contrário de `app`). Lê o mesmo heartbeat e
+  reporta `ok`/`stale`/`never_run` com uma janela de frescor de `NOTIFICATION_WORKER_POLL_SECONDS *
+  3` (mínimo 5 minutos) -- nunca imprime endereço, id de entrega ou segredo, só a palavra de status
+  sanitizada.
+- **`docs/RUNBOOK_MAIL_ALERTS.md`**: configuração segura do Gmail (App Password, nunca a senha da
+  conta), como subir/verificar o worker, troubleshooting por código sanitizado, comportamento de
+  catch-up após reboot, nota de compatibilidade OCI/ARM64 (mesma imagem/dependências já validadas
+  no backlog Oracle/OCI, nenhuma nova) e rollback (nunca destrutivo para
+  `notification_deliveries`/pagamentos/obrigações).
 
 ## Evolução
 
