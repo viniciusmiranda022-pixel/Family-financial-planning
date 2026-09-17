@@ -1154,9 +1154,9 @@ assinado por `itsdangerous`) sem criar um provedor de identidade paralelo:
 ## Alertas de vencimento por e-mail — MAIL-00 (migração `0020`)
 
 `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #67. Primeiro de quatro slices (MAIL-00..03,
-epic #66); este cobre apenas modelo, configuração e contratos -- nenhum scheduler roda ainda
-(MAIL-02) e nenhum e-mail é enviado de fato (MAIL-01 é quem passa a poder enviar, ver seção
-seguinte, mas ainda sem worker automático).
+epic #66); este cobre apenas modelo, configuração e contratos -- o transporte SMTP real é a seção
+MAIL-01 logo abaixo, e o scheduler/worker que efetivamente envia D-1/D0 é a seção MAIL-02 mais
+adiante.
 
 - **`NotificationSettings` (um por household).** `enabled` (default `False`, opt-in explícito),
   `send_time_local` (`"HH:MM"`, default `"08:00"`) e `timezone` (default `"America/Sao_Paulo"`,
@@ -1192,8 +1192,8 @@ seguinte, mas ainda sem worker automático).
 ## Alertas de vencimento por e-mail — MAIL-01 (adapter SMTP e templates)
 
 `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #68. Segundo dos quatro slices: dá ao MAIL-00 um
-transporte real e um endpoint administrativo de teste, mas ainda sem outbox/scheduler (MAIL-02) --
-D-1/D0 continuam sem ser enviados automaticamente.
+transporte real e um endpoint administrativo de teste; o outbox/scheduler que efetivamente envia
+D-1/D0 automaticamente é a seção "MAIL-02" logo abaixo.
 
 - **`app.services.notification_templates`** renderiza HTML + texto puro a partir de primitivos
   (`obligation_name`/`amount`/`due_date`/`alert_kind`/`category` para `render_due_date_alert`; nada
@@ -1226,6 +1226,52 @@ D-1/D0 continuam sem ser enviados automaticamente.
   via toast em caso de falha.
 - **Segredo**: `ALERT_SMTP_APP_PASSWORD` só existe em `.env`/segredo do orquestrador (ver
   `docs/SECURITY.md#alertas-de-e-mail--smtp-e-gmail-mail-01`); `.env.example` só tem placeholders.
+
+## Alertas de vencimento por e-mail — MAIL-02 (outbox, scheduler, idempotência e retry)
+
+`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #69. Terceiro dos quatro slices: fecha o ciclo --
+D-1/D0 agora são de fato descobertos, enviados e reconciliados sem depender de nenhuma requisição
+HTTP nem do navegador aberto. Wiring do worker num serviço Docker/Compose/OCI dedicado, health
+check e runbook do Gmail continuam para o MAIL-03.
+
+- **`notification_deliveries`** (migração `0021`, `app.models.NotificationDelivery`): outbox/trilha
+  de entrega, uma linha por evento lógico `(household_id, obligation_id, recipient_id,
+  obligation_due_date, alert_kind)` -- `uq_notification_delivery_event` é a barreira final contra
+  duas entregas bem-sucedidas para o mesmo evento. Nunca é lida por
+  `financial_snapshots._collect()` nem listada em `FINANCIAL_REVISION_MODELS`: é estado
+  operacional, não fato financeiro. `status` percorre `pending -> sending -> sent | failed |
+  canceled`, com `canceled` como quarto estado terminal (obrigação paga/inativa, ou destinatário
+  que deixou de ser elegível, entre a descoberta e o envio).
+- **`app.services.notification_scheduler`** é o único lugar que decide elegibilidade D-1/D0 e
+  manipula o outbox: `discover_due_deliveries` (cria linhas `pending` por household habilitado, uma
+  vez que `send_time_local` já passou no fuso configurado -- isso é o que faz o catch-up após
+  reinício funcionar de graça, sem estado extra), `claim_delivery`/`finalize_sent`/
+  `finalize_canceled`/`finalize_retry_or_fail`/`fail_exhausted_stale_deliveries` (todos com o mesmo
+  desenho de compare-and-swap `UPDATE ... WHERE status = :observado AND attempt_count =
+  :observado` que `app.services.capture_worker.claim_capture_job`/`finalize_capture_job` já usa --
+  ver o docstring do módulo). `local_today`/`local_now` usam `zoneinfo.ZoneInfo`, não uma tabela de
+  offsets fixos: a dependência `tzdata` (PyPI, pura em Python) foi adicionada a `pyproject.toml`
+  especificamente para isso, porque a imagem base `python:3.12-slim` não garante o pacote de SO
+  `tzdata` que `zoneinfo` precisaria para resolver os fusos da whitelist de
+  `app.services.notification_settings`.
+- **`app.cli.notification_worker`** (`python -m app.cli.notification_worker [--once]
+  [--poll-seconds N]`) orquestra descoberta + claim + revalidação + render
+  (`notification_templates.render_due_date_alert`) + envio
+  (`email_delivery.SmtpEmailAdapter`) + finalização em uma função só,
+  `run_once`, testável sem `smtplib` real (`tests/test_notification_worker.py` usa um adapter falso
+  em memória). Revalida `Obligation`/`NotificationRecipient` direto do banco imediatamente antes de
+  enviar -- nunca confia no estado observado na descoberta -- e cancela (nunca envia, nunca mexe na
+  obrigação/pagamento) se a conta já foi paga/desativada ou o destinatário deixou de valer para
+  aquele tipo de alerta.
+- **Retry**: erro permanente (`not_configured`/`smtp_auth_failed`/`smtp_recipient_refused`) falha
+  imediatamente, sem reentrar em loop; erro transitório
+  (`smtp_timeout`/`smtp_connection_failed`/`smtp_send_failed`) tenta de novo com backoff exponencial
+  (`notification_delivery_retry_backoff_seconds * 2 ** (tentativa - 1)`) até
+  `notification_delivery_max_attempts` (padrão 3), depois vira `failed` também.
+- **Auditoria**: cada `sent`/`canceled`/`failed`/retry agendado grava um `AuditEvent`
+  (`source="notification_worker"`, `user_id=None` -- processo de sistema, não um household member)
+  com `entity_type="notification_delivery"` e `details` contendo só ids/`alert_kind`/código de erro
+  sanitizado, nunca o endereço de e-mail do destinatário nem texto bruto de SMTP.
 
 ## Evolução
 

@@ -110,8 +110,8 @@ do repositório em `%LOCALAPPDATA%\FamilyFinancialPlanning\codex`.
 ## Alertas de e-mail — SMTP e Gmail (MAIL-01)
 
 `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #68. Cobre apenas o adapter de envio e o
-`POST /notification-settings/test-email` administrativo; não há scheduler nem envio automático de
-D-1/D0 ainda (MAIL-02).
+`POST /notification-settings/test-email` administrativo; o scheduler/worker que efetivamente envia
+D-1/D0 automaticamente é a seção "Alertas de e-mail — outbox e worker (MAIL-02)" logo abaixo.
 
 - a credencial SMTP (`ALERT_SMTP_USERNAME`/`ALERT_SMTP_APP_PASSWORD`) só existe em variável de
   ambiente (`.env`/segredo do orquestrador) -- nunca no banco, nunca na UI, nunca em resposta de API;
@@ -145,6 +145,27 @@ D-1/D0 ainda (MAIL-02).
 | `test-email` responde `502` com "Falha de autenticação" | usuário/App Password do Gmail incorretos ou revogados | gerar uma nova App Password |
 | `test-email` responde `502` com "Não foi possível conectar" | host/porta incorretos ou rede sem saída para `smtp.gmail.com:587` | validar `ALERT_SMTP_HOST`/`ALERT_SMTP_PORT` e a rede do contêiner |
 | `test-email` responde `429` | mais de uma chamada dentro de `ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS` | aguardar o intervalo configurado |
+
+## Alertas de e-mail — outbox e worker (MAIL-02)
+
+`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #69. Cobre o envio automático de D-1/D0 em si
+(`app.services.notification_scheduler`, `app.cli.notification_worker`).
+
+- a credencial SMTP continua exclusivamente em variável de ambiente (nada muda aqui em relação ao
+  MAIL-01) -- o worker reusa o mesmo `SmtpEmailAdapter`, nunca lê/grava a credencial em
+  `notification_deliveries`;
+- `AuditEvent` gravado pelo worker (`source="notification_worker"`) tem `user_id=None` (processo de
+  sistema) e `details` restrito a ids/`alert_kind`/código de erro sanitizado -- nunca o endereço de
+  e-mail do destinatário, nunca o corpo do e-mail, nunca texto bruto de exceção SMTP;
+- descoberta, claim e finalização são sempre filtradas por `household_id`; nenhuma consulta do
+  worker lê ou grava `Obligation`/`NotificationRecipient`/`NotificationDelivery` de outro household
+  (`tests/test_notification_worker.py::test_household_isolation_worker_processes_each_household_independently`);
+- o worker nunca cria `Transaction`, nunca marca `Obligation` como paga, nunca altera valor/
+  vencimento -- ele só observa esse estado para decidir enviar/cancelar
+  (`tests/test_notification_worker.py::test_obligation_paid_between_discovery_and_send_is_canceled_not_sent`);
+- CI/testes automatizados (`tests/test_notification_scheduler.py`,
+  `tests/test_notification_worker.py`) sempre substituem o adapter por um dublê em memória -- nenhum
+  job de CI autentica no Gmail real, igual ao MAIL-01.
 
 ## CI (PR 8)
 
