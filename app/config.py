@@ -99,6 +99,46 @@ class Settings(BaseSettings):
     cvm_quota_base_url: str = "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS"
     cvm_quota_timeout_seconds: int = 60
     cvm_valuation_worker_poll_seconds: int = 21600
+    # WA-01 (docs/WORK_ORDER_WA_01.md, issue #73): the WhatsApp webhook
+    # gateway ships **disabled by default** -- unlike `advisor_enabled`, this
+    # is a new public-facing surface (`docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md`
+    # §4.2), so an operator opts in deliberately once real Meta credentials
+    # exist, exactly like `cvm_valuation_enabled`'s "ships effectively idle"
+    # rollout control above. No field here has a mandatory (no-default)
+    # value the way `mfa_encryption_key` does, precisely because this
+    # feature must never break an existing deployment's startup that has
+    # not configured WhatsApp at all -- `app/services/whatsapp_gateway.py`
+    # fails closed (raises `WhatsAppConfigurationError`) the first time an
+    # unconfigured key is actually *used* (hashing/encrypting a phone
+    # number, or verifying a webhook signature), the same "fail explicitly,
+    # never fall back to plaintext/unsigned" contract as
+    # `app.services.mfa._cipher`, just checked at use-time instead of at
+    # process startup since the feature is opt-in.
+    whatsapp_gateway_enabled: bool = False
+    # Meta app secret used to verify `X-Hub-Signature-256` (HMAC-SHA256 over
+    # the raw request body) on every inbound webhook POST -- never the same
+    # value as `whatsapp_verify_token` below (different purpose: this one
+    # authenticates the sender of every event; the token below only proves
+    # ownership during the one-time GET subscription handshake).
+    whatsapp_app_secret: str = ""
+    # The `hub.verify_token` Meta's dashboard sends back during the webhook
+    # subscription GET handshake -- compared to what the operator configured
+    # in Meta's App Dashboard when registering the callback URL.
+    whatsapp_verify_token: str = ""
+    # Fernet key exclusive to encrypting a linked phone number at rest for
+    # admin display (`app.services.whatsapp_gateway.encrypt_phone`) *and*,
+    # reusing the same "Key separation" + HMAC idiom as
+    # `app.services.mfa.hash_recovery_code`, as the HMAC key that derives
+    # the deterministic `phone_hash` used to look up an inbound sender
+    # without ever storing or logging the number in the clear. Never
+    # `SECRET_KEY`/`FILE_ENCRYPTION_KEY`/`MFA_ENCRYPTION_KEY`.
+    whatsapp_phone_encryption_key: str = ""
+    # Fixed-window rate limit applied per sender (`phone_hash`), enforced by
+    # `app.services.whatsapp_gateway.check_rate_limit` via an atomically
+    # locked `WhatsAppRateLimitBucket` row -- abuse/flood protection for the
+    # one genuinely public endpoint in this project, not a financial control.
+    whatsapp_rate_limit_max_per_window: int = 30
+    whatsapp_rate_limit_window_seconds: int = 60
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

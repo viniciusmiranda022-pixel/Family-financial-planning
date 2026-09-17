@@ -371,6 +371,18 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
         ),
         ("user deactivate", "delete", "/api/users/missing", {}),
         (
+            "whatsapp authorized number create",
+            "post",
+            "/api/whatsapp/authorized-numbers",
+            {"json": {"user_id": "missing-user-id", "phone_number": "+5511999998888"}},
+        ),
+        (
+            "whatsapp authorized number deactivate",
+            "delete",
+            "/api/whatsapp/authorized-numbers/missing",
+            {},
+        ),
+        (
             "account create",
             "post",
             "/api/accounts",

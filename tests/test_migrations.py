@@ -601,6 +601,46 @@ EXPECTED_FUND_VALUATION_COLUMNS = {
 }
 
 
+EXPECTED_0024_TABLES = {
+    "whatsapp_authorized_numbers",
+    "whatsapp_inbound_events",
+    "whatsapp_rate_limit_buckets",
+}
+
+EXPECTED_WHATSAPP_AUTHORIZED_NUMBER_COLUMNS = {
+    "id",
+    "household_id",
+    "user_id",
+    "phone_hash",
+    "phone_encrypted",
+    "phone_last4",
+    "active",
+    "created_by",
+    "deactivated_at",
+    "deactivated_by",
+    "created_at",
+    "updated_at",
+}
+
+EXPECTED_WHATSAPP_INBOUND_EVENT_COLUMNS = {
+    "id",
+    "provider_message_id",
+    "sender_phone_hash",
+    "household_id",
+    "user_id",
+    "status",
+    "received_at",
+}
+
+EXPECTED_WHATSAPP_RATE_LIMIT_BUCKET_COLUMNS = {
+    "id",
+    "bucket_key",
+    "window_start",
+    "count",
+    "updated_at",
+}
+
+
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("SECRET_KEY", "migration-test-secret-that-is-long-enough")
@@ -659,6 +699,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0021_TABLES,
             *EXPECTED_0022_TABLES,
             *EXPECTED_0023_TABLES,
+            *EXPECTED_0024_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -700,6 +741,27 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_fund_valuations_trace_id",
         "ix_fund_valuations_household_fund_date",
     }
+    assert {column["name"] for column in inspector.get_columns("whatsapp_authorized_numbers")} == (
+        EXPECTED_WHATSAPP_AUTHORIZED_NUMBER_COLUMNS
+    )
+    assert {index["name"] for index in inspector.get_indexes("whatsapp_authorized_numbers")} == {
+        "ix_whatsapp_authorized_numbers_household_id",
+        "ix_whatsapp_authorized_numbers_user_id",
+        "ix_whatsapp_authorized_numbers_phone_hash",
+        "uq_whatsapp_authorized_numbers_active_user",
+        "uq_whatsapp_authorized_numbers_active_phone_hash",
+    }
+    assert {column["name"] for column in inspector.get_columns("whatsapp_inbound_events")} == (
+        EXPECTED_WHATSAPP_INBOUND_EVENT_COLUMNS
+    )
+    assert {index["name"] for index in inspector.get_indexes("whatsapp_inbound_events")} == {
+        "ix_whatsapp_inbound_events_sender_phone_hash",
+        "ix_whatsapp_inbound_events_household_id",
+        "ix_whatsapp_inbound_events_received_at",
+    }
+    assert {column["name"] for column in inspector.get_columns("whatsapp_rate_limit_buckets")} == (
+        EXPECTED_WHATSAPP_RATE_LIMIT_BUCKET_COLUMNS
+    )
     assert {column["name"] for column in inspector.get_columns("integrity_runs")} == (
         EXPECTED_INTEGRITY_RUN_COLUMNS
     )
@@ -1282,6 +1344,72 @@ def test_downgrade_from_0020_refuses_to_discard_notification_recipients(monkeypa
     get_settings.cache_clear()
 
 
+def test_downgrade_from_0024_refuses_to_discard_whatsapp_authorized_numbers(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #73: `whatsapp_authorized_numbers` is the only record of which
+    admin authorized which household member's WhatsApp number -- not
+    reconstructible from anything else. Same guarded-downgrade pattern as
+    0015/0016/0019/0020/0023. `whatsapp_inbound_events`/
+    `whatsapp_rate_limit_buckets` are unguarded operational telemetry, same
+    treatment as `notification_worker_heartbeats` (0022)."""
+
+    from sqlalchemy.orm import sessionmaker
+
+    database_url = f"sqlite:///{tmp_path / 'migrations-whatsapp-guard.sqlite'}"
+    config = _alembic_config(monkeypatch, database_url)
+
+    from app.models import Household, User, WhatsAppAuthorizedNumber
+
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url)
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        household = Household(name="Família Downgrade WhatsApp")
+        db.add(household)
+        db.flush()
+        member = User(
+            household_id=household.id,
+            name="Vinicius",
+            username=f"vinicius-{household.id[:8]}",
+            password_hash="scrypt$16384$8$1$AAAA$BBBB",
+        )
+        db.add(member)
+        db.flush()
+        db.add(
+            WhatsAppAuthorizedNumber(
+                household_id=household.id,
+                user_id=member.id,
+                phone_hash="a" * 64,
+                phone_encrypted="gAAAAA-fake-fernet-token",
+                phone_last4="8888",
+            )
+        )
+        db.commit()
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="whatsapp_authorized_numbers"):
+        command.downgrade(config, "0023")
+
+    engine, inspector = _inspect(database_url)
+    assert "whatsapp_authorized_numbers" in inspector.get_table_names()
+    engine.dispose()
+
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM whatsapp_authorized_numbers")
+    engine.dispose()
+
+    command.downgrade(config, "0023")
+    engine, inspector = _inspect(database_url)
+    assert "whatsapp_authorized_numbers" not in inspector.get_table_names()
+    assert "whatsapp_inbound_events" not in inspector.get_table_names()
+    assert "whatsapp_rate_limit_buckets" not in inspector.get_table_names()
+    engine.dispose()
+    get_settings.cache_clear()
+
+
 def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     output = StringIO()
     config = _alembic_config(
@@ -1315,6 +1443,9 @@ def test_migrations_render_valid_postgresql_ddl_offline(monkeypatch) -> None:
     assert "CREATE TABLE assistant_action_events" in sql
     assert "CREATE TABLE entry_type_templates" in sql
     assert "CREATE TABLE assistant_action_proposals" in sql
+    assert "CREATE TABLE whatsapp_authorized_numbers" in sql
+    assert "CREATE TABLE whatsapp_inbound_events" in sql
+    assert "CREATE TABLE whatsapp_rate_limit_buckets" in sql
     assert "INSERT INTO alembic_version" in sql
     get_settings.cache_clear()
 
@@ -1362,7 +1493,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0023"
+        ).scalar_one() == "0024"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -1388,6 +1519,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0023"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0024"
     engine.dispose()
     get_settings.cache_clear()

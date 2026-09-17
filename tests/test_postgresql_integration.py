@@ -38,6 +38,7 @@ import pytest
 os.environ.setdefault("SECRET_KEY", "postgres-integration-test-secret-not-used-in-production")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 os.environ.setdefault("MFA_ENCRYPTION_KEY", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
+os.environ.setdefault("WHATSAPP_PHONE_ENCRYPTION_KEY", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=")
 
 from alembic.config import Config  # noqa: E402
 from sqlalchemy import create_engine, func, inspect, select, text  # noqa: E402
@@ -135,7 +136,7 @@ def test_upgrade_empty_postgresql_database_to_head() -> None:
     }.issubset(tables)
     with engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0023"
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0024"
         )
     engine.dispose()
 
@@ -156,7 +157,7 @@ def test_upgrade_from_legacy_0002_baseline_preserves_existing_rows() -> None:
 
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0023"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0024"
         preserved_name = connection.execute(
             text("SELECT name FROM households WHERE id = :id"), {"id": household_id}
         ).scalar_one()
@@ -1497,6 +1498,228 @@ def test_fund_valuation_concurrent_run_is_serialized_to_a_single_row() -> None:
                 )
             ).all()
             assert len(rows) == 1, "concurrent valuation run duplicated a valuation row"
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_whatsapp_inbound_event_concurrent_redelivery_is_serialized_to_a_single_event() -> None:
+    """Engineering review on PR #103 (WA-01, issue #73), item 1:
+    `app.whatsapp_gateway_app._process_one_message`'s `is_duplicate_message`
+    pre-check is a plain SELECT, not the actual idempotency guarantee --
+    two genuinely concurrent deliveries of the same `provider_message_id`
+    can both pass it before either has committed. The real barrier is
+    `uq_whatsapp_inbound_events_message_id`, enforced when
+    `gateway.record_inbound_event` flushes; the fix wraps each message's
+    processing in `db.begin_nested()` and catches the loser's
+    `IntegrityError`, exactly the `begin_nested()`/`IntegrityError` idiom
+    `app.services.notification_scheduler.discover_due_deliveries` and
+    `app.services.privilege_valuation.ingest_latest_quote` already use for
+    their own unique constraints.
+
+    Proves it under a real two-connection PostgreSQL race: two threads,
+    synchronized with a `threading.Barrier` to maximize transaction overlap,
+    both process the exact same inbound message concurrently. Neither call
+    may raise (previously: the loser's `record_inbound_event` INSERT could
+    surface as an unhandled `IntegrityError` at the caller's later,
+    request-wide `db.commit()`), exactly one `WhatsAppInboundEvent` row may
+    exist afterward, and the pre-seeded rate-limit bucket must show exactly
+    one accounted hit -- the loser's own rate-limit accounting must be
+    rolled back together with its failed insert, not left double-counting a
+    message that was never actually processed twice.
+    """
+
+    from app.models import WhatsAppAuthorizedNumber, WhatsAppInboundEvent, WhatsAppRateLimitBucket
+    from app.services import whatsapp_gateway as gateway
+    from app.whatsapp_gateway_app import _process_one_message
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        sender_digits = "5511999998888"
+        phone_hash = gateway.hash_phone(sender_digits)
+        with Session(engine) as setup_db:
+            household = Household(name="Família WhatsApp Concorrência")
+            setup_db.add(household)
+            setup_db.flush()
+            user = User(
+                household_id=household.id,
+                name="Usuário WhatsApp Concorrência",
+                username=f"wa-concur-{household.id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            setup_db.add(user)
+            setup_db.flush()
+            setup_db.add(
+                WhatsAppAuthorizedNumber(
+                    household_id=household.id,
+                    user_id=user.id,
+                    phone_hash=phone_hash,
+                    phone_encrypted=gateway.encrypt_phone(sender_digits),
+                    phone_last4=gateway.phone_last4(sender_digits),
+                )
+            )
+            # Pre-seed the rate-limit bucket so this test isolates the
+            # message-dedup race from the separate bucket-creation race
+            # covered by the test below.
+            setup_db.add(
+                WhatsAppRateLimitBucket(
+                    bucket_key=phone_hash,
+                    window_start=datetime.now(UTC),
+                    count=5,
+                )
+            )
+            setup_db.commit()
+
+        message = gateway.NormalizedInboundMessage(
+            provider_message_id="wa-msg-concurrent-redelivery",
+            sender_digits=sender_digits,
+        )
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _deliver() -> None:
+            try:
+                thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(thread_engine) as db:
+                    barrier.wait(timeout=5.0)
+                    _process_one_message(db, message, settings=get_settings())
+                    db.commit()
+                thread_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=_deliver, daemon=True) for _ in range(2)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10.0)
+
+        assert not errors, f"concurrent redelivery must never raise: {errors}"
+        with Session(engine) as verify_db:
+            events = verify_db.scalars(
+                select(WhatsAppInboundEvent).where(
+                    WhatsAppInboundEvent.provider_message_id == "wa-msg-concurrent-redelivery"
+                )
+            ).all()
+            assert len(events) == 1, "concurrent redelivery duplicated the inbound event row"
+            assert events[0].status == "accepted"
+
+            bucket = verify_db.scalar(
+                select(WhatsAppRateLimitBucket).where(WhatsAppRateLimitBucket.bucket_key == phone_hash)
+            )
+            assert bucket.count == 6, (
+                "the losing racer's rate-limit accounting for what turned out to be a "
+                "duplicate must roll back with its failed insert, not double-count a "
+                "message that was only ever processed once"
+            )
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_whatsapp_rate_limit_bucket_concurrent_first_hit_is_serialized_to_a_single_bucket() -> None:
+    """Engineering review on PR #103 (WA-01, issue #73), item 2:
+    `SELECT ... FOR UPDATE` cannot lock a row that does not exist yet, so a
+    brand-new sender's very first two messages arriving concurrently can
+    both observe no `WhatsAppRateLimitBucket` row for their shared
+    `bucket_key` and both attempt the INSERT. The fix wraps that INSERT in
+    `db.begin_nested()`/`IntegrityError` and, on losing the race, re-selects
+    `FOR UPDATE` (now that the winner's row exists) and joins the normal
+    locked-row accounting instead of short-circuiting `True` unaccounted.
+
+    Proves it under a real two-connection PostgreSQL race: two threads,
+    synchronized with a `threading.Barrier`, each process a *different*
+    first message from the same brand-new sender concurrently (isolating
+    this bucket-creation race from the message-dedup race covered by the
+    test above -- two distinct `provider_message_id`s, so
+    `uq_whatsapp_inbound_events_message_id` never comes into play). Neither
+    call may raise, exactly one bucket row may exist for that sender
+    afterward, its count must reflect both legitimate hits, and both
+    messages must each get their own accepted inbound event.
+    """
+
+    from app.models import WhatsAppAuthorizedNumber, WhatsAppInboundEvent, WhatsAppRateLimitBucket
+    from app.services import whatsapp_gateway as gateway
+    from app.whatsapp_gateway_app import _process_one_message
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        sender_digits = "5511988887777"
+        phone_hash = gateway.hash_phone(sender_digits)
+        with Session(engine) as setup_db:
+            household = Household(name="Família WhatsApp Bucket Concorrência")
+            setup_db.add(household)
+            setup_db.flush()
+            user = User(
+                household_id=household.id,
+                name="Usuário WhatsApp Bucket Concorrência",
+                username=f"wa-bucket-concur-{household.id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            setup_db.add(user)
+            setup_db.flush()
+            setup_db.add(
+                WhatsAppAuthorizedNumber(
+                    household_id=household.id,
+                    user_id=user.id,
+                    phone_hash=phone_hash,
+                    phone_encrypted=gateway.encrypt_phone(sender_digits),
+                    phone_last4=gateway.phone_last4(sender_digits),
+                )
+            )
+            setup_db.commit()
+
+        messages = [
+            gateway.NormalizedInboundMessage(
+                provider_message_id=f"wa-msg-bucket-race-{i}", sender_digits=sender_digits
+            )
+            for i in range(2)
+        ]
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _deliver(message: gateway.NormalizedInboundMessage) -> None:
+            try:
+                thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(thread_engine) as db:
+                    barrier.wait(timeout=5.0)
+                    _process_one_message(db, message, settings=get_settings())
+                    db.commit()
+                thread_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=_deliver, args=(m,), daemon=True) for m in messages]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10.0)
+
+        assert not errors, f"concurrent first-hit accounting must never raise: {errors}"
+        with Session(engine) as verify_db:
+            buckets = verify_db.scalars(
+                select(WhatsAppRateLimitBucket).where(WhatsAppRateLimitBucket.bucket_key == phone_hash)
+            ).all()
+            assert len(buckets) == 1, "concurrent first hits duplicated the rate-limit bucket row"
+            assert buckets[0].count == 2, "both legitimate concurrent hits must be accounted for"
+
+            events = verify_db.scalars(
+                select(WhatsAppInboundEvent).where(
+                    WhatsAppInboundEvent.provider_message_id.in_(
+                        [m.provider_message_id for m in messages]
+                    )
+                )
+            ).all()
+            assert len(events) == 2, "each distinct message must still get its own inbound event"
+            assert {event.status for event in events} == {"accepted"}
         engine.dispose()
     finally:
         get_settings.cache_clear()

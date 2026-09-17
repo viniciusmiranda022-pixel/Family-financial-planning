@@ -762,6 +762,17 @@ class MfaChallengeRequest(BaseModel):
         return self
 
 
+class WhatsAppAuthorizedNumberCreateRequest(BaseModel):
+    """WA-01 (`docs/WORK_ORDER_WA_01.md`): admin request to link a phone
+    number to a household member. `phone_number` accepts any human-typed
+    format (`"+55 11 99999-8888"`, `"5511999998888"`, ...) --
+    `app.services.whatsapp_gateway.normalize_phone` reduces it to the same
+    digits-only canonical form an inbound webhook's `wa_id` already is."""
+
+    user_id: str = Field(min_length=1, max_length=36)
+    phone_number: str = Field(min_length=8, max_length=32)
+
+
 class MfaReauthRequest(BaseModel):
     """Strong re-authentication for reconfiguration/recovery-code
     regeneration: current password plus current second factor, per the
