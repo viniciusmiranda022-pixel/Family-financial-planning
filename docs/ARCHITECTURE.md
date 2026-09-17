@@ -1155,7 +1155,8 @@ assinado por `itsdangerous`) sem criar um provedor de identidade paralelo:
 
 `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #67. Primeiro de quatro slices (MAIL-00..03,
 epic #66); este cobre apenas modelo, configuração e contratos -- nenhum scheduler roda ainda
-(MAIL-02) e nenhum e-mail é enviado de fato (MAIL-01).
+(MAIL-02) e nenhum e-mail é enviado de fato (MAIL-01 é quem passa a poder enviar, ver seção
+seguinte, mas ainda sem worker automático).
 
 - **`NotificationSettings` (um por household).** `enabled` (default `False`, opt-in explícito),
   `send_time_local` (`"HH:MM"`, default `"08:00"`) e `timezone` (default `"America/Sao_Paulo"`,
@@ -1187,6 +1188,44 @@ epic #66); este cobre apenas modelo, configuração e contratos -- nenhum schedu
   locais do navegador (que continuam existindo, sem relação com este). Mostra somente
   destinatários/preferências/horário/fuso -- nunca a credencial Gmail, que não tem lugar nenhum na
   UI nesta ou em nenhuma etapa futura do Work Order.
+
+## Alertas de vencimento por e-mail — MAIL-01 (adapter SMTP e templates)
+
+`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #68. Segundo dos quatro slices: dá ao MAIL-00 um
+transporte real e um endpoint administrativo de teste, mas ainda sem outbox/scheduler (MAIL-02) --
+D-1/D0 continuam sem ser enviados automaticamente.
+
+- **`app.services.notification_templates`** renderiza HTML + texto puro a partir de primitivos
+  (`obligation_name`/`amount`/`due_date`/`alert_kind`/`category` para `render_due_date_alert`; nada
+  para `render_test_email`). Não lê `Obligation`/`Transaction` -- quem lerá o registro canônico e
+  chamará esta função é o worker do MAIL-02, ainda não implementado. Todo campo de texto livre é
+  escapado (`html.escape`) antes de entrar no corpo HTML.
+- **`app.services.email_delivery.SmtpEmailAdapter`** encapsula `smtplib`/STARTTLS. `configured` é
+  `True` somente com `ALERT_EMAIL_ENABLED=true` e todos os `ALERT_SMTP_HOST`/`ALERT_SMTP_USERNAME`/
+  `ALERT_SMTP_APP_PASSWORD`/`ALERT_EMAIL_FROM` preenchidos; caso contrário `send()` retorna
+  `EmailDeliveryResult(ok=False, error_code="not_configured")` sem tentar `smtplib.SMTP(...)`. Toda
+  exceção de transporte colapsa para um `EmailErrorCode` fixo (`EmailErrorCode.AUTH_FAILED`/
+  `CONNECTION_FAILED`/`TIMEOUT`/`RECIPIENT_REFUSED`/`SEND_FAILED`) -- o texto bruto da exceção nunca
+  chega à resposta HTTP, ao `AuditEvent` ou a um log.
+- **`app.services.email_delivery.EmailSendThrottle`** (instância módulo-level `test_email_throttle`):
+  contador em memória por `household_id`, mínimo `ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS` (padrão 60s)
+  entre chamadas de teste. Deliberadamente não persistido -- `scripts/entrypoint.sh` roda um único
+  processo `uvicorn` sem `--workers`, então o controle por processo já é efetivo, e uma coluna nova só
+  para isso não teria nenhum outro leitor.
+- **`POST /notification-settings/test-email`** (`app.api.notification_settings_test_email`):
+  `_require_admin`; recebe somente `recipient_id` (`NotificationTestEmailRequest`), nunca host/
+  username/password; `404` se o destinatário não existir no household do chamador; `503` se o adapter
+  não estiver configurado; `429` se o throttle recusar; `502` com a mensagem sanitizada
+  (`email_error_message`) se o SMTP falhar; `200 {"ok": true}` em sucesso. Grava exatamente um
+  `AuditEvent` (`notification_settings.test_email`, `entity_type="notification_recipient"`,
+  `entity_id=<recipient_id>`, `details={"result": "sent"|"failed", "error_code": ...}`) -- nunca o
+  endereço de e-mail do destinatário, que já está disponível via `entity_id` para quem tiver
+  permissão de leitura.
+- **UI**: botão "Testar" por linha em `#notification-recipients-table`
+  (`app/static/app.js:renderNotificationRecipients`), admin-only, mostra a mensagem sanitizada da API
+  via toast em caso de falha.
+- **Segredo**: `ALERT_SMTP_APP_PASSWORD` só existe em `.env`/segredo do orquestrador (ver
+  `docs/SECURITY.md#alertas-de-e-mail--smtp-e-gmail-mail-01`); `.env.example` só tem placeholders.
 
 ## Evolução
 

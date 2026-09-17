@@ -2308,7 +2308,9 @@ function renderNotificationRecipients(recipients) {
       <td><input type="checkbox" class="notification-recipient-toggle" data-id="${escapeHtml(item.id)}" data-field="notify_d1" ${item.notify_d1 ? "checked" : ""} ${admin ? "" : "disabled"}></td>
       <td><input type="checkbox" class="notification-recipient-toggle" data-id="${escapeHtml(item.id)}" data-field="notify_d0" ${item.notify_d0 ? "checked" : ""} ${admin ? "" : "disabled"}></td>
       <td><input type="checkbox" class="notification-recipient-toggle" data-id="${escapeHtml(item.id)}" data-field="active" ${item.active ? "checked" : ""} ${admin ? "" : "disabled"}></td>
-      <td class="right">${admin ? `<button class="danger-button notification-recipient-delete" data-id="${escapeHtml(item.id)}">Remover</button>` : ""}</td>
+      <td class="right">${admin ? `
+        <button class="secondary notification-recipient-test-email" data-id="${escapeHtml(item.id)}">Testar</button>
+        <button class="danger-button notification-recipient-delete" data-id="${escapeHtml(item.id)}">Remover</button>` : ""}</td>
     </tr>`).join("")
     : emptyRow(5, "Nenhum destinatário cadastrado");
 
@@ -2325,6 +2327,24 @@ function renderNotificationRecipients(recipients) {
     if (!window.confirm("Remover este destinatário de alertas de vencimento?")) return;
     try { await api(`/notification-recipients/${button.dataset.id}`, { method: "DELETE" }); await loadNotificationSettings(); toast("Destinatário removido"); }
     catch (error) { toast(error.message, true); }
+  }));
+  // MAIL-01 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #68): sends
+  // exactly one fixed confirmation message to this already-cadastrado
+  // recipient through the real backend SMTP adapter -- never a host/
+  // username/password the browser would supply.
+  document.querySelectorAll(".notification-recipient-test-email").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await api("/notification-settings/test-email", {
+        method: "POST",
+        body: JSON.stringify({ recipient_id: button.dataset.id }),
+      });
+      toast("E-mail de teste enviado");
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      button.disabled = false;
+    }
   }));
 }
 

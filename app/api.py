@@ -96,6 +96,7 @@ from app.schemas import (
     NotificationRecipientCreateRequest,
     NotificationRecipientUpdateRequest,
     NotificationSettingsUpdateRequest,
+    NotificationTestEmailRequest,
     ObligationPaymentRequest,
     ObligationPaymentUndoRequest,
     ObligationRequest,
@@ -199,6 +200,13 @@ from app.services.duplicates import (
     serialize_duplicate_group,
     source_priority,
 )
+from app.services.email_delivery import (
+    EmailErrorCode,
+    OutboundEmail,
+    SmtpEmailAdapter,
+    email_error_message,
+    test_email_throttle,
+)
 from app.services.entry_type_templates import (
     EntryTypeTemplateError,
     accept_entry_type_template,
@@ -288,6 +296,7 @@ from app.services.notification_settings import (
     update_notification_recipient,
     update_notification_settings,
 )
+from app.services.notification_templates import render_test_email
 from app.services.projection_engine import PROJECTION_CALCULATION_VERSION, projection_liquidity_facts
 from app.services.projection_validator import PROJECTION_TOLERANCE, validate_projection
 from app.services.reconciliation import (
@@ -11985,6 +11994,60 @@ def notification_recipients_delete(
         source="notification_settings",
     )
     db.commit()
+    return {"ok": True}
+
+
+# MAIL-01 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #68): sends a
+# fixed confirmation message to one already-cadastrado recipient through
+# the real SMTP adapter. Admin-only, never accepts host/username/password
+# from the caller, never creates/alters a financial fact, and is
+# rate-limited per household to avoid accidental spam (see
+# `app.services.email_delivery.EmailSendThrottle`).
+@router.post("/notification-settings/test-email")
+def notification_settings_test_email(
+    payload: NotificationTestEmailRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        recipient = get_notification_recipient(
+            db, household_id=user.household_id, recipient_id=payload.recipient_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Destinatário não encontrado") from exc
+
+    adapter = SmtpEmailAdapter()
+    if not adapter.configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=email_error_message(EmailErrorCode.NOT_CONFIGURED),
+        )
+
+    settings = get_settings()
+    if not test_email_throttle.allow(
+        user.household_id, min_interval_seconds=settings.alert_test_email_min_interval_seconds
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Aguarde antes de enviar outro e-mail de teste.",
+        )
+
+    result = adapter.send(OutboundEmail(to_email=recipient.email, rendered=render_test_email()))
+    audit(
+        db,
+        user,
+        "notification_settings.test_email",
+        "notification_recipient",
+        recipient.id,
+        {"result": "sent" if result.ok else "failed", "error_code": result.error_code},
+        source="notification_settings",
+    )
+    db.commit()
+    if not result.ok:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=email_error_message(result.error_code)
+        )
     return {"ok": True}
 
 

@@ -358,6 +358,15 @@ class NotificationRecipientUpdateRequest(BaseModel):
     notify_d0: bool | None = None
 
 
+class NotificationTestEmailRequest(BaseModel):
+    """MAIL-01 (`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`). Only a
+    reference to an already-cadastrado recipient -- never a host/username/
+    password, which the Work Order explicitly forbids accepting from the
+    browser for this endpoint."""
+
+    recipient_id: str = Field(min_length=1, max_length=36)
+
+
 class IntegrityRunRequest(BaseModel):
     scope: str = Field(pattern="^(entity|period|global)$")
     period: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")

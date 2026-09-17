@@ -685,6 +685,15 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             {"json": {"active": False}},
         ),
         ("notification recipient delete", "delete", "/api/notification-recipients/missing", {}),
+        (
+            # MAIL-01 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #68):
+            # `_require_admin` rejects before the recipient lookup, so the
+            # placeholder id below never needs to resolve to a real row.
+            "notification test-email",
+            "post",
+            "/api/notification-settings/test-email",
+            {"json": {"recipient_id": "missing"}},
+        ),
     ]
 
 
@@ -860,3 +869,23 @@ def test_notification_recipient_household_isolation(roles: RoleFixture) -> None:
     # Neither cross-household attempt above had any side effect.
     unchanged = roles.admin.get("/api/notification-settings").json()
     assert unchanged["recipients"] == own_settings["recipients"]
+
+
+def test_notification_test_email_household_isolation(roles: RoleFixture) -> None:
+    """MAIL-01 (`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #68):
+    sending a test e-mail to a recipient id from a different household must
+    404 like every other `notification_recipients` mutation -- and must
+    never reach the SMTP adapter while doing it."""
+
+    other = _setup_household(uuid.uuid4().hex[:8])
+
+    created = roles.admin.post("/api/notification-recipients", json={"email": "vinicius@exemplo.com"})
+    assert created.status_code == 201, created.text
+    recipient_id = created.json()["id"]
+
+    with mock.patch("app.api.SmtpEmailAdapter.send") as send_mock:
+        cross_household_test_email = other.admin.post(
+            "/api/notification-settings/test-email", json={"recipient_id": recipient_id}
+        )
+        assert cross_household_test_email.status_code == 404
+        send_mock.assert_not_called()

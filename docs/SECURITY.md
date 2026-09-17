@@ -107,6 +107,45 @@ do repositório em `%LOCALAPPDATA%\FamilyFinancialPlanning\codex`.
 - QR Code e URI `otpauth://` são gerados inteiramente no processo da aplicação (`qrcode`/`pyotp`); nenhum
   segredo ou URI é enviado a um serviço externo.
 
+## Alertas de e-mail — SMTP e Gmail (MAIL-01)
+
+`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #68. Cobre apenas o adapter de envio e o
+`POST /notification-settings/test-email` administrativo; não há scheduler nem envio automático de
+D-1/D0 ainda (MAIL-02).
+
+- a credencial SMTP (`ALERT_SMTP_USERNAME`/`ALERT_SMTP_APP_PASSWORD`) só existe em variável de
+  ambiente (`.env`/segredo do orquestrador) -- nunca no banco, nunca na UI, nunca em resposta de API;
+  `NotificationSettings`/`NotificationRecipient` (MAIL-00) não têm coluna para ela;
+- gere uma **App Password** do Gmail (exige verificação em duas etapas na conta remetente) em
+  https://myaccount.google.com/apppasswords -- nunca use a senha normal de login da conta nesse campo;
+- com `ALERT_EMAIL_ENABLED=false` (padrão) ou qualquer variável `ALERT_SMTP_*`/`ALERT_EMAIL_FROM`
+  vazia, `app.services.email_delivery.SmtpEmailAdapter.configured` é `False` e nenhuma tentativa de
+  conexão SMTP é feita -- `POST /notification-settings/test-email` responde `503` de forma explícita,
+  nunca finge sucesso;
+- erros de transporte (`smtplib`/socket) são reduzidos a um conjunto fixo de códigos sanitizados
+  (`app.services.email_delivery.EmailErrorCode`) antes de alcançar resposta HTTP, `AuditEvent.details`
+  ou qualquer log -- o texto bruto da exceção/resposta do servidor SMTP nunca é propagado;
+- `test-email` é `_require_admin`-gated, envia somente para um `NotificationRecipient` já cadastrado do
+  household do chamador (nunca aceita host/username/password do navegador) e é limitado a uma chamada
+  por `ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS` (padrão 60s) por household
+  (`app.services.email_delivery.EmailSendThrottle`, em memória -- `scripts/entrypoint.sh` roda um único
+  processo `uvicorn` sem `--workers`, então o limite é efetivo, não apenas best-effort);
+- o e-mail é sempre HTML com alternativa texto puro (`app.services.notification_templates`), nunca
+  inclui senha, segredo MFA, token de sessão ou dado bancário completo, e todo campo de texto livre do
+  household (nome da obrigação, categoria) é escapado antes de entrar no HTML;
+- CI e testes automatizados (`tests/test_email_delivery.py`, `tests/test_notification_test_email_api.py`)
+  sempre substituem `smtplib.SMTP`/`SmtpEmailAdapter` por um dublê determinístico -- nenhum job de CI
+  autentica no Gmail real.
+
+**Troubleshooting operacional:**
+
+| Sintoma | Causa provável | Verificação |
+| --- | --- | --- |
+| `test-email` responde `503` | `ALERT_EMAIL_ENABLED=false` ou uma variável `ALERT_SMTP_*`/`ALERT_EMAIL_FROM` vazia | conferir `.env` do serviço `app` |
+| `test-email` responde `502` com "Falha de autenticação" | usuário/App Password do Gmail incorretos ou revogados | gerar uma nova App Password |
+| `test-email` responde `502` com "Não foi possível conectar" | host/porta incorretos ou rede sem saída para `smtp.gmail.com:587` | validar `ALERT_SMTP_HOST`/`ALERT_SMTP_PORT` e a rede do contêiner |
+| `test-email` responde `429` | mais de uma chamada dentro de `ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS` | aguardar o intervalo configurado |
+
 ## CI (PR 8)
 
 - `.github/workflows/ci.yml` usa apenas credenciais fixas e claramente falsas, nunca reaproveitadas
