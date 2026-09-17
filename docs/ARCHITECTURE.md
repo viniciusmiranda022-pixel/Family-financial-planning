@@ -576,6 +576,65 @@ template quando normalizam igual.
   `app.services.card_invoice_lifecycle.pay_invoice`; `register_refund` depende das próprias
   invariantes de vínculo (INV-027). Nenhuma dessas três precisa de uma segunda checagem redundante.
 
+### Orquestrador LLM tool-driven e Tool Layer genérica (WA-02, `docs/WORK_ORDER_WA_02.md`, issue #74)
+
+Preenche o gap documentado em `docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md` §1.4/§6: a intent `query`
+do `/v1/interpret` (acima) nunca teve implementação -- toda pergunta de consulta/agregação/
+comparação/projeção caía em desambiguação. O WA-02 não altera `/assistant/interpret`/
+`/assistant/execute` (Slice 4, inalterados) nem o vocabulário fechado de `TYPED_ACTIONS`; adiciona
+uma camada nova, aditiva, para perguntas em linguagem natural que exigem compor mais de uma
+consulta determinística:
+
+**Quinto contrato consultivo do sidecar: `POST /v1/plan`** (`advisor/server.mjs`,
+`advisor/plan-schema.json`). Mesmo padrão estrutural dos quatro anteriores -- nenhum campo de
+autoridade, `additionalProperties: false` -- mas em vez de uma única `intent`, o modelo devolve um
+plano: `{needs_clarification, clarifying_question, steps: [{tool, arguments}]}`, onde `tool` vem de
+um vocabulário fechado (`app.services.assistant_tool_catalog.ALLOWED_TOOLS`: `query_facts`,
+`aggregate_spending`, `compare_periods`, `project_horizon`, `draft_typed_action`,
+`confirm_typed_action`, `undo_typed_action`) e `arguments` são sempre texto livre -- nunca um id,
+nunca um valor monetário, nunca SQL/nome de tabela.
+
+**Fronteira de autoridade em Python:** `app.services.assistant_orchestrator.get_plan`/`_coerce_plan`
+re-validam a resposta do sidecar do zero (mesmo idioma de `_coerce_interpretation`): um passo com um
+`tool` fora do allowlist derruba o plano inteiro (`available=False`), nunca executa parcialmente;
+mais de `MAX_PLAN_STEPS` (5) passos também é rejeitado. `app.services.assistant_tools.run_tool`
+re-checa `tool`/`arguments` uma segunda vez, independente do que o `/v1/plan` já validou -- duas
+portas independentes, nenhuma confia que a outra estava certa.
+
+**Nenhuma tool é um segundo motor financeiro.** Toda tool de leitura chama exclusivamente serviços
+determinísticos já existentes e devolve os mesmos números que `/dashboard`/`/reports`/`/forecast`
+já publicam -- nunca uma soma/agregação nova:
+
+| Tool | Fonte determinística reaproveitada |
+|---|---|
+| `query_facts` (saldo/gasto_mes/fatura/obrigacoes) | `financial_snapshots.build_snapshot`/`dashboard_monetary_publication`, `card_invoice_lifecycle.list_invoices`, `app.api._obligation_rows` |
+| `aggregate_spending`/`compare_periods` (categoria/conta/cartão) | `financial_snapshots.category_spending_rows`/`account_cash_flow_rows` -- as mesmas linhas que o Dashboard/Relatórios já publicam |
+| `project_horizon` (30/60/90 dias) | `app.api.forecast` (mesmo endpoint, chamado em processo) |
+| `draft_typed_action`/`confirm_typed_action`/`undo_typed_action` | wrappers finos sobre `assistant_interpreter.interpret_message`/`assistant_actions.build_typed_action_proposal`/`execute_typed_action`/`undo_assistant_action`, inalterados -- o único caminho de escrita continua sendo exatamente o mesmo do Slice 4 |
+
+Resolução de período ("setembro", "mês passado", "este mês") é determinística
+(`app.services.assistant_tools.resolve_period`), ancorada em `America/Sao_Paulo`
+(`sao_paulo_today`) -- nunca resolvida pelo modelo. Um período/dimensão/tópico ausente ou não
+reconhecido nunca é adivinhado: a tool devolve uma pergunta de esclarecimento
+(`ToolOutcome.clarifying_question`), e o orquestrador propaga essa pergunta como a resposta final
+em vez de seguir para o próximo passo. `household_id`/`user` nunca vêm do plano -- sempre do
+contexto de sessão do servidor (`app.api.assistant_ask` -> `get_current_user`).
+
+A resposta final em português é montada de forma determinística a partir dos fatos que as tools
+devolveram (`app.services.assistant_orchestrator._format_step`) -- o LLM nunca é chamado uma
+segunda vez para "explicar" ou recalcular o número (INV-021 estendido a esta camada). Um trace
+sanitizado (nome da tool, chaves de argumento, chaves de fato, ok/falha/precisa-esclarecimento --
+nunca o valor de um fato nem a mensagem bruta do usuário) é persistido como `AuditEvent`
+(`event_type="assistant.orchestrate"`) a cada chamada, mesmo quando a pergunta é somente leitura.
+
+**Rota HTTP:** `POST /assistant/ask` (`app.api.assistant_ask`), aditiva a
+`/assistant/interpret`+`/assistant/execute` -- mesmo gate `_require_admin` do restante do Assistente
+web; não introduz uma nova camada de autorização por número de telefone (isso é escopo do WA-01/
+WA-03, não deste slice). Profundidade de chamada de tool é limitada a exatamente uma rodada de
+planejamento (sem laço de replanejamento realimentando resultados de tool para uma nova chamada ao
+modelo) -- defesa estrutural contra prompt injection/loop descontrolado, não apenas uma escolha de
+desempenho.
+
 ## Navegação e UX final (October Go-Live Slice 5, P0 #87)
 
 `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_5.md`, `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.6 e
