@@ -1,0 +1,56 @@
+{
+  "$comment": "Output contract for POST /v1/plan (WA-02, issue #74, docs/WORK_ORDER_WA_02.md). Same structural boundary as interpret-schema.json/audit-schema.json: there is no field here that could authorize a mutation, run SQL, or reference an id the model was never given -- `steps[].tool` is a closed enum of generic, already-existing Family Finance tools, and `steps[].arguments` is a flat string-only bag the deterministic backend (app.services.assistant_tools) re-validates per tool, re-resolves against real household data, and may still reject or ask for clarification even when this schema accepts it. The model plans which tools to call and with which free-text hints; it never computes a financial total and never receives one back to recompute -- see app.services.assistant_orchestrator for the full re-validation/execution boundary. `additionalProperties: false` throughout means an attempt to smuggle an authority-shaped field (e.g. `account_id`, `amount`, `sql`, `confirmed`) is a schema violation, not a warning.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "needs_clarification": { "type": "boolean" },
+    "clarifying_question": { "type": ["string", "null"], "maxLength": 300 },
+    "steps": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string",
+            "enum": [
+              "query_facts",
+              "aggregate_spending",
+              "compare_periods",
+              "project_horizon",
+              "draft_typed_action",
+              "confirm_typed_action",
+              "undo_typed_action"
+            ]
+          },
+          "arguments": {
+            "type": "object",
+            "properties": {
+              "topic": {
+                "type": "string",
+                "enum": ["saldo", "gasto_mes", "fatura", "obrigacoes"]
+              },
+              "dimension": {
+                "type": "string",
+                "enum": ["categoria", "conta", "cartao"]
+              },
+              "period_text": { "type": "string", "maxLength": 60 },
+              "period_a_text": { "type": "string", "maxLength": 60 },
+              "period_b_text": { "type": "string", "maxLength": 60 },
+              "horizon_days": {
+                "type": "string",
+                "enum": ["30", "60", "90"]
+              },
+              "reference_text": { "type": "string", "maxLength": 300 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": ["tool", "arguments"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema_version", "needs_clarification", "clarifying_question", "steps"],
+  "additionalProperties": false
+}

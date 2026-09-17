@@ -96,3 +96,25 @@ test("POST /v1/interpret with the shared secret but no Codex auth answers 503, n
   // uniformly as "interpretation unavailable".
   assert.equal(response.status, 503);
 });
+
+test("POST /v1/plan without the shared secret is rejected with 401", async () => {
+  const response = await fetch(`${baseUrl}/v1/plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: "Quanto gastei em setembro comparado a agosto?" }),
+  });
+  assert.equal(response.status, 401);
+});
+
+test("POST /v1/plan with the shared secret but no Codex auth answers 503, never a fabricated plan", async () => {
+  const response = await fetch(`${baseUrl}/v1/plan`, {
+    method: "POST",
+    headers: { "X-Advisor-Token": "test-shared-secret", "Content-Type": "application/json" },
+    body: JSON.stringify({ message: "Quanto gastei em setembro comparado a agosto?" }),
+  });
+  // Same fail-safe boundary as /v1/interpret: an unauthenticated sidecar
+  // never returns a tool-call plan, only a transport failure the Python
+  // caller (app.services.assistant_orchestrator) treats uniformly as
+  // "plan unavailable" -- it never falls back to guessing a plan.
+  assert.equal(response.status, 503);
+});
