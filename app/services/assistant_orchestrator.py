@@ -297,6 +297,8 @@ def _format_step(tool: str, facts: dict[str, Any]) -> str:
         return "Ação confirmada e executada."
     if tool == "undo_typed_action":
         return "Ação desfeita -- o histórico original foi preservado."
+    if tool == "cancel_typed_action":
+        return "Combinado, cancelei essa proposta. Nada foi lançado."
     return ""  # pragma: no cover - unreachable, ALLOWED_TOOLS already checked in run_tool
 
 

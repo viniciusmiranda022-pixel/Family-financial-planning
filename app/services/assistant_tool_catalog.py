@@ -78,6 +78,14 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
         description="Desfaz uma ação do Assistente já executada anteriormente.",
         arguments=(("reference_text", "trecho/identificador da ação a desfazer, se houver"),),
     ),
+    ToolSpec(
+        name="cancel_typed_action",
+        description=(
+            "Cancela uma proposta de ação pendente ainda não confirmada -- nunca executa nada, "
+            "apenas descarta o rascunho."
+        ),
+        arguments=(("reference_text", "trecho/identificador da proposta a cancelar, se houver"),),
+    ),
 )
 
 ALLOWED_TOOLS: frozenset[str] = frozenset(spec.name for spec in TOOL_CATALOG)
