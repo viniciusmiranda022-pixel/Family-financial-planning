@@ -130,10 +130,12 @@ def test_upgrade_empty_postgresql_database_to_head() -> None:
         "monthly_financial_closes",
         "household_financial_revisions",
         "backfill_runs",
+        "notification_settings",
+        "notification_recipients",
     }.issubset(tables)
     with engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0020"
         )
     engine.dispose()
 
@@ -154,7 +156,7 @@ def test_upgrade_from_legacy_0002_baseline_preserves_existing_rows() -> None:
 
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0019"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0020"
         preserved_name = connection.execute(
             text("SELECT name FROM households WHERE id = :id"), {"id": household_id}
         ).scalar_one()

@@ -1404,6 +1404,68 @@ class BackfillRun(Base):
     )
 
 
+class NotificationSettings(Base, TimestampMixin):
+    """One row per household: the household-wide toggle, send time and
+    timezone for due-date e-mail alerts (MAIL-00,
+    `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`).
+
+    This slice only persists configuration -- no scheduler reads this table
+    yet (that is MAIL-02) and no e-mail is ever sent because of it (MAIL-01).
+    `enabled` defaults to `False`: alerts must be an explicit admin opt-in,
+    never on by default the moment a household is created.
+
+    Not listed in `FINANCIAL_REVISION_MODELS` below: this is delivery
+    configuration, not a financial fact or a `FinancialSnapshot`/monthly-close
+    gate input -- it never feeds `financial_snapshots._collect()` and mutating
+    it can never change what a period's snapshot recomputes to.
+    """
+
+    __tablename__ = "notification_settings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    send_time_local: Mapped[str] = mapped_column(String(5), default="08:00")
+    timezone: Mapped[str] = mapped_column(String(64), default="America/Sao_Paulo")
+
+
+class NotificationRecipient(Base, TimestampMixin):
+    """One e-mail address configured to receive due-date alerts for a
+    household (MAIL-00, `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`).
+
+    Deliberately has no foreign key to `User`: the Work Order is explicit
+    that an alert recipient is not a login identity -- a household can
+    register an e-mail (e.g. a relative who does not use the app) that has
+    no corresponding `User` row, and a `User` is never required to have one
+    of these rows either. `normalized_email` (lowercased, trimmed) is the
+    per-household uniqueness key so "Kelly@Ex.com" and "kelly@ex.com"
+    collapse to the same recipient instead of becoming two rows that would
+    silently double-send once MAIL-02 exists.
+
+    Not listed in `FINANCIAL_REVISION_MODELS`: same reasoning as
+    `NotificationSettings` above -- contact/preference metadata, not a
+    financial fact.
+    """
+
+    __tablename__ = "notification_recipients"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id", "normalized_email", name="uq_notification_recipient_household_email"
+        ),
+        Index("ix_notification_recipients_household_id", "household_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(ForeignKey("households.id", ondelete="CASCADE"))
+    email: Mapped[str] = mapped_column(String(254))
+    normalized_email: Mapped[str] = mapped_column(String(254))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    notify_d1: Mapped[bool] = mapped_column(Boolean, default=True)
+    notify_d0: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
 # Every model whose rows feed either (a) `app/services/financial_snapshots.py`'s
 # `_collect()` (what a period's `FinancialSnapshot` recomputes to) or (b) a
 # deterministic gate `trust_monthly_close` relies on without recomputing --

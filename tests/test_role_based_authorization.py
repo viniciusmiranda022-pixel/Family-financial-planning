@@ -224,6 +224,7 @@ def test_consulta_reads_household_data(roles: RoleFixture) -> None:
         "/api/integrity/status",
         "/api/integrity/findings",
         "/api/advisor/status",
+        "/api/notification-settings",
     ]
     for path in read_only_paths:
         response = roles.consulta.get(path)
@@ -665,6 +666,25 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             "/api/investments/missing/valuations/missing/undo",
             {"json": reason},
         ),
+        (
+            "notification settings update",
+            "put",
+            "/api/notification-settings",
+            {"json": {"enabled": True, "send_time_local": "08:00", "timezone": "America/Sao_Paulo"}},
+        ),
+        (
+            "notification recipient create",
+            "post",
+            "/api/notification-recipients",
+            {"json": {"email": "escalada@exemplo.com"}},
+        ),
+        (
+            "notification recipient update",
+            "patch",
+            "/api/notification-recipients/missing",
+            {"json": {"active": False}},
+        ),
+        ("notification recipient delete", "delete", "/api/notification-recipients/missing", {}),
     ]
 
 
@@ -809,3 +829,34 @@ def test_household_isolation_holds_for_both_roles(roles: RoleFixture) -> None:
 
     cross_household_balance_history = other.admin.get(f"/api/accounts/{roles.account_id}/balances")
     assert cross_household_balance_history.status_code == 404
+
+
+def test_notification_recipient_household_isolation(roles: RoleFixture) -> None:
+    """MAIL-00 (`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`): a recipient
+    created by household A's admin must be invisible to household B's own
+    admin -- not merely rejected for lack of privilege (both callers here
+    are admins), the `household_id` filter itself must fail closed."""
+
+    other = _setup_household(uuid.uuid4().hex[:8])
+
+    created = roles.admin.post("/api/notification-recipients", json={"email": "vinicius@exemplo.com"})
+    assert created.status_code == 201, created.text
+    recipient_id = created.json()["id"]
+
+    own_settings = roles.admin.get("/api/notification-settings").json()
+    assert recipient_id in {item["id"] for item in own_settings["recipients"]}
+
+    other_settings = other.admin.get("/api/notification-settings").json()
+    assert recipient_id not in {item["id"] for item in other_settings["recipients"]}
+
+    cross_household_patch = other.admin.patch(
+        f"/api/notification-recipients/{recipient_id}", json={"active": False}
+    )
+    assert cross_household_patch.status_code == 404
+
+    cross_household_delete = other.admin.delete(f"/api/notification-recipients/{recipient_id}")
+    assert cross_household_delete.status_code == 404
+
+    # Neither cross-household attempt above had any side effect.
+    unchanged = roles.admin.get("/api/notification-settings").json()
+    assert unchanged["recipients"] == own_settings["recipients"]

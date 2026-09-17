@@ -93,6 +93,9 @@ from app.schemas import (
     MfaEnrollConfirmRequest,
     MfaReauthRequest,
     MonthlyCloseReopenRequest,
+    NotificationRecipientCreateRequest,
+    NotificationRecipientUpdateRequest,
+    NotificationSettingsUpdateRequest,
     ObligationPaymentRequest,
     ObligationPaymentUndoRequest,
     ObligationRequest,
@@ -272,6 +275,18 @@ from app.services.monthly_close import (
     serialize_monthly_close,
     trust_monthly_close,
     upsert_monthly_close_after_run,
+)
+from app.services.notification_settings import (
+    NotificationSettingsError,
+    create_notification_recipient,
+    delete_notification_recipient,
+    get_notification_recipient,
+    get_or_create_notification_settings,
+    list_notification_recipients,
+    serialize_notification_recipient,
+    serialize_notification_settings,
+    update_notification_recipient,
+    update_notification_settings,
 )
 from app.services.projection_engine import PROJECTION_CALCULATION_VERSION, projection_liquidity_facts
 from app.services.projection_validator import PROJECTION_TOLERANCE, validate_projection
@@ -11813,6 +11828,164 @@ def deactivate_entry_type_template_endpoint(
     )
     db.commit()
     return serialize_entry_type_template(template)
+
+
+# MAIL-00 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #67): configuration
+# only -- no scheduler reads these settings yet (MAIL-02) and no e-mail is
+# ever sent because of them (MAIL-01). Reads are household-scoped for any
+# authenticated user; every mutation is `_require_admin`-gated, same
+# boundary every other settings-like write in this file already uses.
+@router.get("/notification-settings")
+def notification_settings_get(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    settings_row = get_or_create_notification_settings(db, household_id=user.household_id)
+    db.commit()
+    recipients = list_notification_recipients(db, household_id=user.household_id)
+    return {
+        **serialize_notification_settings(settings_row),
+        "recipients": [serialize_notification_recipient(item) for item in recipients],
+    }
+
+
+@router.put("/notification-settings")
+def notification_settings_update(
+    payload: NotificationSettingsUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    before = serialize_notification_settings(get_or_create_notification_settings(db, household_id=user.household_id))
+    try:
+        settings_row = update_notification_settings(
+            db,
+            household_id=user.household_id,
+            enabled=payload.enabled,
+            send_time_local=payload.send_time_local,
+            timezone=payload.timezone,
+        )
+    except NotificationSettingsError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    after = serialize_notification_settings(settings_row)
+    audit(
+        db,
+        user,
+        "notification_settings.update",
+        "notification_settings",
+        settings_row.id,
+        {},
+        before_state=before,
+        after_state=after,
+        source="notification_settings",
+    )
+    db.commit()
+    return after
+
+
+@router.post("/notification-recipients", status_code=status.HTTP_201_CREATED)
+def notification_recipients_create(
+    payload: NotificationRecipientCreateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        recipient = create_notification_recipient(
+            db,
+            household_id=user.household_id,
+            email=payload.email,
+            active=payload.active,
+            notify_d1=payload.notify_d1,
+            notify_d0=payload.notify_d0,
+        )
+    except NotificationSettingsError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    result = serialize_notification_recipient(recipient)
+    audit(
+        db,
+        user,
+        "notification_recipient.create",
+        "notification_recipient",
+        recipient.id,
+        {},
+        after_state=result,
+        source="notification_settings",
+    )
+    db.commit()
+    return result
+
+
+@router.patch("/notification-recipients/{recipient_id}")
+def notification_recipients_update(
+    recipient_id: str,
+    payload: NotificationRecipientUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        before = serialize_notification_recipient(
+            get_notification_recipient(db, household_id=user.household_id, recipient_id=recipient_id)
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Destinatário não encontrado") from exc
+    try:
+        recipient = update_notification_recipient(
+            db,
+            household_id=user.household_id,
+            recipient_id=recipient_id,
+            email=payload.email,
+            active=payload.active,
+            notify_d1=payload.notify_d1,
+            notify_d0=payload.notify_d0,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Destinatário não encontrado") from exc
+    except NotificationSettingsError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    after = serialize_notification_recipient(recipient)
+    audit(
+        db,
+        user,
+        "notification_recipient.update",
+        "notification_recipient",
+        recipient.id,
+        {},
+        before_state=before,
+        after_state=after,
+        source="notification_settings",
+    )
+    db.commit()
+    return after
+
+
+@router.delete("/notification-recipients/{recipient_id}")
+def notification_recipients_delete(
+    recipient_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    try:
+        before = serialize_notification_recipient(
+            get_notification_recipient(db, household_id=user.household_id, recipient_id=recipient_id)
+        )
+        delete_notification_recipient(db, household_id=user.household_id, recipient_id=recipient_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Destinatário não encontrado") from exc
+    audit(
+        db,
+        user,
+        "notification_recipient.delete",
+        "notification_recipient",
+        recipient_id,
+        {},
+        before_state=before,
+        source="notification_settings",
+    )
+    db.commit()
+    return {"ok": True}
 
 
 # FAMILY_FINANCE_CURRENT_CONFIRMED_LIQUIDITY_V16_1

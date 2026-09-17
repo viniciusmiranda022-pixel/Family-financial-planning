@@ -1151,6 +1151,43 @@ assinado por `itsdangerous`) sem criar um provedor de identidade paralelo:
   `qrcode`) e devolve um `data:image/png;base64,...`; a URI `otpauth://` (biblioteca `pyotp`) nunca sai
   do processo da aplicação.
 
+## Alertas de vencimento por e-mail — MAIL-00 (migração `0020`)
+
+`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #67. Primeiro de quatro slices (MAIL-00..03,
+epic #66); este cobre apenas modelo, configuração e contratos -- nenhum scheduler roda ainda
+(MAIL-02) e nenhum e-mail é enviado de fato (MAIL-01).
+
+- **`NotificationSettings` (um por household).** `enabled` (default `False`, opt-in explícito),
+  `send_time_local` (`"HH:MM"`, default `"08:00"`) e `timezone` (default `"America/Sao_Paulo"`,
+  igual a `Settings.default_timezone`). Deliberadamente ausente de `FINANCIAL_REVISION_MODELS`:
+  configuração de entrega não é fato financeiro e nunca alimenta `financial_snapshots._collect()`.
+- **`NotificationRecipient` (um ou mais por household).** `email`/`normalized_email` (chave de
+  unicidade por household, minúsculo + trim -- sem *folding* de alias Gmail `+`/`.`, que poderia
+  colapsar dois endereços que a família quer manter distintos), `active`, `notify_d1`, `notify_d0`.
+  Sem *foreign key* para `User`: um destinatário de alerta não é uma identidade de login (Work
+  Order, "não transformar e-mail de alerta em identidade de login").
+- **Sem `notification_deliveries` ainda.** A tabela de outbox/idempotência (`(household_id,
+  obligation_id, recipient_id, obligation_due_date, alert_kind)` única) pertence a MAIL-02, que
+  também introduz o worker que a escreveria -- criá-la vazia agora antecipararia o contrato de um
+  slice ainda não iniciado.
+- **`app.services.notification_settings`** valida e-mail com um regex pragmático (sem depender de
+  `pydantic[email]`/`email-validator`, ausentes de `pyproject.toml`) e valida `timezone` contra uma
+  lista curada de fusos IANA do Brasil, não `zoneinfo.available_timezones()` -- a imagem de produção
+  (`python:3.12-slim`) não garante `tzdata` do SO instalado, e uma checagem que passa em dev/CI e
+  falha em runtime seria pior que uma lista fixa e explícita.
+- **API** (`_require_admin` em toda mutação; leitura livre dentro do household, mesmo padrão de
+  `entry_type_templates`/`investments`): `GET /notification-settings` (retorna configuração +
+  destinatários juntos), `PUT /notification-settings`, `POST /notification-recipients`,
+  `PATCH /notification-recipients/{id}` (atualização parcial), `DELETE /notification-recipients/{id}`
+  (remoção real -- não é fato financeiro nem histórico auditável obrigatório, ao contrário de
+  `Transaction`/`Obligation`). Nenhuma credencial SMTP existe nesta API ou nesta tabela -- ela só
+  chega em MAIL-01, por variável de ambiente (`ALERT_SMTP_*`), nunca por request/response.
+- **UI** (`app/templates/index.html#notification-settings-panel`,
+  `app/static/app.js:loadNotificationSettings`): novo cartão em Configurações, abaixo dos alertas
+  locais do navegador (que continuam existindo, sem relação com este). Mostra somente
+  destinatários/preferências/horário/fuso -- nunca a credencial Gmail, que não tem lugar nenhum na
+  UI nesta ou em nenhuma etapa futura do Work Order.
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila
