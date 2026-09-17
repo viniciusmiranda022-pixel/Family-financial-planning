@@ -32,6 +32,7 @@ import logging
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -113,9 +114,39 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
 def _process_one_message(
     db, message: gateway.NormalizedInboundMessage, *, settings
 ) -> None:
+    """`is_duplicate_message` is a cheap pre-check for the common case (a
+    redelivery of a message some *earlier, already-committed* request fully
+    processed) -- it never by itself guarantees no duplicate is processed,
+    because two genuinely concurrent deliveries of the same
+    `provider_message_id` can both pass it before either has committed.
+
+    The actual idempotency barrier is `uq_whatsapp_inbound_events_message_id`
+    (enforced inside `gateway.record_inbound_event`, which flushes
+    immediately). Engineering review on PR #103 (WA-01): wrapping this whole
+    per-message body in `db.begin_nested()` means a concurrent-redelivery
+    `IntegrityError` rolls back only this message's own writes -- including
+    whatever it had just done to the rate-limit bucket -- rather than
+    surfacing at the request's later, request-wide `db.commit()` as an
+    unhandled 500. The loser's rate-limit accounting for what turns out to
+    be a duplicate is exactly what should not have counted, so rolling it
+    back together with the failed insert is correct, not just convenient.
+    """
+
     if gateway.is_duplicate_message(db, provider_message_id=message.provider_message_id):
         return
+    try:
+        with db.begin_nested():
+            _process_new_message(db, message, settings=settings)
+    except IntegrityError:
+        # Lost the race to a concurrent delivery of the exact same
+        # provider_message_id that reached record_inbound_event first --
+        # that delivery's row is the durable fact; this one is the duplicate.
+        pass
 
+
+def _process_new_message(
+    db, message: gateway.NormalizedInboundMessage, *, settings
+) -> None:
     try:
         phone_hash = gateway.hash_phone(message.sender_digits)
     except gateway.WhatsAppConfigurationError:

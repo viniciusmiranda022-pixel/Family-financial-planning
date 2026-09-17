@@ -28,6 +28,7 @@ from typing import Protocol
 
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -286,20 +287,49 @@ def check_rate_limit(db: Session, *, bucket_key: str, now: datetime | None = Non
     codebase accepts that limitation: correctness under true concurrent
     processes is exercised against real PostgreSQL
     (`tests/test_postgresql_integration.py`), not SQLite.
+
+    `FOR UPDATE` cannot lock a row that does not exist yet, so a bucket's
+    first-ever hit (no row for `bucket_key`) is its own race: two concurrent
+    first messages from the same new sender can both see no row and both
+    attempt the INSERT. Engineering review on PR #103 (WA-01): resolved with
+    the same `begin_nested()`/`IntegrityError` idiom as
+    `app.services.notification_scheduler.discover_due_deliveries` and
+    `app.services.privilege_valuation.ingest_latest_quote` -- the loser
+    re-selects `FOR UPDATE` (now that the winner's row exists) and falls
+    through to the normal locked-row accounting below instead of
+    short-circuiting `True`, which would silently skip this hit's own
+    accounting against the bucket the winner just created.
     """
 
     settings = get_settings()
     moment = now or datetime.now(UTC)
+    window = timedelta(seconds=settings.whatsapp_rate_limit_window_seconds)
     bucket = db.scalar(
         select(WhatsAppRateLimitBucket)
         .where(WhatsAppRateLimitBucket.bucket_key == bucket_key)
         .with_for_update()
     )
-    window = timedelta(seconds=settings.whatsapp_rate_limit_window_seconds)
     if bucket is None:
-        db.add(WhatsAppRateLimitBucket(bucket_key=bucket_key, window_start=moment, count=1))
-        db.flush()
-        return True
+        try:
+            with db.begin_nested():
+                db.add(WhatsAppRateLimitBucket(bucket_key=bucket_key, window_start=moment, count=1))
+                db.flush()
+            return True
+        except IntegrityError:
+            # Lost the race to a concurrent first-hit for the same
+            # bucket_key -- its row is now committed-within-the-transaction
+            # and lockable; join the normal accounting path below instead of
+            # treating this hit as unaccounted.
+            bucket = db.scalar(
+                select(WhatsAppRateLimitBucket)
+                .where(WhatsAppRateLimitBucket.bucket_key == bucket_key)
+                .with_for_update()
+            )
+            if bucket is None:  # pragma: no cover - defensive, should be unreachable
+                raise RuntimeError(
+                    "whatsapp_gateway: rate limit bucket missing after IntegrityError "
+                    "on its own unique constraint"
+                ) from None
     if moment - _as_aware_utc(bucket.window_start) >= window:
         bucket.window_start = moment
         bucket.count = 1
@@ -320,6 +350,16 @@ def record_inbound_event(
     household_id: str | None,
     user_id: str | None,
 ) -> WhatsAppInboundEvent:
+    """Inserts the one durable idempotency record for this
+    `provider_message_id` (`uq_whatsapp_inbound_events_message_id`).
+    Flushes immediately -- rather than leaving the INSERT pending for the
+    caller's own flush/commit -- so a concurrent redelivery's `IntegrityError`
+    surfaces here, inside whatever `begin_nested()` savepoint the caller
+    (`app.whatsapp_gateway_app._process_one_message`) wraps this call in,
+    instead of at the caller's later, request-wide `db.commit()` where it
+    could not be told apart from any other write in that request.
+    """
+
     event = WhatsAppInboundEvent(
         provider_message_id=provider_message_id,
         sender_phone_hash=sender_phone_hash,
@@ -328,4 +368,5 @@ def record_inbound_event(
         user_id=user_id,
     )
     db.add(event)
+    db.flush()
     return event
