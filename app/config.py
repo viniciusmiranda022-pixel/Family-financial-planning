@@ -42,6 +42,27 @@ class Settings(BaseSettings):
     capture_async_processing_enabled: bool = True
     capture_job_max_attempts: int = 3
     capture_job_stale_after_seconds: int = 600
+    # MAIL-01 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #68): the
+    # Gmail/SMTP sender credential lives exclusively here (env), never in
+    # the DB or a request/response -- `NotificationSettings`/
+    # `NotificationRecipient` (MAIL-00) have no column for it. `enabled`
+    # defaults `False` so a deployment that never set these vars stays
+    # silent instead of trying to send with an empty host/password.
+    alert_email_enabled: bool = False
+    alert_smtp_host: str = ""
+    alert_smtp_port: int = 587
+    alert_smtp_username: str = ""
+    alert_smtp_app_password: str = ""
+    alert_email_from: str = ""
+    alert_email_use_starttls: bool = True
+    alert_email_timeout_seconds: int = 15
+    # Process-local throttle for `POST /notification-settings/test-email`
+    # ("rate-limited de forma simples para evitar spam acidental" -- Work
+    # Order). `scripts/entrypoint.sh` runs a single `uvicorn` process with
+    # no `--workers`, so an in-memory-per-process counter (see
+    # `app.services.email_delivery._EmailSendThrottle`) is an effective
+    # control here, not just a best-effort one.
+    alert_test_email_min_interval_seconds: int = 60
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
