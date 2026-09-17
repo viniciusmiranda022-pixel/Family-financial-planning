@@ -82,6 +82,8 @@ from app.schemas import (
     EntryTypeTemplateCreateRequest,
     EntryTypeTemplateDeactivateRequest,
     FindingLifecycleRequest,
+    FundPositionMovementRequest,
+    FundPositionSnapshotRequest,
     IntegrityRunRequest,
     InvestmentContributionRequest,
     InvestmentCreateRequest,
@@ -127,7 +129,7 @@ from app.security import (
     set_session_cookie,
     verify_password,
 )
-from app.services import capture_worker
+from app.services import capture_worker, privilege_valuation
 from app.services import mfa as mfa_service
 from app.services.assistant_actions import (
     AssistantActionError,
@@ -8385,6 +8387,184 @@ def _undo_investment_valuation_impl(
     if commit:
         db.commit()
     return {"ok": True, "investment_id": item.id, "valuation_id": valuation.id}
+
+
+@router.get("/privilege-di/valuation")
+def privilege_di_valuation(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> dict:
+    """Issue #85 (`docs/WORK_ORDER_PRIVILEGE_DI_CVM.md`): read-only
+    Privilège DI daily valuation status -- estimated balance from the
+    latest official CVM quota, kept visibly distinct from the confirmed
+    Itaú balance (rebaseline INV-024, "saldo confirmado soberano"). This
+    is never the household's canonical cash figure -- that stays
+    exclusively `AccountBalanceObservation`/`household_patrimony_summary`'s
+    job (see `app.services.privilege_valuation`'s module docstring for why
+    this is a deliberately scoped, additive, display/reconciliation-only
+    slice, not a second financial engine).
+
+    `reconciliation_diff` is always recomputed live from the freshest
+    confirmed observation available right now, never read back from a
+    possibly-stale `FundValuation.reconciliation_diff` snapshot -- a
+    household member editing the confirmed Privilège balance
+    (`PUT /profile`) between the last worker pass and this request must see
+    the divergence update immediately, not wait for the next daily pass.
+    """
+
+    fund_cnpj = privilege_valuation.TRACKED_FUND_CNPJ
+    quote = privilege_valuation.latest_quote_for_fund(db, fund_cnpj=fund_cnpj)
+    position = privilege_valuation.latest_position_for_household(
+        db, household_id=user.household_id, fund_cnpj=fund_cnpj
+    )
+    valuation_row = privilege_valuation.latest_valuation_for_household(
+        db, household_id=user.household_id, fund_cnpj=fund_cnpj
+    )
+    account = privilege_valuation.resolve_privilege_account(db, household_id=user.household_id)
+    observed_balance: Decimal | None = None
+    observed_balance_as_of = None
+    if account is not None:
+        observed_balance, observed_balance_as_of = privilege_valuation.resolve_observed_balance(
+            db, household_id=user.household_id, account_id=account.id
+        )
+
+    reconciliation_diff = None
+    if valuation_row is not None and observed_balance is not None:
+        reconciliation_diff = money(valuation_row.gross_value - observed_balance)
+
+    if valuation_row is not None:
+        status = valuation_row.status
+    elif quote is None:
+        status = "no_quote_available"
+    elif position is None:
+        status = "no_position_evidence"
+    else:
+        status = "pending"
+
+    return {
+        "fund_cnpj": fund_cnpj,
+        "account_id": account.id if account is not None else None,
+        "status": status,
+        "latest_quota": decimal_value(quote.quota_value) if quote is not None else None,
+        "quota_reference_date": quote.quota_reference_date.isoformat() if quote is not None else None,
+        "quote_provider": quote.provider if quote is not None else None,
+        "quote_retrieved_at": quote.retrieved_at.isoformat() if quote is not None else None,
+        "units_held": decimal_value(position.units_held) if position is not None else None,
+        "units_held_as_of": position.effective_date.isoformat() if position is not None else None,
+        "estimated_balance": decimal_value(valuation_row.gross_value) if valuation_row is not None else None,
+        "estimated_gain_loss": (
+            decimal_value(valuation_row.variation_amount)
+            if valuation_row is not None and valuation_row.variation_amount is not None
+            else None
+        ),
+        "estimated_gain_loss_pct": (
+            decimal_value(valuation_row.variation_pct)
+            if valuation_row is not None and valuation_row.variation_pct is not None
+            else None
+        ),
+        "valuation_reference_date": (
+            valuation_row.quota_reference_date.isoformat() if valuation_row is not None else None
+        ),
+        "observed_balance": decimal_value(observed_balance) if observed_balance is not None else None,
+        "observed_balance_as_of": (
+            observed_balance_as_of.isoformat() if observed_balance_as_of is not None else None
+        ),
+        "reconciliation_diff": decimal_value(reconciliation_diff) if reconciliation_diff is not None else None,
+    }
+
+
+@router.post("/privilege-di/position-snapshot", status_code=201)
+def create_privilege_di_position_snapshot(
+    payload: FundPositionSnapshotRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Bootstrap or correct `units_held` from direct evidence (Work Order
+    "Quantity-of-units bootstrap") -- never inferred, never guessed by any
+    automated process. Admin-only, matching every other manual financial-
+    fact-recording route (`create_investment`, `create_account_balance_observation`)."""
+
+    _require_admin(user)
+    try:
+        position = privilege_valuation.record_position_snapshot(
+            db,
+            household_id=user.household_id,
+            fund_cnpj=payload.fund_cnpj,
+            units_held=payload.units_held,
+            effective_date=payload.effective_date,
+            evidence_type=payload.evidence_type,
+            evidence_document_id=payload.evidence_document_id,
+            evidence_balance_observation_id=payload.evidence_balance_observation_id,
+            note=payload.note,
+            recorded_by=user.id,
+        )
+    except privilege_valuation.PrivilegeValuationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "fund_position.snapshot",
+        "fund_unit_position",
+        position.id,
+        {
+            "fund_cnpj": position.fund_cnpj,
+            "units_held": str(position.units_held),
+            "effective_date": position.effective_date.isoformat(),
+            "evidence_type": position.evidence_type,
+        },
+        reason="Evidência de quantidade de cotas registrada pelo usuário",
+        trace_id=position.trace_id,
+        source="privilege_di",
+    )
+    db.commit()
+    return {"ok": True, "position_id": position.id, "units_held": decimal_value(position.units_held)}
+
+
+@router.post("/privilege-di/position-movement", status_code=201)
+def create_privilege_di_position_movement(
+    payload: FundPositionMovementRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Record a known application/redemption against the household's
+    current fund position (Work Order "Movements": "Applications/
+    redemptions alter units... do not create a fake bank transaction merely
+    to make the valuation match" -- this route only ever touches
+    `fund_unit_positions`, never `transactions`/`account_balance_observations`).
+    Admin-only."""
+
+    _require_admin(user)
+    try:
+        position = privilege_valuation.record_position_movement(
+            db,
+            household_id=user.household_id,
+            fund_cnpj=payload.fund_cnpj,
+            delta_units=payload.delta_units,
+            effective_date=payload.effective_date,
+            evidence_type=payload.evidence_type,
+            note=payload.note,
+            recorded_by=user.id,
+        )
+    except privilege_valuation.PrivilegeValuationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(
+        db,
+        user,
+        "fund_position.movement",
+        "fund_unit_position",
+        position.id,
+        {
+            "fund_cnpj": position.fund_cnpj,
+            "delta_units": str(position.delta_units),
+            "units_held": str(position.units_held),
+            "effective_date": position.effective_date.isoformat(),
+            "evidence_type": position.evidence_type,
+        },
+        reason="Movimento de cotas (aplicação/resgate) registrado pelo usuário",
+        trace_id=position.trace_id,
+        source="privilege_di",
+    )
+    db.commit()
+    return {"ok": True, "position_id": position.id, "units_held": decimal_value(position.units_held)}
 
 
 @router.get("/profile")

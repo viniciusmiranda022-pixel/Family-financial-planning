@@ -1322,6 +1322,64 @@ exclusivamente em `app.services.notification_scheduler`).
   no backlog Oracle/OCI, nenhuma nova) e rollback (nunca destrutivo para
   `notification_deliveries`/pagamentos/obrigações).
 
+## Valorização diária do Privilège DI via CVM (issue #85)
+
+`docs/WORK_ORDER_PRIVILEGE_DI_CVM.md`, `docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`. Escopo
+deliberadamente restrito e aditivo: valorização estimada, exibida ao lado do saldo confirmado --
+nunca o substitui, nunca alimenta `household_patrimony_summary`/`investments_summary` uma segunda
+vez, nunca cria `AccountBalanceObservation`/`Transaction`/`Investment`/`InvestmentValuation`.
+
+- **Fonte oficial**: Portal Dados Abertos CVM, arquivo mensal em lote `inf_diario_fi_{AAAAMM}.csv`
+  (dentro de um ZIP desde maio/2022) -- nunca *screen scraping*. `app.services.cvm_client.CvmClient`
+  é um cliente `urllib` puro (stdlib, sem nova dependência HTTP), mesmo formato
+  never-raise/`CvmResult` de `app.services.codex_client.CodexAdvisorClient`. O parser é
+  orientado por *nome* de coluna (`CNPJ_FUNDO_CLASSE` com fallback para `CNPJ_FUNDO`), nunca por
+  posição -- um layout não reconhecido vira erro de resposta malformada, nunca uma adivinhação.
+  Ver a investigação para a limitação explícita de verificação ao vivo (rede da sandbox que
+  autorou esta feature bloqueia `dados.cvm.gov.br`); o worker sobe desabilitado por padrão
+  (`CVM_VALUATION_ENABLED=false`) até um operador validar a fonte real uma vez.
+- **`fund_reference_quotes`** (migração `0023`, `app.models.FundReferenceQuote`): cotas oficiais
+  ingeridas, globais (não por household -- a cota é o mesmo fato para qualquer household que
+  detenha o fundo). Único `(fund_cnpj, quota_reference_date)` é a garantia de idempotência ("mesma
+  cota/data não duplica fato financeiro").
+- **`fund_unit_positions`** (`app.models.FundUnitPosition`): log de evidência append-only da
+  quantidade de cotas (`units_held`) de cada household -- nunca inferida. `evidence_type` é
+  `statement_position`/`confirmed_balance_reconciliation` (bootstrap) ou
+  `application`/`redemption` (movimento conhecido, `delta_units`). Nunca cria transação bancária
+  sintética; `app.services.privilege_valuation.record_position_snapshot`/`record_position_movement`
+  são os únicos pontos de escrita, expostos via `POST /privilege-di/position-snapshot`/
+  `POST /privilege-di/position-movement` (admin-only).
+- **`fund_valuations`** (`app.models.FundValuation`): uma linha imutável por valorização
+  (`household_id`, `fund_cnpj`, `quota_reference_date`), reproduzível a partir de todos os campos
+  que o Work Order exige (CNPJ, cota/data, `units_held`, valor bruto calculado, provedor,
+  `retrieved_at`, versão). `estimated_gross_value = units_held × latest_official_quota`
+  (`app.services.privilege_valuation.compute_gross_value`, `Decimal` em toda a cadeia, nunca
+  `float`). `observed_balance`/`reconciliation_diff` são uma cópia somente-leitura, para exibição/
+  auditoria -- nunca escritos de volta em `account_balance_observations`. Único
+  `(household_id, fund_cnpj, quota_reference_date)` garante idempotência por rerun.
+- **`app.cli.cvm_valuation_worker`**: mesmo formato `--once`/loop de `app.cli.notification_worker`
+  (MAIL-02/MAIL-03) -- uma passada ingere a cota mais recente uma vez (global) e depois valoriza
+  cada household com evidência de posição registrada, isolando falha por household (uma exceção
+  em um household nunca aborta a passada inteira). Heartbeat via
+  `app.services.cvm_worker_status`, reaproveitando a tabela `notification_worker_heartbeats`
+  (`app.models.NotificationWorkerHeartbeat`) com um segundo id de singleton -- o modelo já é
+  bookkeeping operacional genérico, sem necessidade de nova migração só para o heartbeat.
+  Serviço `cvm-worker` (`compose.yaml`): mesmo endurecimento do `notification-worker`
+  (`read_only`, `cap_drop: [ALL]`, `no-new-privileges`), `depends_on: app: condition:
+  service_healthy` (nunca roda `alembic` por conta própria).
+- **`GET /privilege-di/valuation`**: leitura para qualquer membro autenticado do household --
+  saldo estimado, cota oficial/data de referência, variação diária, ganho/perda, saldo confirmado
+  (quando existir) e a diferença de reconciliação, sempre recalculada ao vivo a partir da
+  observação confirmada mais recente (nunca a cópia possivelmente desatualizada gravada na
+  valorização). `status` explícito (`no_quote_available`/`no_position_evidence`/`pending`/`ok`) --
+  nunca "sucesso" fabricado na ausência de dados.
+- **INV-035** (`app.services.invariant_registry`, `docs/FINANCIAL_INVARIANTS.md`): uma valorização
+  derivada da cota CVM nunca contribui para renda, despesa, consumo, resultado operacional ou
+  patrimônio -- mesmo formato `_validate_zero_effects` de INV-003/INV-004 (aplicação/resgate).
+- **Dashboard**: painel opcional (`#privilege-valuation-panel`, oculto até haver cota+posição)
+  reaproveitando o `.kpi-grid`/`.kpi` existentes -- sem novo CSS, sem jargão interno
+  (`canonical_status`/`funding_source`/etc.) na tela.
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila

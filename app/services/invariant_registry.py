@@ -24,6 +24,7 @@ from app.services.financial_invariants import (
     validate_conservative_delay,
     validate_dashboard_consistency,
     validate_deficit_consumes_liquidity,
+    validate_fund_valuation_is_not_cash_flow,
     validate_individual_receivable_tax,
     validate_internal_transfer,
     validate_investment_application,
@@ -523,6 +524,30 @@ _DEFINITIONS = (
             "net_worth_contribution",
         ),
         validator=validate_net_worth_current_value_only,
+    ),
+    InvariantDefinition(
+        id="INV-035",
+        name="fund_valuation_is_not_cash_flow",
+        title="Valorização do fundo não é fluxo de caixa",
+        description=(
+            "Issue #85: uma valorização diária derivada da cota oficial CVM "
+            "(app.services.privilege_valuation, app.models.FundValuation) "
+            "nunca contribui para renda, despesa, consumo, resultado "
+            "operacional ou patrimônio -- valorização/desvalorização de "
+            "cota não é renda/despesa nem, nesta fase, patrimônio "
+            "(app.models.FundValuation permanece deliberadamente "
+            "adicional/somente-exibição, sem alimentar "
+            "household_patrimony_summary)."
+        ),
+        severity=IntegritySeverity.CRITICAL,
+        required_facts=(
+            "operating_income_effect",
+            "operating_expense_effect",
+            "budget_usage_effect",
+            "operating_result_effect",
+            "net_worth_effect",
+        ),
+        validator=validate_fund_valuation_is_not_cash_flow,
     ),
 )
 

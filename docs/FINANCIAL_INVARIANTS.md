@@ -1,7 +1,14 @@
 # Contrato de invariantes financeiros
 
-**Versão das regras:** `2026.10.5`
+**Versão das regras:** `2026.10.6`
 **Status:** normativo
+
+**Controle de mudança (2026-09-17, issue #85):** INV-035 adicionada —
+valorização diária do fundo (Privilège DI) derivada da cota oficial CVM
+nunca contribui para renda, despesa, consumo, resultado operacional ou
+patrimônio (`docs/WORK_ORDER_PRIVILEGE_DI_CVM.md`). Nenhuma regra anterior
+foi alterada; a versão avança porque o conjunto de invariantes deste
+contrato mudou.
 
 **Controle de mudança (2026-09-14, October Go-Live Slice 6, P0 #87):**
 INV-034 adicionada — patrimônio de um investimento/ativo (incluindo o
@@ -766,6 +773,35 @@ com o Patrimônio total do household (`app.services.investments.household_patrim
 `tests/test_investments_slice6.py::test_investments_summary_sums_current_value_only_never_historical_or_projected`,
 `tests/test_investments_slice6.py::test_updating_expected_receivable_value_never_changes_net_worth`,
 `tests/test_investments_slice6.py::test_dashboard_patrimony_includes_confirmed_cash_and_investments_never_historical_or_projected`.
+
+## INV-035 — Valorização do fundo não é fluxo de caixa
+
+**Escopo:** `FundValuation` (`app.services.privilege_valuation.run_valuation_for_household`).
+**Título:** Valorização do fundo não é fluxo de caixa
+**Descrição:** Uma valorização diária derivada da cota oficial CVM (issue #85,
+`docs/WORK_ORDER_PRIVILEGE_DI_CVM.md`) nunca contribui para renda, despesa, consumo, resultado
+operacional ou patrimônio.
+**Motivação:** Issue #85, seção "Financial architecture" -- "appreciation is not income/cash-flow";
+e a decisão de escopo deste slice (ver docstring de `app.models.FundValuation`) de manter a
+valorização estritamente adicional/somente-exibição, sem alimentar
+`household_patrimony_summary`/`investments_summary` uma segunda vez. Uma segunda contribuição ao
+patrimônio duplicaria o Privilège DI (já refletido via `AccountBalanceObservation` da conta) ou
+criaria um segundo motor financeiro -- ambos proibidos.
+**Entradas:** `operating_income_effect`, `operating_expense_effect`, `budget_usage_effect`,
+`operating_result_effect`, `net_worth_effect`.
+**Resultado esperado:** todos os cinco efeitos são exatamente zero.
+**Severidade se violado:** `CRITICAL`.
+**Implementação executável:** `app/services/invariant_registry.py`
+(`validate_fund_valuation_is_not_cash_flow`, reaproveitando `_validate_zero_effects`, o mesmo
+formato de `validate_investment_application`/`validate_investment_redemption`).
+`app.services.privilege_valuation.run_valuation_for_household` já garante esta propriedade por
+construção (nunca cria `Transaction`, nunca toca `AccountBalanceObservation`, nunca cria
+`Investment`/`InvestmentValuation`); esta invariante formaliza o contrato para o Financial Integrity
+Engine/validação independente do Codex também poderem recomputar e conferir o mesmo fato de forma
+determinística.
+**Teste automatizado associado:**
+`tests/test_financial_invariants.py::test_fund_valuation_is_not_cash_flow_pass_and_fail`,
+`tests/test_privilege_cvm_valuation.py::test_run_valuation_never_creates_transaction_or_balance_observation`.
 
 ## Controle de mudança
 

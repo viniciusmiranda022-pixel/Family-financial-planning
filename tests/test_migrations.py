@@ -537,6 +537,69 @@ EXPECTED_NOTIFICATION_WORKER_HEARTBEAT_COLUMNS = {
     "updated_at",
 }
 
+EXPECTED_0023_TABLES = {"fund_reference_quotes", "fund_unit_positions", "fund_valuations"}
+
+EXPECTED_FUND_REFERENCE_QUOTE_COLUMNS = {
+    "id",
+    "fund_cnpj",
+    "quota_reference_date",
+    "quota_value",
+    "net_worth",
+    "provider",
+    "source_url",
+    "ingestion_batch",
+    "retrieved_at",
+    "created_at",
+}
+
+EXPECTED_FUND_UNIT_POSITION_COLUMNS = {
+    "id",
+    "household_id",
+    "fund_cnpj",
+    "units_held",
+    "effective_date",
+    "evidence_type",
+    "delta_units",
+    "evidence_document_id",
+    "evidence_balance_observation_id",
+    "note",
+    "recorded_by",
+    "invalidated_at",
+    "invalidated_by",
+    "invalidation_reason",
+    "trace_id",
+    "created_at",
+}
+
+EXPECTED_FUND_VALUATION_COLUMNS = {
+    "id",
+    "household_id",
+    "fund_cnpj",
+    "account_id",
+    "quote_id",
+    "position_id",
+    "quota_reference_date",
+    "quota_value",
+    "units_held",
+    "gross_value",
+    "previous_gross_value",
+    "variation_amount",
+    "variation_pct",
+    "observed_balance",
+    "observed_balance_as_of",
+    "reconciliation_diff",
+    "provider",
+    "retrieved_at",
+    "valuation_version",
+    "status",
+    "error_code",
+    "invalidated_at",
+    "invalidated_by",
+    "invalidation_reason",
+    "trace_id",
+    "created_at",
+}
+
 
 def _alembic_config(monkeypatch, database_url: str, *, output_buffer=None) -> Config:
     monkeypatch.setenv("DATABASE_URL", database_url)
@@ -595,6 +658,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0020_TABLES,
             *EXPECTED_0021_TABLES,
             *EXPECTED_0022_TABLES,
+            *EXPECTED_0023_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -612,6 +676,30 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
     assert {column["name"] for column in inspector.get_columns("notification_worker_heartbeats")} == (
         EXPECTED_NOTIFICATION_WORKER_HEARTBEAT_COLUMNS
     )
+    assert {column["name"] for column in inspector.get_columns("fund_reference_quotes")} == (
+        EXPECTED_FUND_REFERENCE_QUOTE_COLUMNS
+    )
+    assert {column["name"] for column in inspector.get_columns("fund_unit_positions")} == (
+        EXPECTED_FUND_UNIT_POSITION_COLUMNS
+    )
+    assert {column["name"] for column in inspector.get_columns("fund_valuations")} == (
+        EXPECTED_FUND_VALUATION_COLUMNS
+    )
+    assert {index["name"] for index in inspector.get_indexes("fund_reference_quotes")} == {
+        "ix_fund_reference_quotes_fund_cnpj",
+    }
+    assert {index["name"] for index in inspector.get_indexes("fund_unit_positions")} == {
+        "ix_fund_unit_positions_household_id",
+        "ix_fund_unit_positions_fund_cnpj",
+        "ix_fund_unit_positions_trace_id",
+        "ix_fund_unit_positions_household_fund_date",
+    }
+    assert {index["name"] for index in inspector.get_indexes("fund_valuations")} == {
+        "ix_fund_valuations_household_id",
+        "ix_fund_valuations_fund_cnpj",
+        "ix_fund_valuations_trace_id",
+        "ix_fund_valuations_household_fund_date",
+    }
     assert {column["name"] for column in inspector.get_columns("integrity_runs")} == (
         EXPECTED_INTEGRITY_RUN_COLUMNS
     )
@@ -1018,6 +1106,112 @@ def test_downgrade_from_0019_refuses_to_discard_investment_valuations(monkeypatc
     get_settings.cache_clear()
 
 
+def test_downgrade_from_0023_refuses_to_discard_fund_valuations(monkeypatch, tmp_path) -> None:
+    """Issue #85: `fund_valuations`/`fund_unit_positions`/`fund_reference_quotes`
+    are the only durable record of a CVM-derived daily valuation and of the
+    evidence it was computed from -- none of it is reconstructible from
+    CVM after the fact (CVM only guarantees twelve months of published
+    files, and the evidence for `units_held` may not exist anywhere else at
+    all). Same guarded-downgrade pattern as 0015/0016/0019/0020."""
+
+    from datetime import UTC, date, datetime
+    from decimal import Decimal
+
+    from sqlalchemy.orm import sessionmaker
+
+    database_url = f"sqlite:///{tmp_path / 'migrations-fund-valuation-guard.sqlite'}"
+    config = _alembic_config(monkeypatch, database_url)
+
+    from app.models import FundReferenceQuote, FundUnitPosition, FundValuation, Household
+
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url)
+    session_factory = sessionmaker(bind=engine)
+    retrieved_at = datetime(2026, 9, 15, 8, 0, tzinfo=UTC)
+    with session_factory() as db:
+        household = Household(name="Família Downgrade Privilège DI")
+        db.add(household)
+        db.flush()
+        quote = FundReferenceQuote(
+            fund_cnpj="26199519000134",
+            quota_reference_date=date(2026, 9, 15),
+            quota_value=Decimal("28.1234567890"),
+            provider="cvm_dados_abertos",
+            source_url="http://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/inf_diario_fi_202609.csv",
+            ingestion_batch="202609",
+            retrieved_at=retrieved_at,
+        )
+        db.add(quote)
+        db.flush()
+        position = FundUnitPosition(
+            household_id=household.id,
+            fund_cnpj="26199519000134",
+            units_held=Decimal("1445.12345678"),
+            effective_date=date(2026, 9, 11),
+            evidence_type="confirmed_balance_reconciliation",
+            trace_id="trace-fund-position-guard",
+        )
+        db.add(position)
+        db.flush()
+        valuation = FundValuation(
+            household_id=household.id,
+            fund_cnpj="26199519000134",
+            quote_id=quote.id,
+            position_id=position.id,
+            quota_reference_date=date(2026, 9, 15),
+            quota_value=quote.quota_value,
+            units_held=position.units_held,
+            gross_value=Decimal("40650.12"),
+            provider="cvm_dados_abertos",
+            retrieved_at=retrieved_at,
+            valuation_version="v1",
+            status="ok",
+            trace_id="trace-fund-valuation-guard",
+        )
+        db.add(valuation)
+        db.commit()
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="fund_valuations"):
+        command.downgrade(config, "0022")
+
+    engine, inspector = _inspect(database_url)
+    assert "fund_valuations" in inspector.get_table_names()
+    assert "fund_unit_positions" in inspector.get_table_names()
+    assert "fund_reference_quotes" in inspector.get_table_names()
+    engine.dispose()
+
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM fund_valuations")
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="fund_unit_positions"):
+        command.downgrade(config, "0022")
+
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM fund_unit_positions")
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="fund_reference_quotes"):
+        command.downgrade(config, "0022")
+
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM fund_reference_quotes")
+    engine.dispose()
+
+    command.downgrade(config, "0022")
+    engine, inspector = _inspect(database_url)
+    assert "fund_valuations" not in inspector.get_table_names()
+    assert "fund_unit_positions" not in inspector.get_table_names()
+    assert "fund_reference_quotes" not in inspector.get_table_names()
+    engine.dispose()
+    get_settings.cache_clear()
+
+
 def test_downgrade_from_0020_refuses_to_discard_notification_recipients(monkeypatch, tmp_path) -> None:
     """MAIL-00: a `notification_recipients` row is the household's only
     record of who asked to be alerted and how -- not reconstructible from
@@ -1168,7 +1362,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0022"
+        ).scalar_one() == "0023"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -1194,6 +1388,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0022"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0023"
     engine.dispose()
     get_settings.cache_clear()

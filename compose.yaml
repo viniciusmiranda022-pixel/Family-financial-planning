@@ -73,6 +73,40 @@ services:
       retries: 3
     networks: [internal, lan]
 
+  # Issue #85 (docs/WORK_ORDER_PRIVILEGE_DI_CVM.md): the CVM daily fund
+  # valuation worker, same shape as `notification-worker` above -- reuses
+  # the `app` image/entrypoint with `command: ["cvm-worker"]` instead of a
+  # third Dockerfile. `depends_on: app: condition: service_healthy`
+  # guarantees migration 0023 has already run. `lan` network for outbound
+  # HTTPS to CVM's Open Data Portal (`CVM_QUOTA_BASE_URL`); `internal` for
+  # PostgreSQL. Ships effectively idle: `CVM_VALUATION_ENABLED` defaults to
+  # `false` (`app/config.py`), so this container runs a cheap no-op pass
+  # every `CVM_VALUATION_WORKER_POLL_SECONDS` until an operator opts in
+  # after verifying the live CVM source once (see
+  # `docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`'s explicit
+  # verification-limitation note).
+  cvm-worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: ["cvm-worker"]
+    depends_on:
+      app:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.cli.cvm_valuation_worker_healthcheck"]
+      interval: 300s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    networks: [internal, lan]
+
   advisor:
     profiles: ["container-advisor"]
     build: ./advisor

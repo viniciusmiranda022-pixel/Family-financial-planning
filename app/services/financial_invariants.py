@@ -27,7 +27,12 @@ from typing import Any
 # always exactly its current value -- never the sum of cost basis, current
 # value and future projection. See
 # docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_6.md.
-FINANCIAL_RULES_VERSION = "2026.10.5"
+# Issue #85: INV-035 is added so a CVM-quota-derived fund valuation never
+# contributes to income, expense, budget usage, operating result or net
+# worth -- appreciation is not cash-flow, and this slice deliberately never
+# feeds household_patrimony_summary a second time. See
+# docs/WORK_ORDER_PRIVILEGE_DI_CVM.md.
+FINANCIAL_RULES_VERSION = "2026.10.6"
 MONEY_TOLERANCE = Decimal("0.01")
 PROBABLE_DUPLICATE_THRESHOLD = Decimal("0.60")
 STRONG_DUPLICATE_THRESHOLD = Decimal("0.85")
@@ -263,6 +268,37 @@ def validate_investment_redemption(
         ),
         pass_message="O resgate foi mantido como movimento patrimonial de liquidez.",
         fail_message="O resgate foi contado como renda, despesa, consumo ou ganho patrimonial fictício.",
+    )
+
+
+def validate_fund_valuation_is_not_cash_flow(
+    definition: InvariantDefinition, context: InvariantContext
+) -> InvariantResult:
+    """INV-035 (issue #85, `docs/WORK_ORDER_PRIVILEGE_DI_CVM.md`): a
+    CVM-quota-derived fund valuation (`app.services.privilege_valuation
+    .run_valuation_for_household`, `app.models.FundValuation`) must never
+    contribute to operating income, operating expense, budget usage,
+    operating result, or net worth -- appreciation/depreciation from a
+    quota movement is neither income/cash-flow nor a patrimony change in
+    this slice (the Work Order's "Financial architecture": "appreciation is
+    not income/cash-flow"; this codebase's own scoping decision, see
+    `app.models.FundValuation`'s docstring, to keep this slice additive/
+    display-only rather than feeding `household_patrimony_summary` a second
+    time). Same `_validate_zero_effects` shape as
+    `validate_investment_application`/`validate_investment_redemption`."""
+
+    return _validate_zero_effects(
+        definition,
+        context,
+        fields=(
+            "operating_income_effect",
+            "operating_expense_effect",
+            "budget_usage_effect",
+            "operating_result_effect",
+            "net_worth_effect",
+        ),
+        pass_message="A valorização do fundo não afetou renda, despesa, consumo, resultado ou patrimônio.",
+        fail_message="A valorização do fundo contaminou renda, despesa, consumo, resultado ou patrimônio.",
     )
 
 
