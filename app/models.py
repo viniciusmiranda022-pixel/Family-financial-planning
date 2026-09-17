@@ -17,6 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
@@ -1802,6 +1803,143 @@ class NotificationWorkerHeartbeat(Base, TimestampMixin):
     ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     counts: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+
+class WhatsAppAuthorizedNumber(Base, TimestampMixin):
+    """WA-01 (`docs/WORK_ORDER_WA_01.md`, issue #73): the allowlist mapping
+    one authorized phone number to exactly one `User`/`household`.
+
+    Never stores a phone number in the clear: `phone_hash` is the
+    deterministic HMAC (`app.services.whatsapp_gateway.hash_phone`) the
+    inbound webhook looks up the sender by; `phone_encrypted` is the same
+    number Fernet-encrypted at rest, decrypted only for an authenticated
+    admin managing the allowlist (`GET /whatsapp/authorized-numbers`);
+    `phone_last4` is a non-reversible display aid so an admin can recognize
+    "which number" in a list/log without decrypting anything. Same
+    "hash for lookup, encrypt for display" key-reuse idiom as
+    `app.services.mfa.hash_recovery_code`/`encrypt_secret` -- one dedicated
+    key (`WHATSAPP_PHONE_ENCRYPTION_KEY`), two uses.
+
+    `active` is a soft-delete flag, never a hard delete (mandate §54: "não
+    apagar dados... auditabilidade"): revoking a number preserves who
+    linked/unlinked it and when. Only one row per `user_id` and one row per
+    `phone_hash` may be `active` at a time -- enforced by the two partial
+    unique indexes below, not just at the application layer, because an
+    ambiguous phone->user mapping is a security/authorization defect
+    (`docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md` §4.3), not merely a data
+    hygiene one. A number can be relinked after deactivation (a new,
+    separate row) without deleting the history of the old link.
+    """
+
+    __tablename__ = "whatsapp_authorized_numbers"
+    __table_args__ = (
+        Index(
+            "uq_whatsapp_authorized_numbers_active_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("active"),
+            sqlite_where=text("active"),
+        ),
+        Index(
+            "uq_whatsapp_authorized_numbers_active_phone_hash",
+            "phone_hash",
+            unique=True,
+            postgresql_where=text("active"),
+            sqlite_where=text("active"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    phone_hash: Mapped[str] = mapped_column(String(64), index=True)
+    phone_encrypted: Mapped[str] = mapped_column(Text)
+    phone_last4: Mapped[str] = mapped_column(String(4))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    created_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deactivated_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class WhatsAppInboundEvent(Base):
+    """WA-01: minimal, privacy-minimized receipt record for one inbound
+    WhatsApp webhook message -- idempotency (dedup by `provider_message_id`)
+    and abuse/audit visibility, nothing else.
+
+    Deliberately holds no message text and no phone number in any
+    recoverable form (`docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md` §8, Work
+    Order "Persist only identifiers/hashes/timestamps/status"): WA-01 does
+    not interpret or act on message content at all (`No WA-02+
+    orchestration` prohibition), so there is nothing here yet that INV-032's
+    `AssistantActionEvent` audit trail would apply to -- that starts only
+    once a later slice actually executes a typed action from this channel.
+    `household_id`/`user_id` are populated only once the sender is resolved
+    against `WhatsAppAuthorizedNumber`; both stay `NULL` for an unauthorized
+    or not-yet-resolved sender, which is exactly the "reject without
+    revealing whether a household/user/resource exists" contract -- no
+    branch of the webhook handler returns a different HTTP status or body
+    depending on `status` here (`app/whatsapp_gateway_app.py`).
+
+    `status` is one of: `accepted` (authorized, deduplicated, no further
+    processing implemented in this slice), `unauthorized`, `rate_limited`.
+    A redelivered `provider_message_id` never gets a second row -- the
+    existing row's presence *is* the dedup check (unique index below) --
+    so `duplicate` is a webhook-response outcome, not a stored `status`.
+    """
+
+    __tablename__ = "whatsapp_inbound_events"
+    __table_args__ = (
+        UniqueConstraint("provider_message_id", name="uq_whatsapp_inbound_events_message_id"),
+        Index("ix_whatsapp_inbound_events_sender_phone_hash", "sender_phone_hash"),
+        Index("ix_whatsapp_inbound_events_household_id", "household_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    provider_message_id: Mapped[str] = mapped_column(String(128))
+    sender_phone_hash: Mapped[str] = mapped_column(String(64))
+    household_id: Mapped[str | None] = mapped_column(
+        ForeignKey("households.id", ondelete="SET NULL"), nullable=True
+    )
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(20))
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class WhatsAppRateLimitBucket(Base):
+    """WA-01: one fixed-window counter per sender (`bucket_key` ==
+    `phone_hash`), incremented atomically under `SELECT ... FOR UPDATE`
+    (`app.services.whatsapp_gateway.check_rate_limit`) -- same row-lock
+    idiom already used for concurrency safety in this codebase
+    (`app/services/assistant_actions.py`'s proposal-execution lock). A
+    dedicated table rather than counting recent `WhatsAppInboundEvent` rows
+    on the fly: a single lockable row gives an atomic check-and-increment
+    under concurrent deliveries from the same sender, which a COUNT(*) query
+    cannot (mandate §56: "não presuma que apenas um processo executará").
+    Global (not household-scoped): rate limiting protects this process
+    against one sender's message volume regardless of whether that sender
+    is even authorized yet.
+    """
+
+    __tablename__ = "whatsapp_rate_limit_buckets"
+    __table_args__ = (UniqueConstraint("bucket_key", name="uq_whatsapp_rate_limit_buckets_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    bucket_key: Mapped[str] = mapped_column(String(64))
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 # Every model whose rows feed either (a) `app/services/financial_snapshots.py`'s

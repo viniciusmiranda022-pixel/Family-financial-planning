@@ -107,6 +107,42 @@ services:
       retries: 3
     networks: [internal, lan]
 
+  # WA-01 (docs/WORK_ORDER_WA_01.md, issue #73): the WhatsApp webhook
+  # gateway, `app/whatsapp_gateway_app.py` -- reuses the `app` image/
+  # entrypoint with `command: ["gateway"]` (see `scripts/entrypoint.sh`),
+  # same shape as `notification-worker`/`cvm-worker`. `profiles:
+  # ["whatsapp-gateway"]` (mirroring `advisor`'s `container-advisor`
+  # profile below) keeps this off by default: `docker compose up` alone
+  # never starts it, matching `WHATSAPP_GATEWAY_ENABLED=false`'s
+  # ship-disabled default in `app/config.py`. `depends_on: app: condition:
+  # service_healthy` guarantees migration 0024 has already run. `internal`
+  # only (no `lan`): this slice never makes an outbound call (it only
+  # receives webhooks; sending a reply is WA-02+). This is the one
+  # component of the project meant to eventually sit behind a public
+  # reverse proxy/TLS terminator (`docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md`
+  # §4.2) -- provisioning that public endpoint is explicit OCI/deployment
+  # work, out of scope here (Work Order: "Oracle/OCI implementation/
+  # deployment is explicitly out of scope"); `WHATSAPP_GATEWAY_PORT` only
+  # exposes it on the host for local testing of the webhook contract.
+  whatsapp-gateway:
+    profiles: ["whatsapp-gateway"]
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: ["gateway"]
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "${WHATSAPP_GATEWAY_PORT:-8091}:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [internal]
+
   advisor:
     profiles: ["container-advisor"]
     build: ./advisor

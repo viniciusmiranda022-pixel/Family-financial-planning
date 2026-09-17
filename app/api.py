@@ -57,6 +57,7 @@ from app.models import (
     ReviewItem,
     Transaction,
     User,
+    WhatsAppAuthorizedNumber,
 )
 from app.schemas import (
     AccountBalanceObservationRequest,
@@ -113,6 +114,7 @@ from app.schemas import (
     TransactionUpdate,
     TransferRequest,
     UserCreateRequest,
+    WhatsAppAuthorizedNumberCreateRequest,
 )
 from app.security import (
     PENDING_PURPOSE_ENROLL,
@@ -129,7 +131,7 @@ from app.security import (
     set_session_cookie,
     verify_password,
 )
-from app.services import capture_worker, privilege_valuation
+from app.services import capture_worker, privilege_valuation, whatsapp_gateway
 from app.services import mfa as mfa_service
 from app.services.assistant_actions import (
     AssistantActionError,
@@ -2676,6 +2678,141 @@ def deactivate_user(
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
     item.active = False
     audit(db, user, "user.deactivate", "user", item.id, {"username": item.username})
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/whatsapp/authorized-numbers")
+def list_whatsapp_authorized_numbers(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> list[dict]:
+    """WA-01 (`docs/WORK_ORDER_WA_01.md`): admin-only allowlist management.
+    Lives in the main `app` (session-cookie auth, full household/user
+    context) -- never in the isolated gateway process
+    (`app/whatsapp_gateway_app.py`), which only reads this same table by
+    `phone_hash` to resolve an inbound sender. Never returns a decrypted
+    phone number: `phone_last4` is enough for an admin to recognize which
+    number a row is without this endpoint ever handling the plaintext
+    number in a response body/log."""
+
+    _require_admin(user)
+    rows = db.execute(
+        select(WhatsAppAuthorizedNumber, User.name)
+        .join(User, User.id == WhatsAppAuthorizedNumber.user_id)
+        .where(WhatsAppAuthorizedNumber.household_id == user.household_id)
+        .order_by(WhatsAppAuthorizedNumber.created_at)
+    ).all()
+    return [
+        {
+            "id": item.id,
+            "user_id": item.user_id,
+            "user_name": name,
+            "phone_last4": item.phone_last4,
+            "active": item.active,
+            "created_at": item.created_at.isoformat(),
+            "deactivated_at": item.deactivated_at.isoformat() if item.deactivated_at else None,
+        }
+        for item, name in rows
+    ]
+
+
+@router.post("/whatsapp/authorized-numbers", status_code=201)
+def create_whatsapp_authorized_number(
+    payload: WhatsAppAuthorizedNumberCreateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    target = db.scalar(
+        select(User).where(User.id == payload.user_id, User.household_id == user.household_id)
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+    try:
+        digits = whatsapp_gateway.normalize_phone(payload.phone_number)
+    except whatsapp_gateway.InvalidPhoneNumberError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        phone_hash = whatsapp_gateway.hash_phone(digits)
+        phone_encrypted = whatsapp_gateway.encrypt_phone(digits)
+    except whatsapp_gateway.WhatsAppConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    existing_for_user = db.scalar(
+        select(WhatsAppAuthorizedNumber).where(
+            WhatsAppAuthorizedNumber.user_id == target.id,
+            WhatsAppAuthorizedNumber.active.is_(True),
+        )
+    )
+    if existing_for_user:
+        raise HTTPException(
+            status_code=409, detail="Este usuário já possui um número vinculado ativo"
+        )
+    existing_for_phone = db.scalar(
+        select(WhatsAppAuthorizedNumber).where(
+            WhatsAppAuthorizedNumber.phone_hash == phone_hash,
+            WhatsAppAuthorizedNumber.active.is_(True),
+        )
+    )
+    if existing_for_phone:
+        raise HTTPException(status_code=409, detail="Este número já está vinculado a outro usuário")
+
+    item = WhatsAppAuthorizedNumber(
+        household_id=user.household_id,
+        user_id=target.id,
+        phone_hash=phone_hash,
+        phone_encrypted=phone_encrypted,
+        phone_last4=whatsapp_gateway.phone_last4(digits),
+        active=True,
+        created_by=user.id,
+    )
+    db.add(item)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Número ou usuário já vinculado") from exc
+    audit(
+        db,
+        user,
+        "whatsapp.authorized_number.create",
+        "whatsapp_authorized_number",
+        item.id,
+        {"user_id": target.id, "phone_last4": item.phone_last4},
+    )
+    db.commit()
+    return {"id": item.id, "user_id": item.user_id, "phone_last4": item.phone_last4}
+
+
+@router.delete("/whatsapp/authorized-numbers/{authorized_number_id}")
+def deactivate_whatsapp_authorized_number(
+    authorized_number_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    item = db.scalar(
+        select(WhatsAppAuthorizedNumber).where(
+            WhatsAppAuthorizedNumber.id == authorized_number_id,
+            WhatsAppAuthorizedNumber.household_id == user.household_id,
+        )
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Vínculo não encontrado")
+    if not item.active:
+        return {"ok": True}
+    item.active = False
+    item.deactivated_at = datetime.now(UTC)
+    item.deactivated_by = user.id
+    audit(
+        db,
+        user,
+        "whatsapp.authorized_number.deactivate",
+        "whatsapp_authorized_number",
+        item.id,
+        {"user_id": item.user_id, "phone_last4": item.phone_last4},
+    )
     db.commit()
     return {"ok": True}
 

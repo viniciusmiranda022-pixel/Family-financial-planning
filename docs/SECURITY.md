@@ -46,7 +46,9 @@
 ## O que não fazer
 
 - não publicar a porta do PostgreSQL;
-- não expor a aplicação diretamente à internet;
+- não expor a aplicação (`app`, a UI/API principal) diretamente à internet -- a única exceção
+  deliberada é o serviço isolado `whatsapp-gateway` (ver "Gateway WhatsApp (WA-01)" abaixo), que
+  nunca compartilha banco de documentos, sessão de usuário ou qualquer rota do `app`;
 - não compartilhar a conta do Tailscale nem o usuário do sistema entre Vinicius e Kelly;
 - não armazenar senha de internet banking;
 - não configurar `OPENAI_API_KEY` no serviço `advisor`; a API tem cobrança separada e não é necessária;
@@ -211,6 +213,32 @@ completos.
   fictício (`tests/fixtures/synthetic_household.py`).
 - O serviço `advisor` não participa de nenhum job de CI; `advisor-contract-security` valida apenas o
   contrato/sanitização/allowlist com o fake provider já existente, sem rede real com nenhum sidecar.
+
+## Gateway WhatsApp (WA-01, issue #73)
+
+- Transporte/autenticação apenas -- não interpreta mensagem, não executa ação tipada, não cria
+  nenhuma `Transaction`/`Obligation`. Ver "Gateway WhatsApp — transporte e autorização (WA-01)" em
+  `docs/ARCHITECTURE.md` para o desenho completo.
+- Único componente do projeto pensado para ficar atrás de um endpoint público -- processo isolado
+  (`app/whatsapp_gateway_app.py`), sem montar `document_data`, sem servir a UI, sem as ~150 rotas do
+  `app` principal. Desligado por padrão (`WHATSAPP_GATEWAY_ENABLED=false`).
+- Toda requisição POST é rejeitada (`403`, sem tocar no banco) antes de qualquer parsing se a
+  assinatura `X-Hub-Signature-256` (HMAC-SHA256 do corpo bruto) não bater com `WHATSAPP_APP_SECRET`.
+- Nenhum número de telefone é armazenado em claro: `phone_hash` (HMAC) é a única forma usada para
+  localizar o remetente; `phone_encrypted` (Fernet, mesma chave `WHATSAPP_PHONE_ENCRYPTION_KEY`)
+  existe só para exibição futura ao admin, nunca é devolvido por nenhuma rota hoje.
+  `WHATSAPP_PHONE_ENCRYPTION_KEY` nunca é `SECRET_KEY`/`FILE_ENCRYPTION_KEY`/`MFA_ENCRYPTION_KEY`
+  (mesma separação de chaves de `app.services.mfa`).
+- Resposta HTTP idêntica (`{"status": "ok"}`) para mensagem aceita, duplicada, de remetente não
+  autorizado ou limitada por taxa -- um atacante não consegue enumerar households/usuários pelo
+  código/corpo da resposta.
+- Nenhum texto de mensagem é persistido; `whatsapp_inbound_events` guarda só identificador/hash/
+  timestamp/status, suficiente para idempotência e auditoria operacional, nunca conteúdo.
+- Gerenciamento do allowlist (`POST/GET/DELETE /api/whatsapp/authorized-numbers`) é admin-only,
+  fail-closed via `app.api._require_admin`, e vive no `app` principal (sessão de cookie existente) --
+  nunca no processo do gateway.
+- Testado inteiramente com `FakeWhatsAppProvider`/payloads fabricados
+  (`tests/test_whatsapp_gateway.py`); nenhum job de CI faz chamada real à Meta.
 
 ## Backfill (`app.cli.backfill`, PR 8)
 

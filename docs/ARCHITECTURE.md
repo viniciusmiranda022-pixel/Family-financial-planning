@@ -1380,6 +1380,56 @@ vez, nunca cria `AccountBalanceObservation`/`Transaction`/`Investment`/`Investme
   reaproveitando o `.kpi-grid`/`.kpi` existentes -- sem novo CSS, sem jargão interno
   (`canonical_status`/`funding_source`/etc.) na tela.
 
+## Gateway WhatsApp — transporte e autorização (WA-01, issue #73)
+
+`docs/WORK_ORDER_WA_01.md`, `docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md`. Escopo deliberadamente
+restrito a transporte/autenticação: recebe e valida o webhook, deduplica, aplica rate limit e
+resolve o remetente autorizado -- **não interpreta nem age sobre o conteúdo da mensagem** (a
+Orquestração/Tool Layer descritas na ADR são WA-02+, fora deste PR). Nenhuma `Transaction`/
+`Obligation`/tabela financeira é criada, lida ou alterada por este componente.
+
+- **Processo isolado, não uma rota do `app`**: `app/whatsapp_gateway_app.py` é uma segunda
+  aplicação FastAPI própria, montada apenas com `/health` e `/webhooks/whatsapp` -- a única
+  superfície do projeto pensada para eventualmente ficar atrás de um proxy público
+  (`docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md` §4.2). Reaproveita a mesma imagem/entrypoint do `app`
+  com `command: ["gateway"]` (`scripts/entrypoint.sh`), mesmo padrão de `notification-worker`/
+  `cvm-worker` -- não um quarto `Dockerfile`. Serviço `whatsapp-gateway` (`compose.yaml`) sobe sob o
+  profile `whatsapp-gateway`, desligado por padrão, mesmo endurecimento dos demais workers
+  (`read_only`, `cap_drop: [ALL]`, `no-new-privileges`), só na rede `internal` (nunca chama nada
+  externamente nesta fatia).
+- **`WHATSAPP_GATEWAY_ENABLED=false` por padrão** (`app/config.py`): ao contrário do `advisor`, este
+  é um novo componente publicamente exposto -- rollout control explícito, mesmo racional do
+  `CVM_VALUATION_ENABLED`. Nenhuma variável nova é obrigatória para uma instalação existente subir
+  (`WHATSAPP_PHONE_ENCRYPTION_KEY` etc. têm default vazio; o erro de configuração só aparece se algo
+  tentar de fato usar a chave, nunca no boot).
+- **Verificação de assinatura**: `X-Hub-Signature-256` (HMAC-SHA256 sobre o corpo bruto,
+  `hmac.compare_digest`) verificado *antes* de qualquer parsing JSON ou acesso ao banco
+  (`app.services.whatsapp_gateway.verify_signature`) -- mesmo padrão de
+  `advisor/server.mjs`'s `authorized()`/`timingSafeEqual`. O handshake `GET` (`hub.verify_token`)
+  segue o mesmo fail-closed.
+- **`whatsapp_authorized_numbers`** (migração `0024`): vínculo número->usuário->household, gerido
+  apenas pelo admin via `POST/GET/DELETE /api/whatsapp/authorized-numbers` (no `app` principal, não
+  no gateway). Nunca guarda o número em claro: `phone_hash` (HMAC, mesma chave
+  `WHATSAPP_PHONE_ENCRYPTION_KEY`) é a chave de busca do webhook; `phone_encrypted` (Fernet) existe
+  só para exibição futura ao admin; `phone_last4` é o único dado de número que a API hoje devolve.
+  Dois índices únicos parciais (`active`) impedem duas linhas ativas para o mesmo usuário ou o mesmo
+  número -- uma resolução telefone->usuário ambígua seria uma falha de autorização, não só de
+  higiene de dados. Desativar preserva a linha (nunca hard-delete); um número pode ser revinculado
+  depois como uma nova linha.
+- **`whatsapp_inbound_events`**: recibo mínimo por mensagem (idempotência por
+  `provider_message_id`, `status` `accepted`/`unauthorized`/`rate_limited`) -- nunca guarda texto da
+  mensagem nem o número do remetente em qualquer forma recuperável. `household_id`/`user_id` só são
+  preenchidos quando o remetente é resolvido; toda resposta HTTP é idêntica
+  (`{"status": "ok"}`) independentemente do motivo interno, para nunca revelar se um número/household
+  existe.
+- **`whatsapp_rate_limit_buckets`**: limitador de janela fixa por `phone_hash`, incrementado sob
+  `SELECT ... FOR UPDATE` (mesmo idioma de trava de linha de `assistant_actions.py`) -- não uma
+  contagem de `whatsapp_inbound_events` em tempo real, para ganhar atomicidade sob concorrência.
+- **Adapter desacoplado**: `normalize_inbound_messages`/`build_outbound_text_message` traduzem o
+  formato da WhatsApp Cloud API de/para uma forma mínima interna; `WhatsAppProvider` (protocolo) +
+  `FakeWhatsAppProvider` (testes) seguem o mesmo papel de `advisor/providers/fakeProvider.mjs` --
+  nenhum provider real/credencial Meta é implementado neste PR (fora de escopo do Work Order).
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila
