@@ -1466,6 +1466,96 @@ class NotificationRecipient(Base, TimestampMixin):
     notify_d0: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class NotificationDelivery(Base, TimestampMixin):
+    """Outbox row for one D-1/D0 due-date alert event -- one
+    `Obligation` x `NotificationRecipient` x `obligation_due_date` x
+    `alert_kind` combination (MAIL-02,
+    `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #69).
+
+    This is delivery/operational state, never a financial fact: nothing
+    here is read by `app/services/financial_snapshots.py._collect()`, no
+    row here ever creates/edits a `Transaction`/`Obligation`/payment, and
+    it is deliberately absent from `FINANCIAL_REVISION_MODELS` below for
+    the same reason `NotificationSettings`/`NotificationRecipient` are.
+    `app.services.notification_scheduler` is the only writer; it only
+    *observes* `Obligation` (`household_id`, `active`, `status`,
+    `due_date`) and never mutates it -- see that module's docstring for
+    the eligibility/claim/retry contract this row's columns exist to
+    support.
+
+    `obligation_due_date` is a snapshot of `Obligation.due_date` at
+    discovery time, not a live join value: it is part of the row's own
+    identity (see the unique constraint below), so a later edit to the
+    obligation's `due_date` can never retroactively change which logical
+    event an already-created delivery row represents.
+
+    Status lifecycle: `pending` -> `sending` -> `sent` | `failed` |
+    `canceled`, or `sending` -> `pending` again for a bounded retry
+    (`attempt_count` bumped, `next_attempt_at` set to the backoff
+    deadline). `canceled` is a fourth terminal status beyond the Work
+    Order's baseline `pending`/`sending`/`sent`/`failed` list ("estados
+    adicionais podem existir se tecnicamente necessários"): it is the
+    "Cancelamento por pagamento" outcome -- the obligation was paid or
+    deactivated between discovery and send -- and must stay distinct from
+    `failed` (which means "the send itself did not work and may be
+    retried/inspected"), or an operator reading `failed` rows for SMTP
+    trouble would have to also mentally filter out ordinary paid-in-time
+    obligations. Reuses `last_error_code` to carry the machine-readable
+    cancellation reason (`"canceled_obligation_paid"` /
+    `"canceled_obligation_inactive"`) instead of adding a second reason
+    column -- the same reuse `CaptureProcessingJob.error_code` already
+    makes for its own non-error `"cancelled_by_user"` terminal state.
+
+    Every status transition after the initial `pending` insert is a
+    compare-and-swap `UPDATE ... WHERE status = :observed AND
+    attempt_count = :observed_attempt_count`, mirroring
+    `app.services.capture_worker.claim_capture_job`/`finalize_capture_job`
+    exactly (see that module's docstrings for why `status` alone is not a
+    sufficient predicate once reclaim/retry can bump the row more than
+    once). `claimed_at` is this row's `started_at` equivalent -- when the
+    current `sending` attempt began, used both to detect an abandoned
+    claim (`notification_delivery_stale_after_seconds`) and, together with
+    `attempt_count`, as the CAS lease token.
+    """
+
+    __tablename__ = "notification_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id",
+            "obligation_id",
+            "recipient_id",
+            "obligation_due_date",
+            "alert_kind",
+            name="uq_notification_delivery_event",
+        ),
+        Index("ix_notification_deliveries_household_id", "household_id"),
+        Index("ix_notification_deliveries_status_next_attempt", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(ForeignKey("households.id", ondelete="CASCADE"))
+    obligation_id: Mapped[str] = mapped_column(ForeignKey("obligations.id", ondelete="CASCADE"))
+    # SET NULL (not CASCADE): a household may delete/replace a
+    # `NotificationRecipient` (e.g. a typo correction) without that
+    # silently destroying the audit trail of alerts already attempted for
+    # it -- same reasoning `AuditEvent.user_id` already documents for a
+    # deleted `User`.
+    recipient_id: Mapped[str | None] = mapped_column(
+        ForeignKey("notification_recipients.id", ondelete="SET NULL"), nullable=True
+    )
+    obligation_due_date: Mapped[date] = mapped_column(Date)
+    alert_kind: Mapped[str] = mapped_column(String(2))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
 # Every model whose rows feed either (a) `app/services/financial_snapshots.py`'s
 # `_collect()` (what a period's `FinancialSnapshot` recomputes to) or (b) a
 # deterministic gate `trust_monthly_close` relies on without recomputing --

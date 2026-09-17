@@ -63,6 +63,22 @@ class Settings(BaseSettings):
     # `app.services.email_delivery._EmailSendThrottle`) is an effective
     # control here, not just a best-effort one.
     alert_test_email_min_interval_seconds: int = 60
+    # MAIL-02 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #69): the
+    # outbox/scheduler worker's own tuning. `notification_worker_poll_seconds`
+    # is how often `python -m app.cli.notification_worker` sweeps for newly
+    # eligible D-1/D0 events when run as a persistent process ("polling leve
+    # e barato" -- Work Order); it never affects when a delivery is
+    # *eligible* (that is always local calendar-date + `send_time_local`),
+    # only how promptly the worker notices. `notification_delivery_max_attempts`
+    # and `notification_delivery_retry_backoff_seconds` bound retry of a
+    # transient SMTP failure ("no máximo 3 tentativas", "backoff crescente");
+    # `notification_delivery_stale_after_seconds` is how long a delivery may
+    # sit in `sending` before it is considered an abandoned/crashed claim and
+    # offered for reclaim -- mirrors `capture_job_stale_after_seconds` above.
+    notification_worker_poll_seconds: int = 120
+    notification_delivery_max_attempts: int = 3
+    notification_delivery_retry_backoff_seconds: int = 300
+    notification_delivery_stale_after_seconds: int = 900
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
