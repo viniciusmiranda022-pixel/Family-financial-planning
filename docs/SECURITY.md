@@ -167,6 +167,39 @@ D-1/D0 automaticamente é a seção "Alertas de e-mail — outbox e worker (MAIL
   `tests/test_notification_worker.py`) sempre substituem o adapter por um dublê em memória -- nenhum
   job de CI autentica no Gmail real, igual ao MAIL-01.
 
+## Alertas de e-mail — integração operacional e observabilidade (MAIL-03)
+
+`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #70. Cobre o serviço `notification-worker`
+(`compose.yaml`), o heartbeat `notification_worker_heartbeats` (migração `0022`) e
+`GET /notification-settings/status`. Ver `docs/RUNBOOK_MAIL_ALERTS.md` para operação/troubleshooting
+completos.
+
+- a credencial SMTP continua exclusivamente em `.env`/segredo do orquestrador -- o serviço
+  `notification-worker` usa `env_file: .env`, os mesmos `ALERT_SMTP_*` que `app` já usava, nunca uma
+  cópia ou uma segunda fonte de configuração;
+- `GET /notification-settings/status` não é `_require_admin`-gated (qualquer membro autenticado do
+  household lê, mesma fronteira de `GET /notification-settings`) porque nada na resposta é segredo
+  ou endereço de destinatário: `sender_configured` é um booleano, `worker` traz apenas timestamps/
+  booleano/código de erro sanitizado, `deliveries` são contagens por status filtradas pelo
+  `household_id` do chamador (`app.services.notification_worker_status.delivery_status_counts`,
+  `tests/test_notification_worker_status.py::test_status_endpoint_never_leaks_another_households_deliveries`);
+- `notification_worker_heartbeats` é uma tabela global (um único processo cobre todos os households
+  numa passada), nunca filtrada por `household_id` -- por isso `worker` na resposta nunca inclui
+  nada específico de household, só timestamps/booleano/código de erro do processo;
+- `app/cli/notification_worker_healthcheck.py` (o `HEALTHCHECK` do contêiner) nunca imprime um
+  endereço de e-mail, um id de entrega ou uma credencial -- só a palavra de status sanitizada
+  (`ok`/`stale`/`never_run`) em stdout, verificado em
+  `tests/test_notification_worker_healthcheck.py::test_main_exits_zero_when_healthy_and_nonzero_when_not`;
+- o contêiner `notification-worker` roda com `read_only: true`, `cap_drop: [ALL]` (mais restrito que
+  `app`, que precisa bindar uma porta HTTP) e `security_opt: no-new-privileges:true`, sem `ports:` e
+  sem o volume `document_data` -- superfície de ataque menor que `app`, já que o processo nunca serve
+  HTTP e nunca precisa ler um documento;
+- uma passada que lança uma exceção não tratada nunca fica invisível: `run_once` grava o heartbeat
+  com `ok=False`/`last_error_code="worker_pass_exception"` num `finally` antes de repropagar a
+  exceção (`tests/test_notification_worker.py::test_run_once_records_a_failed_heartbeat_and_still_raises_when_a_pass_crashes`),
+  e a mesma passada nunca deixa uma `notification_delivery`/`Transaction` órfã ou parcial (a
+  transação da sessão correspondente é revertida pelo `with Session(...)` do SQLAlchemy).
+
 ## CI (PR 8)
 
 - `.github/workflows/ci.yml` usa apenas credenciais fixas e claramente falsas, nunca reaproveitadas

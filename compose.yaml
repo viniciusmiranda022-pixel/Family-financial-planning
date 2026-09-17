@@ -36,6 +36,43 @@ services:
       - no-new-privileges:true
     networks: [internal, lan]
 
+  # MAIL-03 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #70): the
+  # due-date e-mail alert worker as its own restart-safe service, reusing
+  # the `app` image/entrypoint with `command: ["worker"]` (see
+  # `scripts/entrypoint.sh`) instead of a second Dockerfile. `depends_on:
+  # app: condition: service_healthy` guarantees migrations (0022 included)
+  # have already run before this starts -- this service never runs
+  # `alembic upgrade head` itself. Networks mirror `app`'s own
+  # (`internal` for PostgreSQL, `lan` for outbound SMTP to Gmail); no
+  # `ports:` and no `document_data` volume, since the worker never serves
+  # HTTP and never touches a document. `cap_drop: [ALL]` beyond `app`'s
+  # own hardening: unlike `app`, this process never needs to bind a
+  # listening port, so it needs no Linux capability at all. See
+  # `docs/RUNBOOK_MAIL_ALERTS.md` for operating/troubleshooting this
+  # service and `app/cli/notification_worker_healthcheck.py` for what the
+  # healthcheck actually probes.
+  notification-worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: ["worker"]
+    depends_on:
+      app:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.cli.notification_worker_healthcheck"]
+      interval: 60s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    networks: [internal, lan]
+
   advisor:
     profiles: ["container-advisor"]
     build: ./advisor

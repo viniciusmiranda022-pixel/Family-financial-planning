@@ -2297,6 +2297,56 @@ async function loadNotificationSettings() {
   recipientForm.classList.toggle("hidden", !isAdmin());
 
   renderNotificationRecipients(data.recipients || []);
+  await loadNotificationStatus();
+}
+
+// MAIL-03 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #70): renders
+// GET /notification-settings/status -- read-only, nothing here is a
+// secret or a recipient address. Never fails the whole settings screen if
+// this call errors (older backend during a rolling deploy, etc.): the
+// panel just stays hidden.
+async function loadNotificationStatus() {
+  const panel = document.querySelector("#notification-status-panel");
+  try {
+    const status = await api("/notification-settings/status");
+    panel.innerHTML = renderNotificationStatusPanel(status);
+  } catch (error) {
+    panel.innerHTML = "";
+  }
+}
+
+function renderNotificationStatusPanel(status) {
+  const sender = status.sender_configured
+    ? '<span class="status-chip ok">Configurado</span>'
+    : '<span class="status-chip warn">Não configurado</span>';
+
+  const worker = status.worker;
+  let workerCell;
+  if (!worker) {
+    workerCell = '<span class="status-chip muted">Nunca executado</span>';
+  } else if (worker.last_run_ok === false) {
+    workerCell = `<span class="status-chip danger">Falhou</span> <small>${new Date(worker.last_finished_at || worker.last_started_at).toLocaleString("pt-BR")}</small>`;
+  } else if (worker.last_finished_at) {
+    workerCell = `<span class="status-chip ok">Em dia</span> <small>${new Date(worker.last_finished_at).toLocaleString("pt-BR")}</small>`;
+  } else {
+    workerCell = '<span class="status-chip warn">Em execução</span>';
+  }
+
+  const deliveries = status.deliveries || {};
+  return `
+    <table>
+      <thead><tr><th>Alertas</th><th>Sender SMTP</th><th>Worker</th><th class="right">Enviados</th><th class="right">Falharam</th><th class="right">Pendentes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>${status.enabled ? '<span class="status-chip ok">Ativo</span>' : '<span class="status-chip muted">Inativo</span>'}</td>
+          <td>${sender}</td>
+          <td>${workerCell}</td>
+          <td class="right">${deliveries.sent ?? 0}</td>
+          <td class="right">${deliveries.failed ?? 0}</td>
+          <td class="right">${(deliveries.pending ?? 0) + (deliveries.sending ?? 0)}</td>
+        </tr>
+      </tbody>
+    </table>`;
 }
 
 function renderNotificationRecipients(recipients) {

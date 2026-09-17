@@ -37,6 +37,7 @@ from app.models import (  # noqa: E402
     Transaction,
 )
 from app.services import notification_scheduler as scheduler  # noqa: E402
+from app.services import notification_worker_status as worker_status  # noqa: E402
 from app.services.email_delivery import EmailDeliveryResult  # noqa: E402
 
 TZ = "America/Sao_Paulo"
@@ -348,3 +349,85 @@ def test_household_isolation_worker_processes_each_household_independently() -> 
         for household_id, delivery in deliveries.items():
             obligation = db.get(Obligation, delivery.obligation_id)
             assert obligation.household_id == household_id
+
+
+# MAIL-03 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #70): the
+# heartbeat `run_once` writes via `app.services.notification_worker_status`
+# on every pass -- what `GET /notification-settings/status` (tested in
+# `tests/test_notification_worker_status.py`) reads as "última execução do
+# worker".
+def test_run_once_records_a_successful_heartbeat() -> None:
+    SessionFactory = _session_factory()
+    today = date(2026, 3, 10)
+    with SessionFactory() as db:
+        household = _household(db)
+        _settings(db, household.id)
+        _recipient(db, household.id)
+        _obligation(db, household.id, due_date=today)
+        db.commit()
+
+    adapter = _FakeAdapter()
+    run_once(session_factory=SessionFactory, adapter=adapter, now_utc=_utc_at(today, 9, 0))
+
+    with SessionFactory() as db:
+        heartbeat = worker_status.heartbeat_snapshot(db)
+        assert heartbeat is not None
+        assert heartbeat["last_run_ok"] is True
+        assert heartbeat["last_started_at"] is not None
+        assert heartbeat["last_finished_at"] is not None
+        assert heartbeat["last_error_code"] is None
+        assert heartbeat["last_counts"]["sent"] == 1
+
+
+def test_run_once_records_a_failed_heartbeat_and_still_raises_when_a_pass_crashes(monkeypatch) -> None:
+    SessionFactory = _session_factory()
+    today = date(2026, 3, 10)
+    with SessionFactory() as db:
+        household = _household(db)
+        _settings(db, household.id)
+        _recipient(db, household.id)
+        _obligation(db, household.id, due_date=today)
+        db.commit()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated database outage")
+
+    monkeypatch.setattr(scheduler, "discover_due_deliveries", _boom)
+
+    adapter = _FakeAdapter()
+    try:
+        run_once(session_factory=SessionFactory, adapter=adapter, now_utc=_utc_at(today, 9, 0))
+        raise AssertionError("run_once should have propagated the exception")
+    except RuntimeError:
+        pass
+
+    with SessionFactory() as db:
+        heartbeat = worker_status.heartbeat_snapshot(db)
+        assert heartbeat is not None
+        assert heartbeat["last_run_ok"] is False
+        assert heartbeat["last_error_code"] == "worker_pass_exception"
+
+        # Regression: a crashed pass must never leave a delivery claimed
+        # forever or create a financial fact.
+        assert db.query(NotificationDelivery).count() == 0
+        assert db.query(Transaction).count() == 0
+
+
+def test_worker_error_code_from_a_failed_send_surfaces_on_the_heartbeat() -> None:
+    SessionFactory = _session_factory()
+    today = date(2026, 3, 10)
+    with SessionFactory() as db:
+        household = _household(db)
+        _settings(db, household.id)
+        _recipient(db, household.id)
+        _obligation(db, household.id, due_date=today)
+        db.commit()
+
+    adapter = _FakeAdapter(results=[EmailDeliveryResult(ok=False, error_code="smtp_auth_failed")])
+    run_once(session_factory=SessionFactory, adapter=adapter, now_utc=_utc_at(today, 9, 0))
+
+    with SessionFactory() as db:
+        heartbeat = worker_status.heartbeat_snapshot(db)
+        assert heartbeat is not None
+        assert heartbeat["last_run_ok"] is True
+        assert heartbeat["last_error_code"] == "smtp_auth_failed"

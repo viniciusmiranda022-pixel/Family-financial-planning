@@ -1556,6 +1556,48 @@ class NotificationDelivery(Base, TimestampMixin):
     message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
+class NotificationWorkerHeartbeat(Base, TimestampMixin):
+    """Singleton row recording the most recent
+    `app.cli.notification_worker.run_once()` pass -- the durable "última
+    execução do worker"/"último erro sanitizado" the Work Order's
+    "Observabilidade" section requires (MAIL-03,
+    `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #70).
+
+    Global, not household-scoped: one worker process sweeps every
+    household's deliveries in a single pass, so there is one timeline of
+    runs, not one per household. `app.services.notification_worker_status`
+    is the only writer/reader; `GET /notification-settings/status` is the
+    only route that surfaces it, alongside the (already known)
+    `NotificationDelivery` counts and `SmtpEmailAdapter.configured` --
+    never a secret, never a recipient address.
+
+    Overwritten in place every pass rather than accumulated: nothing reads
+    history here (that is what `NotificationDelivery`/`AuditEvent` are for
+    already), only "when did the worker last run, did it finish cleanly,
+    and what was the last sanitized error", so an unbounded operational
+    table would only cost storage for no benefit. `started_at` is bumped
+    when a pass begins and `finished_at`/`ok`/`counts`/`last_error_code`
+    only when it completes, so a pass that is still running (or crashed
+    hard enough to never reach the `finally`) is visible as `started_at`
+    newer than `finished_at` -- the "worker parado/falhando" signal the
+    Work Order asks for.
+
+    Not listed in `FINANCIAL_REVISION_MODELS` below: same reasoning as
+    `NotificationDelivery` -- an operational record about a process, never
+    a financial fact, never read by `financial_snapshots._collect()`.
+    """
+
+    __tablename__ = "notification_worker_heartbeats"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    worker_id: Mapped[str] = mapped_column(String(120))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    counts: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT, nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+
 # Every model whose rows feed either (a) `app/services/financial_snapshots.py`'s
 # `_collect()` (what a period's `FinancialSnapshot` recomputes to) or (b) a
 # deterministic gate `trust_monthly_close` relies on without recomputing --

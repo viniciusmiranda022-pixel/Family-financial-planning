@@ -974,7 +974,11 @@
              Work Order "Decisão de produto solicitada". -->
         <article class="panel settings-panel" id="notification-settings-panel">
           <div class="panel-heading"><div><span class="step-label">ALERTAS POR E-MAIL</span><h2>Alertas de vencimento por e-mail</h2></div></div>
-          <p class="muted-copy">Avisa por e-mail um dia antes (D-1) e no dia do vencimento (D0) de contas/obrigações cadastradas. O envio automático ainda não está ativo nesta etapa — aqui você configura destinatários/preferências e pode enviar um e-mail de teste manualmente.</p>
+          <p class="muted-copy">Avisa por e-mail um dia antes (D-1) e no dia do vencimento (D0) de contas/obrigações cadastradas. O envio automático roda em segundo plano, sem depender do navegador aberto — aqui você configura destinatários/preferências e acompanha o status do envio.</p>
+          <!-- MAIL-03 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #70):
+               read-only view of GET /notification-settings/status --
+               nothing here is a secret or a recipient address. -->
+          <div class="table-wrap" id="notification-status-panel"></div>
           <form id="notification-settings-form" class="form-grid three">
             <label>Ativo<select name="enabled"><option value="false">Não</option><option value="true">Sim</option></select></label>
             <label>Horário<input type="time" name="send_time_local" required></label>
@@ -1014,6 +1018,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/app.js?v={{ asset_version }}-mail-01-test-email" defer></script>
+  <script src="/static/app.js?v={{ asset_version }}-mail-03-worker-status" defer></script>
 </body>
 </html>

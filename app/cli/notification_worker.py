@@ -1,5 +1,5 @@
-"""Due-date e-mail alert worker (MAIL-02,
-`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #69).
+"""Due-date e-mail alert worker (MAIL-02/MAIL-03,
+`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issues #69/#70).
 
 Wires the pieces that are each individually owned elsewhere into the one
 place the Work Order calls "processo/serviço separado": discovery, claim
@@ -26,10 +26,12 @@ single bounded pass will do:
         state lives in `notification_deliveries`, and a `sending` row a
         killed pass abandoned is reclaimed by the next pass's stale check.
 
-Wiring this into `compose.yaml`/Docker/OCI as an actual running service,
-plus health/observability surfacing and the Gmail runbook, is MAIL-03's
-scope ("Divisão em slices" in the Work Order) -- deliberately not touched
-here.
+MAIL-03 wires the second invocation shape above into `compose.yaml` as
+its own `notification-worker` service (see that file and
+`docs/RUNBOOK_MAIL_ALERTS.md`) and adds the heartbeat this module writes
+via `app.services.notification_worker_status` on every pass -- "última
+execução"/"último erro sanitizado" for `GET /notification-settings/status`
+to surface, per the Work Order's "Observabilidade" section.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models import AuditEvent, NotificationDelivery, NotificationRecipient, Obligation
 from app.services import notification_scheduler as scheduler
+from app.services import notification_worker_status as worker_status
 from app.services.email_delivery import EmailDeliveryResult, OutboundEmail, SmtpEmailAdapter
 from app.services.notification_templates import render_due_date_alert
 
@@ -101,12 +104,17 @@ def _process_claimed_delivery(
     max_attempts: int,
     retry_backoff_seconds: int,
     now_utc=None,
-) -> str:
+) -> tuple[str, str | None]:
     """Revalidates, sends (or cancels/retries/fails) exactly one already-
-    claimed delivery, and audits the outcome. Returns one of `"sent"`,
-    `"canceled"`, `"retry_scheduled"`, `"failed"`, or `"claim_lost"` (a
-    concurrent reclaim/finalize won the row first -- see
-    `app.services.notification_scheduler`'s CAS discipline).
+    claimed delivery, and audits the outcome. Returns `(outcome,
+    error_code)`: `outcome` is one of `"sent"`, `"canceled"`,
+    `"retry_scheduled"`, `"failed"`, or `"claim_lost"` (a concurrent
+    reclaim/finalize won the row first -- see
+    `app.services.notification_scheduler`'s CAS discipline); `error_code`
+    is the sanitized `app.services.email_delivery.EmailErrorCode` (or
+    cancellation reason) when the outcome is not `"sent"`/`"claim_lost"`,
+    for `run_once` to surface as this pass's heartbeat
+    `last_error_code` -- never a recipient address or raw SMTP text.
 
     Every branch below re-checks the canonical `Obligation`/
     `NotificationRecipient` fresh from `db` -- never trusts the state the
@@ -128,7 +136,7 @@ def _process_claimed_delivery(
         )
         if not won:
             db.rollback()
-            return "claim_lost"
+            return "claim_lost", None
         _audit(
             db,
             household_id=delivery.household_id,
@@ -137,7 +145,7 @@ def _process_claimed_delivery(
             details={"alert_kind": delivery.alert_kind, "reason": reason},
         )
         db.commit()
-        return "canceled"
+        return "canceled", reason
 
     if not scheduler.is_recipient_still_eligible(
         db,
@@ -153,7 +161,7 @@ def _process_claimed_delivery(
         )
         if not won:
             db.rollback()
-            return "claim_lost"
+            return "claim_lost", None
         _audit(
             db,
             household_id=delivery.household_id,
@@ -165,7 +173,7 @@ def _process_claimed_delivery(
             },
         )
         db.commit()
-        return "canceled"
+        return "canceled", scheduler.CANCEL_REASON_RECIPIENT_GONE
 
     recipient = db.scalar(
         select(NotificationRecipient).where(
@@ -202,7 +210,7 @@ def _process_claimed_delivery(
         )
         if not won:
             db.rollback()
-            return "claim_lost"
+            return "claim_lost", None
         _audit(
             db,
             household_id=delivery.household_id,
@@ -211,7 +219,7 @@ def _process_claimed_delivery(
             details={"alert_kind": delivery.alert_kind, "recipient_id": delivery.recipient_id},
         )
         db.commit()
-        return "sent"
+        return "sent", None
 
     won = scheduler.finalize_retry_or_fail(
         db,
@@ -224,7 +232,7 @@ def _process_claimed_delivery(
     )
     if not won:
         db.rollback()
-        return "claim_lost"
+        return "claim_lost", None
     # `populate_existing=True`: `finalize_retry_or_fail` issued a Core
     # `UPDATE`, and this same `delivery` instance is still tracked in this
     # session's identity map from the claim above -- force a fresh read of
@@ -247,7 +255,7 @@ def _process_claimed_delivery(
         },
     )
     db.commit()
-    return outcome
+    return outcome, result.error_code
 
 
 def run_once(
@@ -260,54 +268,83 @@ def run_once(
 ) -> dict[str, int]:
     """One discovery+claim+send pass. Returns counts for observability and
     testing; never raises for an individual delivery's failure (captured
-    on that delivery's own row, exactly like the capture-job worker)."""
+    on that delivery's own row, exactly like the capture-job worker).
+
+    Every pass -- whether it completes normally or aborts on an unhandled
+    exception -- records a `NotificationWorkerHeartbeat` row (MAIL-03,
+    `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #70,
+    `app.services.notification_worker_status`): `started_at` before
+    anything else runs, `finished_at`/`ok`/`counts`/`last_error_code` in a
+    `finally` so a crash is recorded as `ok=False` instead of leaving the
+    previous pass's result looking current forever.
+    """
 
     settings = get_settings()
     worker_id = worker_id or scheduler.worker_identity()
     stale_after_seconds = settings.notification_delivery_stale_after_seconds
 
     with session_factory() as db:
-        exhausted_failed = scheduler.fail_exhausted_stale_deliveries(
-            db, stale_after_seconds=stale_after_seconds, now_utc=now_utc
-        )
+        worker_status.mark_run_started(db, worker_id=worker_id, now_utc=now_utc)
         db.commit()
-        discovered = scheduler.discover_due_deliveries(db, now_utc=now_utc)
-        db.commit()
-        claimable_ids = scheduler.find_claimable_delivery_ids(
-            db, limit=limit, stale_after_seconds=stale_after_seconds, now_utc=now_utc
-        )
 
-    active_adapter = adapter or SmtpEmailAdapter()
     counts = {
-        "discovered": discovered,
-        "exhausted_failed": exhausted_failed,
+        "discovered": 0,
+        "exhausted_failed": 0,
         "sent": 0,
         "canceled": 0,
         "retry_scheduled": 0,
         "failed": 0,
         "claim_lost": 0,
     }
-    for delivery_id in claimable_ids:
+    last_error_code: str | None = None
+    ok = False
+    try:
         with session_factory() as db:
-            delivery = scheduler.claim_delivery(
+            counts["exhausted_failed"] = scheduler.fail_exhausted_stale_deliveries(
+                db, stale_after_seconds=stale_after_seconds, now_utc=now_utc
+            )
+            db.commit()
+            counts["discovered"] = scheduler.discover_due_deliveries(db, now_utc=now_utc)
+            db.commit()
+            claimable_ids = scheduler.find_claimable_delivery_ids(
+                db, limit=limit, stale_after_seconds=stale_after_seconds, now_utc=now_utc
+            )
+
+        active_adapter = adapter or SmtpEmailAdapter()
+        for delivery_id in claimable_ids:
+            with session_factory() as db:
+                delivery = scheduler.claim_delivery(
+                    db,
+                    delivery_id,
+                    worker_id=worker_id,
+                    stale_after_seconds=stale_after_seconds,
+                    now_utc=now_utc,
+                )
+                if delivery is None:
+                    counts["claim_lost"] += 1
+                    continue
+                outcome, error_code = _process_claimed_delivery(
+                    db,
+                    delivery,
+                    adapter=active_adapter,
+                    max_attempts=delivery.max_attempts,
+                    retry_backoff_seconds=settings.notification_delivery_retry_backoff_seconds,
+                    now_utc=now_utc,
+                )
+                counts[outcome] = counts.get(outcome, 0) + 1
+                if error_code is not None:
+                    last_error_code = error_code
+        ok = True
+    finally:
+        with session_factory() as db:
+            worker_status.mark_run_finished(
                 db,
-                delivery_id,
-                worker_id=worker_id,
-                stale_after_seconds=stale_after_seconds,
+                ok=ok,
+                counts=dict(counts),
+                error_code=last_error_code if ok else (last_error_code or "worker_pass_exception"),
                 now_utc=now_utc,
             )
-            if delivery is None:
-                counts["claim_lost"] += 1
-                continue
-            outcome = _process_claimed_delivery(
-                db,
-                delivery,
-                adapter=active_adapter,
-                max_attempts=delivery.max_attempts,
-                retry_backoff_seconds=settings.notification_delivery_retry_backoff_seconds,
-                now_utc=now_utc,
-            )
-            counts[outcome] = counts.get(outcome, 0) + 1
+            db.commit()
 
     logger.info("notification_worker_pass", extra=counts)
     return counts
