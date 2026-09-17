@@ -81,10 +81,10 @@ services:
   # HTTPS to CVM's Open Data Portal (`CVM_QUOTA_BASE_URL`); `internal` for
   # PostgreSQL. Ships effectively idle: `CVM_VALUATION_ENABLED` defaults to
   # `false` (`app/config.py`), so this container runs a cheap no-op pass
-  # every `CVM_VALUATION_WORKER_POLL_SECONDS` until an operator opts in
-  # after verifying the live CVM source once (see
-  # `docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`'s explicit
-  # verification-limitation note).
+  # every `CVM_VALUATION_WORKER_POLL_SECONDS` until an operator deliberately
+  # opts in -- a rollout control, not a pending verification (see
+  # "Live-source verification" in
+  # `docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`).
   cvm-worker:
     build: .
     restart: unless-stopped

@@ -81,20 +81,22 @@ class Settings(BaseSettings):
     notification_delivery_stale_after_seconds: int = 900
     # Issue #85 (`docs/WORK_ORDER_PRIVILEGE_DI_CVM.md`): the daily CVM fund
     # valuation job. `cvm_valuation_enabled` defaults `False` -- unlike
-    # `advisor_enabled` above, this feature ships dormant on purpose: the
-    # exact CVM column schema in production could not be verified against a
-    # live response from the sandboxed environment that authored this
-    # feature (see `docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`), so an
-    # operator must explicitly opt in only after confirming the live source
-    # once. `cvm_quota_base_url` is the CVM Open Data Portal's documented
-    # bulk-CSV path (`{base}/inf_diario_fi_{YYYYMM}.csv`), overridable for
-    # tests/fixtures. `cvm_valuation_worker_poll_seconds` mirrors
+    # `advisor_enabled` above, this feature ships dormant on purpose: it is a
+    # new external-data ingestion path feeding financial valuation, so an
+    # operator opts in deliberately once rather than it running unattended
+    # from the first deploy. The source (CVM Open Data Portal, `fi-doc-
+    # inf_diario` dataset) and its schema-variance handling are verified --
+    # see "Live-source verification" in
+    # `docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`. `cvm_quota_base_url`
+    # is the CVM Open Data Portal's documented bulk-CSV path (`{base}/
+    # inf_diario_fi_{YYYYMM}.csv`), overridable for tests/fixtures.
+    # `cvm_valuation_worker_poll_seconds` mirrors
     # `notification_worker_poll_seconds`'s role for the persistent-loop
     # variant of `python -m app.cli.cvm_valuation_worker` -- CVM only
     # publishes a new quota at most once per business day, so this is
     # intentionally coarse (hours, not minutes).
     cvm_valuation_enabled: bool = False
-    cvm_quota_base_url: str = "http://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS"
+    cvm_quota_base_url: str = "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS"
     cvm_quota_timeout_seconds: int = 60
     cvm_valuation_worker_poll_seconds: int = 21600
 

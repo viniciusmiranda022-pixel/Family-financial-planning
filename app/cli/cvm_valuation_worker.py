@@ -12,12 +12,14 @@ sequences calls into those modules and persists the outcome, exactly like
 
 Ships **disabled by default** (`cvm_valuation_enabled=false`,
 `app/config.py`): `CvmClient.configured` is `False` until an operator opts
-in, specifically because this feature's exact CVM column schema could not
-be verified against a live response from the sandboxed environment that
-authored it (`docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`). A pass
-run while disabled is a deliberate, cheap no-op (heartbeat still records
-`ok=True`, `counts={"quote_ingested": 0, ...}`) -- never a crash, never
-something an operator has to specifically avoid running.
+in. This is a deliberate rollout control for a new external-data ingestion
+path feeding financial valuation, not a workaround for an unverified source
+-- the CVM source and its schema-variance handling are verified, see
+"Live-source verification" in
+`docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`. A pass run while
+disabled is a deliberate, cheap no-op (heartbeat still records `ok=True`,
+`counts={"quote_ingested": 0, ...}`) -- never a crash, never something an
+operator has to specifically avoid running.
 
 Two invocation shapes, matching `app.cli.notification_worker`:
 

@@ -3,7 +3,10 @@
 
 Section 1 unit-tests `app.services.cvm_client` directly (no DB, no HTTP):
 CSV/ZIP parsing, the `CNPJ_FUNDO`/`CNPJ_FUNDO_CLASSE` schema-variance
-fallback, and malformed-response handling.
+fallback (legacy layout retained *and* the verified current layout with the
+`ID_SUBCLASSE` column -- see "Live-source verification" in
+`docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`), and malformed-response
+handling.
 
 Section 2 unit-tests `app.services.privilege_valuation` directly against an
 in-memory SQLite session -- idempotency, quota rise/unchanged, missing
@@ -64,11 +67,27 @@ FUND_CNPJ = pv.TRACKED_FUND_CNPJ  # "26199519000134"
 # ---------------------------------------------------------------------------
 
 
-def _fixture_csv(*, date_str="2026-09-15", quota="28.1234567890", cnpj_column="CNPJ_FUNDO") -> str:
+def _fixture_csv(
+    *,
+    date_str="2026-09-15",
+    quota="28.1234567890",
+    cnpj_column="CNPJ_FUNDO",
+    include_id_subclasse=False,
+) -> str:
+    # `include_id_subclasse=True` reproduces the verified *current* CVM
+    # layout (`CNPJ_FUNDO_CLASSE` join column, `ID_SUBCLASSE` inserted right
+    # after `DENOM_SOCIAL` -- see "Live-source verification" in
+    # `docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md`). The tracked fund
+    # has no subclasses, so its `ID_SUBCLASSE` value is blank, exactly as
+    # CVM publishes it for a single-class fund -- this proves the
+    # name-based parser tolerates the extra column without misreading any
+    # field that follows it.
+    id_subclasse_header = ";ID_SUBCLASSE" if include_id_subclasse else ""
+    id_subclasse_value = ";" if include_id_subclasse else ""
     return (
-        f"TP_FUNDO;{cnpj_column};DENOM_SOCIAL;DT_COMPTC;VL_TOTAL;VL_QUOTA;VL_PATRIM_LIQ;CAPTC_DIA;RESG_DIA;NR_COTST\n"
-        f"FI;26.199.519/0001-34;ITAU PRIVILEGE;{date_str};1000000.00;{quota};900000.00;0;0;10\n"
-        f"FI;11.111.111/0001-11;OUTRO FUNDO;{date_str};500.00;10.0000000000;400.00;0;0;5\n"
+        f"TP_FUNDO;{cnpj_column};DENOM_SOCIAL{id_subclasse_header};DT_COMPTC;VL_TOTAL;VL_QUOTA;VL_PATRIM_LIQ;CAPTC_DIA;RESG_DIA;NR_COTST\n"
+        f"FI;26.199.519/0001-34;ITAU PRIVILEGE{id_subclasse_value};{date_str};1000000.00;{quota};900000.00;0;0;10\n"
+        f"FI;11.111.111/0001-11;OUTRO FUNDO{id_subclasse_value};{date_str};500.00;10.0000000000;400.00;0;0;5\n"
     )
 
 
@@ -91,10 +110,26 @@ def test_picks_the_latest_reference_date_when_several_rows_exist() -> None:
 
 
 def test_cnpj_fundo_classe_column_variant_is_recognized() -> None:
-    # CVM's Resolução 175 fund-classes reform may rename the join column --
-    # the parser must not depend on CNPJ_FUNDO specifically.
+    # CVM's Resolução 175 fund-classes reform renamed the join column --
+    # the parser must not depend on CNPJ_FUNDO specifically. Legacy layout
+    # (no ID_SUBCLASSE column) -- pre-reform monthly archives.
     quote = _latest_quote_for_cnpj(_fixture_csv(cnpj_column="CNPJ_FUNDO_CLASSE"), fund_cnpj_digits=FUND_CNPJ)
     assert quote is not None
+    assert quote.quota_value == Decimal("28.1234567890")
+
+
+def test_verified_current_schema_with_id_subclasse_column_is_recognized() -> None:
+    # The verified current CVM Informe Diário layout: CNPJ_FUNDO_CLASSE join
+    # column *and* an ID_SUBCLASSE column inserted after DENOM_SOCIAL (see
+    # "Live-source verification",
+    # docs/PRIVILEGE_DI_CVM_INGESTION_INVESTIGATION.md). The parser must
+    # ignore ID_SUBCLASSE and still correctly read every column after it.
+    quote = _latest_quote_for_cnpj(
+        _fixture_csv(cnpj_column="CNPJ_FUNDO_CLASSE", include_id_subclasse=True),
+        fund_cnpj_digits=FUND_CNPJ,
+    )
+    assert quote is not None
+    assert quote.quota_reference_date == date(2026, 9, 15)
     assert quote.quota_value == Decimal("28.1234567890")
 
 
