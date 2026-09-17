@@ -21,10 +21,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
@@ -33,6 +37,8 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import WhatsAppAuthorizedNumber, WhatsAppInboundEvent, WhatsAppRateLimitBucket
+
+logger = logging.getLogger(__name__)
 
 _MIN_DIGITS = 8
 _MAX_DIGITS = 15
@@ -143,26 +149,46 @@ def verify_handshake(*, mode: str | None, verify_token: str | None, configured_t
     return hmac.compare_digest((verify_token or "").encode(), configured_token.encode())
 
 
+_MAX_INBOUND_TEXT_CHARS = 2000
+
+
 @dataclass(frozen=True)
 class NormalizedInboundMessage:
     provider_message_id: str
     sender_digits: str
+    # WA-03 (`docs/WORK_ORDER_WA_03.md`, issue #75): `None` for anything WA-01
+    # already tolerated (a non-`"text"` message type, or a `"text"` entry
+    # with no/blank `text.body`) -- the caller must treat `None` as
+    # "nothing to interpret", never as an empty-but-valid message, exactly
+    # the same "hint absent, never guessed" contract the Tool Layer already
+    # uses elsewhere. Only free text is in scope for this slice (no
+    # image/audio/location/interactive-button handling -- that is the
+    # existing OCR/transcription capture pipeline's territory, out of this
+    # Work Order's scope: "não antecipar WA-04+").
+    text: str | None = None
 
 
 def normalize_inbound_messages(payload: dict) -> list[NormalizedInboundMessage]:
     """Extracts every text/message entry from a WhatsApp Cloud API webhook
     body (`entry[].changes[].value.messages[]`) into the minimal shape this
-    slice needs. Deliberately ignores everything else in the payload
-    (`statuses[]` delivery receipts, contact profile fields, other
-    `changes[].field` values, unknown message types) -- WA-01 does not
-    process message content, so nothing beyond "who sent it, what is its
-    canonical id" is extracted; there is nothing here to normalize an
-    *outbound* reply from because WA-01 never sends one automatically (see
-    `build_outbound_text_message` for the outbound half of this adapter,
-    used only by tests/future orchestration, never called from this
-    module). Tolerant of a malformed/unexpected shape: returns whatever
-    valid entries it can find rather than raising, since a webhook handler
-    must never 500 on an unexpected-but-Meta-signed payload shape."""
+    slice needs: who sent it, its canonical id, and -- since WA-03 -- its
+    text body when the message is a plain `"text"` message. Deliberately
+    ignores everything else in the payload (`statuses[]` delivery receipts,
+    contact profile fields, other `changes[].field` values, non-text message
+    types) -- there is nothing here to normalize an *outbound* reply from
+    because this module never sends one automatically on its own (see
+    `build_outbound_text_message` for the outbound envelope,
+    used by `app.whatsapp_gateway_app`'s orchestration wiring and by tests).
+    Tolerant of a malformed/unexpected shape: returns whatever valid entries
+    it can find rather than raising, since a webhook handler must never 500
+    on an unexpected-but-Meta-signed payload shape.
+
+    A `"text"` message's body is truncated to `_MAX_INBOUND_TEXT_CHARS` --
+    the same "hint, never a guess, but also never unbounded" discipline
+    `app.services.assistant_orchestrator._coerce_step` already applies to
+    plan-step arguments; nothing here changes the free-text interpreter's
+    own budget, this only bounds what this module itself passes onward.
+    """
 
     messages: list[NormalizedInboundMessage] = []
     for entry in payload.get("entry") or []:
@@ -185,9 +211,18 @@ def normalize_inbound_messages(payload: dict) -> list[NormalizedInboundMessage]:
                     sender_digits = normalize_phone(str(sender_raw))
                 except InvalidPhoneNumberError:
                     continue
+                text: str | None = None
+                if message.get("type") == "text":
+                    body = message.get("text")
+                    if isinstance(body, dict):
+                        raw_text = body.get("body")
+                        if isinstance(raw_text, str) and raw_text.strip():
+                            text = raw_text.strip()[:_MAX_INBOUND_TEXT_CHARS]
                 messages.append(
                     NormalizedInboundMessage(
-                        provider_message_id=str(message_id), sender_digits=sender_digits
+                        provider_message_id=str(message_id),
+                        sender_digits=sender_digits,
+                        text=text,
                     )
                 )
     return messages
@@ -241,6 +276,74 @@ class FakeWhatsAppProvider:
     def send_message(self, payload: dict) -> ProviderSendResult:
         self.sent.append(payload)
         return ProviderSendResult(ok=True, provider_message_id=f"fake-{len(self.sent)}")
+
+
+class MetaCloudApiProvider:
+    """WA-03 (`docs/WORK_ORDER_WA_03.md`, issue #75): the real Meta Cloud API
+    `WhatsAppProvider` -- `POST https://graph.facebook.com/{version}/{phone_number_id}/messages`,
+    Bearer-authenticated with `settings.whatsapp_access_token`. Same stdlib
+    `urllib.request` idiom as `app.services.codex_client.CodexAdvisorClient`
+    (no new HTTP dependency for one more outbound JSON call). Never raises:
+    a transport/HTTP failure becomes `ProviderSendResult(ok=False, error=...)`,
+    exactly like `CodexAdvisorClient._request`'s own fail-closed contract --
+    a WhatsApp delivery failure must never bubble up and turn an otherwise
+    already-committed financial fact into a 500 for the webhook caller.
+    """
+
+    def __init__(self) -> None:
+        self.settings = get_settings()
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.settings.whatsapp_access_token and self.settings.whatsapp_phone_number_id)
+
+    def send_message(self, payload: dict) -> ProviderSendResult:
+        if not self.configured:
+            return ProviderSendResult(ok=False, error="whatsapp_send_not_configured")
+        url = (
+            f"{self.settings.whatsapp_api_base_url.rstrip('/')}"
+            f"/{self.settings.whatsapp_phone_number_id}/messages"
+        )
+        request = Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.settings.whatsapp_access_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.settings.whatsapp_send_timeout_seconds) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                detail = json.loads(exc.read().decode("utf-8"))
+            except (ValueError, OSError):
+                detail = {}
+            error = (detail.get("error") or {}).get("message") if isinstance(detail, dict) else None
+            return ProviderSendResult(ok=False, error=error or f"http_{exc.code}")
+        except (URLError, TimeoutError, ValueError, OSError) as exc:
+            return ProviderSendResult(ok=False, error=str(exc.__class__.__name__))
+        message_id = None
+        if isinstance(result, dict):
+            messages = result.get("messages")
+            if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+                message_id = messages[0].get("id")
+        return ProviderSendResult(ok=True, provider_message_id=message_id)
+
+
+def resolve_provider() -> WhatsAppProvider | None:
+    """The one place `app.whatsapp_gateway_app` asks "which provider do I
+    send replies through" -- returns `None` when outbound credentials are
+    not configured (an operator may enable *receiving* -- `whatsapp_gateway_enabled`
+    -- before provisioning a send-capable access token), so a caller never
+    needs to know `MetaCloudApiProvider` exists to fail closed correctly.
+    Reads settings itself, same "no caller-supplied settings" idiom as
+    every other function in this module (`check_rate_limit`, `_cipher`, ...)."""
+
+    provider = MetaCloudApiProvider()
+    return provider if provider.configured else None
 
 
 def find_authorized_sender(db: Session, *, phone_hash: str) -> WhatsAppAuthorizedNumber | None:
@@ -349,15 +452,16 @@ def record_inbound_event(
     status: str,
     household_id: str | None,
     user_id: str | None,
+    trace_id: str | None = None,
 ) -> WhatsAppInboundEvent:
     """Inserts the one durable idempotency record for this
     `provider_message_id` (`uq_whatsapp_inbound_events_message_id`).
     Flushes immediately -- rather than leaving the INSERT pending for the
     caller's own flush/commit -- so a concurrent redelivery's `IntegrityError`
-    surfaces here, inside whatever `begin_nested()` savepoint the caller
-    (`app.whatsapp_gateway_app._process_one_message`) wraps this call in,
-    instead of at the caller's later, request-wide `db.commit()` where it
-    could not be told apart from any other write in that request.
+    surfaces here, at the caller's own claim step
+    (`app.whatsapp_gateway_app._process_new_message`), instead of at some
+    later, unrelated `db.commit()` where it could not be told apart from any
+    other write in that request.
     """
 
     event = WhatsAppInboundEvent(
@@ -366,7 +470,22 @@ def record_inbound_event(
         status=status,
         household_id=household_id,
         user_id=user_id,
+        trace_id=trace_id,
     )
     db.add(event)
     db.flush()
     return event
+
+
+def finalize_inbound_event(db: Session, event: WhatsAppInboundEvent, *, status: str, trace_id: str) -> None:
+    """WA-03: the one place that updates an already-claimed
+    `WhatsAppInboundEvent` row with its Tool Layer outcome, after
+    `app.services.assistant_orchestrator.plan_and_execute` (and, in turn,
+    any reply send) has run. Commits on its own -- this update is
+    intentionally independent of whatever transaction state
+    `plan_and_execute`'s own internal commits left the session in, the same
+    "each unit of work commits itself" idiom that module already uses."""
+
+    event.status = status
+    event.trace_id = trace_id
+    db.commit()
