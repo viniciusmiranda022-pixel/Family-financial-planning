@@ -63,6 +63,7 @@ from app.schemas import (
     AccountBalanceObservationRequest,
     AccountRequest,
     AdvisorRequest,
+    AssistantAskRequest,
     AssistantExecuteRequest,
     AssistantInterpretRequest,
     AssistantUndoRequest,
@@ -144,6 +145,7 @@ from app.services.assistant_actions import (
     undo_assistant_action,
 )
 from app.services.assistant_interpreter import interpret_message
+from app.services.assistant_orchestrator import plan_and_execute
 from app.services.card_competence import (
     card_invoice_competence,
     resolve_expense_competence,
@@ -12032,6 +12034,36 @@ def assistant_action_undo(
         if message == "Ação do Assistente não encontrada":
             raise HTTPException(status_code=404, detail=message) from exc
         raise HTTPException(status_code=409, detail=message) from exc
+
+
+# WA-02 (`docs/WORK_ORDER_WA_02.md`, issue #74): the Tool Layer's single
+# entry point. Additive to, never a replacement for, `/assistant/interpret`
+# + `/assistant/execute` above -- those remain exactly as Slice 4 shipped
+# them. This route handles read-only compound questions (query/aggregate/
+# compare/project) via generic tool composition, and also reaches the exact
+# same typed-action pipeline through `draft_typed_action`/
+# `confirm_typed_action`/`undo_typed_action` tool wrappers -- there is still
+# only one path that can ever mutate a financial fact
+# (`app.services.assistant_actions.execute_typed_action`); this endpoint
+# never bypasses it. Same `_require_admin` gate as the rest of the web
+# Assistant -- WA-02 does not introduce a new authorization tier for
+# non-admin household members (that is a WA-01/WA-03 WhatsApp
+# phone-authority concern, out of this slice's scope).
+@router.post("/assistant/ask")
+def assistant_ask(
+    payload: AssistantAskRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    result = plan_and_execute(
+        db,
+        user=user,
+        message=payload.message,
+        history=payload.history,
+        trace_id=payload.trace_id,
+    )
+    return result.to_dict()
 
 
 @router.post("/entry-type-templates", status_code=status.HTTP_201_CREATED)
