@@ -136,7 +136,7 @@ def test_upgrade_empty_postgresql_database_to_head() -> None:
     }.issubset(tables)
     with engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0024"
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0025"
         )
     engine.dispose()
 
@@ -157,7 +157,7 @@ def test_upgrade_from_legacy_0002_baseline_preserves_existing_rows() -> None:
 
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0024"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0025"
         preserved_name = connection.execute(
             text("SELECT name FROM households WHERE id = :id"), {"id": household_id}
         ).scalar_one()
@@ -1606,7 +1606,13 @@ def test_whatsapp_inbound_event_concurrent_redelivery_is_serialized_to_a_single_
                 )
             ).all()
             assert len(events) == 1, "concurrent redelivery duplicated the inbound event row"
-            assert events[0].status == "accepted"
+            # WA-03: this message carries no `text` (`NormalizedInboundMessage`
+            # default), so it reaches `_run_assistant_reply`'s no-content
+            # branch and its terminal status becomes "unsupported_content",
+            # not the original WA-01 claim status "accepted" -- the
+            # concurrency guarantee under test (exactly one row, exactly one
+            # rate-limit hit accounted) is unaffected by that later update.
+            assert events[0].status == "unsupported_content"
 
             bucket = verify_db.scalar(
                 select(WhatsAppRateLimitBucket).where(WhatsAppRateLimitBucket.bucket_key == phone_hash)
@@ -1719,7 +1725,183 @@ def test_whatsapp_rate_limit_bucket_concurrent_first_hit_is_serialized_to_a_sing
                 )
             ).all()
             assert len(events) == 2, "each distinct message must still get its own inbound event"
-            assert {event.status for event in events} == {"accepted"}
+            # WA-03: no `text` on either message -> terminal status is
+            # "unsupported_content" (see the sibling redelivery test above);
+            # the bucket-creation race under test is unaffected.
+            assert {event.status for event in events} == {"unsupported_content"}
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_whatsapp_webhook_concurrent_confirm_from_two_messages_serializes_to_one_mutation(monkeypatch) -> None:
+    """WA-03 (`docs/WORK_ORDER_WA_03.md`, issue #75), Work Order item 7/
+    acceptance criterion "duplicidade por retry é bloqueada" and item 10
+    ("concorrência de confirmação"): two *distinct* WhatsApp messages (e.g.
+    the household member tapping "confirmar" twice, or a mobile client
+    retrying a slow send) that both resolve to the same pending
+    `AssistantActionProposal` must still produce exactly one financial
+    mutation -- this is a different race than
+    `test_assistant_execute_concurrent_same_proposal_is_serialized_to_a_single_mutation`
+    above (which drives `execute_typed_action` directly): here, two
+    completely independent `app.whatsapp_gateway_app._process_one_message`
+    calls -- each with its own `provider_message_id`, each running the full
+    `plan_and_execute` Tool Layer round-trip (`confirm_typed_action` ->
+    `_find_pending_proposal` -> `execute_typed_action`) -- race on the
+    *lookup and dispatch* of the same underlying proposal, not merely on a
+    caller-supplied `proposal_id`. `_find_pending_proposal`'s own `SELECT`
+    (no locking) can let both callers resolve the same still-unconsumed
+    proposal id before either reaches `execute_typed_action`'s
+    `SELECT ... FOR UPDATE` -- this test proves that later lock still
+    collapses both attempts to a single dispatch even though the race began
+    one layer higher than the lock itself.
+    """
+
+    from app.models import (
+        AssistantActionProposal,
+        Category,
+        FinancialProfile,
+        WhatsAppAuthorizedNumber,
+        WhatsAppInboundEvent,
+    )
+    from app.services import whatsapp_gateway as gateway
+    from app.services.assistant_actions import build_typed_action_proposal, persist_action_proposal
+    from app.services.assistant_interpreter import StructuredInterpretation
+    from app.services.codex_client import CodexAdvisorClient, CodexResult
+    from app.whatsapp_gateway_app import _process_one_message
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        # No `WHATSAPP_APP_SECRET`/`WHATSAPP_VERIFY_TOKEN`/`WHATSAPP_GATEWAY_ENABLED`
+        # needed: this test drives `_process_one_message` directly, the same
+        # layer the sibling WA-01 concurrency tests above exercise, never
+        # `receive_webhook`'s own signature/`_ready()` gate.
+        sender_digits = "5511966665555"
+        phone_hash = gateway.hash_phone(sender_digits)
+        with Session(engine) as setup_db:
+            household = Household(name="Família WhatsApp Confirmação Concorrência")
+            setup_db.add(household)
+            setup_db.flush()
+            household_id = household.id
+            setup_db.add(FinancialProfile(household_id=household_id, monthly_cash_cap=Decimal("5000")))
+            setup_db.add(Account(household_id=household_id, name="Conta Corrente", account_type="checking"))
+            setup_db.add(Category(household_id=household_id, name="Mercado"))
+            user = User(
+                household_id=household_id,
+                name="Usuário WhatsApp Confirmação Concorrência",
+                username=f"wa-confirm-concur-{household_id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            setup_db.add(user)
+            setup_db.flush()
+            user_id = user.id
+            setup_db.add(
+                WhatsAppAuthorizedNumber(
+                    household_id=household_id,
+                    user_id=user_id,
+                    phone_hash=phone_hash,
+                    phone_encrypted=gateway.encrypt_phone(sender_digits),
+                    phone_last4=gateway.phone_last4(sender_digits),
+                )
+            )
+            setup_db.commit()
+
+        interpretation = StructuredInterpretation(
+            available=True,
+            reason=None,
+            intent="create_expense",
+            extracted_fields={
+                "amount_text": "120",
+                "description": "Combustível concorrência WhatsApp",
+                "account_hint": "Conta Corrente",
+                "funding_source_hint": "account",
+                "category_hint": "Mercado",
+            },
+            missing_fields=(),
+            clarifying_question=None,
+            confidence=0.9,
+        )
+        with Session(engine) as propose_db:
+            proposal = build_typed_action_proposal(
+                propose_db, household_id=household_id, interpretation=interpretation
+            )
+            assert proposal.can_execute is True, proposal.clarifying_question
+            proposal_id = persist_action_proposal(
+                propose_db,
+                household_id=household_id,
+                user_id=user_id,
+                trace_id=str(uuid.uuid4()),
+                original_message="Gastei 120 de combustível",
+                structured_interpretation=interpretation.to_dict(),
+                proposal=proposal,
+            )
+
+        def _confirm_plan(_self, _payload: dict) -> CodexResult:
+            return CodexResult(
+                {
+                    "schema_version": "1.0.0",
+                    "needs_clarification": False,
+                    "clarifying_question": None,
+                    "steps": [{"tool": "confirm_typed_action", "arguments": {}}],
+                    "model": "modelo-de-teste",
+                }
+            )
+
+        monkeypatch.setattr(CodexAdvisorClient, "configured", property(lambda _self: True))
+        monkeypatch.setattr(CodexAdvisorClient, "plan", _confirm_plan)
+
+        messages = [
+            gateway.NormalizedInboundMessage(
+                provider_message_id=f"wa-confirm-race-{i}", sender_digits=sender_digits, text="confirmo"
+            )
+            for i in range(2)
+        ]
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _deliver(message: gateway.NormalizedInboundMessage) -> None:
+            try:
+                thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(thread_engine) as db:
+                    barrier.wait(timeout=5.0)
+                    _process_one_message(db, message, settings=get_settings())
+                thread_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=_deliver, args=(m,), daemon=True) for m in messages]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10.0)
+
+        assert not errors, f"concurrent confirmation must never raise: {errors}"
+        with Session(engine) as verify_db:
+            transactions = verify_db.scalars(
+                select(Transaction).where(
+                    Transaction.household_id == household_id,
+                    Transaction.description == "Combustível concorrência WhatsApp",
+                )
+            ).all()
+            assert len(transactions) == 1, "concurrent confirmation from two messages must mutate exactly once"
+
+            proposal_row = verify_db.get(AssistantActionProposal, proposal_id)
+            assert proposal_row.consumed_at is not None
+            assert proposal_row.consumed_action_event_id is not None
+
+            events = verify_db.scalars(
+                select(WhatsAppInboundEvent).where(
+                    WhatsAppInboundEvent.provider_message_id.in_(
+                        [m.provider_message_id for m in messages]
+                    )
+                )
+            ).all()
+            assert len(events) == 2, "each confirmation message still gets its own inbound event"
+            assert {event.status for event in events} == {"processed"}
         engine.dispose()
     finally:
         get_settings.cache_clear()

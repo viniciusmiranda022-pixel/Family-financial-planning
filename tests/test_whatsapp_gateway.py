@@ -238,7 +238,13 @@ def test_authorized_sender_is_recorded_as_accepted() -> None:
 
     with session_factory() as db:
         event = db.scalar(select(WhatsAppInboundEvent))
-        assert event.status == "accepted"
+        # WA-03: `_inbound_payload` sends `type: "text"` with no `text.body`
+        # (unrealistic for a real Meta payload, but this fixture predates
+        # WA-03 and several other tests below still use it just to exercise
+        # auth/dedup/rate-limit, not content) -- normalize_inbound_messages
+        # extracts no text for it, so the terminal status is
+        # "unsupported_content", not the original claim status "accepted".
+        assert event.status == "unsupported_content"
         assert event.household_id == household_id
         assert event.user_id == user_id
         assert event.provider_message_id == "m1"
