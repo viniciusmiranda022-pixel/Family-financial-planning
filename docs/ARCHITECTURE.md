@@ -1526,6 +1526,18 @@ WhatsApp, nenhuma escrita SQL/ORM vinda do LLM.
   O caminho web (`POST /assistant/execute`) nunca chamava `_find_pending_proposal` na mesma sessão,
   por isso o bug só se manifestava a partir de um tool que já resolve o proposal antes de executá-lo
   (todo o Tool Layer WA-02+, não só WhatsApp).
+- **A mesma classe de bug existia em `undo_assistant_action`** (revisão de engenharia do PR #105,
+  comentário MERGE BLOCKED): `_tool_undo_typed_action` chama `_find_undoable_action` (sem lock) na
+  mesma sessão logo antes de `undo_assistant_action`, exatamente o mesmo formato de pré-leitura que
+  causava o bug acima. `undo_assistant_action` agora também trava a linha do
+  `AssistantActionEvent` com `SELECT ... FOR UPDATE OF assistant_action_events` +
+  `.execution_options(populate_existing=True)` no PostgreSQL, mantida até o `db.commit()` final --
+  duas mensagens "desfaz" concorrentes sobre a mesma ação produzem exatamente uma reversão; a
+  perdedora observa `undone_at` já preenchido e falha fechado com "Esta ação já foi desfeita" em vez
+  de desfazer uma segunda vez. Reproduzido e coberto por
+  `tests/test_postgresql_integration.py::test_whatsapp_webhook_concurrent_undo_from_two_messages_reverses_exactly_once`
+  (falha sem a correção: duas `AuditEvent` de reversão e um `DELETE` sem linha correspondente na
+  segunda tentativa).
 
 ## Evolução
 

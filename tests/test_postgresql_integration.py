@@ -1905,3 +1905,201 @@ def test_whatsapp_webhook_concurrent_confirm_from_two_messages_serializes_to_one
         engine.dispose()
     finally:
         get_settings.cache_clear()
+
+
+def test_whatsapp_webhook_concurrent_undo_from_two_messages_reverses_exactly_once(monkeypatch) -> None:
+    """WA-03 (`docs/WORK_ORDER_WA_03.md`, issue #75), engineering review of
+    PR #105 (MERGE BLOCKED comment): `undo_assistant_action` must serialize
+    under real concurrency exactly like `execute_typed_action`/
+    `cancel_action_proposal` already do -- two *distinct* WhatsApp
+    "desfaz"/"desfazer" messages (e.g. a household member tapping undo
+    twice) that both resolve to the same undoable `AssistantActionEvent`
+    must reverse it exactly once, never twice.
+
+    This exercises the exact stale-identity-map scenario the review called
+    out, not merely the row lock in isolation:
+    `app.services.assistant_tools._find_undoable_action` already runs an
+    *unlocked* `SELECT` of the `AssistantActionEvent` row -- in the same
+    session -- immediately before `undo_assistant_action`'s own locked
+    `SELECT ... FOR UPDATE`, the identical shape that
+    `test_whatsapp_webhook_concurrent_confirm_from_two_messages_serializes_to_one_mutation`
+    above already proves matters for confirmation. Without
+    `populate_existing()` on the locked re-`SELECT`, the second message's
+    session would unblock from the lock and still read its own stale,
+    pre-lock `undone_at IS NULL` from the identity map instead of the
+    winner's just-committed `undone_at`, and both would dispatch
+    `_delete_manual_transaction_impl` against the same `Transaction` --
+    the second deleting an already-deleted row.
+    """
+
+    from app.models import (
+        AssistantActionEvent,
+        AuditEvent,
+        Category,
+        FinancialProfile,
+        Transaction,
+        WhatsAppAuthorizedNumber,
+        WhatsAppInboundEvent,
+    )
+    from app.services import whatsapp_gateway as gateway
+    from app.services.assistant_actions import (
+        build_typed_action_proposal,
+        execute_typed_action,
+        persist_action_proposal,
+    )
+    from app.services.assistant_interpreter import StructuredInterpretation
+    from app.services.codex_client import CodexAdvisorClient, CodexResult
+    from app.whatsapp_gateway_app import _process_one_message
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        sender_digits = "5511966664444"
+        phone_hash = gateway.hash_phone(sender_digits)
+        with Session(engine) as setup_db:
+            household = Household(name="Família WhatsApp Undo Concorrência")
+            setup_db.add(household)
+            setup_db.flush()
+            household_id = household.id
+            setup_db.add(FinancialProfile(household_id=household_id, monthly_cash_cap=Decimal("5000")))
+            setup_db.add(Account(household_id=household_id, name="Conta Corrente", account_type="checking"))
+            setup_db.add(Category(household_id=household_id, name="Mercado"))
+            user = User(
+                household_id=household_id,
+                name="Usuário WhatsApp Undo Concorrência",
+                username=f"wa-undo-concur-{household_id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            setup_db.add(user)
+            setup_db.flush()
+            user_id = user.id
+            setup_db.add(
+                WhatsAppAuthorizedNumber(
+                    household_id=household_id,
+                    user_id=user_id,
+                    phone_hash=phone_hash,
+                    phone_encrypted=gateway.encrypt_phone(sender_digits),
+                    phone_last4=gateway.phone_last4(sender_digits),
+                )
+            )
+            setup_db.commit()
+
+        # Establish one real, undoable AssistantActionEvent directly through
+        # the Tool Layer's own dispatcher -- the create/confirm path itself
+        # is already proven above; this test's subject is solely the undo
+        # race that follows.
+        interpretation = StructuredInterpretation(
+            available=True,
+            reason=None,
+            intent="create_expense",
+            extracted_fields={
+                "amount_text": "80",
+                "description": "Combustível concorrência undo WhatsApp",
+                "account_hint": "Conta Corrente",
+                "funding_source_hint": "account",
+                "category_hint": "Mercado",
+            },
+            missing_fields=(),
+            clarifying_question=None,
+            confidence=0.9,
+        )
+        with Session(engine) as setup_db:
+            proposal = build_typed_action_proposal(
+                setup_db, household_id=household_id, interpretation=interpretation
+            )
+            assert proposal.can_execute is True, proposal.clarifying_question
+            proposal_id = persist_action_proposal(
+                setup_db,
+                household_id=household_id,
+                user_id=user_id,
+                trace_id=str(uuid.uuid4()),
+                original_message="Gastei 80 de combustível",
+                structured_interpretation=interpretation.to_dict(),
+                proposal=proposal,
+            )
+            user_row = setup_db.get(User, user_id)
+            execute_typed_action(setup_db, user=user_row, proposal_id=proposal_id)
+
+        def _undo_plan(_self, _payload: dict) -> CodexResult:
+            return CodexResult(
+                {
+                    "schema_version": "1.0.0",
+                    "needs_clarification": False,
+                    "clarifying_question": None,
+                    "steps": [{"tool": "undo_typed_action", "arguments": {}}],
+                    "model": "modelo-de-teste",
+                }
+            )
+
+        monkeypatch.setattr(CodexAdvisorClient, "configured", property(lambda _self: True))
+        monkeypatch.setattr(CodexAdvisorClient, "plan", _undo_plan)
+
+        messages = [
+            gateway.NormalizedInboundMessage(
+                provider_message_id=f"wa-undo-race-{i}", sender_digits=sender_digits, text="desfaz essa ultima acao"
+            )
+            for i in range(2)
+        ]
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _deliver(message: gateway.NormalizedInboundMessage) -> None:
+            try:
+                thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(thread_engine) as db:
+                    barrier.wait(timeout=5.0)
+                    _process_one_message(db, message, settings=get_settings())
+                thread_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=_deliver, args=(m,), daemon=True) for m in messages]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10.0)
+
+        assert not errors, f"concurrent undo must never raise: {errors}"
+        with Session(engine) as verify_db:
+            remaining = verify_db.scalars(
+                select(Transaction).where(
+                    Transaction.household_id == household_id,
+                    Transaction.description == "Combustível concorrência undo WhatsApp",
+                )
+            ).all()
+            assert remaining == [], "the transaction must be reversed exactly once, never left half-undone"
+
+            action_events = verify_db.scalars(
+                select(AssistantActionEvent)
+                .join(AuditEvent, AuditEvent.id == AssistantActionEvent.audit_event_id)
+                .where(AuditEvent.household_id == household_id)
+            ).all()
+            assert len(action_events) == 1, "undo reverses the existing action, it never creates a new one"
+            assert action_events[0].undone_at is not None
+            assert action_events[0].undone_by == user_id
+
+            undo_audit_events = verify_db.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.household_id == household_id, AuditEvent.event_type == "assistant.undo"
+                )
+            ).all()
+            assert len(undo_audit_events) == 1, "exactly one reversal effect, never two"
+
+            events = verify_db.scalars(
+                select(WhatsAppInboundEvent).where(
+                    WhatsAppInboundEvent.provider_message_id.in_([m.provider_message_id for m in messages])
+                )
+            ).all()
+            assert len(events) == 2, "each undo message still gets its own inbound event"
+            # The winner reverses the action ("processed"); the loser's
+            # locked, populate_existing() re-read observes the now-committed
+            # `undone_at` and fails closed with a clean clarifying reply
+            # ("Esta ação já foi desfeita") instead of raising or double
+            # -reversing.
+            assert {event.status for event in events} == {"processed", "needs_clarification"}
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()

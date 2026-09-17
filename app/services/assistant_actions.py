@@ -1518,15 +1518,43 @@ def _undo_capability(typed_action: str) -> tuple[bool, str | None]:
 def undo_assistant_action(
     db: Session, *, user: Any, action_id: str, reason: str
 ) -> dict[str, Any]:
+    """Reverse the one typed action `action_id` names.
+
+    Concurrency (engineering review of PR #105, MERGE BLOCKED comment): same
+    contract as `execute_typed_action`/`cancel_action_proposal` above --
+    `SELECT ... FOR UPDATE` on PostgreSQL, held through the reversal's own
+    domain write and the final `db.commit()` below, so two concurrent undo
+    attempts on the same `action_id` (e.g. two WhatsApp "desfaz" messages
+    arriving together) can never both observe `undone_at IS NULL`: the
+    second blocks on the lock until the first commits or rolls back, then
+    its own locked read sees `undone_at` already set and fails closed with
+    "Esta ação já foi desfeita" instead of reversing a second time.
+
+    `populate_existing()` is required for the identical reason documented
+    on `execute_typed_action`'s locking `SELECT`: every caller here
+    (`app.services.assistant_tools._tool_undo_typed_action`) already ran an
+    unlocked `_find_undoable_action` `SELECT` for this exact row, in this
+    exact session, immediately before calling this function. Without
+    `populate_existing()`, SQLAlchemy's identity map would hand back that
+    same, pre-lock Python object -- with `undone_at` still cached as
+    `None` -- even after this `SELECT ... FOR UPDATE` re-fetches the row
+    from PostgreSQL and finds it already undone by the concurrent winner.
+    """
+
     import app.api as api
     import app.schemas as schemas
     from app.models import AssistantActionEvent, AuditEvent
 
-    action_event = db.scalar(
+    action_query = (
         select(AssistantActionEvent)
         .join(AuditEvent, AuditEvent.id == AssistantActionEvent.audit_event_id)
         .where(AssistantActionEvent.id == action_id, AuditEvent.household_id == user.household_id)
     )
+    if db.get_bind().dialect.name == "postgresql":
+        action_query = action_query.with_for_update(of=AssistantActionEvent).execution_options(
+            populate_existing=True
+        )
+    action_event = db.scalar(action_query)
     if action_event is None:
         raise AssistantActionError("Ação do Assistente não encontrada")
     if action_event.undone_at is not None:
