@@ -1,7 +1,8 @@
 # ADR/Discovery — WA-00: Family Finance AI Assistant via WhatsApp
 
-**Status:** documental (discovery + ADR). Nenhuma implementação de produção, webhook real, número
-real, credencial, dado real ou migration foi feita neste PR. Nenhuma API paga foi ativada.
+**Status:** documental (discovery + ADR), corrigido em 2026-09-17 conforme revisão de engenharia
+(ver §3.2, §3.4, §4.3, §8, §10, §13). Nenhuma implementação de produção, webhook real, número real,
+credencial, dado real ou migration foi feita neste PR. Nenhuma API paga foi ativada.
 
 **Issue:** #72 (parent #71). **Work Order:** `docs/WORK_ORDER_WA_00.md`.
 
@@ -29,15 +30,23 @@ externa citada com data.
 O objetivo do WA-00 é decidir, com evidência, a arquitetura executável de um AI Assistant via
 WhatsApp para o Family Finance, sem implementar nada além de documentação.
 
-**Decisão de runtime de IA (ADR-1):** manter a ordem de prioridade determinada pelo issue #72 —
-reutilizar o Codex atual primeiro. A evidência de código (§2) mostra que o Codex já opera hoje sob
-exatamente o modelo de confiança que o WhatsApp Assistant precisa (LLM só interpreta/explica; o
-backend determinístico calcula, valida e persiste) e que essa fronteira já é **channel-agnostic**:
-os endpoints `/assistant/interpret` e `/assistant/execute` (Slice 4) não sabem se quem os chamou foi
-o navegador ou outro canal. Isso torna a Opção 1 (reuso do Codex, sem custo adicional) tecnicamente
-viável para dar início ao WA-01, **condicionada a três mitigações obrigatórias antes de qualquer
-implementação** (detalhadas em §3.3) e a **um item que este discovery não conseguiu verificar**
-(§13, TECHNICAL CHALLENGE / HUMAN BLOCKER sobre Acceptable Use Policy da OpenAI).
+**Decisão de runtime de IA (ADR-1 — corrigida na revisão de engenharia de 2026-09-17):** a ordem de
+prioridade do issue #72 permanece integralmente (reutilizar o Codex atual → modelo local → API paga
+somente via Technical Challenge), mas a conclusão original deste discovery superestimou o alcance da
+Opção 1. Evidência normativa oficial (OpenAI Help Center e ChatGPT Terms of Use vigentes desde
+2026-01-01, citadas em §3.2) mostra que uma sessão do Codex CLI autenticada por login pessoal do
+ChatGPT (`scripts/setup-codex.sh:20-31`) está sujeita aos Termos de Uso do ChatGPT, que proíbem
+compartilhar credenciais de conta ou torná-la disponível a terceiros. Isso significa que a Opção 1
+**não pode ser o adapter de produção para mensagens de WhatsApp originadas por membros do household
+que não sejam o titular da conta ChatGPT autenticada** — usá-la assim equivaleria a servir outra
+pessoa através da conta pessoal do titular por um canal automatizado, o que os Termos vedam
+explicitamente. A Opção 1 permanece válida **apenas** como adapter de desenvolvimento/single-owner
+(uso exclusivo pelo próprio titular da conta). Para produção multi-usuário do WA-01, a arquitetura
+deve seguir diretamente para a Opção 2 (modelo local, §3.4), a menos que um arranjo de API/negócio
+elegível para múltiplos usuários seja aprovado posteriormente via Technical Challenge. Isso não é uma
+revisão da ordem obrigatória do issue #72 — é a mesma ordem, apenas com a Opção 1 corretamente
+delimitada ao seu escopo real de elegibilidade contratual. Ver §3.2 (avaliação), §3.4 (Opção 2 para
+produção) e §13 item 1 (resolvido nesta revisão; deixou de ser HUMAN BLOCKER).
 
 **Decisão de arquitetura (ADR-2):** `WhatsApp Cloud API → Gateway dedicado (novo, isolado do `app`
 privado) → Orchestrator (reusa `assistant_interpreter`/`assistant_actions`) → Tool Layer tipada
@@ -164,16 +173,30 @@ resolve exatamente o mesmo problema (interpretar linguagem natural em `intent` +
 WhatsApp Assistant precisa; a fronteira de confiança (§1.4) já é agnóstica de canal.
 
 Contra: autenticação por login humano de assinatura pessoal, sem chave de API e sem SLA de
-provisionamento; nenhum limite de concorrência hoje; incerteza não resolvida sobre política de uso
-aceitável da OpenAI para "múltiplos usuários por uma assinatura" (§13).
+provisionamento; nenhum limite de concorrência hoje; **restrição contratual confirmada** — o artigo
+do OpenAI Help Center sobre o Codex (`https://help.openai.com/en/articles/11369540`) e os ChatGPT
+Terms of Use vigentes desde 2026-01-01 (`https://openai.com/policies/row-terms-of-use/`, seção
+"Registration and access") deixam explícito que uma sessão do Codex autenticada por conta pessoal do
+ChatGPT segue os Termos de Uso do ChatGPT, e que credenciais/conta não podem ser compartilhadas nem
+disponibilizadas a terceiros. Uma sessão Codex autenticada pela conta pessoal do titular, usada para
+processar mensagens de **outros** membros do household via WhatsApp, está sujeita a essa restrição.
 
-**Conclusão da Opção 1:** viável para iniciar o WA-01 na escala real deste projeto — uma única
-família, poucos usuários simultâneos, não um SaaS multi-tenant público — desde que as três
-mitigações abaixo sejam tratadas como pré-requisito de implementação do WA-01 (não deste discovery)
-e desde que o item de ToS em §13 seja verificado e aceito explicitamente pelo engenheiro
-responsável/proprietário antes de qualquer uso em produção.
+**Conclusão da Opção 1 (revisada em 2026-09-17):** viável **apenas como adapter de
+desenvolvimento/single-owner** — quando o próprio titular da conta ChatGPT autenticada é o único
+usuário efetivo do canal (ambiente de teste, ou uso exclusivo pelo próprio titular). **Não é viável
+como adapter de produção do WA-01 para números de WhatsApp de outros membros do household** — isso
+violaria os Termos de Uso do ChatGPT citados acima. Para produção multi-usuário, a arquitetura deve
+avançar diretamente para a Opção 2 (modelo local, §3.4), seguindo a mesma ordem obrigatória do issue
+#72; API paga permanece condicionada a Technical Challenge e aprovação explícita, e só se torna
+elegível se um arranjo de negócio/API compatível com múltiplos usuários for adotado. As três
+mitigações do §3.3 seguem necessárias para qualquer uso do Codex neste projeto (dev/single-owner, ou
+uso residual no Assistente web), mas não revertem a restrição contratual acima nem habilitam a Opção
+1 para produção multi-usuário.
 
 ### 3.3 Mitigações obrigatórias antes do WA-01 (não implementadas neste PR)
+
+Aplicam-se a qualquer uso do Codex (dev/single-owner, ou o Assistente web já existente) — não
+habilitam, por si só, a Opção 1 para produção multi-usuário do WA-01 (§3.2).
 
 a) **Limite de concorrência**: adicionar fila/semáforo no gateway ou no sidecar, limitando quantas
    invocações `codex exec` simultâneas o serviço pode disparar, para não sobrecarregar a mesma
@@ -190,10 +213,49 @@ c) **Fallback determinístico sem Codex**: o WhatsApp Assistant deve continuar o
    hoje — isso não é uma mitigação nova, é a mesma invariante (`docs/INTELLIGENCE.md:26`) aplicada
    ao novo canal.
 
-Se, na prática do WA-01, a Opção 1 se mostrar insuficiente sob essas mitigações (por exemplo,
-throughput real da conta ChatGPT for excedido de forma recorrente), a escalada segue para a Opção 2
-(modelo local) antes de qualquer avaliação de API paga, por decisão já registrada no issue #72 — não
-cabe a este discovery antecipar essa escolha sem evidência de uso real.
+Estas mitigações continuam obrigatórias para o modo dev/single-owner e para o Assistente web já
+existente. Para produção multi-usuário do WA-01, elas não substituem a Opção 2 (§3.4) — a restrição
+é contratual (§3.2), não de throughput, logo não é algo que uma fila/alerta/fallback resolva.
+
+### 3.4 Opção 2 (modelo local) — avaliação para produção multi-usuário do WA-01
+
+Conforme §3.2, a Opção 1 (Codex/ChatGPT pessoal) está contratualmente restrita a uso
+dev/single-owner. Para o WA-01 em produção — qualquer número de WhatsApp de um membro do household
+que não seja o titular da conta ChatGPT autenticada — a arquitetura usa um modelo local por padrão,
+seguindo a mesma ordem obrigatória do issue #72. Nenhuma implementação é feita neste discovery;
+apenas os critérios abaixo, para orientar o Work Order de implementação do WA-01.
+
+**Fronteira de adapter (reaproveitando o desenho já channel-agnostic do §1.4):** o modelo local deve
+implementar exatamente a mesma interface hoje usada pelos providers — `(prompt, schemaFile, opts) →
+JSON validado contra schema` (mesma assinatura de `advisor/providers/fakeProvider.mjs:22-23`) — como
+um novo provider dentro de `advisor/providers/`, sem mudar nenhum contrato consumido por
+`app/services/codex_client.py`, `assistant_interpreter.py` ou `assistant_actions.py`. O LLM continua
+apenas interpretando/explicando; o backend determinístico continua calculando, validando e
+persistindo — nenhuma mudança na fronteira de autoridade do §1.4.
+
+**Critérios mínimos de suitability** (a validar por um Work Order de implementação futuro antes de
+declarar o modelo local apto para produção do WA-01 — não avaliados/medidos neste discovery):
+1. Executa localmente, sem dependência de conta de assinatura pessoal de terceiro, sob licença
+   compatível com uso comercial/familiar contínuo.
+2. Produz JSON estruturado válido contra os mesmos schemas já usados
+   (`advisor/interpret-schema.json` e demais) com taxa de erro de parsing/validação comparável ou
+   melhor que o Codex atual, medida em bateria de exemplos reais antes de substituir o Codex nas
+   rotas de produção.
+3. Latência por chamada compatível com a experiência de WhatsApp (resposta em segundos, não
+   minutos) no hardware já disponível para o projeto, sem depender de GPU dedicada nova não
+   orçada, salvo decisão explícita futura.
+4. Suporta as mesmas rotas consultivas (`/v1/classify`, `/v1/analyze`, `/v1/interpret`, `/v1/audit`)
+   sem exigir reescrita de `advisor/server.mjs` além da troca de provider.
+5. Mantém fail-closed idêntico ao atual (`app/services/codex_audit.py:173-182`): qualquer
+   erro/indisponibilidade do modelo local nunca produz aprovação por ausência de resposta.
+6. Não introduz nenhum caminho de tool calling nativo com efeito colateral direto no banco — a
+   resolução determinística de campos continua no backend
+   (`assistant_actions.build_typed_action_proposal`), nunca no modelo.
+
+Se nenhum modelo local viável for encontrado sob esses critérios, a escalada para API paga (terceiro
+nível) exige Technical Challenge e aprovação explícita do engenheiro responsável — como já
+determinado pelo issue #72 — antes de qualquer implementação, incluindo para o cenário de produção
+multi-usuário aqui descrito.
 
 ---
 
@@ -246,13 +308,29 @@ Orchestrator apenas pela rede interna. Isso preserva o restante do sistema (UI, 
 raio de exposição pública — decisão de infraestrutura a confirmar no ADR de implementação do WA-01,
 não deste discovery, mas registrada aqui porque muda a superfície de ameaça do projeto inteiro.
 
-### 4.3 Autoridade de execução por número de telefone — decisão de produto em aberto
+### 4.3 Autoridade de execução por número de telefone — default de least privilege resolvido
 
-Hoje, `/assistant/interpret` e `/assistant/execute` exigem `_require_admin` (`app/api.py:1046-1048`).
-O WA-00 precisa que o engenheiro responsável decida: um número de WhatsApp vinculado a um membro não
-administrador do household deve poder (i) apenas consultar, (ii) propor ações tipadas mas exigir
-confirmação por um admin, ou (iii) ter paridade total com a sessão web administrativa? Este discovery
-não decide isso — ver Technical Challenge/pergunta em §13.
+Não é necessária uma nova decisão de produto do proprietário para o WA-01: o default seguro é
+derivado diretamente da fronteira de autoridade já existente (§1.4) e do princípio de least
+privilege. Hoje `/assistant/interpret` e `/assistant/execute` exigem `_require_admin`
+(`app/api.py:1046-1048`); o WA-01 preserva esse limite por padrão:
+
+- Um número de WhatsApp vinculado ao **admin** do household pode propor **e** confirmar/executar
+  ações tipadas (paridade com a sessão web administrativa).
+- Um número de WhatsApp vinculado a um membro **não-administrador** do household pode consultar
+  fatos do household (Tool Layer somente-leitura, §6) e pode propor ações tipadas
+  (`draft_typed_action`), mas a **confirmação/execução de qualquer ação tipada de escrita exige
+  confirmação por um número admin** — um não-admin nunca chama `confirm_typed_action` sobre a
+  própria proposta.
+- `household_id` nunca é inferido do payload do webhook ou do texto da mensagem; a resolução
+  número → usuário → household ocorre inteiramente no lado do servidor (Gateway/Orchestrator), a
+  partir de uma tabela de vínculo mantida pelo admin (WA-01) — nunca a partir de dado enviado pelo
+  cliente (mesmo princípio já documentado em §8).
+
+Este é o default seguro documentado para o WA-01, consistente com a fronteira typed-action/audit já
+vigente. Uma ampliação futura (ex.: paridade total para não-admin) exige decisão de produto explícita
+e registrada separadamente — não é assumida por este discovery. Este item deixa de ser Technical
+Challenge/pergunta aberta (ver §13, item 2, resolvido).
 
 ---
 
@@ -317,11 +395,26 @@ partir do canal WhatsApp).
 - **PII mínima ao LLM:** manter o padrão já vigente — o Codex nunca recebe telefone, nome completo,
   documento ou dado bruto de extrato; recebe apenas o texto da mensagem, histórico curto e fatos
   agregados sanitizados (mesmo padrão de `assistant_sanitizer.py`/`audit_sanitizer.py`).
-- **Retenção do texto original da mensagem do WhatsApp:** deve ser preservado no
-  `AssistantActionEvent`/`AuditEvent` (INV-032 já exige isso para o canal web); política de retenção
-  de logs específica de WhatsApp (quanto tempo guardar o payload bruto do webhook da Meta) fica como
-  pergunta aberta em §13 — depende de decisão de produto sobre janela de suporte/auditoria, não de
-  limitação técnica.
+- **Retenção do payload do webhook — minimização de dados (resolvido; ver §13, item 3):** o Gateway
+  valida `X-Hub-Signature-256` **antes** de qualquer outra operação (§9); passada a validação, o
+  Gateway **não persiste o payload bruto completo da Meta por padrão**. Persiste somente os campos já
+  normalizados abaixo:
+  - `message_id` da Meta (idempotência do webhook, ver abaixo);
+  - referência à identidade do remetente autorizado (o vínculo número→usuário já resolvido no
+    servidor, §4.3 — nunca o número solto em múltiplos lugares);
+  - timestamps de recebimento/processamento;
+  - o texto normalizado da mensagem do usuário, **somente onde a invariante de auditoria do
+    Assistente já exige isso** (INV-032, `AssistantActionEvent`/`AuditEvent` — mesmo padrão do canal
+    web, nenhum requisito novo);
+  - referências à proposta/ação tipada e ao resultado (`proposal_id`/`action_id`, status).
+
+  Metadados da Meta não relacionados (headers extras, campos de telemetria/entrega do provedor,
+  dados de outros participantes do payload) são descartados, não armazenados por precaução. Qualquer
+  payload bruto usado para diagnóstico transitório de incidente tem retenção limitada e configurável
+  (TTL curto, acesso restrito a operação/depuração) e falha fail-closed se detectado vazamento de PII
+  além do necessário — nunca retenção indefinida "porque pode ser útil depois". Este é aplicação
+  direta do princípio de minimização de dados já vigente no projeto (`docs/SECURITY.md`, padrão de
+  `assistant_sanitizer.py`), não uma decisão de produto nova.
 - **Idempotência do webhook:** a Meta pode reentregar o mesmo evento; o Gateway deve deduplicar por
   `message_id` do WhatsApp antes de chamar o Orchestrator (novo, WA-01) — mesmo princípio de
   idempotência documental já usado em importação de extrato, não duplicidade semântica (§38 do
@@ -378,7 +471,11 @@ documentação oficial da Meta pelo engenheiro responsável antes de qualquer de
 
 **Custo recorrente não aprovado bloqueia ativação, não a documentação** (issue #72) — nenhuma decisão
 de custo é tomada aqui; qualquer ativação de número/tier pago exige Technical Challenge e aprovação
-explícita antes do WA-01.
+explícita antes do WA-01. A impossibilidade de navegar os domínios oficiais da Meta neste ambiente de
+execução **não é um bloqueio humano deste discovery**: os números acima devem ser **revalidados
+contra a documentação oficial da Meta (`developers.facebook.com/docs/whatsapp/pricing`)
+imediatamente antes de qualquer ativação de número/tier**, não antes da aceitação deste documento —
+ver §13, item 4.
 
 ---
 
@@ -387,11 +484,11 @@ explícita antes do WA-01.
 | # | Risco | Impacto | Mitigação proposta | Fase |
 |---|---|---|---|---|
 | R1 | Gateway público é a primeira superfície de internet do sistema | Alto — amplia superfície de ataque de um sistema hoje privado | Isolar Gateway como componente próprio, sem acesso direto a DB/documentos, validação de assinatura antes de qualquer lógica (§4.2) | WA-01 |
-| R2 | Auth do Codex depende de login humano por assinatura pessoal, sem chave de API | Médio — degradação silenciosa da qualidade do Assistente | Alerta operacional em `authenticated=false` + fallback determinístico já existente (§3.3) | WA-01 |
-| R3 | Sem limite de concorrência hoje no sidecar Codex | Médio — sobrecarga da conta/host sob uso simultâneo de vários membros | Fila/semáforo no Gateway/Orchestrator (§3.3) | WA-01 |
-| R4 | Incerteza sobre Acceptable Use Policy da OpenAI para "múltiplos usuários por uma assinatura" | Alto — risco contratual/de bloqueio de conta | Verificação humana da ToS oficial antes de produção (§13) | Bloqueio antes do WA-01 produção |
-| R5 | Autoridade de execução por número de telefone não decidida (membro não-admin) | Médio — risco de execução de ação financeira sem autorização adequada | Decisão de produto explícita do engenheiro responsável (§4.3, §13) | Antes do WA-01 |
-| R6 | Custos da WhatsApp Business Platform não confirmados na fonte oficial | Baixo/Médio — decisão de ativação sem número exato | Confirmação manual da documentação oficial da Meta antes de qualquer ativação | Antes do WA-01 |
+| R2 | Auth do Codex depende de login humano por assinatura pessoal, sem chave de API (uso dev/single-owner) | Médio — degradação silenciosa da qualidade do Assistente | Alerta operacional em `authenticated=false` + fallback determinístico já existente (§3.3) | WA-01 (modo dev/single-owner) |
+| R3 | Sem limite de concorrência hoje no sidecar Codex | Médio — sobrecarga da conta/host sob uso simultâneo de vários membros | Fila/semáforo no Gateway/Orchestrator (§3.3) | WA-01 (modo dev/single-owner) |
+| R4 | ChatGPT Terms of Use proíbem compartilhar credenciais/conta com outros usuários | Alto — usar a Opção 1 para mensagens de membros não-titulares do household violaria contrato com a OpenAI | **Resolvido neste discovery**: Opção 1 restrita a dev/single-owner; produção multi-usuário usa Opção 2 (modelo local, §3.4) por padrão, salvo Technical Challenge futuro para arranjo de API elegível (§3.2) | Resolvido — condição de design para o WA-01 |
+| R5 | Autoridade de execução por número de telefone (membro não-admin) | Médio — risco de execução de ação financeira sem autorização adequada, se implementado incorretamente | **Resolvido neste discovery**: default de least privilege documentado (§4.3) — admin confirma/executa, não-admin só consulta/propõe | Resolvido — condição de design para o WA-01 |
+| R6 | Custos da WhatsApp Business Platform não confirmados na fonte oficial neste ambiente | Baixo/Médio — decisão de ativação sem número exato | Revalidação obrigatória contra a documentação oficial da Meta imediatamente antes de qualquer ativação de número/tier (§10, §13) — não bloqueia a documentação | Antes de qualquer ativação (não antes do discovery) |
 | R7 | Mudança de cobrança em 1º de outubro de 2026 (mensagens de serviço passam a ser cobradas) | Médio — pode inviabilizar respostas proativas sem custo | Desenhar o Assistente para operar dentro da janela de atendimento de 24h sempre que possível; revisitar antes de outubro/2026 | WA-01/operacional |
 
 ---
@@ -407,36 +504,42 @@ operando normalmente caso o Gateway seja removido.
 
 ---
 
-## 13. TECHNICAL CHALLENGE / questões abertas para o engenheiro responsável
+## 13. Questões resolvidas na revisão de engenharia de 2026-09-17 (nenhuma é HUMAN BLOCKER)
 
 **Orientação questionada:** nenhuma orientação do Work Order é contestada — a ordem de prioridade de
-runtime e as proibições foram seguidas integralmente. O que segue são lacunas de evidência genuínas,
-não desacordo técnico.
+runtime e as proibições foram seguidas integralmente. A primeira versão deste discovery apresentou
+os quatro itens abaixo como lacunas exigindo decisão humana antes da aceitação do documento; a
+revisão de engenharia mostrou que os quatro são resolvíveis com evidência normativa/oficial já
+disponível, sem necessidade de nova leitura ou decisão do proprietário neste momento.
 
-1. **HUMAN BLOCKER — verificação de Acceptable Use Policy da OpenAI.** Não foi possível acessar
-   `openai.com` neste ambiente (egress bloqueado pela política de rede da sessão) para confirmar se
-   o uso do Codex CLI autenticado por uma assinatura pessoal do ChatGPT, servindo múltiplos membros
-   de uma família através de um canal automatizado (WhatsApp), é compatível com os termos de uso da
-   OpenAI. Fontes de terceiros (não oficiais) sugerem cautela para "aplicações servindo múltiplos
-   usuários com uma assinatura". **Ação necessária:** o proprietário/engenheiro responsável deve ler
-   a Acceptable Use Policy oficial da OpenAI (`openai.com/policies`) e confirmar explicitamente que
-   esse uso é aceitável antes de qualquer implementação do WA-01 que dependa do Codex em produção.
-   **Como validar:** leitura direta da política oficial; se ambígua, considerar abrir um ticket de
-   suporte à OpenAI perguntando diretamente.
-2. **Autoridade de execução por número de telefone (§4.3):** um membro não-administrador do
-   household deve poder executar ações tipadas (gastar, pagar) via WhatsApp com a mesma autoridade
-   de uma sessão admin, ou apenas consultar/propor com confirmação de um admin? Isso é uma decisão de
-   produto, não técnica — preciso da decisão do engenheiro responsável antes do WA-01.
-3. **Retenção do payload bruto do webhook da Meta:** por quanto tempo guardar o corpo original da
-   mensagem recebida (para auditoria/depuração) versus quando descartá-lo? Não há requisito
-   normativo hoje que responda isso.
-4. **Confirmação de custos/limites oficiais (§10):** os números citados vêm de fontes secundárias
-   (2026-09-17) porque os domínios oficiais da Meta estavam bloqueados neste ambiente. Pedir para
-   alguém com acesso confirmar contra `developers.facebook.com/docs/whatsapp/pricing` antes de
-   qualquer decisão de ativação de número.
+1. **Elegibilidade contratual da Opção 1 (Codex/ChatGPT pessoal) — resolvido, não é HUMAN BLOCKER.**
+   Os ChatGPT Terms of Use vigentes desde 2026-01-01 (`https://openai.com/policies/row-terms-of-use/`,
+   seção "Registration and access") e o artigo do OpenAI Help Center sobre o Codex
+   (`https://help.openai.com/en/articles/11369540`) deixam explícito que credenciais/conta não podem
+   ser compartilhadas nem disponibilizadas a terceiros. Isso resolve a questão, não a reabre: a
+   Opção 1 é elegível apenas como adapter de desenvolvimento/single-owner; produção multi-usuário do
+   WA-01 usa a Opção 2 (modelo local, §3.4) por padrão (§3.2). Um arranjo de API/negócio elegível
+   para múltiplos usuários, se buscado no futuro, permanece sujeito a Technical Challenge — mas essa
+   decisão não é necessária para aceitar este discovery.
+2. **Autoridade de execução por número de telefone — resolvido, default de least privilege
+   documentado (§4.3).** Não é necessária nova decisão do proprietário para o WA-01: admin
+   confirma/executa; não-admin consulta e propõe, nunca confirma sozinho. Ampliação futura desse
+   escopo, se desejada, é decisão de produto separada e explícita — não bloqueia este documento.
+3. **Retenção do payload bruto do webhook — resolvido, minimização de dados aplicada (§8).** Não
+   persistir o payload completo por padrão; persistir apenas os campos mínimos normalizados
+   necessários a idempotência/auditoria; qualquer payload de diagnóstico transitório tem retenção
+   limitada e configurável, fail-closed contra vazamento de PII.
+4. **Custos/limites da WhatsApp Business Platform (§10) — não é bloqueio, é revalidação obrigatória
+   pré-ativação.** A impossibilidade de navegar `developers.facebook.com`/`business.whatsapp.com`
+   neste ambiente de execução não é convertida em bloqueio humano: os números citados em §10 vêm de
+   fontes secundárias datadas (2026-09-17) e devem ser revalidados contra a documentação oficial da
+   Meta **imediatamente antes de qualquer ativação de número/tier**, não antes da aceitação deste
+   documento. Nenhuma ativação paga é permitida por este slice de qualquer forma (Work Order,
+   "Invariantes e proibições").
 
-Nenhum desses itens bloqueia a aceitação deste discovery/ADR como documento de arquitetura — eles
-bloqueiam apenas o início da implementação do WA-01 que dependa da resposta.
+Nenhum destes itens bloqueia a aceitação deste discovery/ADR como documento de arquitetura, e nenhum
+exige mais leitura/decisão do proprietário além do que já está registrado aqui. A implementação do
+WA-01 permanece fora de escopo deste PR.
 
 ---
 
@@ -446,11 +549,13 @@ bloqueiam apenas o início da implementação do WA-01 que dependa da resposta.
 |---|---|
 | ADR completo e coerente com arquitetura/invariantes atuais | §4, §7 |
 | Inventário do runtime Advisor/Codex baseado em código atual, evidência objetiva de viabilidade | §1, §2 |
+| Elegibilidade contratual da Opção 1 e avaliação da Opção 2 (modelo local) para produção multi-usuário | §3.2, §3.4 |
 | Tool contracts genéricos cobrem consultas dinâmicas e drafts sem SQL do LLM | §5, §6 |
-| Política de segurança/PII/retenção/idempotência/household isolation documentada | §8, §9 |
+| Política de segurança/PII/retenção/idempotência/household isolation documentada | §4.3, §8, §9 |
 | Custos e limites externos documentados com data/fonte, Technical Challenge quando aplicável | §10, §13 |
 | Riscos, rollback e decisões para WA-01..WA-07 explicitados | §11, §12 |
-| Nenhuma alteração de semântica financeira ou dado real | Confirmado — nenhum arquivo de `app/`, `alembic/`, `advisor/*.mjs` foi alterado neste PR, apenas este documento |
+| Nenhuma alteração de semântica financeira ou dado real | Confirmado — nenhum arquivo de `app/`, `alembic/`, `advisor/*.mjs` foi alterado neste PR, apenas documentação |
+| Nenhum item pendente apresentado como HUMAN BLOCKER | §13 — os quatro itens da revisão de engenharia de 2026-09-17 foram resolvidos com evidência normativa/oficial, nenhum exige decisão humana antes da aceitação |
 | CI documental/lint aplicável verde | A confirmar após push (gates de markdown/lint do repositório) |
 
 ---
