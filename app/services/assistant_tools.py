@@ -65,6 +65,8 @@ from app.services.financial_query import (
     apply_metric,
     apply_top_n,
     collect_range_totals,
+    filtered_expense_total,
+    holder_rows,
     matches_hint,
     previous_equal_length_range,
     resolve_period,
@@ -483,7 +485,7 @@ def _tool_financial_aggregate(
     dimension = arguments.get("dimension")
     if dimension not in _AGGREGATE_DIMENSIONS:
         return ToolOutcome(
-            ok=True, clarifying_question="Você quer agrupar por categoria, conta, cartão ou mês?"
+            ok=True, clarifying_question="Você quer agrupar por categoria, conta, cartão, mês ou titular?"
         )
     metric = arguments.get("metric") or "total"
     if metric not in _AGGREGATE_METRICS:
@@ -504,8 +506,28 @@ def _tool_financial_aggregate(
         start_period=start_period,
         end_period=end_period,
     )
-    label_hint = arguments.get("category_hint") or arguments.get("account_hint")
-    rows = range_dimension_rows(totals, dimension, label_hint=label_hint)
+    category_hint = arguments.get("category_hint")
+    account_hint = arguments.get("account_hint")
+    holder_hint = arguments.get("holder_hint")
+
+    def _rows_for(range_totals: Any) -> list[dict[str, Any]]:
+        # WA-04 PR #106 review round 1: `titular` is a real grouping
+        # dimension, not a `search_transactions`-only filter -- it reads
+        # `RangeTotals.detail_rows` (`holder_rows`) so `category_hint` and
+        # `account_hint` compose simultaneously with it instead of one
+        # silently overriding the other. `categoria`/`conta`/`cartao`/`mes`
+        # keep their original single-`label_hint` behavior unchanged (no
+        # canonical per-month snapshot output exposes those four dimensions
+        # pre-filtered by more than one hint at once without re-deriving
+        # what counts as expense -- see `dimension_rows`'s own docstring).
+        if dimension == "titular":
+            return holder_rows(
+                range_totals, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint
+            )
+        label_hint = category_hint or account_hint
+        return range_dimension_rows(range_totals, dimension, label_hint=label_hint)
+
+    rows = _rows_for(totals)
 
     if metric in _AGGREGATE_VARIATION_METRICS:
         compare_text = arguments.get("compare_period_text")
@@ -529,7 +551,7 @@ def _tool_financial_aggregate(
             start_period=compare_start,
             end_period=compare_end,
         )
-        previous_rows = range_dimension_rows(previous_totals, dimension, label_hint=label_hint)
+        previous_rows = _rows_for(previous_totals)
         percentage = metric == "variacao_percentual"
         result_rows = variation_rows(rows, previous_rows, percentage=percentage)
         sort_key = "variation_percent" if percentage else "variation_absolute"
@@ -613,21 +635,25 @@ def _tool_get_expenses(db: Session, *, user: Any, arguments: dict[str, str], tod
     )
     category_hint = arguments.get("category_hint")
     account_hint = arguments.get("account_hint")
+    holder_hint = arguments.get("holder_hint")
     category_rows = range_dimension_rows(totals, "categoria", label_hint=category_hint)
     account_rows = range_dimension_rows(totals, "conta", label_hint=account_hint) + range_dimension_rows(
         totals, "cartao", label_hint=account_hint
     )
-    # A category/account filter narrows `expenses` to that filter's own
-    # rows; combining both filters at once is not offered here -- the
-    # canonical per-month snapshot exposes category and account/card
-    # breakdowns independently, never a joint category-by-account
-    # breakdown, so this never fabricates one.
-    if category_hint:
-        filtered_total = sum((row["amount"] for row in category_rows), Decimal("0"))
-    elif account_hint:
-        filtered_total = sum((row["amount"] for row in account_rows), Decimal("0"))
-    else:
-        filtered_total = totals.expenses
+    # WA-04 PR #106 review round 1: `category_hint`/`account_hint`/
+    # `holder_hint` compose simultaneously (AND) via `filtered_expense_total`
+    # -- the same per-transaction `expense_detail_rows` contributions
+    # `category_rows`/`account_rows` above are already built from, just not
+    # collapsed to one dimension first -- instead of the previous "category
+    # wins over account, no combination possible" priority order. With no
+    # hint at all this is exactly `totals.expenses` (every row, unfiltered).
+    filtered_total = (
+        filtered_expense_total(
+            totals, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint
+        )
+        if (category_hint or account_hint or holder_hint)
+        else totals.expenses
+    )
     return ToolOutcome(
         ok=True,
         facts={

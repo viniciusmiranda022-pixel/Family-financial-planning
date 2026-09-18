@@ -256,9 +256,13 @@ def _format_project_horizon(facts: dict[str, Any]) -> str:
 
 
 def _format_dimension_label(dimension: str | None) -> str:
-    return {"categoria": "categoria", "conta": "conta", "cartao": "cartão", "mes": "mês"}.get(
-        dimension or "", str(dimension)
-    )
+    return {
+        "categoria": "categoria",
+        "conta": "conta",
+        "cartao": "cartão",
+        "mes": "mês",
+        "titular": "titular",
+    }.get(dimension or "", str(dimension))
 
 
 def _format_financial_aggregate(facts: dict[str, Any]) -> str:

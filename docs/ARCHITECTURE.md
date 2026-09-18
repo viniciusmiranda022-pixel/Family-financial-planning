@@ -660,21 +660,28 @@ já publicados.
 
 | Tool | Fonte determinística reaproveitada |
 |---|---|
-| `financial_aggregate` (categoria/conta/cartão/mês, métrica total/média/contagem/mínimo/máximo/participação/variação) | `financial_query.collect_range_totals` sobre `build_snapshot` por mês |
-| `get_income`/`get_expenses` (intervalo de período, filtro opcional por categoria/conta) | idem, com `by_month` sempre incluso |
+| `financial_aggregate` (categoria/conta/cartão/mês/titular, métrica total/média/contagem/mínimo/máximo/participação/variação) | `financial_query.collect_range_totals` sobre `build_snapshot` por mês; dimensão `titular` e composição simultânea de `category_hint`/`account_hint`/`holder_hint` lêem `RangeTotals.detail_rows` (`holder_rows`/`filtered_expense_total`) |
+| `get_income`/`get_expenses` (intervalo de período, filtro opcional simultâneo por categoria/conta/titular) | idem, com `by_month` sempre incluso; `get_expenses` usa `filtered_expense_total` quando qualquer combinação de `category_hint`/`account_hint`/`holder_hint` é informada |
 | `get_commitments` (REALIZADO/COMPROMETIDO nunca somados) | `app.api._obligation_rows` (já carrega `financial_state`) |
 | `get_installments` (contratado/impacto no mês/parcelas futuras) | `app.api._installment_anchor_month`/`_installment_series_key`/`_installment_remaining_schedule` -- mesma identidade de série e cronograma que `_project_installments` já usa para a projeção do household, aplicada a uma única compra |
 | `search_transactions` (listagem crua, nunca soma nada) | `Transaction` filtrado por household -- mesmos filtros/rótulos que `GET /transactions` já resolve, limitado a 20 linhas (nunca o corpus inteiro ao modelo) |
 
-**Decisão de escopo deliberada -- sem agrupamento por titular:** o Work Order pede filtro e
-agrupamento por "titular" (`owner_label`). Filtro existe (`search_transactions.holder_hint`);
-agrupamento por titular em `financial_aggregate` não foi implementado nesta fatia porque nenhuma
-saída canônica do snapshot (`category_spending_rows`/`account_cash_flow_rows`) expõe renda/despesa
-por titular -- calculá-lo aqui exigiria reclassificar `Transaction` de forma independente do loop
-de `financial_snapshots._collect`, exatamente o "segundo motor financeiro" que o Work Order proíbe.
-Risco residual registrado para decisão do engenheiro responsável: extrair a classificação de
-`_collect` para uma função pura reaproveitável exigiria revisão dedicada do núcleo do snapshot
-engine, fora do escopo desta fatia.
+**Agrupamento por titular e filtros combináveis (PR #106 review round 1):** a primeira rodada
+desta fatia registrava agrupamento por titular como risco residual, por não existir saída
+canônica do snapshot já particionada por `owner_label`. A correção não reclassifica
+`Transaction` de forma independente -- ela reaproveita literalmente as mesmas contribuições que
+`financial_snapshots._collect` já soma em `categories`/`totals["expenses"]`, apenas sem
+colapsá-las por categoria antes de escrevê-las no payload: `expense_detail` (novo campo aditivo do
+payload do snapshot, série de linhas `{categoria, conta, tipo de conta, titular, valor}`) e sua
+função de leitura `expense_detail_rows`. `financial_query.RangeTotals.detail_rows` concatena essas
+linhas por mês; `holder_rows` agrupa por titular e `filtered_expense_total` soma o total já
+filtrado por `category_hint`/`account_hint`/`holder_hint` simultaneamente (nunca um filtro
+sobrepondo o outro). Teste de regressão de paridade: a soma de `expense_detail_rows` por categoria
+reproduz exatamente `category_spending_rows`; a soma de `holder_rows` (sem filtro) reproduz
+`RangeTotals.expenses`. As dimensões `categoria`/`conta`/`cartao`/`mes` de `financial_aggregate`
+continuam lendo `category_rows`/`account_rows`/`month_expense_rows` sem alteração -- só a nova
+dimensão `titular` e a composição simultânea de filtros passam pelo caminho `detail_rows`, para não
+arriscar divergência numérica no comportamento já testado dessas quatro dimensões.
 
 **Variação sem período de comparação explícito:** quando `metric` é `variacao_absoluta`/
 `variacao_percentual` e o chamador não informa `compare_period_text`, o intervalo de comparação é

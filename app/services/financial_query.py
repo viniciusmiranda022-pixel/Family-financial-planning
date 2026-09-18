@@ -41,17 +41,19 @@ from app.services.financial_snapshots import (
     account_cash_flow_rows,
     build_snapshot,
     category_spending_rows,
+    expense_detail_rows,
     report_month_monetary_publication,
 )
 
 # Grouping dimensions the canonical per-month snapshot already publishes
-# rows for. "titular" (holder) is deliberately not offered here: no
-# canonical income/expense-by-holder snapshot output exists yet, and
-# reclassifying raw transactions by holder ourselves would be exactly the
-# "second financial engine" the Work Order prohibits. `search_transactions`
-# (a raw, unclassified listing) supports a holder filter instead -- see
-# `app.services.assistant_tools._tool_search_transactions`.
-DIMENSIONS: tuple[str, ...] = ("categoria", "conta", "cartao", "mes")
+# rows for. "categoria"/"conta"/"cartao"/"mes" read `category_rows`/
+# `account_rows`/`month_expense_rows` below (unchanged since WA-04's first
+# round). "titular" (holder) reads `RangeTotals.detail_rows` instead --
+# `app.services.financial_snapshots.expense_detail_rows`' per-(category,
+# account, titular) canonical contributions (PR #106 review round 1) --
+# the same numbers, just not collapsed across holder before being summed
+# here, never a second classification of a raw `Transaction`.
+DIMENSIONS: tuple[str, ...] = ("categoria", "conta", "cartao", "mes", "titular")
 
 METRICS: tuple[str, ...] = (
     "total",
@@ -266,6 +268,14 @@ class RangeTotals:
     account_rows: dict[str, dict[str, Any]]
     month_income_rows: dict[str, Decimal]
     month_expense_rows: dict[str, Decimal]
+    # WA-04 review round 1 (PR #106): the range's per-(category, account,
+    # titular) canonical expense contributions, concatenated verbatim from
+    # each month's `expense_detail_rows` (see `collect_range_totals`) --
+    # `holder_rows`/`filtered_expense_total` below group/filter this list on
+    # more than one dimension at once instead of picking a single
+    # `label_hint` the way `dimension_rows` does for the four dimensions
+    # above.
+    detail_rows: tuple[dict[str, Any], ...]
 
 
 def collect_range_totals(
@@ -287,6 +297,7 @@ def collect_range_totals(
     account_rows: dict[str, dict[str, Any]] = {}
     month_income_rows: dict[str, Decimal] = {}
     month_expense_rows: dict[str, Decimal] = {}
+    detail_rows: list[dict[str, Any]] = []
 
     for period in period_range_months(start_period, end_period):
         snapshot = build_snapshot(db, household_id=household_id, period=period, generated_by=generated_by)
@@ -308,6 +319,8 @@ def collect_range_totals(
                 label, {"cash_out": Decimal("0"), "account_type": row.get("account_type") or "other"}
             )
             bucket["cash_out"] = bucket["cash_out"] + money(Decimal(str(row.get("cash_out", 0))))
+        for row in expense_detail_rows(snapshot):
+            detail_rows.append({**row, "period": period})
 
     return RangeTotals(
         start_period=start_period,
@@ -318,6 +331,7 @@ def collect_range_totals(
         account_rows=account_rows,
         month_income_rows=month_income_rows,
         month_expense_rows=month_expense_rows,
+        detail_rows=tuple(detail_rows),
     )
 
 
@@ -339,6 +353,71 @@ def dimension_rows(totals: RangeTotals, dimension: str, *, label_hint: str | Non
             if (bucket.get("account_type") == "credit_card") == wants_card
         ]
     return [row for row in rows if matches_hint(label_hint, row["label"])]
+
+
+def _detail_matches(
+    row: dict[str, Any], *, category_hint: str | None, account_hint: str | None, holder_hint: str | None
+) -> bool:
+    """True when `row` (one of `RangeTotals.detail_rows`) satisfies every
+    provided hint at once (AND, never "last one wins") -- a hint left
+    absent/`None` matches everything, same contract as `matches_hint`."""
+
+    return (
+        matches_hint(category_hint, row.get("category"))
+        and matches_hint(account_hint, row.get("account"))
+        and matches_hint(holder_hint, row.get("holder"))
+    )
+
+
+def filtered_expense_total(
+    totals: RangeTotals,
+    *,
+    category_hint: str | None = None,
+    account_hint: str | None = None,
+    holder_hint: str | None = None,
+) -> Decimal:
+    """Operating-expense total narrowed by every provided hint at once.
+
+    Reads `totals.detail_rows` -- the exact per-transaction category/
+    account/holder contributions `RangeTotals.expenses`/`category_rows` are
+    already built from (see `app.services.financial_snapshots.
+    expense_detail_rows`) -- instead of picking a single dimension's
+    pre-aggregated rows the way `dimension_rows` does; this is what lets a
+    caller combine `category_hint` and `account_hint` (WA-04 PR #106 review
+    round 1: "gasto de combustível no Nubank", not just one filter at a
+    time, with `account_hint`/`category_hint` silently overriding each
+    other). With no hint at all this returns `totals.expenses` itself
+    (every detail row, unfiltered)."""
+
+    matched = [
+        row
+        for row in totals.detail_rows
+        if _detail_matches(row, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint)
+    ]
+    return money(sum((Decimal(str(row.get("amount", 0))) for row in matched), Decimal("0")))
+
+
+def holder_rows(
+    totals: RangeTotals,
+    *,
+    category_hint: str | None = None,
+    account_hint: str | None = None,
+    holder_hint: str | None = None,
+) -> list[dict[str, Any]]:
+    """Per-holder `{"label", "amount"}` rows for `financial_aggregate`'s
+    `titular` dimension -- grouped from `totals.detail_rows`, narrowed by
+    every provided hint at once first (see `filtered_expense_total`), so
+    "quanto a Kelly gastou em Mercado" (a category filter combined with the
+    holder dimension) is one query instead of two independently-filtered
+    ones."""
+
+    grouped: dict[str, Decimal] = {}
+    for row in totals.detail_rows:
+        if not _detail_matches(row, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint):
+            continue
+        label = str(row.get("holder") or "Não informado")
+        grouped[label] = grouped.get(label, Decimal("0")) + money(Decimal(str(row.get("amount", 0))))
+    return [{"label": label, "amount": amount} for label, amount in grouped.items()]
 
 
 def apply_metric(rows: Sequence[dict[str, Any]], metric: str) -> list[dict[str, Any]]:

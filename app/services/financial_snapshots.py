@@ -460,11 +460,22 @@ def _collect(
     }
     categories: dict[str, Decimal] = {}
     accounts: dict[str, dict[str, Any]] = {}
+    # WA-04 (docs/WORK_ORDER_WA_04.md, issue #76, PR #106 review round 1):
+    # the exact same per-transaction expense/refund contributions that get
+    # collapsed into `categories` above, kept instead at the finer
+    # (category, account, titular) grain -- reused verbatim by
+    # `app.services.financial_query`'s holder dimension and combined-filter
+    # queries so they never re-derive what counts as operating expense
+    # ("second financial engine" the Work Order prohibits). See
+    # `expense_detail_rows` below.
+    expense_detail: dict[tuple[str, str, str], Decimal] = {}
     pending_duplicates = 0
     for transaction, category_name in rows:
         amount = money(transaction.amount)
         role = "excluded" if transaction.excluded else "canonical"
         account_type = transaction.account.account_type if transaction.account else "other"
+        account_key = transaction.account_id or "unidentified"
+        holder_label = transaction.owner_label or "Não informado"
         metric = "source_count"
         contribution: Decimal | None = None
         if transaction.possible_duplicate and transaction.canonical_status == "unassigned":
@@ -514,6 +525,8 @@ def _collect(
                 # operating expense economically, but must remain visible in flow.
                 totals["bank_in"] += amount
             categories[category_name] = categories.get(category_name, Decimal("0")) - amount
+            detail_key = (category_name, account_key, holder_label)
+            expense_detail[detail_key] = expense_detail.get(detail_key, Decimal("0")) - amount
             contribution = amount
         elif (
             transaction.transaction_type in {"expense", "refund"} and amount < 0 and not transaction.excluded
@@ -521,6 +534,8 @@ def _collect(
             contribution = abs(amount)
             totals["expenses"] += contribution
             categories[category_name] = categories.get(category_name, Decimal("0")) + contribution
+            detail_key = (category_name, account_key, holder_label)
+            expense_detail[detail_key] = expense_detail.get(detail_key, Decimal("0")) + contribution
             if account_type == "credit_card":
                 metric = "card_spend"
                 totals["card_spend"] += contribution
@@ -559,7 +574,7 @@ def _collect(
             # gasto -- only as cash physically leaving the account.
             "card_payments",
         }:
-            key = transaction.account_id or "unidentified"
+            key = account_key
             account = accounts.setdefault(
                 key,
                 {
@@ -683,6 +698,28 @@ def _collect(
                 if value > 0
             ],
             "cash_flow_by_account": _serialize_accounts(accounts),
+            "expense_detail": [
+                {
+                    "category": detail_category,
+                    "account_id": None if detail_account_key == "unidentified" else detail_account_key,
+                    "account": (
+                        accounts[detail_account_key]["account"]
+                        if detail_account_key in accounts
+                        else "Sem conta identificada"
+                    ),
+                    "account_type": (
+                        accounts[detail_account_key]["account_type"]
+                        if detail_account_key in accounts
+                        else "other"
+                    ),
+                    "holder": detail_holder,
+                    "amount": float(money(detail_amount)),
+                }
+                for (detail_category, detail_account_key, detail_holder), detail_amount in sorted(
+                    expense_detail.items(), key=lambda item: item[0]
+                )
+                if detail_amount != 0
+            ],
             "reconciliation": (
                 {
                     "observed_balance": float(intra_period["observed_balance"]),
@@ -1173,6 +1210,28 @@ def _dashboard_account_cash_flow_engine_truth(snapshot: FinancialSnapshot) -> di
         for metric in _ACCOUNT_CASH_FLOW_METRICS:
             fields[f"cash_flow_by_account.{account_key}.{metric}"] = money(Decimal(str(row.get(metric, 0))))
     return fields
+
+
+def expense_detail_rows(snapshot: FinancialSnapshot) -> list[dict[str, Any]]:
+    """Per-(category, account, titular) canonical operating-expense
+    contributions for `snapshot` -- WA-04 (`docs/WORK_ORDER_WA_04.md`,
+    issue #76, PR #106 review round 1)'s shared classification structure
+    for `financial_aggregate`'s `titular` dimension and combined
+    category+account+holder filtering in `app.services.financial_query`.
+
+    Every amount here is the exact same addition/subtraction `_collect()`
+    already performs into `categories[category_name]` (see that function) --
+    this is that same running total, just not collapsed across account/
+    holder before being written to the payload, so summing these rows back
+    up by category alone reproduces `category_spending_rows` exactly.
+    Unlike `category_spending_rows`, a negative net (a category/account/
+    holder slice where a refund exceeded that slice's own spend) is kept
+    rather than hidden -- no new financial fact, no second classification
+    of a raw `Transaction`, only finer grouping of numbers the engine
+    already computed.
+    """
+
+    return list(snapshot.payload.get("expense_detail", []))
 
 
 def category_spending_rows(snapshot: FinancialSnapshot) -> list[dict[str, Any]]:

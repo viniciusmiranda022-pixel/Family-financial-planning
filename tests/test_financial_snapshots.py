@@ -22,9 +22,12 @@ from app.services.financial_invariants import InvariantContext, InvariantScope, 
 from app.services.financial_snapshots import (
     _observation_is_trusted,
     build_snapshot,
+    category_spending_rows,
     dashboard_and_report_consistency_facts,
+    expense_detail_rows,
     realized_balance_sovereignty_facts,
     realized_liquidity_evidence_facts,
+    report_month_monetary_publication,
     snapshot_lineage_facts,
 )
 from app.services.invariant_registry import evaluate_invariant
@@ -142,6 +145,7 @@ def _transaction(
     transaction_type: str,
     suffix: str,
     excluded: bool = False,
+    owner_label: str = "Família",
 ) -> Transaction:
     return Transaction(
         household_id=household.id,
@@ -155,6 +159,7 @@ def _transaction(
         fingerprint=suffix.rjust(64, "0"),
         canonical_status="canonical",
         excluded=excluded,
+        owner_label=owner_label,
     )
 
 
@@ -457,6 +462,113 @@ def test_report_aggregates_snapshot_refunds_and_latest_balance_observation() -> 
         # withdrawal from the net operating deficit alone.
         assert result["summary"]["liquidity_withdrawal"] == 0.0
         assert result["monthly"][-1]["snapshot_id"]
+
+
+def test_expense_detail_rows_reproduce_category_and_spending_totals_and_split_by_holder() -> None:
+    """WA-04 (`docs/WORK_ORDER_WA_04.md`, issue #76, PR #106 review round 1):
+    `expense_detail_rows` must be the exact same per-transaction
+    contributions `categories`/`totals["expenses"]` already sum inside
+    `_collect` -- just not collapsed across account/holder first. This
+    proves that equivalence, including the trickiest case: a refund netted
+    against a category that otherwise has no spend this month, which
+    `category_spending_rows` hides (`if value > 0`) but `expense_detail_rows`
+    must keep (a negative-net slice is real information, not a fabricated
+    fact)."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        household = Household(name="Família Detalhe")
+        db.add(household)
+        db.flush()
+        checking = Account(household_id=household.id, name="Conta Corrente", account_type="checking")
+        card = Account(household_id=household.id, name="Cartão", account_type="credit_card")
+        market = Category(household_id=household.id, name="Mercado")
+        fuel = Category(household_id=household.id, name="Combustível")
+        shopping = Category(household_id=household.id, name="Compras")
+        profile = FinancialProfile(household_id=household.id, monthly_cash_cap=Decimal("5000"))
+        db.add_all([checking, card, market, fuel, shopping, profile])
+        db.flush()
+        db.add_all(
+            [
+                _transaction(
+                    household,
+                    checking,
+                    market,
+                    booked_at=date(2026, 9, 3),
+                    amount="-300",
+                    transaction_type="expense",
+                    suffix="detail-market-spend",
+                    owner_label="Vinicius",
+                ),
+                # Partial refund of the same Mercado purchase -- category nets
+                # to 270, still positive (stays in `category_spending_rows`).
+                _transaction(
+                    household,
+                    checking,
+                    market,
+                    booked_at=date(2026, 9, 4),
+                    amount="30",
+                    transaction_type="refund",
+                    suffix="detail-market-refund",
+                    owner_label="Vinicius",
+                ),
+                _transaction(
+                    household,
+                    card,
+                    fuel,
+                    booked_at=date(2026, 9, 5),
+                    amount="-200",
+                    transaction_type="expense",
+                    suffix="detail-fuel-spend",
+                    owner_label="Kelly",
+                ),
+                # A refund with no matching spend in "Compras" this month --
+                # category nets negative, dropped by `category_spending_rows`
+                # but must still be visible here.
+                _transaction(
+                    household,
+                    card,
+                    shopping,
+                    booked_at=date(2026, 9, 6),
+                    amount="50",
+                    transaction_type="refund",
+                    suffix="detail-shopping-refund",
+                    owner_label="Kelly",
+                ),
+            ]
+        )
+        db.commit()
+
+        snapshot = build_snapshot(db, household_id=household.id, period="2026-09", generated_by="tester")
+
+        detail = expense_detail_rows(snapshot)
+        by_category: dict[str, float] = {}
+        by_holder: dict[str, float] = {}
+        for row in detail:
+            by_category[row["category"]] = by_category.get(row["category"], 0.0) + row["amount"]
+            by_holder[row["holder"]] = by_holder.get(row["holder"], 0.0) + row["amount"]
+
+        # Parity with the published category rows for the categories that
+        # survive the `> 0` publication filter.
+        published = {row["category"]: row["amount"] for row in category_spending_rows(snapshot)}
+        assert published == {"Mercado": 270.0, "Combustível": 200.0}
+        assert by_category["Mercado"] == 270.0
+        assert by_category["Combustível"] == 200.0
+        # "Compras" nets negative -- hidden from `category_spending_rows`,
+        # kept (not fabricated away) in the finer-grained detail.
+        assert "Compras" not in published
+        assert by_category["Compras"] == -50.0
+
+        # Parity with the canonical monthly spending total.
+        spending = float(report_month_monetary_publication(snapshot)["spending"])
+        assert spending == 420.0
+        assert sum(row["amount"] for row in detail) == spending
+
+        # Split by holder: Vinicius (Mercado net 270) vs Kelly (fuel 200 -
+        # shopping refund 50 = 150) -- also reproduces the same grand total.
+        assert by_holder == {"Vinicius": 270.0, "Kelly": 150.0}
+        assert sum(by_holder.values()) == spending
 
 
 def _evaluate_report_check(invariant_id: str, facts: dict[str, object]):

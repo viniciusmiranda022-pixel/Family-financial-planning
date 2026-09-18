@@ -39,7 +39,7 @@
               },
               "dimension": {
                 "type": "string",
-                "enum": ["categoria", "conta", "cartao", "mes"]
+                "enum": ["categoria", "conta", "cartao", "mes", "titular"]
               },
               "period_text": { "type": "string", "maxLength": 60 },
               "period_a_text": { "type": "string", "maxLength": 60 },

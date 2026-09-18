@@ -257,6 +257,106 @@ def test_get_expenses_category_filter_narrows_total_to_that_category() -> None:
     assert outcome.facts["expenses"] == Decimal("200.00")
 
 
+def test_get_expenses_combines_category_and_account_hint_simultaneously() -> None:
+    """PR #106 review round 1 -- MERGE BLOCKED item 2: `category_hint` and
+    `account_hint` used to silently override each other (category winning),
+    so this exact scenario returned the whole "Mercado" category total
+    (R$350) instead of only the purchase that matches *both* filters at
+    once (R$300). `filtered_expense_total` fixes this by ANDing every
+    provided hint against `RangeTotals.detail_rows` instead of picking one
+    dimension's pre-aggregated rows."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="expenses-combined")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+        description="Supermercado na Conta Corrente",
+    )
+    # Same category, different account -- must NOT count once account_hint
+    # narrows to "Conta Corrente".
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-50.00"),
+        transaction_type="expense",
+        description="Supermercado no Cartão",
+    )
+    # Same account, different category -- must NOT count once category_hint
+    # narrows to "Mercado".
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-80.00"),
+        transaction_type="expense",
+        description="Combustível na Conta Corrente",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={
+                "period_text": "este mês",
+                "category_hint": "mercado",
+                "account_hint": "conta corrente",
+            },
+            message="quanto gastei de mercado na conta corrente esse mês?",
+            today=TODAY,
+        )
+    assert outcome.facts["expenses"] == Decimal("300.00")
+
+
+def test_get_expenses_holder_hint_combines_with_category_hint() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="expenses-holder")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+        owner_label="Vinicius",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-120.00"),
+        transaction_type="expense",
+        owner_label="Kelly",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={"period_text": "este mês", "category_hint": "mercado", "holder_hint": "Vinicius"},
+            message="quanto o Vinicius gastou de mercado esse mês?",
+            today=TODAY,
+        )
+    assert outcome.facts["expenses"] == Decimal("300.00")
+
+
 def test_get_income_excludes_internal_transfer_and_investment() -> None:
     session_factory = _session_factory()
     ids = _seed_household(session_factory, username="income-excl")
@@ -482,6 +582,107 @@ def test_financial_aggregate_missing_dimension_asks_never_guesses() -> None:
     assert outcome.ok is True
     assert outcome.clarifying_question is not None
     assert outcome.facts == {}
+
+
+def test_financial_aggregate_titular_dimension_groups_by_holder() -> None:
+    """PR #106 review round 1 -- MERGE BLOCKED item 1: `titular` (holder)
+    was documented as out of scope; it is now a real grouping dimension,
+    reading `RangeTotals.detail_rows` (`app.services.financial_snapshots.
+    expense_detail_rows`) instead of a second reclassification of
+    `Transaction`."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="aggregate-titular")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+        owner_label="Vinicius",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-100.00"),
+        transaction_type="expense",
+        owner_label="Kelly",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "titular", "period_text": "este mês"},
+            message="quanto cada um gastou esse mês?",
+            today=TODAY,
+        )
+    rows = {row["label"]: row["amount"] for row in outcome.facts["rows"]}
+    assert rows == {"Vinicius": Decimal("300.00"), "Kelly": Decimal("100.00")}
+    # Parity: the grouped total must reproduce the same canonical total
+    # `get_expenses`/`report_month_monetary_publication` report.
+    with session_factory() as db:
+        expenses = run_tool(
+            db, user=user, tool="get_expenses", arguments={"period_text": "este mês"}, message="x", today=TODAY
+        )
+    assert sum(rows.values(), Decimal("0")) == expenses.facts["expenses"]
+
+
+def test_financial_aggregate_titular_dimension_combines_with_category_hint() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="aggregate-titular-category")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+        owner_label="Vinicius",
+    )
+    # Same holder, different category -- must not inflate the "Mercado"-only
+    # breakdown below.
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-100.00"),
+        transaction_type="expense",
+        owner_label="Vinicius",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-50.00"),
+        transaction_type="expense",
+        owner_label="Kelly",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "titular", "period_text": "este mês", "category_hint": "mercado"},
+            message="quanto cada um gastou de mercado esse mês?",
+            today=TODAY,
+        )
+    rows = {row["label"]: row["amount"] for row in outcome.facts["rows"]}
+    assert rows == {"Vinicius": Decimal("300.00"), "Kelly": Decimal("50.00")}
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +918,52 @@ def test_household_isolation_new_tools_never_see_another_households_data() -> No
     assert expenses.facts["expenses"] == Decimal("0.00")
     assert search.facts["total_matches"] == 0
     assert commitments.facts["committed_total"] == Decimal("0")
+
+
+def test_household_isolation_titular_dimension_and_combined_filters() -> None:
+    """PR #106 review round 1: the new `titular` grouping dimension and the
+    new combined category+account+holder filtering both read `RangeTotals.
+    detail_rows`, a brand new code path -- must be re-proven independently
+    of the pre-existing isolation test above. The other household's holder
+    label ("Vinicius") deliberately collides with a label our own household
+    could plausibly also use, so this also proves isolation is keyed on
+    `household_id`, never accidentally on the free-text holder string."""
+
+    session_factory = _session_factory()
+    mine = _seed_household(session_factory, username="isolation-titular-mine")
+    theirs = _seed_household(session_factory, username="isolation-titular-theirs")
+    _seed_transaction(
+        session_factory,
+        household_id=theirs["household_id"],
+        account_id=theirs["checking_id"],
+        category_id=theirs["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-9999.00"),
+        transaction_type="expense",
+        description="Segredo de outra família",
+        owner_label="Vinicius",
+    )
+    user = _admin_user(session_factory, household_id=mine["household_id"])
+
+    with session_factory() as db:
+        aggregate = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "titular", "period_text": "este mês"},
+            message="quanto cada um gastou esse mês?",
+            today=TODAY,
+        )
+        expenses = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={"period_text": "este mês", "category_hint": "mercado", "holder_hint": "Vinicius"},
+            message="x",
+            today=TODAY,
+        )
+    assert aggregate.facts["rows"] == []
+    assert expenses.facts["expenses"] == Decimal("0.00")
 
 
 # ---------------------------------------------------------------------------

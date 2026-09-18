@@ -92,12 +92,13 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="financial_aggregate",
         description=(
-            "Agrega o gasto operacional de um período por categoria, conta, cartão ou mês, com métrica "
-            "(total, média, contagem, mínimo, máximo, participação percentual, variação absoluta ou "
-            "percentual) e, opcionalmente, apenas os top N resultados."
+            "Agrega o gasto operacional de um período por categoria, conta, cartão, mês ou titular, com "
+            "métrica (total, média, contagem, mínimo, máximo, participação percentual, variação absoluta "
+            "ou percentual) e, opcionalmente, apenas os top N resultados. category_hint/account_hint/"
+            "holder_hint combinam-se simultaneamente quando mais de um for informado."
         ),
         arguments=(
-            ("dimension", "um de: categoria, conta, cartao, mes"),
+            ("dimension", "um de: categoria, conta, cartao, mes, titular"),
             ("period_text", "período em texto livre (ex.: 'este mês', 'últimos 3 meses', 'últimos 90 dias')"),
             (
                 "metric",
@@ -107,6 +108,7 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
             ("compare_period_text", "período de comparação, apenas para as métricas de variação"),
             ("category_hint", "nome (ou nomes, separados por vírgula) de categoria para filtrar"),
             ("account_hint", "nome de conta/cartão para filtrar"),
+            ("holder_hint", "titular/responsável para filtrar"),
             ("top_n", "quantidade máxima de resultados a devolver, já ordenados"),
         ),
     ),
@@ -119,12 +121,14 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
         name="get_expenses",
         description=(
             "Gasto operacional total (por categoria, conta/cartão e por mês) de um período, opcionalmente "
-            "filtrado por categoria ou conta/cartão."
+            "filtrado por categoria, conta/cartão e/ou titular -- os filtros informados combinam-se "
+            "simultaneamente (nunca um sobrepõe o outro)."
         ),
         arguments=(
             ("period_text", "período em texto livre (ex.: 'este mês', 'últimos 3 meses')"),
             ("category_hint", "nome (ou nomes, separados por vírgula) de categoria para filtrar"),
             ("account_hint", "nome de conta/cartão para filtrar"),
+            ("holder_hint", "titular/responsável para filtrar"),
         ),
     ),
     ToolSpec(
