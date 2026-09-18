@@ -86,6 +86,86 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
         ),
         arguments=(("reference_text", "trecho/identificador da proposta a cancelar, se houver"),),
     ),
+    # WA-04 (docs/WORK_ORDER_WA_04.md, issue #76) -- generic, composable
+    # read/query tools, additive to the WA-02 set above (nothing here
+    # replaces query_facts/aggregate_spending/compare_periods).
+    ToolSpec(
+        name="financial_aggregate",
+        description=(
+            "Agrega o gasto operacional de um período por categoria, conta, cartão, mês ou titular, com "
+            "métrica (total, média, contagem, mínimo, máximo, participação percentual, variação absoluta "
+            "ou percentual) e, opcionalmente, apenas os top N resultados. category_hint/account_hint/"
+            "holder_hint combinam-se simultaneamente quando mais de um for informado."
+        ),
+        arguments=(
+            ("dimension", "um de: categoria, conta, cartao, mes, titular"),
+            ("period_text", "período em texto livre (ex.: 'este mês', 'últimos 3 meses', 'últimos 90 dias')"),
+            (
+                "metric",
+                "um de: total, media, contagem, minimo, maximo, participacao, variacao_absoluta, "
+                "variacao_percentual (padrão: total)",
+            ),
+            ("compare_period_text", "período de comparação, apenas para as métricas de variação"),
+            ("category_hint", "nome (ou nomes, separados por vírgula) de categoria para filtrar"),
+            ("account_hint", "nome de conta/cartão para filtrar"),
+            ("holder_hint", "titular/responsável para filtrar"),
+            ("top_n", "quantidade máxima de resultados a devolver, já ordenados"),
+        ),
+    ),
+    ToolSpec(
+        name="get_income",
+        description="Renda operacional total (e por mês) de um período, nunca incluindo transferência/resgate/aplicação.",
+        arguments=(("period_text", "período em texto livre (ex.: 'este mês', 'último ano', 'ano passado')"),),
+    ),
+    ToolSpec(
+        name="get_expenses",
+        description=(
+            "Gasto operacional total (por categoria, conta/cartão e por mês) de um período, opcionalmente "
+            "filtrado por categoria, conta/cartão e/ou titular -- os filtros informados combinam-se "
+            "simultaneamente (nunca um sobrepõe o outro)."
+        ),
+        arguments=(
+            ("period_text", "período em texto livre (ex.: 'este mês', 'últimos 3 meses')"),
+            ("category_hint", "nome (ou nomes, separados por vírgula) de categoria para filtrar"),
+            ("account_hint", "nome de conta/cartão para filtrar"),
+            ("holder_hint", "titular/responsável para filtrar"),
+        ),
+    ),
+    ToolSpec(
+        name="get_commitments",
+        description=(
+            "Obrigações REALIZADAS (já pagas) e COMPROMETIDAS (pendentes), opcionalmente filtradas por "
+            "período de vencimento, categoria ou status."
+        ),
+        arguments=(
+            ("period_text", "mês de vencimento em texto livre, opcional"),
+            ("status_hint", "um de: realizado, comprometido -- opcional, mostra ambos se ausente"),
+            ("category_hint", "nome da categoria da obrigação, opcional"),
+        ),
+    ),
+    ToolSpec(
+        name="get_installments",
+        description=(
+            "Detalhe de uma compra parcelada: valor contratado, impacto no mês atual e saldo de parcelas "
+            "futuras ainda não realizadas."
+        ),
+        arguments=(("merchant_hint", "nome/descrição da compra parcelada (obrigatório)"),),
+    ),
+    ToolSpec(
+        name="search_transactions",
+        description=(
+            "Lista transações já lançadas de um período, filtráveis por categoria, conta/cartão, tipo, "
+            "titular ou trecho da descrição -- nunca soma nada, apenas lista os fatos já lançados."
+        ),
+        arguments=(
+            ("period_text", "período em texto livre (ex.: 'este mês', 'agosto')"),
+            ("category_hint", "nome da categoria para filtrar"),
+            ("account_hint", "nome de conta/cartão para filtrar"),
+            ("type_hint", "um de: renda, despesa, transferencia, estorno, conciliacao"),
+            ("holder_hint", "titular/responsável para filtrar"),
+            ("merchant_hint", "trecho da descrição/estabelecimento para filtrar"),
+        ),
+    ),
 )
 
 ALLOWED_TOOLS: frozenset[str] = frozenset(spec.name for spec in TOOL_CATALOG)

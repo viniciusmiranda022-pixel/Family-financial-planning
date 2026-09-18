@@ -255,6 +255,113 @@ def _format_project_horizon(facts: dict[str, Any]) -> str:
     )
 
 
+def _format_dimension_label(dimension: str | None) -> str:
+    return {
+        "categoria": "categoria",
+        "conta": "conta",
+        "cartao": "cartão",
+        "mes": "mês",
+        "titular": "titular",
+    }.get(dimension or "", str(dimension))
+
+
+def _format_financial_aggregate(facts: dict[str, Any]) -> str:
+    rows = facts.get("rows") or []
+    dimension_label = _format_dimension_label(facts.get("dimension"))
+    period = facts.get("start_period")
+    end_period = facts.get("end_period")
+    period_label = period if period == end_period else f"{period} a {end_period}"
+    if not rows:
+        return f"Não encontrei movimentação em {period_label} para essa consulta."
+    metric = facts.get("metric")
+    if metric == "participacao":
+        parts = [
+            f"{row.get('label')}: {_format_money(row.get('amount'))} "
+            f"({Decimal(str(row.get('share', 0))) * 100:.1f}%)"
+            for row in rows[:8]
+        ]
+        return f"Participação por {dimension_label} em {period_label}: " + "; ".join(parts) + "."
+    if metric == "variacao_percentual":
+        parts = []
+        for row in rows[:8]:
+            variation = row.get("variation_percent")
+            variation_text = f"{Decimal(str(variation)):.1f}%" if variation is not None else "sem base de comparação"
+            parts.append(f"{row.get('label')}: {_format_money(row.get('amount'))} ({variation_text})")
+        return (
+            f"Variação por {dimension_label} entre {facts.get('compare_start_period')} e "
+            f"{facts.get('compare_end_period')} vs {period_label}: " + "; ".join(parts) + "."
+        )
+    if metric == "variacao_absoluta":
+        parts = [
+            f"{row.get('label')}: {_format_money(row.get('amount'))} "
+            f"(variação de {_format_money(row.get('variation_absolute'))})"
+            for row in rows[:8]
+        ]
+        return f"Variação por {dimension_label} em {period_label}: " + "; ".join(parts) + "."
+    if metric in ("media", "contagem", "minimo", "maximo"):
+        return f"{metric.capitalize()} por {dimension_label} em {period_label}: {_format_money(rows[0].get('amount'))}."
+    return f"Gasto por {dimension_label} em {period_label}: " + _format_rows(rows) + "."
+
+
+def _format_get_income(facts: dict[str, Any]) -> str:
+    period = facts.get("start_period")
+    end_period = facts.get("end_period")
+    period_label = period if period == end_period else f"{period} a {end_period}"
+    return f"Renda operacional em {period_label}: {_format_money(facts.get('income'))}."
+
+
+def _format_get_expenses(facts: dict[str, Any]) -> str:
+    period = facts.get("start_period")
+    end_period = facts.get("end_period")
+    period_label = period if period == end_period else f"{period} a {end_period}"
+    return f"Gasto operacional em {period_label}: {_format_money(facts.get('expenses'))}."
+
+
+def _format_get_commitments(facts: dict[str, Any]) -> str:
+    realized = facts.get("realized") or []
+    committed = facts.get("committed") or []
+    if not realized and not committed:
+        return "Não encontrei obrigações realizadas nem pendentes para esse filtro."
+    parts = []
+    if committed:
+        parts.append(
+            f"COMPROMETIDO (pendente): {_format_money(facts.get('committed_total'))} em "
+            f"{len(committed)} obrigação(ões)"
+        )
+    if realized:
+        parts.append(
+            f"REALIZADO (já pago): {_format_money(facts.get('realized_total'))} em {len(realized)} obrigação(ões)"
+        )
+    return "; ".join(parts) + "."
+
+
+def _format_get_installments(facts: dict[str, Any]) -> str:
+    purchases = facts.get("purchases") or []
+    if not purchases:
+        return "Não encontrei nenhuma compra parcelada para esse filtro."
+    parts = [
+        f"{item.get('description')}: contratado {_format_money(item.get('contracted_total'))} "
+        f"({item.get('installment_current')}/{item.get('installment_total')}x), impacto neste mês "
+        f"{_format_money(item.get('impact_this_month'))}, parcelas futuras "
+        f"{_format_money(item.get('future_remaining'))}"
+        for item in purchases[:5]
+    ]
+    return "; ".join(parts) + "."
+
+
+def _format_search_transactions(facts: dict[str, Any]) -> str:
+    transactions = facts.get("transactions") or []
+    total_matches = facts.get("total_matches", 0)
+    if not transactions:
+        return f"Não encontrei transações em {facts.get('period')} para esse filtro."
+    parts = [
+        f"{row.get('date')}: {row.get('description')} ({_format_money(row.get('amount'))})"
+        for row in transactions[:8]
+    ]
+    suffix = " e outras" if total_matches > len(transactions) else ""
+    return f"{total_matches} transação(ões) encontrada(s): " + "; ".join(parts) + suffix + "."
+
+
 _TYPED_ACTION_LABELS = {
     "create_expense": "uma saída",
     "create_income": "uma entrada",
@@ -299,6 +406,18 @@ def _format_step(tool: str, facts: dict[str, Any]) -> str:
         return "Ação desfeita -- o histórico original foi preservado."
     if tool == "cancel_typed_action":
         return "Combinado, cancelei essa proposta. Nada foi lançado."
+    if tool == "financial_aggregate":
+        return _format_financial_aggregate(facts)
+    if tool == "get_income":
+        return _format_get_income(facts)
+    if tool == "get_expenses":
+        return _format_get_expenses(facts)
+    if tool == "get_commitments":
+        return _format_get_commitments(facts)
+    if tool == "get_installments":
+        return _format_get_installments(facts)
+    if tool == "search_transactions":
+        return _format_search_transactions(facts)
     return ""  # pragma: no cover - unreachable, ALLOWED_TOOLS already checked in run_tool
 
 
