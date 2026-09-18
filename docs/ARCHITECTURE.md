@@ -635,6 +635,54 @@ planejamento (sem laço de replanejamento realimentando resultados de tool para 
 modelo) -- defesa estrutural contra prompt injection/loop descontrolado, não apenas uma escolha de
 desempenho.
 
+### Camada de leitura/consulta genérica (WA-04, `docs/WORK_ORDER_WA_04.md`, issue #76)
+
+Aditiva ao Tool Layer do WA-02 acima -- nenhuma tool existente foi removida ou teve sua semântica
+alterada. Adiciona seis tools genéricas e compostas ao vocabulário fechado
+(`app.services.assistant_tool_catalog.ALLOWED_TOOLS`) para perguntas analíticas livres que o
+conjunto fixo do WA-02 (`query_facts`/`aggregate_spending`, um único mês, quatro tópicos fechados)
+não cobria: `financial_aggregate`, `get_income`, `get_expenses`, `get_commitments`,
+`get_installments`, `search_transactions`. `compare_periods`/`query_facts`/`project_horizon`
+continuam existindo e inalteradas -- `financial_aggregate` não as substitui, apenas cobre o que
+elas não cobriam (intervalo de meses, métrica composta, top N).
+
+**Novo módulo `app.services.financial_query`:** resolução determinística de intervalo de período
+(`resolve_period_range` -- "últimos N meses", "últimos N dias" convertido para meses inteiros via
+`ceil(dias/30)`, "este ano", "ano passado", "último ano"/"últimos 12 meses", além de delegar todo
+formato de mês único para `resolve_period`, que foi movido para este módulo e é reexportado por
+`app.services.assistant_tools` para não quebrar nenhum import existente) e composição de métrica
+(`apply_metric`, `variation_rows`, `apply_top_n`) sobre linhas já agrupadas. **Nenhuma aritmética
+financeira nova**: `collect_range_totals` soma, mês a mês, exatamente os números que
+`report_month_monetary_publication`/`category_spending_rows`/`account_cash_flow_rows` (o mesmo
+snapshot canônico que `/dashboard`/`/reports` publicam) já calculam -- somar Decimals já canônicos
+across meses não é um segundo motor financeiro, é a mesma soma que uma pessoa faria com os números
+já publicados.
+
+| Tool | Fonte determinística reaproveitada |
+|---|---|
+| `financial_aggregate` (categoria/conta/cartão/mês, métrica total/média/contagem/mínimo/máximo/participação/variação) | `financial_query.collect_range_totals` sobre `build_snapshot` por mês |
+| `get_income`/`get_expenses` (intervalo de período, filtro opcional por categoria/conta) | idem, com `by_month` sempre incluso |
+| `get_commitments` (REALIZADO/COMPROMETIDO nunca somados) | `app.api._obligation_rows` (já carrega `financial_state`) |
+| `get_installments` (contratado/impacto no mês/parcelas futuras) | `app.api._installment_anchor_month`/`_installment_series_key`/`_installment_remaining_schedule` -- mesma identidade de série e cronograma que `_project_installments` já usa para a projeção do household, aplicada a uma única compra |
+| `search_transactions` (listagem crua, nunca soma nada) | `Transaction` filtrado por household -- mesmos filtros/rótulos que `GET /transactions` já resolve, limitado a 20 linhas (nunca o corpus inteiro ao modelo) |
+
+**Decisão de escopo deliberada -- sem agrupamento por titular:** o Work Order pede filtro e
+agrupamento por "titular" (`owner_label`). Filtro existe (`search_transactions.holder_hint`);
+agrupamento por titular em `financial_aggregate` não foi implementado nesta fatia porque nenhuma
+saída canônica do snapshot (`category_spending_rows`/`account_cash_flow_rows`) expõe renda/despesa
+por titular -- calculá-lo aqui exigiria reclassificar `Transaction` de forma independente do loop
+de `financial_snapshots._collect`, exatamente o "segundo motor financeiro" que o Work Order proíbe.
+Risco residual registrado para decisão do engenheiro responsável: extrair a classificação de
+`_collect` para uma função pura reaproveitável exigiria revisão dedicada do núcleo do snapshot
+engine, fora do escopo desta fatia.
+
+**Variação sem período de comparação explícito:** quando `metric` é `variacao_absoluta`/
+`variacao_percentual` e o chamador não informa `compare_period_text`, o intervalo de comparação é
+sempre o intervalo imediatamente anterior de mesmo tamanho
+(`financial_query.previous_equal_length_range`) -- uma convenção estrutural determinística, nunca
+um período inventado. Denominador zero (categoria nova, sem base no período anterior) produz
+`variation_percent = None`, nunca `0%` nem infinito.
+
 ## Navegação e UX final (October Go-Live Slice 5, P0 #87)
 
 `docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_5.md`, `docs/OCTOBER_GO_LIVE_CONFLICT_MATRIX.md` §3.6 e

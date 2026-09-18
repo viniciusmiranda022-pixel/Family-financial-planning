@@ -32,6 +32,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -50,38 +51,67 @@ from app.services.assistant_actions import (
 from app.services.assistant_interpreter import interpret_message
 from app.services.assistant_tool_catalog import ALLOWED_TOOLS, TOOL_ARGUMENT_KEYS
 from app.services.card_invoice_lifecycle import list_invoices, serialize_card_invoice
+from app.services.finance import add_months, money
+from app.services.financial_query import (
+    DIMENSIONS as _AGGREGATE_DIMENSIONS,
+)
+from app.services.financial_query import (
+    METRICS as _AGGREGATE_METRICS,
+)
+from app.services.financial_query import (
+    VARIATION_METRICS as _AGGREGATE_VARIATION_METRICS,
+)
+from app.services.financial_query import (
+    apply_metric,
+    apply_top_n,
+    collect_range_totals,
+    matches_hint,
+    previous_equal_length_range,
+    resolve_period,
+    resolve_period_range,
+    variation_rows,
+)
+from app.services.financial_query import (
+    dimension_rows as range_dimension_rows,
+)
 from app.services.financial_snapshots import (
     account_cash_flow_rows,
     build_snapshot,
     category_spending_rows,
     dashboard_monetary_publication,
 )
+from app.services.financial_state import COMPROMETIDO, REALIZADO
 
 SAO_PAULO = ZoneInfo("America/Sao_Paulo")
 
 _QUERY_FACTS_TOPICS = ("saldo", "gasto_mes", "fatura", "obrigacoes")
 _DIMENSIONS = ("categoria", "conta", "cartao")
 _HORIZON_DAYS = ("30", "60", "90")
+_MAX_SEARCH_RESULTS = 20
+_MAX_COMMITMENT_ROWS = 10
 
-_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-
-_MONTH_NAMES = {
-    "janeiro": 1,
-    "fevereiro": 2,
-    "marco": 3,
-    "abril": 4,
-    "maio": 5,
-    "junho": 6,
-    "julho": 7,
-    "agosto": 8,
-    "setembro": 9,
-    "outubro": 10,
-    "novembro": 11,
-    "dezembro": 12,
+_TYPE_HINT_MAP = {
+    "renda": "income",
+    "receita": "income",
+    "receitas": "income",
+    "entrada": "income",
+    "entradas": "income",
+    "despesa": "expense",
+    "despesas": "expense",
+    "saida": "expense",
+    "saidas": "expense",
+    "gasto": "expense",
+    "gastos": "expense",
+    "transferencia": "transfer",
+    "transferencias": "transfer",
+    "estorno": "refund",
+    "estornos": "refund",
+    "reembolso": "refund",
+    "reembolsos": "refund",
+    "conciliacao": "reconciliation",
 }
 
-_EXPLICIT_PERIOD_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
-_SLASH_PERIOD_RE = re.compile(r"^(0[1-9]|1[0-2])/(\d{4})$")
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def sao_paulo_today(now: datetime | None = None) -> date:
@@ -102,66 +132,15 @@ def _strip_accents(value: str) -> str:
     return "".join(character for character in normalized if not unicodedata.combining(character))
 
 
-def _add_months(base: date, delta: int) -> date:
-    month_index = base.month - 1 + delta
-    year = base.year + month_index // 12
-    month = month_index % 12 + 1
-    return date(year, month, 1)
+def _normalize_type_hint(value: str | None) -> str | None:
+    """Free-text movement-type hint -> canonical `Transaction.transaction_type`,
+    or `None` when absent/unrecognized (an unrecognized hint is silently
+    ignored as "no type filter" -- `search_transactions` still returns
+    every other matching row instead of failing closed on a soft filter)."""
 
-
-def _period_key(value: date) -> str:
-    return f"{value.year:04d}-{value.month:02d}"
-
-
-def resolve_period(text: str | None, *, today: date) -> str | None:
-    """Deterministically resolve a free-text period hint into a `"YYYY-MM"`
-    snapshot period key, or `None` when it cannot be resolved with
-    confidence -- callers must treat `None` as "ask the user", never as
-    "assume this month" (an absent/empty hint is the one case that legitimately
-    defaults to the current month, the same default `GET /reports`'s own
-    `end_month=None` already uses). Supports: empty/"hoje"/"este mês", "mês
-    passado"/"mês retrasado", an explicit month name with an optional year
-    ("setembro", "setembro de 2026"), `"YYYY-MM"`, and `"MM/YYYY"`. Anything
-    else (a range, "últimos N meses", an unrecognized word) is intentionally
-    left unresolved rather than guessed.
-    """
-
-    if text is None or not text.strip():
-        return _period_key(today.replace(day=1))
-
-    cleaned = _strip_accents(text.strip().lower())
-    cleaned = " ".join(cleaned.split())
-
-    if cleaned in ("hoje", "este mes", "esse mes", "mes atual", "mes corrente", "atual"):
-        return _period_key(today.replace(day=1))
-    if cleaned in ("mes passado", "mes anterior", "ultimo mes"):
-        return _period_key(_add_months(today.replace(day=1), -1))
-    if cleaned == "mes retrasado":
-        return _period_key(_add_months(today.replace(day=1), -2))
-
-    compact = cleaned.replace(" ", "")
-    match = _EXPLICIT_PERIOD_RE.match(compact)
-    if match:
-        return f"{match.group(1)}-{match.group(2)}"
-    match = _SLASH_PERIOD_RE.match(compact)
-    if match:
-        return f"{match.group(2)}-{match.group(1)}"
-
-    tokens = [token for token in re.split(r"[\s/]+", cleaned) if token and token != "de"]
-    if tokens and tokens[0] in _MONTH_NAMES:
-        month = _MONTH_NAMES[tokens[0]]
-        year = today.year
-        if len(tokens) >= 2 and tokens[1].isdigit() and len(tokens[1]) == 4:
-            year = int(tokens[1])
-        elif month > today.month:
-            # A bare month name later than the current month means "last
-            # year's occurrence" ("em outubro" said in September means
-            # October last year, never a future month the household has no
-            # data for yet) -- never the current year's not-yet-happened month.
-            year -= 1
-        return f"{year:04d}-{month:02d}"
-
-    return None
+    if not value:
+        return None
+    return _TYPE_HINT_MAP.get(_strip_accents(value.strip().lower()))
 
 
 def _extract_reference_id(*candidates: str | None) -> str | None:
@@ -491,6 +470,397 @@ def _tool_undo_typed_action(db: Session, *, user: Any, arguments: dict[str, str]
     return ToolOutcome(ok=True, facts={"undone": True, "result": result})
 
 
+def _tool_financial_aggregate(
+    db: Session, *, user: Any, arguments: dict[str, str], today: date
+) -> ToolOutcome:
+    """WA-04 (`docs/WORK_ORDER_WA_04.md`, issue #76) generic composable
+    aggregation: group operational expense by `categoria`/`conta`/`cartao`/
+    `mes` over a resolved period range, apply a `metric`, and optionally
+    keep only the top `top_n` rows -- all backend-computed and already
+    sorted, so the model never sums, sorts or picks a "top N" out of raw
+    numbers itself."""
+
+    dimension = arguments.get("dimension")
+    if dimension not in _AGGREGATE_DIMENSIONS:
+        return ToolOutcome(
+            ok=True, clarifying_question="Você quer agrupar por categoria, conta, cartão ou mês?"
+        )
+    metric = arguments.get("metric") or "total"
+    if metric not in _AGGREGATE_METRICS:
+        metric = "total"
+    period_range = resolve_period_range(arguments.get("period_text"), today=today)
+    if period_range is None:
+        return ToolOutcome(
+            ok=True,
+            clarifying_question=(
+                "De qual período? (por exemplo: este mês, últimos 3 meses, últimos 90 dias, ano passado)"
+            ),
+        )
+    start_period, end_period = period_range
+    totals = collect_range_totals(
+        db,
+        household_id=user.household_id,
+        generated_by=user.id,
+        start_period=start_period,
+        end_period=end_period,
+    )
+    label_hint = arguments.get("category_hint") or arguments.get("account_hint")
+    rows = range_dimension_rows(totals, dimension, label_hint=label_hint)
+
+    if metric in _AGGREGATE_VARIATION_METRICS:
+        compare_text = arguments.get("compare_period_text")
+        if compare_text:
+            compare_range = resolve_period_range(compare_text, today=today)
+            if compare_range is None:
+                return ToolOutcome(
+                    ok=True, clarifying_question="Com qual período você quer comparar?"
+                )
+        else:
+            # No explicit comparison period named -- deterministic default:
+            # the immediately preceding range of the same length (never a
+            # fabricated/guessed period), see
+            # `app.services.financial_query.previous_equal_length_range`.
+            compare_range = previous_equal_length_range(start_period, end_period)
+        compare_start, compare_end = compare_range
+        previous_totals = collect_range_totals(
+            db,
+            household_id=user.household_id,
+            generated_by=user.id,
+            start_period=compare_start,
+            end_period=compare_end,
+        )
+        previous_rows = range_dimension_rows(previous_totals, dimension, label_hint=label_hint)
+        percentage = metric == "variacao_percentual"
+        result_rows = variation_rows(rows, previous_rows, percentage=percentage)
+        sort_key = "variation_percent" if percentage else "variation_absolute"
+        result_rows = apply_top_n(result_rows, arguments.get("top_n"), sort_key=sort_key)
+        return ToolOutcome(
+            ok=True,
+            facts={
+                "dimension": dimension,
+                "metric": metric,
+                "start_period": start_period,
+                "end_period": end_period,
+                "compare_start_period": compare_start,
+                "compare_end_period": compare_end,
+                "rows": result_rows,
+            },
+        )
+
+    result_rows = apply_metric(rows, metric)
+    if metric in ("total", "participacao"):
+        sort_key = "share" if metric == "participacao" else "amount"
+        result_rows = apply_top_n(result_rows, arguments.get("top_n"), sort_key=sort_key)
+    return ToolOutcome(
+        ok=True,
+        facts={
+            "dimension": dimension,
+            "metric": metric,
+            "start_period": start_period,
+            "end_period": end_period,
+            "rows": result_rows,
+        },
+    )
+
+
+def _tool_get_income(db: Session, *, user: Any, arguments: dict[str, str], today: date) -> ToolOutcome:
+    period_range = resolve_period_range(arguments.get("period_text"), today=today)
+    if period_range is None:
+        return ToolOutcome(
+            ok=True,
+            clarifying_question=(
+                "De qual período você quer a renda? (por exemplo: este mês, últimos 3 meses, ano passado)"
+            ),
+        )
+    start_period, end_period = period_range
+    totals = collect_range_totals(
+        db,
+        household_id=user.household_id,
+        generated_by=user.id,
+        start_period=start_period,
+        end_period=end_period,
+    )
+    return ToolOutcome(
+        ok=True,
+        facts={
+            "start_period": start_period,
+            "end_period": end_period,
+            "income": totals.income,
+            "by_month": [
+                {"period": period, "amount": amount}
+                for period, amount in sorted(totals.month_income_rows.items())
+            ],
+        },
+    )
+
+
+def _tool_get_expenses(db: Session, *, user: Any, arguments: dict[str, str], today: date) -> ToolOutcome:
+    period_range = resolve_period_range(arguments.get("period_text"), today=today)
+    if period_range is None:
+        return ToolOutcome(
+            ok=True,
+            clarifying_question=(
+                "De qual período você quer o gasto? (por exemplo: este mês, últimos 3 meses, ano passado)"
+            ),
+        )
+    start_period, end_period = period_range
+    totals = collect_range_totals(
+        db,
+        household_id=user.household_id,
+        generated_by=user.id,
+        start_period=start_period,
+        end_period=end_period,
+    )
+    category_hint = arguments.get("category_hint")
+    account_hint = arguments.get("account_hint")
+    category_rows = range_dimension_rows(totals, "categoria", label_hint=category_hint)
+    account_rows = range_dimension_rows(totals, "conta", label_hint=account_hint) + range_dimension_rows(
+        totals, "cartao", label_hint=account_hint
+    )
+    # A category/account filter narrows `expenses` to that filter's own
+    # rows; combining both filters at once is not offered here -- the
+    # canonical per-month snapshot exposes category and account/card
+    # breakdowns independently, never a joint category-by-account
+    # breakdown, so this never fabricates one.
+    if category_hint:
+        filtered_total = sum((row["amount"] for row in category_rows), Decimal("0"))
+    elif account_hint:
+        filtered_total = sum((row["amount"] for row in account_rows), Decimal("0"))
+    else:
+        filtered_total = totals.expenses
+    return ToolOutcome(
+        ok=True,
+        facts={
+            "start_period": start_period,
+            "end_period": end_period,
+            "expenses": filtered_total,
+            "by_category": category_rows,
+            "by_account": account_rows,
+            "by_month": [
+                {"period": period, "amount": amount}
+                for period, amount in sorted(totals.month_expense_rows.items())
+            ],
+        },
+    )
+
+
+def _tool_get_commitments(
+    db: Session, *, user: Any, arguments: dict[str, str], today: date
+) -> ToolOutcome:
+    period_text = arguments.get("period_text")
+    period_label: str | None = None
+    if period_text:
+        period = resolve_period(period_text, today=today)
+        if period is None:
+            return ToolOutcome(
+                ok=True,
+                clarifying_question="De qual período você quer as obrigações? (por exemplo: este mês, outubro)",
+            )
+        period_label = period
+
+    from app.api import _obligation_rows  # deferred: avoids app.api <-> services circular import
+
+    rows = _obligation_rows(db, user.household_id, include_paid=True)
+    if period_label is not None:
+        start = datetime.strptime(period_label, "%Y-%m").date()
+        end = add_months(start, 1)
+        rows = [row for row in rows if start <= row["due_date"] < end]
+
+    category_hint = arguments.get("category_hint")
+    if category_hint:
+        rows = [row for row in rows if matches_hint(category_hint, row.get("category"))]
+
+    status_hint = _strip_accents((arguments.get("status_hint") or "").strip().lower())
+    realized = [row for row in rows if row["financial_state"] == REALIZADO]
+    committed = [row for row in rows if row["financial_state"] == COMPROMETIDO]
+    if status_hint in ("realizado", "pago", "pagas", "pagos"):
+        committed = []
+    elif status_hint in ("comprometido", "pendente", "pendentes"):
+        realized = []
+
+    # `_obligation_rows`' own `amount` is a `float` (`decimal_value`, its
+    # established HTTP-response contract) -- round-tripped through `str()`
+    # back into `Decimal` here before any arithmetic, the same idiom
+    # `app.services.financial_snapshots` already uses whenever it sums a
+    # dict/JSON-shaped row (`Decimal(str(row.get("amount", 0)))`), never
+    # binary float addition on a monetary total.
+    return ToolOutcome(
+        ok=True,
+        facts={
+            "period": period_label,
+            "realized": realized[:_MAX_COMMITMENT_ROWS],
+            "realized_total": sum((money(Decimal(str(row["amount"]))) for row in realized), Decimal("0")),
+            "committed": committed[:_MAX_COMMITMENT_ROWS],
+            "committed_total": sum(
+                (money(Decimal(str(row["amount"]))) for row in committed), Decimal("0")
+            ),
+        },
+    )
+
+
+def _tool_get_installments(
+    db: Session, *, user: Any, arguments: dict[str, str], today: date
+) -> ToolOutcome:
+    merchant_hint = arguments.get("merchant_hint")
+    if not merchant_hint or not merchant_hint.strip():
+        return ToolOutcome(
+            ok=True,
+            clarifying_question="Qual compra parcelada você quer consultar? (ex.: nome da loja/descrição)",
+        )
+
+    from app.api import (  # deferred: avoids app.api <-> services circular import
+        _installment_anchor_month,
+        _installment_remaining_schedule,
+        _installment_series_key,
+    )
+    from app.models import Transaction as TransactionModel
+
+    candidates = db.scalars(
+        select(TransactionModel).where(
+            TransactionModel.household_id == user.household_id,
+            TransactionModel.excluded.is_(False),
+            TransactionModel.installment_current.is_not(None),
+            TransactionModel.installment_total.is_not(None),
+        )
+    ).all()
+    matched = [row for row in candidates if matches_hint(merchant_hint, row.description)]
+    if not matched:
+        return ToolOutcome(
+            ok=True,
+            clarifying_question=f'Não encontrei nenhuma compra parcelada com "{merchant_hint}" na descrição.',
+        )
+
+    # Same series-identity/latest-observation policy as
+    # `app.api._project_installments` (Work Order: never a second
+    # installment engine) -- only replicated here because that function
+    # returns one combined household-wide month->amount total, not the
+    # per-purchase contracted/impact/future breakdown this tool answers.
+    latest_by_series: dict[tuple, TransactionModel] = {}
+    for row in matched:
+        current = row.installment_current or 0
+        total = row.installment_total or 0
+        anchor = _installment_anchor_month(competence=row.competence, booked_at=row.booked_at)
+        origin = add_months(anchor, -(max(1, current) - 1))
+        series = _installment_series_key(
+            account_id=row.account_id,
+            card_last_four=row.card_last_four,
+            description=row.description,
+            amount=row.amount,
+            installment_total=total,
+            origin_month=origin,
+        )
+        previous = latest_by_series.get(series)
+        if previous is None or (row.booked_at, current) > (
+            previous.booked_at,
+            previous.installment_current or 0,
+        ):
+            latest_by_series[series] = row
+
+    target_month = today.replace(day=1)
+    target_key = f"{target_month.year:04d}-{target_month.month:02d}"
+    purchases = []
+    for row in latest_by_series.values():
+        current = row.installment_current or 0
+        total = row.installment_total or 0
+        anchor = _installment_anchor_month(competence=row.competence, booked_at=row.booked_at)
+        per_installment = money(abs(row.amount))
+        contracted_total = money(per_installment * total)
+        already_paid = money(per_installment * min(current, total))
+        future_remaining = money(contracted_total - already_paid)
+        anchor_key = f"{anchor.year:04d}-{anchor.month:02d}"
+        if target_key == anchor_key:
+            impact_this_month = per_installment
+        else:
+            schedule = dict(
+                _installment_remaining_schedule(
+                    amount=row.amount,
+                    installment_current=current,
+                    installment_total=total,
+                    anchor_month=anchor,
+                )
+            )
+            impact_this_month = schedule.get(target_key, Decimal("0"))
+        purchases.append(
+            {
+                "description": row.description,
+                "installment_amount": per_installment,
+                "installment_current": current,
+                "installment_total": total,
+                "contracted_total": contracted_total,
+                "already_paid": already_paid,
+                "future_remaining": future_remaining,
+                "impact_this_month": impact_this_month,
+            }
+        )
+    purchases.sort(key=lambda item: item["description"])
+    return ToolOutcome(ok=True, facts={"merchant_hint": merchant_hint, "purchases": purchases})
+
+
+def _tool_search_transactions(
+    db: Session, *, user: Any, arguments: dict[str, str], today: date
+) -> ToolOutcome:
+    period = resolve_period(arguments.get("period_text"), today=today)
+    if period is None:
+        return ToolOutcome(
+            ok=True,
+            clarifying_question="De qual período você quer ver as transações? (por exemplo: este mês, agosto)",
+        )
+
+    from app.models import Transaction as TransactionModel  # deferred, same reason as above
+
+    start = datetime.strptime(period, "%Y-%m").date()
+    end = add_months(start, 1)
+    query = (
+        select(TransactionModel)
+        .where(
+            TransactionModel.household_id == user.household_id,
+            TransactionModel.booked_at >= start,
+            TransactionModel.booked_at < end,
+        )
+        .order_by(TransactionModel.booked_at.desc())
+    )
+    type_hint = _normalize_type_hint(arguments.get("type_hint"))
+    if type_hint:
+        query = query.where(TransactionModel.transaction_type == type_hint)
+    rows = list(db.scalars(query))
+
+    category_hint = arguments.get("category_hint")
+    account_hint = arguments.get("account_hint")
+    holder_hint = arguments.get("holder_hint")
+    merchant_hint = arguments.get("merchant_hint")
+
+    filtered = []
+    for row in rows:
+        category_name = row.category.name if row.category else None
+        account_name = row.account.name if row.account else None
+        if not matches_hint(category_hint, category_name):
+            continue
+        if not matches_hint(account_hint, account_name):
+            continue
+        if not matches_hint(holder_hint, row.owner_label):
+            continue
+        if not matches_hint(merchant_hint, row.description):
+            continue
+        filtered.append(row)
+
+    serialized = [
+        {
+            "date": row.booked_at,
+            "description": row.description,
+            "amount": money(row.amount),
+            "type": row.transaction_type,
+            "category": row.category.name if row.category else None,
+            "account": row.account.name if row.account else None,
+            "holder": row.owner_label,
+        }
+        for row in filtered[:_MAX_SEARCH_RESULTS]
+    ]
+    return ToolOutcome(
+        ok=True,
+        facts={"period": period, "total_matches": len(filtered), "transactions": serialized},
+    )
+
+
 def run_tool(
     db: Session,
     *,
@@ -554,4 +924,16 @@ def run_tool(
         return _tool_undo_typed_action(db, user=user, arguments=clean_arguments)
     if tool == "cancel_typed_action":
         return _tool_cancel_typed_action(db, user=user, arguments=clean_arguments)
+    if tool == "financial_aggregate":
+        return _tool_financial_aggregate(db, user=user, arguments=clean_arguments, today=resolved_today)
+    if tool == "get_income":
+        return _tool_get_income(db, user=user, arguments=clean_arguments, today=resolved_today)
+    if tool == "get_expenses":
+        return _tool_get_expenses(db, user=user, arguments=clean_arguments, today=resolved_today)
+    if tool == "get_commitments":
+        return _tool_get_commitments(db, user=user, arguments=clean_arguments, today=resolved_today)
+    if tool == "get_installments":
+        return _tool_get_installments(db, user=user, arguments=clean_arguments, today=resolved_today)
+    if tool == "search_transactions":
+        return _tool_search_transactions(db, user=user, arguments=clean_arguments, today=resolved_today)
     return ToolOutcome(ok=False)  # pragma: no cover - unreachable, ALLOWED_TOOLS already checked above
