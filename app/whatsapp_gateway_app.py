@@ -259,6 +259,16 @@ def _run_assistant_reply(
     from app.models import User
     from app.services.assistant_orchestrator import plan_and_execute
 
+    # WA-05 (`docs/WORK_ORDER_WA_05.md`, issue #77): `authorized.id` is the
+    # stable `WhatsAppAuthorizedNumber` row id for this one phone-user link
+    # -- exactly one per active number (unique index on `user_id` and on
+    # `phone_hash`), so it doubles as this channel's conversation key
+    # without adding a second lookup. Two authorized numbers linked to the
+    # same household (e.g. Vinicius and Kelly) always get distinct keys, and
+    # a relinked number after deactivation gets a brand-new row/id -- old
+    # conversational memory never carries over to a different person taking
+    # over a number (Work Order "different households are strictly
+    # isolated" / separate-per-user state, applied within one household).
     if not message.text:
         _send_reply(to_digits=message.sender_digits, body=_UNSUPPORTED_CONTENT_REPLY)
         gateway.finalize_inbound_event(db, event, status="unsupported_content", trace_id=trace_id)
@@ -274,7 +284,14 @@ def _run_assistant_reply(
         return
 
     try:
-        result = plan_and_execute(db, user=user, message=message.text, trace_id=trace_id)
+        result = plan_and_execute(
+            db,
+            user=user,
+            message=message.text,
+            conversation_id=f"whatsapp:{authorized.id}",
+            channel="whatsapp",
+            trace_id=trace_id,
+        )
     except Exception:
         logger.exception("whatsapp_gateway.orchestration_failed", extra={"trace_id": trace_id})
         _send_reply(to_digits=message.sender_digits, body=_ORCHESTRATION_FAILURE_REPLY)

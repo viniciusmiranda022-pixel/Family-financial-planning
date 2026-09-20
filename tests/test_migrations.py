@@ -607,6 +607,8 @@ EXPECTED_0024_TABLES = {
     "whatsapp_rate_limit_buckets",
 }
 
+EXPECTED_0026_TABLES = {"assistant_conversation_states"}
+
 EXPECTED_WHATSAPP_AUTHORIZED_NUMBER_COLUMNS = {
     "id",
     "household_id",
@@ -701,6 +703,7 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
             *EXPECTED_0022_TABLES,
             *EXPECTED_0023_TABLES,
             *EXPECTED_0024_TABLES,
+            *EXPECTED_0026_TABLES,
         "capture_drafts",
         "alembic_version",
     }
@@ -1494,7 +1497,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0025"
+        ).scalar_one() == "0026"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -1520,6 +1523,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0025"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0026"
     engine.dispose()
     get_settings.cache_clear()

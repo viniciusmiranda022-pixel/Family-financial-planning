@@ -1594,6 +1594,51 @@ WhatsApp, nenhuma escrita SQL/ORM vinda do LLM.
   (falha sem a correção: duas `AuditEvent` de reversão e um `DELETE` sem linha correspondente na
   segunda tentativa).
 
+### Contexto conversacional (WA-05, `docs/WORK_ORDER_WA_05.md`, issue #77)
+
+Continuidade curta e estruturada entre mensagens de um mesmo `(household_id, user_id,
+conversation_id)`, para perguntas de acompanhamento ("e mês passado?", "e a Kelly?", "mostra por
+mês", "qual a diferença?") sem virar uma segunda fonte de verdade financeira nem conceder
+autoridade por memória.
+
+- **Armazenamento**: `AssistantConversationState` (uma linha por `household_id`+`user_id`+
+  `conversation_id`, `app.services.assistant_conversation_context`), guardando só (a) até 8 turnos
+  de texto já saneado (`turns`, o mesmo formato/limite que `POST /assistant/ask` já aceita do
+  cliente como `history`) e (b) até 3 chamadas de ferramenta *somente leitura* já resolvidas
+  (`last_steps` -- `tool` restrito a um subconjunto de `assistant_tool_catalog.ALLOWED_TOOLS`,
+  `arguments` filtrado pelo `TOOL_ARGUMENT_KEYS` daquele tool, a mesma validação independente que
+  `assistant_tools.run_tool` já aplica). `draft_typed_action`/`confirm_typed_action`/
+  `cancel_typed_action`/`undo_typed_action` nunca viram `last_steps` -- o fluxo de escrita continua
+  resolvendo sua própria autoridade/idempotência sempre a partir do banco
+  (`AssistantActionProposal`/`AssistantActionEvent`), nunca da memória conversacional.
+- **TTL deslizante** (`CONVERSATION_STATE_TTL_MINUTES = 30`), renovado a cada turno; uma
+  conversa expirada nunca é ressuscitada -- `load_context` a trata como inexistente, e o próximo
+  toque na mesma chave a apaga (limpeza preguiçosa, sem scheduler dedicado; ver docstring do
+  módulo sobre por que este é um deployment single-family sem Redis).
+- **Concorrência**: mesmo idioma de `app.services.whatsapp_gateway.check_rate_limit` --
+  `SELECT ... FOR UPDATE` mais `begin_nested()`/`IntegrityError` para o primeiro turno de uma
+  chave nova, porque `FOR UPDATE` não trava uma linha que ainda não existe.
+- **Isolamento**: chave sempre inclui `user_id`, nunca só `household_id` -- Vinicius e Kelly têm
+  memória separada mesmo reutilizando o mesmo `conversation_id` literal (ex.: duas abas). No
+  WhatsApp, `conversation_id = f"whatsapp:{WhatsAppAuthorizedNumber.id}"` (um número autorizado por
+  pessoa); no Assistente web, `AssistantAskRequest.conversation_id` é opcional e usa
+  `f"web:{user.id}"` como padrão quando omitido.
+- **Sidecar (`advisor/server.mjs`, `planPrompt`)**: `context_hints` é um campo aditivo ao payload
+  de `/v1/plan` (schema de saída do `/v1/plan` não muda) com as últimas chamadas de leitura já
+  resolvidas -- o modelo usa isso só para preencher, na pergunta atual, um argumento que ela não
+  repete (ex.: manter `category_hint` ao trocar só o período); informação nova na mensagem atual
+  substitui apenas a dimensão correspondente. Continua vedado: LLM calcular um valor financeiro,
+  `context_hints` autorizar confirmar/cancelar/desfazer/trocar household, ou inventar um argumento
+  que nem a mensagem nem o próprio contexto contêm -- ambiguidade cai em `needs_clarification`,
+  nunca em uma combinação de ferramentas inédita.
+- **Decisão de escopo deliberada**: este slice não adiciona nenhuma nova capacidade de cálculo
+  (ex.: "excluir uma categoria do total", "projetar o ritmo de gasto até o fim do mês") --
+  reaproveita só as ferramentas WA-04 já existentes. Um pedido que hoje não corresponde a nenhuma
+  combinação existente de tool/argumentos (ex.: "e se continuar nessa média até o fim do mês?")
+  recebe `needs_clarification`, nunca uma extrapolação nova do orquestrador; a alternativa exigiria
+  uma nova primitiva determinística do motor financeiro, fora do escopo de "contexto
+  conversacional" deste Work Order.
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila

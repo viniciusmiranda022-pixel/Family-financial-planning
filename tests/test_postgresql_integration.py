@@ -136,7 +136,7 @@ def test_upgrade_empty_postgresql_database_to_head() -> None:
     }.issubset(tables)
     with engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0025"
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0026"
         )
     engine.dispose()
 
@@ -157,7 +157,7 @@ def test_upgrade_from_legacy_0002_baseline_preserves_existing_rows() -> None:
 
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0025"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0026"
         preserved_name = connection.execute(
             text("SELECT name FROM households WHERE id = :id"), {"id": household_id}
         ).scalar_one()
@@ -2100,6 +2100,219 @@ def test_whatsapp_webhook_concurrent_undo_from_two_messages_reverses_exactly_onc
             # ("Esta ação já foi desfeita") instead of raising or double
             # -reversing.
             assert {event.status for event in events} == {"processed", "needs_clarification"}
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_assistant_conversation_state_concurrent_first_turn_is_serialized_to_a_single_row() -> None:
+    """WA-05 (`docs/WORK_ORDER_WA_05.md`, issue #77):
+    `app.services.assistant_conversation_context.record_turn` cannot lock a
+    row that does not exist yet, so a conversation's very first two turns
+    arriving concurrently (e.g. a household member sending two quick
+    WhatsApp messages before the first reply lands) race on the same
+    `begin_nested()`/`IntegrityError` insert-on-race idiom
+    `app.services.whatsapp_gateway.check_rate_limit` already uses -- proven
+    here under a real two-connection PostgreSQL race, mirroring
+    `test_whatsapp_rate_limit_bucket_concurrent_first_hit_is_serialized_to_a_single_bucket`
+    above. Neither call may raise, exactly one
+    `assistant_conversation_states` row may exist afterward for the shared
+    key, and both turns' text must be accounted for -- the loser's own
+    memory update must never be silently dropped."""
+
+    from app.models import AssistantConversationState
+    from app.services.assistant_conversation_context import record_turn
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as setup_db:
+            household = Household(name="Família WA-05 Concorrência Primeiro Turno")
+            setup_db.add(household)
+            setup_db.flush()
+            household_id = household.id
+            user = User(
+                household_id=household_id,
+                name="Usuário WA-05 Concorrência",
+                username=f"wa05-concur-{household_id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            setup_db.add(user)
+            setup_db.flush()
+            user_id = user.id
+            setup_db.commit()
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _record(message_text: str) -> None:
+            try:
+                thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(thread_engine) as db:
+                    barrier.wait(timeout=5.0)
+                    record_turn(
+                        db,
+                        household_id=household_id,
+                        user_id=user_id,
+                        conversation_id="whatsapp:concurrent-first-turn",
+                        channel="whatsapp",
+                        user_message=message_text,
+                        assistant_message=f"resposta para {message_text}",
+                    )
+                    db.commit()
+                thread_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=_record, args=(text,), daemon=True)
+            for text in ("primeira mensagem", "segunda mensagem")
+        ]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10.0)
+
+        assert not errors, f"concurrent first turn must never raise: {errors}"
+        with Session(engine) as verify_db:
+            rows = verify_db.scalars(
+                select(AssistantConversationState).where(
+                    AssistantConversationState.household_id == household_id,
+                    AssistantConversationState.user_id == user_id,
+                    AssistantConversationState.conversation_id == "whatsapp:concurrent-first-turn",
+                )
+            ).all()
+            assert len(rows) == 1, "concurrent first turns duplicated the conversation state row"
+            turn_contents = {turn["content"] for turn in rows[0].turns}
+            assert "primeira mensagem" in turn_contents
+            assert "segunda mensagem" in turn_contents
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_assistant_conversation_state_survives_process_restart_and_isolates_by_key() -> None:
+    """Each `record_turn`/`load_context` call below opens a brand-new engine
+    and session -- simulating a process restart between messages, exactly
+    like `test_whatsapp_inbound_event_concurrent_redelivery_is_serialized_to_a_single_event`
+    does for the WhatsApp dedup barrier -- proving context genuinely lives
+    in PostgreSQL, not in any in-process cache. Also proves, under the real
+    engine, the Work Order's isolation acceptance criteria: a second user in
+    the same household and a second household both stay fully isolated even
+    when reusing the exact same literal `conversation_id` string."""
+
+    from app.models import AssistantConversationState
+    from app.services.assistant_conversation_context import load_context, record_turn
+
+    command.upgrade(_alembic_config(), "head")
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        with Session(engine) as setup_db:
+            household_a = Household(name="Família WA-05 Restart A")
+            household_b = Household(name="Família WA-05 Restart B")
+            setup_db.add_all([household_a, household_b])
+            setup_db.flush()
+            household_a_id, household_b_id = household_a.id, household_b.id
+            vinicius = User(
+                household_id=household_a_id,
+                name="Vinicius",
+                username=f"wa05-restart-vinicius-{household_a_id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            kelly = User(
+                household_id=household_a_id,
+                name="Kelly",
+                username=f"wa05-restart-kelly-{household_a_id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            other_household_user = User(
+                household_id=household_b_id,
+                name="Outro Household",
+                username=f"wa05-restart-other-{household_b_id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            setup_db.add_all([vinicius, kelly, other_household_user])
+            setup_db.flush()
+            vinicius_id, kelly_id, other_id = vinicius.id, kelly.id, other_household_user.id
+            setup_db.commit()
+
+        shared_conversation_id = "whatsapp:shared-literal-key"
+
+        def _restart_engine() -> Session:
+            thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+            return Session(thread_engine)
+
+        with _restart_engine() as db:
+            record_turn(
+                db,
+                household_id=household_a_id,
+                user_id=vinicius_id,
+                conversation_id=shared_conversation_id,
+                channel="whatsapp",
+                user_message="mensagem do Vinicius",
+                assistant_message="resposta para Vinicius",
+                resolved_step=("financial_aggregate", {"dimension": "categoria", "period_text": "setembro"}),
+            )
+            db.commit()
+
+        with _restart_engine() as db:
+            record_turn(
+                db,
+                household_id=household_a_id,
+                user_id=kelly_id,
+                conversation_id=shared_conversation_id,
+                channel="whatsapp",
+                user_message="mensagem da Kelly",
+                assistant_message="resposta para Kelly",
+            )
+            db.commit()
+
+        with _restart_engine() as db:
+            record_turn(
+                db,
+                household_id=household_b_id,
+                user_id=other_id,
+                conversation_id=shared_conversation_id,
+                channel="whatsapp",
+                user_message="mensagem de outro household",
+                assistant_message="resposta para outro household",
+            )
+            db.commit()
+
+        with _restart_engine() as db:
+            vinicius_context = load_context(
+                db, household_id=household_a_id, user_id=vinicius_id, conversation_id=shared_conversation_id
+            )
+            kelly_context = load_context(
+                db, household_id=household_a_id, user_id=kelly_id, conversation_id=shared_conversation_id
+            )
+            other_context = load_context(
+                db, household_id=household_b_id, user_id=other_id, conversation_id=shared_conversation_id
+            )
+
+        assert vinicius_context.turns[0]["content"] == "mensagem do Vinicius"
+        assert vinicius_context.last_steps == (
+            {"tool": "financial_aggregate", "arguments": {"dimension": "categoria", "period_text": "setembro"}},
+        )
+        assert kelly_context.turns[0]["content"] == "mensagem da Kelly"
+        assert kelly_context.last_steps == ()
+        assert other_context.turns[0]["content"] == "mensagem de outro household"
+
+        with Session(engine) as verify_db:
+            rows = verify_db.scalars(
+                select(AssistantConversationState).where(
+                    AssistantConversationState.conversation_id == shared_conversation_id
+                )
+            ).all()
+            assert len(rows) == 3, "three distinct (household_id, user_id) keys must yield three rows"
         engine.dispose()
     finally:
         get_settings.cache_clear()

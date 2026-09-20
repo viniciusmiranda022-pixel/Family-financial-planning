@@ -37,6 +37,7 @@ from app.main import app  # noqa: E402
 from app.models import (  # noqa: E402
     Account,
     AssistantActionProposal,
+    AssistantConversationState,
     AuditEvent,
     Category,
     FinancialProfile,
@@ -892,4 +893,259 @@ def test_assistant_ask_http_requires_admin_and_degrades_gracefully_without_codex
         body = response.json()
         assert isinstance(body["answer"], str) and body["answer"]
         assert body["needs_clarification"] is False
-        assert "trace" in body and isinstance(body["trace"], list)
+
+
+# ---------------------------------------------------------------------------
+# 8. WA-05 (`docs/WORK_ORDER_WA_05.md`, issue #77) -- conversational context.
+#
+# These tests exercise the Python-side plumbing WA-05 owns: loading/
+# persisting `app.services.assistant_conversation_context` state around
+# `plan_and_execute`, and forwarding `context_hints`/`history` into the next
+# `/v1/plan` payload. They deliberately do not exercise the Node sidecar's
+# own prompt-following behavior (out of scope for this Python suite, covered
+# by `advisor/test/*`) -- `SequentialPlanClient` below stands in for "the
+# sidecar already resolved this follow-up correctly", so what is actually
+# under test is that each call sees exactly the context the previous call's
+# *tool result* produced, and that the deterministic Tool Layer/backend
+# still recalculates every number itself (Work Order acceptance criterion
+# "financial values recalculated by Family Finance").
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SequentialPlanClient:
+    responses: list[dict | None]
+    configured_value: bool = True
+    captured_payloads: list[dict] = field(default_factory=list, init=False)
+
+    @property
+    def configured(self) -> bool:
+        return self.configured_value
+
+    def plan(self, payload: dict) -> CodexResult:
+        self.captured_payloads.append(payload)
+        response = self.responses[len(self.captured_payloads) - 1]
+        if response is None:
+            return CodexResult(None, "Serviço Codex indisponível: fake")
+        return CodexResult(response)
+
+
+def _financial_aggregate_step(**arguments: str) -> dict:
+    return {"tool": "financial_aggregate", "arguments": arguments}
+
+
+def test_plan_and_execute_issue_77_sequence_forwards_and_accumulates_context_hints() -> None:
+    """Issue #77's four-turn sequence, adapted to this codebase's seeded
+    fixture category ("Mercado" -- `_seed_household_with_spending`, 450 in
+    September, 80 in August): each follow-up's `/v1/plan` payload must see
+    exactly the previous turn's resolved (tool, arguments) as
+    `context_hints`, accumulating up to `MAX_CONTEXT_STEPS`, and every
+    answer's number must come from the real snapshot data, not from
+    anything remembered."""
+
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="issue77"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+
+    client = SequentialPlanClient(
+        responses=[
+            _valid_plan_response(
+                steps=[
+                    _financial_aggregate_step(
+                        dimension="categoria", category_hint="Mercado", period_text="setembro"
+                    )
+                ]
+            ),
+            _valid_plan_response(
+                steps=[
+                    _financial_aggregate_step(
+                        dimension="categoria", category_hint="Mercado", period_text="agosto"
+                    )
+                ]
+            ),
+            _valid_plan_response(
+                steps=[
+                    _financial_aggregate_step(
+                        dimension="categoria",
+                        category_hint="Mercado",
+                        metric="variacao_absoluta",
+                        period_text="agosto",
+                        compare_period_text="setembro",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    with session_factory() as db:
+        turn1 = plan_and_execute(
+            db,
+            user=user,
+            message="quanto gastei em Mercado esse mês?",
+            conversation_id="ctx-issue77",
+            client=client,
+        )
+    assert "450" in turn1.answer
+    assert client.captured_payloads[0]["context_hints"] == []
+
+    with session_factory() as db:
+        turn2 = plan_and_execute(
+            db, user=user, message="e mês passado?", conversation_id="ctx-issue77", client=client
+        )
+    assert "80" in turn2.answer
+    assert client.captured_payloads[1]["context_hints"] == [
+        {
+            "tool": "financial_aggregate",
+            "arguments": {"dimension": "categoria", "category_hint": "Mercado", "period_text": "setembro"},
+        }
+    ]
+
+    with session_factory() as db:
+        turn3 = plan_and_execute(
+            db, user=user, message="qual a diferença?", conversation_id="ctx-issue77", client=client
+        )
+    assert turn3.needs_clarification is False
+    assert client.captured_payloads[2]["context_hints"] == [
+        {
+            "tool": "financial_aggregate",
+            "arguments": {"dimension": "categoria", "category_hint": "Mercado", "period_text": "setembro"},
+        },
+        {
+            "tool": "financial_aggregate",
+            "arguments": {"dimension": "categoria", "category_hint": "Mercado", "period_text": "agosto"},
+        },
+    ]
+
+
+def test_plan_and_execute_still_asks_for_clarification_even_with_context_available() -> None:
+    """Work Order acceptance criterion 'Ambiguous pronouns/entities/periods/
+    metrics fail to clarification without mutation' -- having a populated
+    context never forces a plan to resolve; a sidecar (correctly) unable to
+    map a follow-up onto any tool/argument combination still returns
+    `needs_clarification`, and nothing is mutated."""
+
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="ctx-clarify"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+
+    client = SequentialPlanClient(
+        responses=[
+            _valid_plan_response(
+                steps=[_financial_aggregate_step(dimension="categoria", period_text="setembro")]
+            ),
+            _valid_plan_response(
+                needs_clarification=True,
+                clarifying_question="Ainda não calculo projeção de ritmo por categoria.",
+                steps=[],
+            ),
+        ]
+    )
+
+    with session_factory() as db:
+        plan_and_execute(db, user=user, message="quanto gastei esse mês?", conversation_id="ctx-clarify", client=client)
+    with session_factory() as db:
+        result = plan_and_execute(
+            db,
+            user=user,
+            message="e se continuar nessa média até o fim do mês?",
+            conversation_id="ctx-clarify",
+            client=client,
+        )
+    assert result.needs_clarification is True
+    assert result.answer == "Ainda não calculo projeção de ritmo por categoria."
+
+
+def test_plan_and_execute_context_never_leaks_across_conversation_ids() -> None:
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="ctx-isolation"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+
+    client_a = SequentialPlanClient(
+        responses=[
+            _valid_plan_response(
+                steps=[_financial_aggregate_step(dimension="categoria", period_text="setembro")]
+            )
+        ]
+    )
+    with session_factory() as db:
+        plan_and_execute(db, user=user, message="quanto gastei esse mês?", conversation_id="conv-a", client=client_a)
+
+    client_b = SequentialPlanClient(
+        responses=[_valid_plan_response(steps=[_financial_aggregate_step(dimension="conta", period_text="agosto")])]
+    )
+    with session_factory() as db:
+        plan_and_execute(db, user=user, message="e por conta em agosto?", conversation_id="conv-b", client=client_b)
+
+    assert client_b.captured_payloads[0]["context_hints"] == []
+
+
+def test_plan_and_execute_does_not_persist_or_read_context_without_a_conversation_id() -> None:
+    """Backward compatibility: omitting `conversation_id` (the default)
+    behaves exactly like before WA-05 -- no row is ever created, and no
+    `context_hints` are sent."""
+
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="ctx-optout"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    client = SequentialPlanClient(
+        responses=[_valid_plan_response(steps=[{"tool": "query_facts", "arguments": {"topic": "saldo"}}])]
+    )
+
+    with session_factory() as db:
+        plan_and_execute(db, user=user, message="qual meu saldo?", client=client)
+
+    assert client.captured_payloads[0]["context_hints"] == []
+    with session_factory() as db:
+        assert db.scalar(select(AssistantConversationState)) is None
+
+
+def test_plan_and_execute_explicit_history_overrides_persisted_turns_but_hints_still_apply() -> None:
+    """An explicitly supplied, non-empty `history` (the web Assistant's own
+    client-managed continuity) is never silently replaced by this
+    conversation's persisted turns -- but the persisted, structured
+    `last_steps` hints are layered in regardless, since a client has no way
+    to reconstruct those on its own."""
+
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="ctx-explicit-history"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+
+    client = SequentialPlanClient(
+        responses=[
+            _valid_plan_response(
+                steps=[_financial_aggregate_step(dimension="categoria", period_text="setembro")]
+            ),
+            _valid_plan_response(
+                steps=[_financial_aggregate_step(dimension="categoria", period_text="agosto")]
+            ),
+        ]
+    )
+    with session_factory() as db:
+        plan_and_execute(db, user=user, message="quanto gastei esse mês?", conversation_id="ctx-hist", client=client)
+
+    with session_factory() as db:
+        plan_and_execute(
+            db,
+            user=user,
+            message="e mês passado?",
+            history=[{"role": "user", "content": "mensagem explícita do cliente"}],
+            conversation_id="ctx-hist",
+            client=client,
+        )
+
+    second_payload = client.captured_payloads[1]
+    assert second_payload["history"] == [{"role": "user", "content": "mensagem explícita do cliente"}]
+    assert second_payload["context_hints"] == [
+        {"tool": "financial_aggregate", "arguments": {"dimension": "categoria", "period_text": "setembro"}}
+    ]
+

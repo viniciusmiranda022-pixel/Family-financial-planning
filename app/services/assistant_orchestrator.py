@@ -35,6 +35,14 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.services.assistant_conversation_context import (
+    CONTEXT_ELIGIBLE_TOOLS as _CONTEXT_ELIGIBLE_TOOLS,
+)
+from app.services.assistant_conversation_context import (
+    ConversationContext,
+    load_context,
+    record_turn,
+)
 from app.services.assistant_tool_catalog import ALLOWED_TOOLS, MAX_PLAN_STEPS, TOOL_ARGUMENT_KEYS
 from app.services.assistant_tool_sanitizer import build_plan_payload
 from app.services.assistant_tools import ToolOutcome, run_tool, sao_paulo_today
@@ -135,6 +143,7 @@ def get_plan(
     *,
     message: str,
     history: Sequence[Any] = (),
+    context_hints: Sequence[Any] = (),
     today: date,
     trace_id: str | None = None,
     client: CodexAdvisorClient | None = None,
@@ -142,13 +151,20 @@ def get_plan(
     """Request one Codex plan and return a fail-safe `Plan`. Never raises --
     an unconfigured/unreachable/misbehaving sidecar becomes
     `available=False`, exactly like `assistant_interpreter.interpret_message`,
-    never a fabricated empty-but-successful plan."""
+    never a fabricated empty-but-successful plan.
+
+    `context_hints` (WA-05) is the short, structured list of this same
+    conversation's most recent read-only tool calls -- see
+    `app.services.assistant_tool_sanitizer.build_plan_payload` for the
+    re-validation/shaping this function never duplicates itself."""
 
     plan_client = client or CodexAdvisorClient()
     if not plan_client.configured:
         return _unavailable("codex_disabled")
 
-    payload = build_plan_payload(message=message, history=history, today=today, trace_id=trace_id)
+    payload = build_plan_payload(
+        message=message, history=history, context_hints=context_hints, today=today, trace_id=trace_id
+    )
 
     try:
         result = plan_client.plan(payload)
@@ -473,13 +489,38 @@ def _finish(
     db: Any,
     *,
     user: Any,
+    message: str,
     trace_id: str,
     answer: str,
     needs_clarification: bool,
     clarifying_question: str | None,
     proposal_id: str | None,
     trace: tuple[dict[str, Any], ...],
+    conversation_id: str | None = None,
+    channel: str = "web",
+    resolved_step: tuple[str, dict[str, Any]] | None = None,
 ) -> OrchestratorResult:
+    """WA-05: every return path of `plan_and_execute` funnels through here,
+    so conversational memory is updated exactly once per round, atomically
+    with the same commit `_record_orchestration_audit` already performs --
+    a lost race on `record_turn`'s own row lock (see
+    `app.services.assistant_conversation_context`) never fails this
+    request; it only means this turn is not remembered for the next one.
+    `conversation_id=None` (no channel wired a conversation key through)
+    skips persistence entirely -- unchanged behavior for any caller that
+    does not opt in."""
+
+    if conversation_id:
+        record_turn(
+            db,
+            household_id=user.household_id,
+            user_id=user.id,
+            conversation_id=conversation_id,
+            channel=channel,
+            user_message=message,
+            assistant_message=answer,
+            resolved_step=resolved_step,
+        )
     _record_orchestration_audit(
         db, user=user, trace_id=trace_id, needs_clarification=needs_clarification, trace=trace
     )
@@ -499,6 +540,8 @@ def plan_and_execute(
     user: Any,
     message: str,
     history: Sequence[Any] = (),
+    conversation_id: str | None = None,
+    channel: str = "web",
     trace_id: str | None = None,
     client: CodexAdvisorClient | None = None,
     interpret_client: Any = None,
@@ -514,16 +557,43 @@ def plan_and_execute(
     apology rather than guessing. `client` fakes the `/v1/plan` call;
     `interpret_client` fakes the `/v1/interpret` call a `draft_typed_action`
     step makes -- both are test-only seams, unused in production.
+
+    `conversation_id` (WA-05, `docs/WORK_ORDER_WA_05.md`, issue #77) opts
+    this round into short, structured, server-side conversational
+    continuity, keyed by `household_id`+`user.id`+`conversation_id` (never
+    by household alone -- Vinicius/Kelly always get separate state even
+    inside the same household). `None` (the default) preserves the exact
+    WA-02/WA-04 behavior: no context loaded, nothing persisted. When set,
+    an explicitly caller-supplied `history` is still honored as-is (the web
+    Assistant's own client-managed history is never silently overridden);
+    only an *empty* `history` falls back to this conversation's own
+    persisted turns, and the persisted, structured `last_steps` hints are
+    always layered in regardless, since a client has no way to reconstruct
+    those itself.
     """
 
     resolved_trace_id = trace_id or str(uuid.uuid4())
     today = sao_paulo_today()
-    plan = get_plan(message=message, history=history, today=today, trace_id=resolved_trace_id, client=client)
+    context = (
+        load_context(db, household_id=user.household_id, user_id=user.id, conversation_id=conversation_id)
+        if conversation_id
+        else ConversationContext.empty()
+    )
+    effective_history = history if history else context.turns
+    plan = get_plan(
+        message=message,
+        history=effective_history,
+        context_hints=context.last_steps,
+        today=today,
+        trace_id=resolved_trace_id,
+        client=client,
+    )
 
     if not plan.available:
         return _finish(
             db,
             user=user,
+            message=message,
             trace_id=resolved_trace_id,
             answer=(
                 "Não consegui planejar uma resposta agora. Pode tentar novamente em instantes ou "
@@ -533,6 +603,8 @@ def plan_and_execute(
             clarifying_question=None,
             proposal_id=None,
             trace=({"stage": "plan", "ok": False, "reason": plan.reason},),
+            conversation_id=conversation_id,
+            channel=channel,
         )
 
     if plan.needs_clarification or not plan.steps:
@@ -540,12 +612,15 @@ def plan_and_execute(
         return _finish(
             db,
             user=user,
+            message=message,
             trace_id=resolved_trace_id,
             answer=question,
             needs_clarification=True,
             clarifying_question=question,
             proposal_id=None,
             trace=({"stage": "plan", "ok": True, "needs_clarification": True, "model": plan.model},),
+            conversation_id=conversation_id,
+            channel=channel,
         )
 
     trace: list[dict[str, Any]] = [
@@ -553,6 +628,7 @@ def plan_and_execute(
     ]
     answers: list[str] = []
     proposal_id: str | None = None
+    resolved_step: tuple[str, dict[str, Any]] | None = None
 
     for index, step in enumerate(plan.steps):
         outcome: ToolOutcome = run_tool(
@@ -561,7 +637,7 @@ def plan_and_execute(
             tool=step.tool,
             arguments=step.arguments,
             message=message,
-            history=history,
+            history=effective_history,
             trace_id=resolved_trace_id,
             today=today,
             interpret_client=interpret_client,
@@ -579,12 +655,16 @@ def plan_and_execute(
             return _finish(
                 db,
                 user=user,
+                message=message,
                 trace_id=resolved_trace_id,
                 answer=outcome.clarifying_question,
                 needs_clarification=True,
                 clarifying_question=outcome.clarifying_question,
                 proposal_id=proposal_id,
                 trace=tuple(trace),
+                conversation_id=conversation_id,
+                channel=channel,
+                resolved_step=resolved_step,
             )
         if not outcome.ok:
             step_trace["failed"] = True
@@ -592,28 +672,38 @@ def plan_and_execute(
             return _finish(
                 db,
                 user=user,
+                message=message,
                 trace_id=resolved_trace_id,
                 answer="Não consegui concluir essa solicitação agora. Tente novamente em instantes.",
                 needs_clarification=False,
                 clarifying_question=None,
                 proposal_id=proposal_id,
                 trace=tuple(trace),
+                conversation_id=conversation_id,
+                channel=channel,
+                resolved_step=resolved_step,
             )
 
         step_trace["fact_keys"] = sorted(outcome.facts.keys())
         trace.append(step_trace)
         if step.tool == "draft_typed_action" and outcome.facts.get("can_execute"):
             proposal_id = outcome.facts.get("proposal_id")
+        if step.tool in _CONTEXT_ELIGIBLE_TOOLS:
+            resolved_step = (step.tool, dict(step.arguments))
         answers.append(_format_step(step.tool, outcome.facts))
 
     final_answer = " ".join(part for part in answers if part) or "Não encontrei nada para responder."
     return _finish(
         db,
         user=user,
+        message=message,
         trace_id=resolved_trace_id,
         answer=final_answer,
         needs_clarification=False,
         clarifying_question=None,
         proposal_id=proposal_id,
         trace=tuple(trace),
+        conversation_id=conversation_id,
+        channel=channel,
+        resolved_step=resolved_step,
     )
