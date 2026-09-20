@@ -1631,13 +1631,33 @@ autoridade por memória.
   `context_hints` autorizar confirmar/cancelar/desfazer/trocar household, ou inventar um argumento
   que nem a mensagem nem o próprio contexto contêm -- ambiguidade cai em `needs_clarification`,
   nunca em uma combinação de ferramentas inédita.
-- **Decisão de escopo deliberada**: este slice não adiciona nenhuma nova capacidade de cálculo
-  (ex.: "excluir uma categoria do total", "projetar o ritmo de gasto até o fim do mês") --
-  reaproveita só as ferramentas WA-04 já existentes. Um pedido que hoje não corresponde a nenhuma
-  combinação existente de tool/argumentos (ex.: "e se continuar nessa média até o fim do mês?")
-  recebe `needs_clarification`, nunca uma extrapolação nova do orquestrador; a alternativa exigiria
-  uma nova primitiva determinística do motor financeiro, fora do escopo de "contexto
-  conversacional" deste Work Order.
+- **`exclude_category_hint`** ("e se tirar mercado?"): argumento aditivo de `financial_aggregate`/
+  `get_expenses`, simétrico a `category_hint` mas removendo em vez de restringir -- combina-se com
+  todo outro filtro já existente (AND, nunca sobrepõe), lido de `app.services.financial_query.
+  excludes_hint`/`dimension_rows`/`filtered_expense_total`/`holder_rows`. `financial_aggregate` com
+  `metric=total` passa a devolver também um fato `total` (soma simples, já-decimal, de toda linha
+  retornada) -- mesmo motor determinístico de sempre, nenhum cálculo novo, só uma segunda forma de
+  ler o mesmo número já publicado por `RangeTotals`/`category_spending_rows`.
+- **`project_category_pace`** ("e se continuar nessa média até o fim do mês?"): nova tool somente
+  leitura (`app.services.assistant_tools._tool_project_category_pace`), projeção linear
+  determinística `gasto_até_hoje * dias_no_mês / dias_decorridos`, exclusiva do mês ATUAL ainda em
+  andamento -- um período resolvido para qualquer outro mês (passado ou futuro) sempre cai em
+  `needs_clarification`, nunca numa extrapolação sem base. `gasto_até_hoje` é exatamente o mesmo
+  total canônico do mês corrente que `get_expenses`/`financial_aggregate` já publicam
+  (`collect_range_totals`/`filtered_expense_total` para `start_period == end_period == mês atual`)
+  -- não uma nova consulta a `Transaction` por `booked_at`, para nunca divergir do Dashboard/
+  Relatórios na mesma categoria/período. `dias_decorridos` é `today.day` (nunca `0`; dia 1 é o
+  próprio dia decorrido 1) e `dias_no_mês` vem de `calendar.monthrange` (28/29/30/31). Resposta
+  sempre rotulada "estimativa (PREVISTO)", nunca um fato realizado.
+- **Technical Challenge resolvido (PR #107, review round 2)**: a primeira submissão deste slice
+  havia deixado as duas capacidades acima como `needs_clarification` deliberado, por não existir
+  ainda nenhuma primitiva determinística equivalente e o Work Order pedir "reuse WA-04 tools, no
+  second engine". O engenheiro responsável rejeitou essa resolução porque o Work Order/issue #77
+  listam "e se tirar mercado?" e o 4º turno "e se continuar nessa média..." como critério de
+  aceite obrigatório, não opcional -- a saída correta é adicionar a primitiva determinística mínima
+  no backend (os dois itens acima), nunca aritmética no LLM nem um segundo motor. Ambas reaproveitam
+  o motor de agregação já existente (`app.services.financial_query`) em vez de reclassificar
+  transações; nenhum invariante financeiro foi alterado.
 
 ## Evolução
 
