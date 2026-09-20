@@ -27,6 +27,7 @@ genuine unexpected failure (never used to signal "needs more info").
 
 from __future__ import annotations
 
+import calendar
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -51,7 +52,7 @@ from app.services.assistant_actions import (
 from app.services.assistant_interpreter import interpret_message
 from app.services.assistant_tool_catalog import ALLOWED_TOOLS, TOOL_ARGUMENT_KEYS
 from app.services.card_invoice_lifecycle import list_invoices, serialize_card_invoice
-from app.services.finance import add_months, money
+from app.services.finance import add_months, money, month_key
 from app.services.financial_query import (
     DIMENSIONS as _AGGREGATE_DIMENSIONS,
 )
@@ -302,6 +303,74 @@ def _tool_project_horizon(db: Session, *, user: Any, arguments: dict[str, str]) 
     )
 
 
+def _tool_project_category_pace(db: Session, *, user: Any, arguments: dict[str, str], today: date) -> ToolOutcome:
+    """WA-05 (`docs/WORK_ORDER_WA_05.md`, issue #77) "e se continuar nessa
+    média até o fim do mês?" -- a deterministic linear pace estimate,
+    `amount_so_far * days_in_month / elapsed_days`, for the CURRENT,
+    still-in-progress month only.
+
+    `amount_so_far` is exactly the same canonical current-month figure
+    `get_expenses`/`financial_aggregate` already report for that category
+    (`filtered_expense_total`/`RangeTotals.expenses`, via `collect_range_totals`
+    -- no new transaction-level query, no second classification of what
+    counts as operating expense). This is deliberately the household's
+    already-recorded expense evidence for the month to date, not a
+    `booked_at`-windowed re-query: since no transaction is ever entered for
+    a future date, and a credit-card purchase's `competence` already
+    determines which month's canonical total it belongs to exactly the same
+    way it does for every other WA-04 tool, this is the one number that
+    stays in parity with what the user already sees elsewhere for this same
+    period -- never a second, competence-blind "pace-only" total that could
+    silently disagree with the Dashboard/Relatórios for the same category.
+
+    `elapsed_days` is `today.day` (never `0` -- day 1 of the month is
+    elapsed day 1, not a division by zero) and `days_in_month` is the real
+    length of `today`'s month (28/29/30/31 via `calendar.monthrange`).
+    Explicitly refuses (clarifies, never guesses) a period that resolves to
+    anything other than the month containing `today` -- there is no "pace"
+    for a month that already closed or has not started yet."""
+
+    period_text = arguments.get("period_text")
+    period = resolve_period(period_text, today=today)
+    current_period = month_key(today.replace(day=1))
+    if period is None or period != current_period:
+        return ToolOutcome(
+            ok=True,
+            clarifying_question=(
+                "Ritmo de gasto só é calculado para o mês atual, ainda em andamento "
+                f"({current_period}) -- não para um mês já fechado ou futuro."
+            ),
+        )
+
+    category_hint = arguments.get("category_hint")
+    totals = collect_range_totals(
+        db,
+        household_id=user.household_id,
+        generated_by=user.id,
+        start_period=current_period,
+        end_period=current_period,
+    )
+    amount_so_far = (
+        filtered_expense_total(totals, category_hint=category_hint) if category_hint else totals.expenses
+    )
+
+    elapsed_days = today.day
+    days_in_month = calendar.monthrange(today.year, today.month)[1]
+    projected_total = money(amount_so_far * Decimal(days_in_month) / Decimal(elapsed_days))
+
+    return ToolOutcome(
+        ok=True,
+        facts={
+            "period": current_period,
+            "category_hint": category_hint,
+            "elapsed_days": elapsed_days,
+            "days_in_month": days_in_month,
+            "amount_so_far": amount_so_far,
+            "projected_total": projected_total,
+        },
+    )
+
+
 def _tool_draft_typed_action(
     db: Session,
     *,
@@ -509,6 +578,11 @@ def _tool_financial_aggregate(
     category_hint = arguments.get("category_hint")
     account_hint = arguments.get("account_hint")
     holder_hint = arguments.get("holder_hint")
+    # WA-05 (docs/WORK_ORDER_WA_05.md, issue #77) "e se tirar mercado?":
+    # symmetric to `category_hint`, but removes a matching row instead of
+    # narrowing to it -- composes with every filter above, never overrides
+    # them (see `app.services.financial_query.dimension_rows`/`holder_rows`).
+    exclude_category_hint = arguments.get("exclude_category_hint")
 
     def _rows_for(range_totals: Any) -> list[dict[str, Any]]:
         # WA-04 PR #106 review round 1: `titular` is a real grouping
@@ -522,10 +596,16 @@ def _tool_financial_aggregate(
         # what counts as expense -- see `dimension_rows`'s own docstring).
         if dimension == "titular":
             return holder_rows(
-                range_totals, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint
+                range_totals,
+                category_hint=category_hint,
+                account_hint=account_hint,
+                holder_hint=holder_hint,
+                exclude_category_hint=exclude_category_hint,
             )
         label_hint = category_hint or account_hint
-        return range_dimension_rows(range_totals, dimension, label_hint=label_hint)
+        return range_dimension_rows(
+            range_totals, dimension, label_hint=label_hint, exclude_label_hint=exclude_category_hint
+        )
 
     rows = _rows_for(totals)
 
@@ -573,16 +653,22 @@ def _tool_financial_aggregate(
     if metric in ("total", "participacao"):
         sort_key = "share" if metric == "participacao" else "amount"
         result_rows = apply_top_n(result_rows, arguments.get("top_n"), sort_key=sort_key)
-    return ToolOutcome(
-        ok=True,
-        facts={
-            "dimension": dimension,
-            "metric": metric,
-            "start_period": start_period,
-            "end_period": end_period,
-            "rows": result_rows,
-        },
-    )
+    facts: dict[str, Any] = {
+        "dimension": dimension,
+        "metric": metric,
+        "start_period": start_period,
+        "end_period": end_period,
+        "rows": result_rows,
+    }
+    if metric == "total":
+        # WA-05 (docs/WORK_ORDER_WA_05.md, issue #77) "e se tirar mercado?":
+        # a single grand-total fact, plain decimal addition over every
+        # matching (pre-`top_n`) row -- already-canonical amounts, no second
+        # classification -- so "quanto sobra sem mercado?" never requires the
+        # caller to sum `rows` itself (INV-021, no arithmetic outside the
+        # deterministic engine).
+        facts["total"] = money(sum((row["amount"] for row in rows), Decimal("0")))
+    return ToolOutcome(ok=True, facts=facts)
 
 
 def _tool_get_income(db: Session, *, user: Any, arguments: dict[str, str], today: date) -> ToolOutcome:
@@ -636,7 +722,14 @@ def _tool_get_expenses(db: Session, *, user: Any, arguments: dict[str, str], tod
     category_hint = arguments.get("category_hint")
     account_hint = arguments.get("account_hint")
     holder_hint = arguments.get("holder_hint")
-    category_rows = range_dimension_rows(totals, "categoria", label_hint=category_hint)
+    # WA-05 (docs/WORK_ORDER_WA_05.md, issue #77) "e se tirar mercado?":
+    # symmetric to `category_hint`, removes a matching category from the
+    # total instead of narrowing to it -- see `financial_query.dimension_rows`/
+    # `filtered_expense_total`.
+    exclude_category_hint = arguments.get("exclude_category_hint")
+    category_rows = range_dimension_rows(
+        totals, "categoria", label_hint=category_hint, exclude_label_hint=exclude_category_hint
+    )
     account_rows = range_dimension_rows(totals, "conta", label_hint=account_hint) + range_dimension_rows(
         totals, "cartao", label_hint=account_hint
     )
@@ -649,9 +742,13 @@ def _tool_get_expenses(db: Session, *, user: Any, arguments: dict[str, str], tod
     # hint at all this is exactly `totals.expenses` (every row, unfiltered).
     filtered_total = (
         filtered_expense_total(
-            totals, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint
+            totals,
+            category_hint=category_hint,
+            account_hint=account_hint,
+            holder_hint=holder_hint,
+            exclude_category_hint=exclude_category_hint,
         )
-        if (category_hint or account_hint or holder_hint)
+        if (category_hint or account_hint or holder_hint or exclude_category_hint)
         else totals.expenses
     )
     return ToolOutcome(
@@ -935,6 +1032,8 @@ def run_tool(
         return _tool_compare_periods(db, user=user, arguments=clean_arguments, today=resolved_today)
     if tool == "project_horizon":
         return _tool_project_horizon(db, user=user, arguments=clean_arguments)
+    if tool == "project_category_pace":
+        return _tool_project_category_pace(db, user=user, arguments=clean_arguments, today=resolved_today)
     if tool == "draft_typed_action":
         return _tool_draft_typed_action(
             db,

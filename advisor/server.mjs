@@ -242,6 +242,17 @@ function planPrompt(payload) {
     "referência, o período ou a combinação de filtros pedida não corresponder a nenhuma ferramenta ou",
     "argumento existente, responda com needs_clarification em vez de combinar ferramentas de um jeito",
     "inédito ou de adivinhar.",
+    "Para 'e se tirar/excluir <categoria>?' logo após um passo de financial_aggregate ou get_expenses,",
+    "reaproveite exatamente os mesmos dimension/period_text/demais filtros do context_hints e adicione",
+    "apenas exclude_category_hint com a categoria citada -- nunca remova category_hint/account_hint/",
+    "holder_hint que já estavam lá, e nunca subtraia o valor você mesmo (o backend já devolve um total",
+    "já excluindo a categoria).",
+    "Para 'e se continuar nessa média/ritmo até o fim do mês?' logo após um passo que já respondeu gasto",
+    "do mês atual (financial_aggregate/get_expenses com period_text do mês corrente), use",
+    "project_category_pace com o mesmo category_hint do contexto (ausente = gasto total) e sem",
+    "period_text (ou period_text do mês atual). Nunca use project_category_pace para um mês que não seja",
+    "o mês atual -- se o contexto for de um mês passado/futuro, ou se nenhum passo anterior tiver",
+    "respondido gasto do mês atual, responda needs_clarification em vez de projetar um ritmo sem base.",
     `DADOS_JSON=${JSON.stringify(payload)}`,
   ].join("\n");
 }

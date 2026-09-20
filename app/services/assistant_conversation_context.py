@@ -69,6 +69,7 @@ CONTEXT_ELIGIBLE_TOOLS = frozenset(
         "aggregate_spending",
         "compare_periods",
         "project_horizon",
+        "project_category_pace",
         "financial_aggregate",
         "get_income",
         "get_expenses",

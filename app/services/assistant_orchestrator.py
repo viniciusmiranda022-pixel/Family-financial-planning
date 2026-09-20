@@ -271,6 +271,23 @@ def _format_project_horizon(facts: dict[str, Any]) -> str:
     )
 
 
+def _format_project_category_pace(facts: dict[str, Any]) -> str:
+    amount_so_far = facts.get("amount_so_far")
+    projected_total = facts.get("projected_total")
+    if amount_so_far is None or projected_total is None:
+        return "Não consegui calcular o ritmo de gasto agora."
+    period = facts.get("period")
+    category_hint = facts.get("category_hint")
+    elapsed_days = facts.get("elapsed_days")
+    days_in_month = facts.get("days_in_month")
+    scope = f"em {category_hint}" if category_hint else "no total"
+    return (
+        f"Ritmo de gasto {scope} em {period}: {_format_money(amount_so_far)} já gastos em "
+        f"{elapsed_days} de {days_in_month} dias. Mantendo esse ritmo, a projeção até o fim do mês é "
+        f"{_format_money(projected_total)}. Esta é uma estimativa (PREVISTO), não um fato realizado."
+    )
+
+
 def _format_dimension_label(dimension: str | None) -> str:
     return {
         "categoria": "categoria",
@@ -316,6 +333,12 @@ def _format_financial_aggregate(facts: dict[str, Any]) -> str:
         return f"Variação por {dimension_label} em {period_label}: " + "; ".join(parts) + "."
     if metric in ("media", "contagem", "minimo", "maximo"):
         return f"{metric.capitalize()} por {dimension_label} em {period_label}: {_format_money(rows[0].get('amount'))}."
+    if metric == "total":
+        total = facts.get("total")
+        detail = f"Gasto por {dimension_label} em {period_label}: " + _format_rows(rows) + "."
+        if total is None:
+            return detail
+        return f"{detail} Total: {_format_money(total)}."
     return f"Gasto por {dimension_label} em {period_label}: " + _format_rows(rows) + "."
 
 
@@ -414,6 +437,8 @@ def _format_step(tool: str, facts: dict[str, Any]) -> str:
         return _format_compare_periods(facts)
     if tool == "project_horizon":
         return _format_project_horizon(facts)
+    if tool == "project_category_pace":
+        return _format_project_category_pace(facts)
     if tool == "draft_typed_action":
         return _format_draft_typed_action(facts)
     if tool == "confirm_typed_action":

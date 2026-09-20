@@ -118,6 +118,19 @@ def matches_hint(hint: str | None, label: str | None) -> bool:
     return any(_norm(needle) in haystack for needle in needles)
 
 
+def excludes_hint(hint: str | None, label: str | None) -> bool:
+    """True when `hint` is present and matches `label` -- the exclusion
+    counterpart to `matches_hint`, with the opposite empty-hint default: an
+    empty/`None` exclude-hint excludes nothing (WA-05, issue #77 "e se tirar
+    mercado?" -- callers pass an exclude-hint only when the caller actually
+    asked to drop something; it must never silently drop every row when
+    absent, unlike `matches_hint`'s own "empty hint matches everything")."""
+
+    if not hint or not hint.strip():
+        return False
+    return matches_hint(hint, label)
+
+
 def resolve_period(text: str | None, *, today: date) -> str | None:
     """Deterministically resolve a free-text period hint into a `"YYYY-MM"`
     snapshot period key, or `None` when it cannot be resolved with
@@ -335,11 +348,20 @@ def collect_range_totals(
     )
 
 
-def dimension_rows(totals: RangeTotals, dimension: str, *, label_hint: str | None = None) -> list[dict[str, Any]]:
+def dimension_rows(
+    totals: RangeTotals,
+    dimension: str,
+    *,
+    label_hint: str | None = None,
+    exclude_label_hint: str | None = None,
+) -> list[dict[str, Any]]:
     """Per-group `{"label", "amount"}` rows for `dimension`, already
     summed across `totals`'s whole range by `collect_range_totals`, then
     narrowed by `label_hint` (a free-text filter, never a guess -- see
-    `matches_hint`)."""
+    `matches_hint`) and, symmetrically, with any row matching
+    `exclude_label_hint` dropped (WA-05, issue #77 "e se tirar mercado?" --
+    both hints compose: `label_hint` narrows, `exclude_label_hint` removes,
+    neither overrides the other)."""
 
     if dimension == "mes":
         rows = [{"label": key, "amount": value} for key, value in totals.month_expense_rows.items()]
@@ -352,20 +374,34 @@ def dimension_rows(totals: RangeTotals, dimension: str, *, label_hint: str | Non
             for label, bucket in totals.account_rows.items()
             if (bucket.get("account_type") == "credit_card") == wants_card
         ]
-    return [row for row in rows if matches_hint(label_hint, row["label"])]
+    return [
+        row
+        for row in rows
+        if matches_hint(label_hint, row["label"]) and not excludes_hint(exclude_label_hint, row["label"])
+    ]
 
 
 def _detail_matches(
-    row: dict[str, Any], *, category_hint: str | None, account_hint: str | None, holder_hint: str | None
+    row: dict[str, Any],
+    *,
+    category_hint: str | None,
+    account_hint: str | None,
+    holder_hint: str | None,
+    exclude_category_hint: str | None = None,
 ) -> bool:
     """True when `row` (one of `RangeTotals.detail_rows`) satisfies every
     provided hint at once (AND, never "last one wins") -- a hint left
-    absent/`None` matches everything, same contract as `matches_hint`."""
+    absent/`None` matches everything, same contract as `matches_hint`.
+    `exclude_category_hint` is the one exception: it *removes* a row whose
+    category matches it, symmetric to `category_hint` narrowing one in (WA-05,
+    issue #77 "e se tirar mercado?" -- composes with every other filter here,
+    never a second classification of a raw transaction)."""
 
     return (
         matches_hint(category_hint, row.get("category"))
         and matches_hint(account_hint, row.get("account"))
         and matches_hint(holder_hint, row.get("holder"))
+        and not excludes_hint(exclude_category_hint, row.get("category"))
     )
 
 
@@ -375,6 +411,7 @@ def filtered_expense_total(
     category_hint: str | None = None,
     account_hint: str | None = None,
     holder_hint: str | None = None,
+    exclude_category_hint: str | None = None,
 ) -> Decimal:
     """Operating-expense total narrowed by every provided hint at once.
 
@@ -392,7 +429,13 @@ def filtered_expense_total(
     matched = [
         row
         for row in totals.detail_rows
-        if _detail_matches(row, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint)
+        if _detail_matches(
+            row,
+            category_hint=category_hint,
+            account_hint=account_hint,
+            holder_hint=holder_hint,
+            exclude_category_hint=exclude_category_hint,
+        )
     ]
     return money(sum((Decimal(str(row.get("amount", 0))) for row in matched), Decimal("0")))
 
@@ -403,6 +446,7 @@ def holder_rows(
     category_hint: str | None = None,
     account_hint: str | None = None,
     holder_hint: str | None = None,
+    exclude_category_hint: str | None = None,
 ) -> list[dict[str, Any]]:
     """Per-holder `{"label", "amount"}` rows for `financial_aggregate`'s
     `titular` dimension -- grouped from `totals.detail_rows`, narrowed by
@@ -413,7 +457,13 @@ def holder_rows(
 
     grouped: dict[str, Decimal] = {}
     for row in totals.detail_rows:
-        if not _detail_matches(row, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint):
+        if not _detail_matches(
+            row,
+            category_hint=category_hint,
+            account_hint=account_hint,
+            holder_hint=holder_hint,
+            exclude_category_hint=exclude_category_hint,
+        ):
             continue
         label = str(row.get("holder") or "Não informado")
         grouped[label] = grouped.get(label, Decimal("0")) + money(Decimal(str(row.get("amount", 0))))
