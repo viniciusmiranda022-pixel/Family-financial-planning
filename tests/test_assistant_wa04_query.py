@@ -686,6 +686,482 @@ def test_financial_aggregate_titular_dimension_combines_with_category_hint() -> 
 
 
 # ---------------------------------------------------------------------------
+# 4b. WA-05 (docs/WORK_ORDER_WA_05.md, issue #77) "e se tirar mercado?" --
+#     exclude_category_hint on get_expenses/financial_aggregate: symmetric
+#     to category_hint, but removes a matching row/category from the total
+#     instead of narrowing to it. Composes with every other filter (AND),
+#     never overrides them.
+# ---------------------------------------------------------------------------
+
+
+def test_get_expenses_exclude_category_hint_drops_that_category_from_the_total() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="expenses-exclude")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+        description="Supermercado Extra",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-200.00"),
+        transaction_type="expense",
+        description="Posto Shell",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        full = run_tool(
+            db, user=user, tool="get_expenses", arguments={"period_text": "este mês"}, message="x", today=TODAY
+        )
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={"period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="e se tirar mercado?",
+            today=TODAY,
+        )
+    assert outcome.facts["expenses"] == Decimal("200.00")
+    assert outcome.facts["expenses"] == full.facts["expenses"] - Decimal("300.00")
+    assert all(row["label"] != "Mercado" for row in outcome.facts["by_category"])
+
+
+def test_get_expenses_exclude_category_hint_composes_with_account_hint() -> None:
+    """`exclude_category_hint` and `account_hint` combine (AND), neither
+    silently overriding the other -- same discipline PR #106 already
+    established for `category_hint`/`account_hint`."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="expenses-exclude-account")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-80.00"),
+        transaction_type="expense",
+    )
+    # Different account -- must not count once account_hint narrows to
+    # "Conta Corrente", regardless of exclude_category_hint.
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-999.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={
+                "period_text": "este mês",
+                "account_hint": "conta corrente",
+                "exclude_category_hint": "mercado",
+            },
+            message="e se tirar mercado da conta corrente?",
+            today=TODAY,
+        )
+    assert outcome.facts["expenses"] == Decimal("80.00")
+
+
+def test_financial_aggregate_exclude_category_hint_drops_row_and_reports_grand_total() -> None:
+    """dimension=categoria, no category_hint, exclude_category_hint=Mercado
+    -- the excluded category never resurfaces in `rows`, and metric=total's
+    `total` fact is the grand sum of every remaining row (so a caller asking
+    a single "e se tirar mercado, quanto sobra?" question never has to sum
+    `rows` itself -- INV-021, no arithmetic outside the deterministic
+    engine)."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="aggregate-exclude")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-200.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "categoria", "period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="e se tirar mercado?",
+            today=TODAY,
+        )
+    labels = {row["label"] for row in outcome.facts["rows"]}
+    assert "Mercado" not in labels
+    assert outcome.facts["total"] == Decimal("200.00")
+
+    # Parity: the same grand total `get_expenses` reports with the identical
+    # exclusion filter -- never a second, independently-computed total.
+    with session_factory() as db:
+        expenses = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={"period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="x",
+            today=TODAY,
+        )
+    assert outcome.facts["total"] == expenses.facts["expenses"]
+
+
+def test_financial_aggregate_total_metric_always_reports_the_grand_total_fact() -> None:
+    """Regression: metric=total's `total` fact is always the plain decimal
+    sum of every matching (pre-top_n) row, independent of any exclude
+    filter -- covers the ordinary case with no exclusion at all."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="aggregate-total-fact")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-200.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "categoria", "period_text": "este mês"},
+            message="quanto gastei por categoria?",
+            today=TODAY,
+        )
+    assert outcome.facts["total"] == Decimal("500.00")
+    assert outcome.facts["total"] == sum((row["amount"] for row in outcome.facts["rows"]), Decimal("0"))
+
+
+def test_financial_aggregate_titular_dimension_combines_with_exclude_category_hint() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="aggregate-titular-exclude")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+        owner_label="Vinicius",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-100.00"),
+        transaction_type="expense",
+        owner_label="Vinicius",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "titular", "period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="quanto o Vinicius gastou esse mês, tirando mercado?",
+            today=TODAY,
+        )
+    rows = {row["label"]: row["amount"] for row in outcome.facts["rows"]}
+    assert rows == {"Vinicius": Decimal("100.00")}
+
+
+# ---------------------------------------------------------------------------
+# 4c. WA-05 (docs/WORK_ORDER_WA_05.md, issue #77) "e se continuar nessa
+#     média até o fim do mês?" -- project_category_pace: deterministic
+#     linear pace estimate, current month only.
+# ---------------------------------------------------------------------------
+
+
+def test_project_category_pace_extrapolates_linearly_for_a_category() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="pace-category")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 10),
+        amount=Decimal("-150.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="project_category_pace",
+            arguments={"category_hint": "mercado"},
+            message="e se continuar nessa média até o fim do mês?",
+            today=TODAY,  # 2026-09-17: September has 30 days.
+        )
+    assert outcome.facts["period"] == "2026-09"
+    assert outcome.facts["category_hint"] == "mercado"
+    assert outcome.facts["elapsed_days"] == 17
+    assert outcome.facts["days_in_month"] == 30
+    assert outcome.facts["amount_so_far"] == Decimal("450.00")
+    # 450 * 30 / 17 = 794.1176... -> money() rounds HALF_UP to the cent.
+    assert outcome.facts["projected_total"] == Decimal("794.12")
+
+
+def test_project_category_pace_without_category_hint_projects_total_operational_expense() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="pace-total")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-200.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="project_category_pace",
+            arguments={},
+            message="e se continuar nessa média até o fim do mês?",
+            today=TODAY,
+        )
+    assert outcome.facts["category_hint"] is None
+    assert outcome.facts["amount_so_far"] == Decimal("500.00")
+    assert outcome.facts["projected_total"] == Decimal("882.35")  # 500 * 30 / 17
+
+
+def test_project_category_pace_day_one_never_divides_by_zero() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="pace-day-one")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 1),
+        amount=Decimal("-100.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="project_category_pace",
+            arguments={"category_hint": "mercado"},
+            message="e se continuar nessa média?",
+            today=date(2026, 9, 1),
+        )
+    assert outcome.facts["elapsed_days"] == 1
+    assert outcome.facts["amount_so_far"] == Decimal("100.00")
+    assert outcome.facts["projected_total"] == Decimal("3000.00")  # 100 * 30 / 1
+
+
+def test_project_category_pace_days_in_month_covers_28_29_30_31_day_boundaries() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="pace-month-lengths")
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    # No transactions seeded: amount_so_far/projected_total are both 0 for
+    # every case below -- this test only exercises `calendar.monthrange`'s
+    # day-count boundary, not the linear extrapolation itself (covered by
+    # the tests above).
+    cases = [
+        (date(2027, 2, 10), 28),  # February, non-leap year.
+        (date(2028, 2, 10), 29),  # February, leap year.
+        (date(2026, 4, 10), 30),  # April.
+        (date(2026, 1, 10), 31),  # January.
+    ]
+    for today, expected_days in cases:
+        with session_factory() as db:
+            outcome = run_tool(
+                db,
+                user=user,
+                tool="project_category_pace",
+                arguments={},
+                message="e se continuar nessa média?",
+                today=today,
+            )
+        assert outcome.facts["days_in_month"] == expected_days
+        assert outcome.facts["elapsed_days"] == 10
+        assert outcome.facts["amount_so_far"] == Decimal("0")
+        assert outcome.facts["projected_total"] == Decimal("0.00")
+
+
+def test_project_category_pace_refuses_a_past_or_future_month() -> None:
+    """Technical Challenge resolution (PR #107): a linear pace estimate is
+    only meaningful for the CURRENT, still-in-progress month -- a past month
+    already has its final total, and a future month has no data at all.
+    Never guessed; always a clarifying question, never a mutation."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="pace-wrong-period")
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="project_category_pace",
+            arguments={"period_text": "agosto"},
+            message="e se continuar nessa média em agosto?",
+            today=TODAY,
+        )
+    assert outcome.ok is True
+    assert outcome.clarifying_question is not None
+    assert outcome.facts == {}
+
+
+def test_project_category_pace_unresolvable_period_text_asks_never_guesses() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="pace-unresolvable")
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="project_category_pace",
+            arguments={"period_text": "período qualquer inexistente"},
+            message="e aí, como fica?",
+            today=TODAY,
+        )
+    assert outcome.ok is True
+    assert outcome.clarifying_question is not None
+    assert outcome.facts == {}
+
+
+def test_project_category_pace_amount_so_far_has_parity_with_get_expenses_current_month() -> None:
+    """`amount_so_far` is exactly the same canonical current-month category
+    figure `get_expenses` already reports -- never a second,
+    independently-computed number that could disagree with the Dashboard."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="pace-parity")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-200.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        pace = run_tool(
+            db,
+            user=user,
+            tool="project_category_pace",
+            arguments={"category_hint": "mercado"},
+            message="e se continuar nessa média?",
+            today=TODAY,
+        )
+    with session_factory() as db:
+        expenses = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={"period_text": "este mês", "category_hint": "mercado"},
+            message="x",
+            today=TODAY,
+        )
+    assert pace.facts["amount_so_far"] == expenses.facts["expenses"]
+
+
+# ---------------------------------------------------------------------------
 # 5. get_commitments -- REALIZADO/COMPROMETIDO never merged.
 # ---------------------------------------------------------------------------
 

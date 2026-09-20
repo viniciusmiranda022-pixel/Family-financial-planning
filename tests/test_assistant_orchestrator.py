@@ -13,6 +13,7 @@ parity with the canonical finance engine, and trace sanitization.
 
 from __future__ import annotations
 
+import calendar
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -53,7 +54,9 @@ from app.services.assistant_orchestrator import (  # noqa: E402
 from app.services.assistant_tool_catalog import ALLOWED_TOOLS, MAX_PLAN_STEPS  # noqa: E402
 from app.services.assistant_tools import resolve_period, run_tool, sao_paulo_today  # noqa: E402
 from app.services.codex_client import CodexResult  # noqa: E402
+from app.services.finance import money  # noqa: E402
 from app.services.financial_snapshots import build_snapshot, category_spending_rows  # noqa: E402
+from app.services.notification_templates import format_brl  # noqa: E402
 from tests.fixtures.mfa_enrollment import complete_mfa_enrollment  # noqa: E402
 
 TODAY = date(2026, 9, 17)
@@ -1018,6 +1021,89 @@ def test_plan_and_execute_issue_77_sequence_forwards_and_accumulates_context_hin
         },
     ]
 
+    # Turn 4 (PR #107 review round 2 -- MERGE BLOCKED: the issue #77 sequence's
+    # own 4th turn, "e se continuar nessa média até o fim do mês?", must
+    # resolve through structured context + a real backend tool, never
+    # needs_clarification). `MAX_CONTEXT_STEPS == 3` (`assistant_conversation_
+    # context`), so by now the oldest (turn 1) step has already rolled off --
+    # only the turn 2/turn 3 `financial_aggregate` steps remain, both of
+    # which name the "Mercado" category, letting the sidecar carry
+    # `category_hint="Mercado"` forward into `project_category_pace` here.
+    client.responses.append(
+        _valid_plan_response(
+            steps=[{"tool": "project_category_pace", "arguments": {"category_hint": "Mercado"}}]
+        )
+    )
+    with session_factory() as db:
+        turn4 = plan_and_execute(
+            db,
+            user=user,
+            message="e se continuar nessa média até o fim do mês?",
+            conversation_id="ctx-issue77",
+            client=client,
+        )
+    assert turn4.needs_clarification is False
+    # `plan_and_execute` (unlike `run_tool` in the rest of this suite) always
+    # resolves `today` internally via `sao_paulo_today()` -- never the
+    # module's fixed `TODAY` constant -- so the expected pace projection is
+    # computed the same way here from the real elapsed day of the real
+    # current month, not hardcoded to one specific day. "Mercado" so far
+    # this month is exactly 450 (300 + 150, both seeded on fixed September
+    # dates, always in the past relative to "today" for this suite to run
+    # meaningfully at all).
+    real_today = sao_paulo_today()
+    elapsed_days = real_today.day
+    days_in_month = calendar.monthrange(real_today.year, real_today.month)[1]
+    expected_projected = money(Decimal("450") * Decimal(days_in_month) / Decimal(elapsed_days))
+    assert f"{elapsed_days} de {days_in_month} dias" in turn4.answer
+    assert format_brl(expected_projected) in turn4.answer
+    assert "PREVISTO" in turn4.answer
+
+
+def test_plan_and_execute_e_se_tirar_mercado_excludes_category_via_context() -> None:
+    """WA-05 (docs/WORK_ORDER_WA_05.md, issue #77) mandatory test "e se
+    tirar mercado?" -- a follow-up naming a category to EXCLUDE from an
+    already-answered total, resolved through context + `exclude_category_hint`
+    (never a second engine, never LLM subtraction)."""
+
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="ctx-tirar-mercado"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+
+    client = SequentialPlanClient(
+        responses=[
+            _valid_plan_response(steps=[{"tool": "get_expenses", "arguments": {"period_text": "setembro"}}]),
+            _valid_plan_response(
+                steps=[
+                    {
+                        "tool": "get_expenses",
+                        "arguments": {"period_text": "setembro", "exclude_category_hint": "Mercado"},
+                    }
+                ]
+            ),
+        ]
+    )
+
+    with session_factory() as db:
+        turn1 = plan_and_execute(
+            db, user=user, message="quanto gastei esse mês?", conversation_id="ctx-tirar-mercado", client=client
+        )
+    # Fixture-wide September total is exactly the 450 seeded in "Mercado"
+    # (see `_seed_household_with_spending`).
+    assert "450" in turn1.answer
+
+    with session_factory() as db:
+        turn2 = plan_and_execute(
+            db, user=user, message="e se tirar mercado?", conversation_id="ctx-tirar-mercado", client=client
+        )
+    assert client.captured_payloads[1]["context_hints"] == [
+        {"tool": "get_expenses", "arguments": {"period_text": "setembro"}}
+    ]
+    assert turn2.needs_clarification is False
+    assert "0,00" in turn2.answer  # 450 total, all of it in "Mercado" -- 0 left once excluded.
+
 
 def test_plan_and_execute_still_asks_for_clarification_even_with_context_available() -> None:
     """Work Order acceptance criterion 'Ambiguous pronouns/entities/periods/
@@ -1039,7 +1125,7 @@ def test_plan_and_execute_still_asks_for_clarification_even_with_context_availab
             ),
             _valid_plan_response(
                 needs_clarification=True,
-                clarifying_question="Ainda não calculo projeção de ritmo por categoria.",
+                clarifying_question="Não entendi a que rendimento futuro você está se referindo.",
                 steps=[],
             ),
         ]
@@ -1051,12 +1137,12 @@ def test_plan_and_execute_still_asks_for_clarification_even_with_context_availab
         result = plan_and_execute(
             db,
             user=user,
-            message="e se continuar nessa média até o fim do mês?",
+            message="e qual vai ser o rendimento disso no ano que vem?",
             conversation_id="ctx-clarify",
             client=client,
         )
     assert result.needs_clarification is True
-    assert result.answer == "Ainda não calculo projeção de ritmo por categoria."
+    assert result.answer == "Não entendi a que rendimento futuro você está se referindo."
 
 
 def test_plan_and_execute_context_never_leaks_across_conversation_ids() -> None:
