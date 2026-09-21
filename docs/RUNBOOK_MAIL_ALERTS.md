@@ -33,22 +33,15 @@ o sistema usa `ALERT_SMTP_*` inteiramente, como antes do MAIL-04.
 
 ### 2.1 Pela interface (recomendado -- sem editar arquivos, sem restart)
 
-1. Gere a chave de criptografia dedicada, uma única vez por instalação, e
-   adicione a `.env` (nunca versionada):
-   ```bash
-   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-   ```
-   ```bash
-   SMTP_ENCRYPTION_KEY=<chave gerada>
-   ```
-   Reinicie `app` e `notification-worker` **uma única vez** para carregar
-   essa chave nova:
-   ```bash
-   docker compose up -d --force-recreate app notification-worker
-   ```
-   Instalações que nunca definem `SMTP_ENCRYPTION_KEY` continuam
-   funcionando exatamente como antes (fallback `ALERT_SMTP_*`) -- essa
-   chave só é obrigatória para usar o painel de SMTP da interface.
+1. Nenhuma chave nova para gerar ou adicionar a `.env`: a App Password
+   salva pela interface é criptografada em repouso com uma chave *derivada*
+   de `FILE_ENCRYPTION_KEY` (HKDF-SHA256, domain separation, nunca
+   `FILE_ENCRYPTION_KEY` reutilizada diretamente --
+   `app.services.smtp_config._derive_fernet_key`) -- toda instalação já tem
+   `FILE_ENCRYPTION_KEY` configurada desde antes do MAIL-04 existir
+   (obrigatória para subir o `app`), então o painel de SMTP da interface
+   funciona no primeiro acesso, sem editar `.env` e sem `docker compose
+   ... --force-recreate`.
 2. Ative a verificação em duas etapas na conta Gmail remetente (obrigatório
    para gerar uma App Password) e gere uma **App Password** em
    <https://myaccount.google.com/apppasswords> (nunca use a senha normal de
@@ -65,6 +58,31 @@ o sistema usa `ALERT_SMTP_*` inteiramente, como antes do MAIL-04.
    isso chama `POST /notification-settings/test-email`, que sempre usa a
    configuração SMTP efetiva (banco, se habilitada e completa; senão
    `ALERT_SMTP_*`), nunca um host/usuário/senha vindo do navegador.
+
+### 2.3 Rotação de `FILE_ENCRYPTION_KEY`
+
+Como a chave de criptografia da App Password SMTP é derivada de
+`FILE_ENCRYPTION_KEY` (seção 2.1), rotacionar `FILE_ENCRYPTION_KEY` (ex.:
+resposta a um incidente de segurança) também rotaciona essa chave derivada
+-- qualquer App Password salva antes da rotação se torna indecifrável.
+Isso nunca vira fallback silencioso para texto plano nem um envio
+malsucedido silencioso: `resolve_effective_smtp_settings` levanta
+`SmtpConfigurationError` explicitamente (o worker registra a passada como
+`worker_pass_exception` no heartbeat, seção 5; `POST
+/notification-settings/test-email` retorna erro).
+
+Procedimento após rotacionar `FILE_ENCRYPTION_KEY`:
+
+1. Em **Configurações → Remetente SMTP**, reinsira a App Password (mesmo
+   valor de antes ou uma nova) e salve -- isso a recriptografa com a chave
+   derivada da nova `FILE_ENCRYPTION_KEY`.
+2. Use o botão **Testar** (seção 2.1, passo 5) para confirmar antes de
+   considerar a rotação concluída.
+
+Isso não é específico deste worker: qualquer segredo criptografado com uma
+chave derivada de `FILE_ENCRYPTION_KEY` precisa do mesmo passo de
+re-gravação após uma rotação -- documentado aqui porque a App Password SMTP
+é, por ora, o único.
 
 ### 2.2 Por `.env` (fallback, compatível com instalações anteriores ao MAIL-04)
 
@@ -177,7 +195,7 @@ específicos do worker/heartbeat -- nunca o texto bruto de exceção do
 | `smtp_recipient_refused` | Servidor rejeitou o endereço do destinatário | Confirme o e-mail cadastrado em Configurações. Falha permanente. |
 | `smtp_send_failed` | Outra falha SMTP não classificada acima | Verifique `docker compose logs notification-worker` (nunca inclui a senha). Transitório -- entra em retry. |
 | `worker_timeout_exhausted` | Uma entrega ficou `sending` além de `NOTIFICATION_DELIVERY_STALE_AFTER_SECONDS` e já sem tentativas | O worker provavelmente crashou no meio do envio; verifique se o e-mail chegou de fato (SMTP não tem transação distribuída com o banco -- ver "Limite técnico" no Work Order) antes de qualquer ação manual. |
-| `worker_pass_exception` | A própria passada (`run_once`) lançou uma exceção não tratada (ex.: banco indisponível) | Verifique `docker compose logs notification-worker` e a saúde de `db`. O heartbeat registra `ok=false` para esta passada; a próxima passada tenta de novo automaticamente. |
+| `worker_pass_exception` | A própria passada (`run_once`) lançou uma exceção não tratada (ex.: banco indisponível, ou `SmtpConfigurationError` -- App Password SMTP salva antes de uma rotação de `FILE_ENCRYPTION_KEY`, seção 2.3) | Verifique `docker compose logs notification-worker` e a saúde de `db`. Se o log mostrar `SmtpConfigurationError`, siga o procedimento de rotação da seção 2.3 (reinserir a App Password). O heartbeat registra `ok=false` para esta passada; a próxima passada tenta de novo automaticamente. |
 | `never_run` (healthcheck) | Nenhuma passada terminou ainda | Normal logo após subir; persistente além de `start_period` indica processo travado antes do primeiro `run_once` completar -- veja logs. |
 | `stale` (healthcheck) | Última passada terminou há mais tempo que a janela de frescor | Worker travado ou reiniciando em loop; `docker compose logs notification-worker` e `docker compose ps` para o estado de restart. |
 

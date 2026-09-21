@@ -10,7 +10,7 @@ import os
 import uuid
 
 import pytest
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -53,12 +53,11 @@ def _make_user(session_factory) -> User:
     return user
 
 
-def _settings(*, smtp_key: str | None, **env_alert_overrides) -> Settings:
+def _settings(*, file_encryption_key: str | None = None, **env_alert_overrides) -> Settings:
     base = {
         "secret_key": "x" * 32,
-        "file_encryption_key": Fernet.generate_key().decode(),
+        "file_encryption_key": file_encryption_key or Fernet.generate_key().decode(),
         "mfa_encryption_key": Fernet.generate_key().decode(),
-        "smtp_encryption_key": smtp_key or "",
     }
     base.update(env_alert_overrides)
     return Settings(**base)
@@ -70,30 +69,57 @@ def _settings(*, smtp_key: str | None, **env_alert_overrides) -> Settings:
 
 
 def test_encrypt_then_decrypt_round_trips() -> None:
-    settings = _settings(smtp_key=Fernet.generate_key().decode())
+    """No dedicated SMTP key configured anywhere -- only the mandatory
+    `file_encryption_key` every installation already has -- and encryption
+    still works (MAIL-04 acceptance criterion 1: usable without editing
+    `.env`, engineering review on the PR for issue #110, 2026-09-21)."""
+
+    settings = _settings()
     token = svc.encrypt_app_password("super-secret-app-password", settings=settings)
     assert token != "super-secret-app-password"
     assert svc.decrypt_app_password(token, settings=settings) == "super-secret-app-password"
 
 
-def test_encrypt_without_key_raises_configuration_error_not_plaintext_fallback() -> None:
-    settings = _settings(smtp_key="")
-    with pytest.raises(svc.SmtpConfigurationError):
-        svc.encrypt_app_password("secret", settings=settings)
+def test_derived_key_is_not_the_raw_file_encryption_key() -> None:
+    """Guards the "never reuse FILE_ENCRYPTION_KEY directly" invariant
+    (`docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md`): a token produced by
+    `encrypt_app_password` must not be decryptable with
+    `file_encryption_key` used as a raw Fernet key -- only the HKDF-derived
+    key (`_derive_fernet_key`) works."""
+
+    settings = _settings()
+    token = svc.encrypt_app_password("secret", settings=settings)
+    raw_key_cipher = Fernet(settings.file_encryption_key.encode())
+    with pytest.raises(InvalidToken):
+        raw_key_cipher.decrypt(token.encode())
 
 
-def test_encrypt_with_invalid_key_raises_configuration_error() -> None:
-    settings = _settings(smtp_key="not-a-valid-fernet-key")
-    with pytest.raises(svc.SmtpConfigurationError):
-        svc.encrypt_app_password("secret", settings=settings)
+def test_two_settings_instances_with_the_same_file_encryption_key_interoperate() -> None:
+    """The derived key is deterministic and never cached/persisted -- two
+    independently constructed `Settings` (e.g. the process that saved the
+    App Password and a later worker pass) must derive the same key from
+    the same `file_encryption_key`."""
+
+    shared_key = Fernet.generate_key().decode()
+    settings_a = _settings(file_encryption_key=shared_key)
+    settings_b = _settings(file_encryption_key=shared_key)
+    token = svc.encrypt_app_password("secret", settings=settings_a)
+    assert svc.decrypt_app_password(token, settings=settings_b) == "secret"
 
 
-def test_decrypt_with_wrong_key_raises_configuration_error() -> None:
-    encrypt_settings = _settings(smtp_key=Fernet.generate_key().decode())
+def test_decrypt_after_file_encryption_key_rotation_raises_configuration_error() -> None:
+    """Documented trade-off (`docs/RUNBOOK_MAIL_ALERTS.md` §2.3): because the
+    SMTP key is derived from `file_encryption_key` rather than stored
+    independently, rotating `file_encryption_key` rotates the derived key
+    too -- a previously saved App Password becomes undecryptable, and this
+    must fail explicitly, never silently produce garbage or fall back to
+    plaintext."""
+
+    encrypt_settings = _settings()
     token = svc.encrypt_app_password("secret", settings=encrypt_settings)
-    wrong_settings = _settings(smtp_key=Fernet.generate_key().decode())
+    rotated_settings = _settings()  # different file_encryption_key
     with pytest.raises(svc.SmtpConfigurationError):
-        svc.decrypt_app_password(token, settings=wrong_settings)
+        svc.decrypt_app_password(token, settings=rotated_settings)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +131,7 @@ def test_save_creates_singleton_row_and_encrypts_password() -> None:
     session_factory = _session_factory()
     db = session_factory()
     user = _make_user(session_factory)
-    settings = _settings(smtp_key=Fernet.generate_key().decode())
+    settings = _settings()
 
     row = svc.save_smtp_sender_config(
         db,
@@ -156,7 +182,7 @@ def test_empty_app_password_on_edit_preserves_existing_secret() -> None:
     session_factory = _session_factory()
     db = session_factory()
     user = _make_user(session_factory)
-    settings = _settings(smtp_key=Fernet.generate_key().decode())
+    settings = _settings()
 
     svc.save_smtp_sender_config(
         db,
@@ -190,7 +216,7 @@ def test_remove_app_password_clears_secret() -> None:
     session_factory = _session_factory()
     db = session_factory()
     user = _make_user(session_factory)
-    settings = _settings(smtp_key=Fernet.generate_key().decode())
+    settings = _settings()
 
     svc.save_smtp_sender_config(
         db,
@@ -220,7 +246,7 @@ def test_replace_and_remove_in_same_call_is_rejected() -> None:
     session_factory = _session_factory()
     db = session_factory()
     user = _make_user(session_factory)
-    settings = _settings(smtp_key=Fernet.generate_key().decode())
+    settings = _settings()
 
     with pytest.raises(svc.SmtpSenderConfigValidationError):
         svc.save_smtp_sender_config(
@@ -248,7 +274,7 @@ def test_enabling_with_incomplete_config_is_rejected(update_kwargs: dict) -> Non
     session_factory = _session_factory()
     db = session_factory()
     user = _make_user(session_factory)
-    settings = _settings(smtp_key=Fernet.generate_key().decode())
+    settings = _settings()
 
     with pytest.raises(svc.SmtpSenderConfigValidationError):
         svc.save_smtp_sender_config(
@@ -269,7 +295,7 @@ def test_disabling_with_incomplete_config_is_allowed_as_a_draft() -> None:
     session_factory = _session_factory()
     db = session_factory()
     user = _make_user(session_factory)
-    settings = _settings(smtp_key=Fernet.generate_key().decode())
+    settings = _settings()
 
     row = svc.save_smtp_sender_config(
         db,
@@ -293,7 +319,6 @@ def test_no_db_row_falls_back_to_env() -> None:
     session_factory = _session_factory()
     db = session_factory()
     settings = _settings(
-        smtp_key=Fernet.generate_key().decode(),
         alert_email_enabled=True,
         alert_smtp_host="env-host",
         alert_smtp_username="env-user",
@@ -311,7 +336,6 @@ def test_disabled_db_row_falls_back_to_env_entirely_not_partially() -> None:
     db = session_factory()
     user = _make_user(session_factory)
     settings = _settings(
-        smtp_key=Fernet.generate_key().decode(),
         alert_email_enabled=True,
         alert_smtp_host="env-host",
         alert_smtp_username="env-user",
@@ -342,7 +366,6 @@ def test_enabled_complete_db_row_takes_precedence_over_env() -> None:
     db = session_factory()
     user = _make_user(session_factory)
     settings = _settings(
-        smtp_key=Fernet.generate_key().decode(),
         alert_email_enabled=True,
         alert_smtp_host="env-host",
         alert_smtp_username="env-user",
@@ -379,7 +402,7 @@ def test_effective_settings_satisfy_smtp_settings_like_protocol() -> None:
 
     session_factory = _session_factory()
     db = session_factory()
-    settings = _settings(smtp_key=Fernet.generate_key().decode())
+    settings = _settings()
     effective = svc.resolve_effective_smtp_settings(db, settings=settings)
     assert isinstance(effective, SmtpSettingsLike)
 
@@ -393,7 +416,7 @@ def test_serialize_never_includes_password_material() -> None:
     session_factory = _session_factory()
     db = session_factory()
     user = _make_user(session_factory)
-    settings = _settings(smtp_key=Fernet.generate_key().decode())
+    settings = _settings()
 
     row = svc.save_smtp_sender_config(
         db,

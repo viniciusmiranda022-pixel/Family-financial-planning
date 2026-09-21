@@ -213,11 +213,21 @@ completos.
 `app.services.email_delivery.SmtpEmailAdapter` continua sendo o único transporte, apenas recebendo uma
 configuração já resolvida.
 
-- a App Password é criptografada em repouso com `cryptography.fernet.Fernet` e uma chave dedicada,
-  `SMTP_ENCRYPTION_KEY` -- nunca `SECRET_KEY`, `FILE_ENCRYPTION_KEY`, `MFA_ENCRYPTION_KEY`, ou
-  `WHATSAPP_PHONE_ENCRYPTION_KEY` (mesma disciplina de "uma chave por domínio" já usada por essas
-  quatro), e a criptografia/descriptografia falha explicitamente (`SmtpConfigurationError`) quando a
-  chave está ausente/inválida -- nunca cai para texto plano;
+- a App Password é criptografada em repouso com `cryptography.fernet.Fernet` e uma chave *derivada* de
+  `FILE_ENCRYPTION_KEY` via HKDF-SHA256 (RFC 5869) com um rótulo de domain separation fixo
+  (`family-finance/smtp-app-password/v1`, `app.services.smtp_config._derive_fernet_key`) -- nunca
+  `FILE_ENCRYPTION_KEY` reutilizada diretamente, nunca `SECRET_KEY`, `MFA_ENCRYPTION_KEY`, ou
+  `WHATSAPP_PHONE_ENCRYPTION_KEY`, e nunca persistida (recomputada a cada chamada). A derivação HKDF é
+  unidirecional e com domain separation: quem não possui `FILE_ENCRYPTION_KEY` não ganha nada a partir
+  de um ciphertext SMTP ou da chave derivada, o mesmo isolamento de "uma chave por domínio" que uma
+  quarta env var dedicada daria, sem exigir esse segredo operacional novo (revisão de engenharia na PR
+  da issue #110, 2026-09-21 -- o desenho original, uma `SMTP_ENCRYPTION_KEY` opcional e dedicada,
+  deixava o painel de SMTP inutilizável em qualquer instalação existente até que alguém editasse
+  `.env`, contradizendo o critério de aceite 1 do Work Order). A criptografia/descriptografia falha
+  explicitamente (`SmtpConfigurationError`) quando a derivação ou o ciphertext salvo são inválidos --
+  nunca cai para texto plano. Trade-off aceito e documentado
+  (`docs/RUNBOOK_MAIL_ALERTS.md` §2.3): rotacionar `FILE_ENCRYPTION_KEY` também rotaciona esta chave
+  derivada; uma App Password salva antes da rotação precisa ser reinserida.
 - `GET`/`PUT /smtp-config` são `_require_admin`-gated -- diferente de `GET /notification-settings`,
   aqui a leitura também é admin-only, porque a resposta descreve o remetente do deployment inteiro, não
   uma preferência do household do chamador
@@ -228,7 +238,12 @@ configuração já resolvida.
   usuário/remetente/STARTTLS/timeout) (`tests/test_smtp_config_api.py::test_put_then_get_reflects_saved_config_without_leaking_password`);
 - `AuditEvent` de `smtp_config.update` também nunca carrega a senha -- `details` só tem
   `app_password_changed` (booleano), e `before_state`/`after_state` são a mesma projeção sanitizada
-  devolvida pela API (`tests/test_smtp_config_api.py::test_put_audits_change_without_leaking_password_in_before_after_or_details`);
+  devolvida pela API (`tests/test_smtp_config_api.py::test_put_audits_change_without_leaking_password_in_before_after_or_details`).
+  `app_password_changed` é calculado por `app.api.smtp_config_update` comparando o ciphertext bruto
+  antes/depois da gravação (nunca exposto em `details`/`before_state`/`after_state`) -- não o booleano
+  "configurado" antes/depois, que reporta `false` ao substituir uma senha já configurada por outra
+  (revisão de engenharia na PR da issue #110, 2026-09-21;
+  `tests/test_smtp_config_api.py::test_replacing_an_existing_app_password_audits_changed_true`);
 - editar a configuração com o campo de senha vazio preserva a senha já salva; substituição e remoção
   (`remove_app_password`) são ações explícitas e mutuamente exclusivas com o envio de uma senha nova na
   mesma chamada (`tests/test_smtp_config.py`);
@@ -239,10 +254,12 @@ configuração já resolvida.
   test-email` quanto por cada passada de `app.cli.notification_worker.run_once` -- uma configuração
   salva pela interface vale a partir da própria chamada/passada seguinte, sem restart de processo
   (`tests/test_notification_worker.py::test_run_once_without_explicit_adapter_uses_db_smtp_config_saved_before_this_pass`);
-- `SMTP_ENCRYPTION_KEY` é opcional (diferente de `MFA_ENCRYPTION_KEY`, que é obrigatória desde o
-  primeiro boot): uma instalação que nunca a define continua subindo normalmente e simplesmente não
-  consegue habilitar/salvar o remetente pela interface -- o fallback `ALERT_SMTP_*` continua
-  funcionando sem qualquer mudança (MAIL-04, critério de aceite 1).
+- não existe uma `SMTP_ENCRYPTION_KEY` dedicada: a chave de criptografia é derivada de
+  `FILE_ENCRYPTION_KEY` (já obrigatória desde o primeiro boot para qualquer instalação, muito antes do
+  MAIL-04), então o painel de SMTP da interface já funciona em qualquer instalação existente sem
+  qualquer edição de `.env` ou restart -- uma instalação que nunca usa o painel simplesmente nunca
+  salva uma linha em `smtp_sender_configs`, e o fallback `ALERT_SMTP_*` continua funcionando sem
+  qualquer mudança (MAIL-04, critério de aceite 1).
 
 ## CI (PR 8)
 

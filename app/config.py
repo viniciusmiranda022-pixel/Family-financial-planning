@@ -62,22 +62,28 @@ class Settings(BaseSettings):
     alert_email_from: str = ""
     alert_email_use_starttls: bool = True
     alert_email_timeout_seconds: int = 15
-    # MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md, issue #110): a
-    # dedicated Fernet key for encrypting the SMTP App Password at rest
-    # when it is configured through the Settings UI
-    # (`app.models.SmtpSenderConfig`, `app.services.smtp_config`) instead
-    # of only via `ALERT_SMTP_*` env vars above. Deliberately optional
-    # (empty default, no `min_length`) -- unlike `mfa_encryption_key` this
-    # feature is opt-in convenience layered onto an existing deployment,
-    # not mandatory security infrastructure from day one, so an
-    # installation that never sets it keeps starting exactly as before
-    # (MAIL-04 acceptance criterion 1) and simply cannot save/enable the
-    # DB-backed SMTP path -- `app.services.smtp_config` fails explicitly,
-    # never falling back to plaintext, the same discipline as every other
-    # dedicated key here. Same non-reuse rule as the rest of this file:
-    # never SECRET_KEY, FILE_ENCRYPTION_KEY, MFA_ENCRYPTION_KEY, or
-    # WHATSAPP_PHONE_ENCRYPTION_KEY.
-    smtp_encryption_key: str = ""
+    # MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md, issue #110): the
+    # SMTP App Password saved through the Settings UI
+    # (`app.models.SmtpSenderConfig`) is encrypted at rest with a Fernet key
+    # *derived* from `file_encryption_key` above via HKDF-SHA256 with a
+    # fixed domain-separation label (`app.services.smtp_config
+    #._derive_fernet_key`) -- not a new field on `Settings`. Originally
+    # (through 2026-09-21) this was its own optional, dedicated
+    # `smtp_encryption_key` env var; engineering review on the PR for issue
+    # #110 that day found this contradicted MAIL-04 acceptance criterion 1
+    # ("instalação existente ... sem editar .env") by requiring exactly that
+    # env edit before the Settings UI SMTP panel could be used at all.
+    # Deriving from `file_encryption_key` -- already `Field(min_length=40)`,
+    # mandatory for every deployment since before MAIL-04 existed -- removes
+    # that new mandatory secret while keeping the same "own key per
+    # domain, never SECRET_KEY/MFA_ENCRYPTION_KEY/
+    # WHATSAPP_PHONE_ENCRYPTION_KEY, fail explicitly rather than fall back
+    # to plaintext" discipline (HKDF's domain separation, not raw reuse --
+    # see `_derive_fernet_key`'s docstring for why this is not the "never
+    # reuse" rule's `FILE_ENCRYPTION_KEY` case either). One documented
+    # trade-off: rotating `file_encryption_key` now also rotates this
+    # derived key, so any previously saved App Password must be re-entered
+    # after a rotation (`docs/RUNBOOK_MAIL_ALERTS.md`).
     # Process-local throttle for `POST /notification-settings/test-email`
     # ("rate-limited de forma simples para evitar spam acidental" -- Work
     # Order). `scripts/entrypoint.sh` runs a single `uvicorn` process with

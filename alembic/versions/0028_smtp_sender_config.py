@@ -7,9 +7,10 @@ Revises: 0027
 MAIL-04 (`docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md`, issue #110): purely
 additive schema for the single-row, global SMTP sender configuration an
 admin can save from the UI instead of only via `ALERT_SMTP_*` env vars.
-`app_password_encrypted` stores the App Password Fernet-encrypted with the
-dedicated `SMTP_ENCRYPTION_KEY` (`app.services.smtp_config`) -- never
-plaintext, never reusing another domain's key.
+`app_password_encrypted` stores the App Password Fernet-encrypted with a key
+derived from `FILE_ENCRYPTION_KEY` via HKDF with domain separation
+(`app.services.smtp_config._derive_fernet_key`) -- never plaintext, never
+`FILE_ENCRYPTION_KEY` reused directly, never persisted.
 
 Nothing here touches `notification_settings`, `notification_recipients`,
 `notification_deliveries`, `notification_worker_heartbeats`, or any

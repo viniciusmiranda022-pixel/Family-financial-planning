@@ -1454,11 +1454,18 @@ opcional, para a credencial SMTP -- nunca um segundo motor de envio, nunca uma s
   `notification_worker_status._SINGLETON_ID` (a PK, não disciplina de aplicação, impede duas linhas
   concorrentes na primeira gravação).
 - **`app.services.smtp_config`**: dono de duas decisões, e só duas --
-  - criptografia: `Fernet(settings.smtp_encryption_key)`, uma chave dedicada e opcional (`str = ""`,
-    diferente de `mfa_encryption_key`, que é obrigatória desde o primeiro boot) -- uma instalação que
-    nunca a define continua subindo normalmente (critério de aceite 1 do Work Order) e só não consegue
-    habilitar/salvar o remetente pela interface, com erro explícito
-    (`SmtpConfigurationError`), nunca um fallback silencioso para texto plano;
+  - criptografia: `Fernet(_derive_fernet_key(settings))`, uma chave *derivada* de
+    `settings.file_encryption_key` via HKDF-SHA256 com um rótulo de domain separation fixo
+    (`family-finance/smtp-app-password/v1`), nunca `file_encryption_key` reutilizada diretamente nem
+    persistida em lugar algum -- computada a cada chamada. Revisão de engenharia na PR da issue #110
+    (2026-09-21) substituiu o desenho original (`smtp_encryption_key`, uma env var dedicada e opcional)
+    por essa derivação: exigir uma env var nova antes de o painel de SMTP funcionar contradizia o
+    critério de aceite 1 do Work Order ("instalação existente ... sem editar `.env`"), já que
+    `file_encryption_key` é obrigatória (`Field(min_length=40)`) para *qualquer* deployment desde antes
+    do MAIL-04 existir. Trade-off documentado (`docs/RUNBOOK_MAIL_ALERTS.md` §2.3): rotacionar
+    `FILE_ENCRYPTION_KEY` também rotaciona essa chave derivada, e uma App Password salva antes da
+    rotação fica indecifrável -- erro explícito (`SmtpConfigurationError`), nunca um fallback silencioso
+    para texto plano, mesma disciplina de antes;
   - precedência: `resolve_effective_smtp_settings(db)` -- uma linha habilitada e completa (host,
     username, from_email, App Password) vence por inteiro; caso contrário `ALERT_SMTP_*` (MAIL-01)
     vence por inteiro. Nunca um campo do banco combinado com um campo do `.env` na mesma configuração
@@ -1483,14 +1490,22 @@ opcional, para a credencial SMTP -- nunca um segundo motor de envio, nunca uma s
   (`tests/test_notification_worker.py::test_run_once_without_explicit_adapter_uses_db_smtp_config_saved_before_this_pass`).
 - **Auditoria**: `smtp_config.update` grava apenas `app_password_changed` (booleano) em `details`, e
   `before_state`/`after_state` são a mesma projeção sanitizada da API -- nunca a senha, cifrada ou não.
+  `app.api.smtp_config_update` calcula esse booleano comparando o ciphertext bruto
+  (`app_password_encrypted`) antes/depois da chamada a `save_smtp_sender_config` -- nunca
+  `before["app_password_configured"] != after["app_password_configured"]`, que produzia
+  `false` ao *substituir* uma senha já configurada por outra (`true -> true` no booleano
+  "configurado", sem capturar a troca -- revisão de engenharia na PR da issue #110, 2026-09-21). O
+  ciphertext em si nunca entra em `details`/`before_state`/`after_state`, só é comparado por
+  igualdade dentro do handler.
 - **UI**: painel "Remetente SMTP" em Configurações (`#smtp-config-settings`,
   `app/templates/index.html`), oculto inteiramente para não-admin (`app/static/app.js:showApp`) --
   proteção de UX, a fronteira real é `_require_admin` na API. O campo de senha sempre inicia vazio; o
   placeholder indica se já existe uma senha salva, nunca a senha em si.
-- **Compatibilidade**: uma instalação existente que nunca configura `SMTP_ENCRYPTION_KEY` nem usa este
-  painel continua funcionando exatamente como antes do MAIL-04 -- `resolve_effective_smtp_settings`
-  não encontra linha usável em `smtp_sender_configs` e cai para `ALERT_SMTP_*` por inteiro, o mesmo
-  caminho que já existia.
+- **Compatibilidade**: uma instalação existente continua funcionando exatamente como antes do MAIL-04
+  sem qualquer ação -- `file_encryption_key` já é obrigatória para subir o `app`, então a chave
+  derivada para o painel de SMTP está disponível desde o primeiro boot; uma instalação que nunca usa o
+  painel simplesmente nunca salva uma linha em `smtp_sender_configs`, `resolve_effective_smtp_settings`
+  não encontra linha usável e cai para `ALERT_SMTP_*` por inteiro, o mesmo caminho que já existia.
 
 ## Valorização diária do Privilège DI via CVM (issue #85)
 

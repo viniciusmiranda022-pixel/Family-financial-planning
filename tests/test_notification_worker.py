@@ -24,7 +24,6 @@ os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-notification-worker-{
 os.environ.setdefault("SECRET_KEY", "notification-worker-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
-os.environ.setdefault("SMTP_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.cli.notification_worker import run_once  # noqa: E402
 from app.db import Base  # noqa: E402

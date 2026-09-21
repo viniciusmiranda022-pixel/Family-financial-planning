@@ -12540,7 +12540,19 @@ def smtp_config_update(
     db: Session = Depends(get_db),
 ) -> dict:
     _require_admin(user)
-    before = serialize_smtp_sender_config(get_smtp_sender_config(db))
+    existing = get_smtp_sender_config(db)
+    before = serialize_smtp_sender_config(existing)
+    # Snapshot the raw ciphertext (never logged/audited itself, just compared)
+    # *before* calling save -- `existing` and the row `save_smtp_sender_config`
+    # returns are the same SQLAlchemy-identity-mapped object for this `db`
+    # session, mutated in place, so this has to be read into a local `str`
+    # (immutable, unaffected by that later mutation) now, not derived from
+    # `before`/`after` afterwards. `before["app_password_configured"]` is a
+    # boolean and cannot distinguish "kept the same secret" from "replaced it
+    # with a different one" -- see engineering review on the PR for issue #110
+    # (2026-09-21) and `tests/test_smtp_config_api.py
+    # ::test_replacing_an_existing_app_password_audits_changed_true`.
+    before_app_password_ciphertext = existing.app_password_encrypted if existing is not None else None
     try:
         row = save_smtp_sender_config(
             db,
@@ -12568,7 +12580,7 @@ def smtp_config_update(
         "smtp_config.update",
         "smtp_sender_config",
         row.id,
-        {"app_password_changed": before["app_password_configured"] != after["app_password_configured"]},
+        {"app_password_changed": row.app_password_encrypted != before_app_password_ciphertext},
         before_state=before,
         after_state=after,
         source="smtp_config",

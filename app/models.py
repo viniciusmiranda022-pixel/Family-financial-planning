@@ -1880,10 +1880,11 @@ class SmtpSenderConfig(Base, TimestampMixin):
     household admin, a decision recorded as a residual risk in the MAIL-04
     PR rather than invented here.
 
-    `app_password_encrypted` is the App Password Fernet-encrypted with
-    `settings.smtp_encryption_key` (`app.services.smtp_config`) -- never
-    plaintext, never `SECRET_KEY`/`FILE_ENCRYPTION_KEY`/
-    `MFA_ENCRYPTION_KEY`/`WHATSAPP_PHONE_ENCRYPTION_KEY`. `NULL` means "no
+    `app_password_encrypted` is the App Password Fernet-encrypted with a key
+    derived from `settings.file_encryption_key` via HKDF
+    (`app.services.smtp_config._derive_fernet_key`) -- never plaintext,
+    never `file_encryption_key`/`SECRET_KEY`/`MFA_ENCRYPTION_KEY`/
+    `WHATSAPP_PHONE_ENCRYPTION_KEY` reused directly. `NULL` means "no
     App Password saved yet", not "empty password" -- `app.services
     .smtp_config.save_smtp_sender_config` only ever overwrites it on an
     explicit non-empty value or an explicit removal request, so a caller

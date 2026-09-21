@@ -4,10 +4,16 @@
 Owns two things, and nothing else:
 
 1. Encrypting/decrypting the App Password at rest with a Fernet key
-   exclusive to this module (`settings.smtp_encryption_key`) -- never
-   `SECRET_KEY`, `FILE_ENCRYPTION_KEY`, `MFA_ENCRYPTION_KEY`, or
-   `WHATSAPP_PHONE_ENCRYPTION_KEY`. Same "fail explicitly, never fall back
-   to plaintext" discipline as `app.services.mfa`.
+   derived from `settings.file_encryption_key` via HKDF-SHA256 with a
+   fixed, version-tagged domain-separation label (`_KEY_DERIVATION_INFO`)
+   -- never `file_encryption_key` itself, `SECRET_KEY`, `MFA_ENCRYPTION_KEY`,
+   or `WHATSAPP_PHONE_ENCRYPTION_KEY` directly (see `_derive_fernet_key`
+   for why this satisfies the "no key reuse" discipline the other three
+   keys follow, without requiring a *new* mandatory operator secret --
+   `file_encryption_key` is already required for every deployment since
+   before MAIL-04 existed, engineering review on PR for issue #110,
+   2026-09-21). Same "fail explicitly, never fall back to plaintext"
+   discipline as `app.services.mfa`.
 2. Resolving the *effective* SMTP configuration -- an enabled, complete
    `SmtpSenderConfig` row in the DB, or otherwise the `ALERT_SMTP_*` env
    vars on `app.config.Settings` -- as the single place that decision is
@@ -23,14 +29,25 @@ send engine this module feeds a resolved config into).
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.models import SmtpSenderConfig, User
+
+# HKDF "info" context -- RFC 5869 domain separation, not a secret. Versioned
+# (`v1`) so a future, deliberately *different* derived key (e.g. a second
+# secret encrypted the same way) never collides with this one even if it
+# also derives from `file_encryption_key`. Never change this string for an
+# existing deployment: doing so silently rotates the derived key exactly
+# like rotating `FILE_ENCRYPTION_KEY` itself would (see `_derive_fernet_key`).
+_KEY_DERIVATION_INFO = b"family-finance/smtp-app-password/v1"
 
 # Fixed primary key, not `app.models.new_id()`: exactly one row must ever
 # exist, the same "primary key itself is the concurrency barrier" idiom
@@ -40,8 +57,15 @@ _SINGLETON_ID = "smtp_sender_config"
 
 
 class SmtpConfigurationError(RuntimeError):
-    """Raised when `SMTP_ENCRYPTION_KEY` is missing/invalid while
-    encrypting or decrypting a DB-stored App Password.
+    """Raised when a DB-stored App Password cannot be encrypted/decrypted
+    with the key derived from the current `FILE_ENCRYPTION_KEY` -- in
+    practice this means `FILE_ENCRYPTION_KEY` was rotated after the App
+    Password was saved (the derived Fernet key changed along with it, by
+    design -- see `_derive_fernet_key`). Recovery: an admin re-saves the
+    SMTP config with a fresh App Password through Configurações; there is
+    no way to recover the old ciphertext, the same "fail explicitly, never
+    guess" trade-off `app.services.mfa` makes for `MFA_ENCRYPTION_KEY`
+    rotation.
 
     Never caught to fall back to plaintext storage or to silently drop
     back to the env config from inside the crypto layer -- a caller that
@@ -49,6 +73,43 @@ class SmtpConfigurationError(RuntimeError):
     that decision explicitly in `resolve_effective_smtp_settings`, not by
     swallowing this exception.
     """
+
+
+def _derive_fernet_key(settings: Settings) -> bytes:
+    """HKDF-SHA256 (RFC 5869) derives a 32-byte key from
+    `settings.file_encryption_key`, base64-urlsafe-encoded into Fernet's
+    expected key format. Computed fresh on every call -- never cached,
+    never persisted anywhere (engineering review on PR for issue #110,
+    2026-09-21: "sem persistir a chave derivada no banco") -- the
+    derivation is cheap and `file_encryption_key` can change between
+    calls in tests.
+
+    Why this is not "reusing `FILE_ENCRYPTION_KEY`" in the sense the
+    original Work Order's "never SECRET_KEY/FILE_ENCRYPTION_KEY/
+    MFA_ENCRYPTION_KEY" rule forbids: HKDF with a fixed, distinct `info`
+    label is a one-way, domain-separated derivation, not key sharing --
+    the output is computationally independent of any *other* value ever
+    derived from the same input with a different `info` (and does not
+    itself reveal `file_encryption_key`). A reader who does not already
+    have `FILE_ENCRYPTION_KEY` gains nothing from an SMTP ciphertext or
+    this derived key. This still requires zero *new* mandatory operator
+    secret -- `file_encryption_key` is `Field(min_length=40)` on
+    `Settings`, required for every deployment since before MAIL-04 existed
+    -- which is what makes the Settings UI SMTP panel usable on an
+    existing installation without an env edit or restart (MAIL-04
+    acceptance criterion 1).
+
+    Rotation caveat, documented in `docs/RUNBOOK_MAIL_ALERTS.md`: because
+    this key is *derived* from `FILE_ENCRYPTION_KEY` rather than stored
+    independently, rotating `FILE_ENCRYPTION_KEY` also rotates this key,
+    and any previously saved `app_password_encrypted` becomes
+    undecryptable (`SmtpConfigurationError`, never a silent plaintext
+    fallback) until an admin re-saves the SMTP config.
+    """
+
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=_KEY_DERIVATION_INFO)
+    derived = hkdf.derive(settings.file_encryption_key.encode())
+    return base64.urlsafe_b64encode(derived)
 
 
 class SmtpSenderConfigValidationError(ValueError):
@@ -61,16 +122,12 @@ class SmtpSenderConfigValidationError(ValueError):
 
 def _cipher(settings: Settings | None = None) -> Fernet:
     settings = settings or get_settings()
-    key = settings.smtp_encryption_key
-    if not key:
-        raise SmtpConfigurationError(
-            "SMTP_ENCRYPTION_KEY não configurada neste ambiente -- defina-a em .env para "
-            "usar a configuração de SMTP pela interface"
-        )
     try:
-        return Fernet(key.encode())
+        return Fernet(_derive_fernet_key(settings))
     except (ValueError, TypeError) as exc:
-        raise SmtpConfigurationError("SMTP_ENCRYPTION_KEY inválida") from exc
+        raise SmtpConfigurationError(
+            "Não foi possível derivar a chave de criptografia do remetente SMTP a partir de FILE_ENCRYPTION_KEY"
+        ) from exc
 
 
 def encrypt_app_password(app_password: str, *, settings: Settings | None = None) -> str:
@@ -82,11 +139,12 @@ def decrypt_app_password(token: str, *, settings: Settings | None = None) -> str
         return _cipher(settings).decrypt(token.encode()).decode()
     except InvalidToken as exc:
         # Never happens from a normal application flow -- `app_password_encrypted`
-        # is always written by `encrypt_app_password` in the same process
-        # family sharing the same key. Distinct error (same idiom as
-        # `app.services.mfa.decrypt_secret`) so a `SMTP_ENCRYPTION_KEY`
-        # rotation-without-migration mistake is obvious in logs instead of
-        # masquerading as an unrelated SMTP auth failure.
+        # is always written by `encrypt_app_password` using the key derived
+        # from the same `file_encryption_key`. Distinct error (same idiom as
+        # `app.services.mfa.decrypt_secret`) so a `FILE_ENCRYPTION_KEY`
+        # rotation-without-re-save mistake (see `_derive_fernet_key`) is
+        # obvious in logs instead of masquerading as an unrelated SMTP auth
+        # failure.
         raise SmtpConfigurationError("Não foi possível descriptografar a senha SMTP salva") from exc
 
 
