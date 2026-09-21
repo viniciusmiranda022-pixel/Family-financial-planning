@@ -247,4 +247,24 @@ jobs:
           cache: pip
       - run: pip install -e '.[dev]'
       - name: Backfill and initial-load idempotency/non-mutation against real PostgreSQL locking
-        run: pytest -q tests/test_postgresql_integration.py -k "not (upgrade or downgrade)"
+        run: |
+          set +e
+          pytest -q tests/test_postgresql_integration.py -k "not (upgrade or downgrade)" 2>&1 | tee /tmp/pytest_out.txt
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            python3 - <<'PYEOF'
+with open('/tmp/pytest_out.txt') as f:
+    lines = f.read().splitlines()
+emitted = 0
+for line in lines:
+    stripped = line.strip()
+    if (line.startswith('FAILED') or line.startswith('ERROR') or stripped.startswith('E ')
+            or 'Error' in line and stripped.startswith(('assert', 'raise'))):
+        safe = line.replace('%', '%25').replace('\r', '').replace('\n', '%0A')[:500]
+        print(f"::error::{safe}")
+        emitted += 1
+        if emitted >= 60:
+            break
+PYEOF
+          fi
+          exit "$status"
