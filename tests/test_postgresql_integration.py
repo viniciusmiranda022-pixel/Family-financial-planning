@@ -2105,7 +2105,9 @@ def test_whatsapp_webhook_concurrent_undo_from_two_messages_reverses_exactly_onc
         get_settings.cache_clear()
 
 
-def test_whatsapp_media_concurrent_capture_never_lets_two_drafts_share_the_pending_pointer(monkeypatch) -> None:
+def test_whatsapp_media_concurrent_capture_never_lets_two_drafts_share_the_pending_pointer(
+    tmp_path, monkeypatch
+) -> None:
     """WA-07 (`docs/WORK_ORDER_WA_07.md`, issue #79), engineering review
     finding on PR #109 (2026-09-21): `authorized.pending_capture_id` used to
     be a plain unconditional assignment in `_run_media_reply`, so a second
@@ -2140,6 +2142,14 @@ def test_whatsapp_media_concurrent_capture_never_lets_two_drafts_share_the_pendi
     from app.whatsapp_gateway_app import _process_one_message
 
     command.upgrade(_alembic_config(), "head")
+    # `_run_media_reply` -> `EncryptedDocumentStore` writes the fetched media
+    # to `settings.documents_dir` (default `/data/documents`, the production
+    # container's mounted volume) -- not writable by the unprivileged CI
+    # runner user, unlike this sandbox's own root user. Same fix
+    # `test_initial_load_documents_are_idempotent_and_resumable_on_real_postgresql`
+    # above already uses for the same reason.
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    get_settings.cache_clear()
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     try:
         sender_digits = "5511955554444"
