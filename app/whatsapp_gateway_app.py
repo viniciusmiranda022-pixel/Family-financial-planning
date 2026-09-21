@@ -67,6 +67,7 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -449,6 +450,8 @@ def _format_capture_preview(capture) -> str:
     (which can hold a document's entire OCR/transcription output, or a
     bank/card statement's full line-by-line detail)."""
 
+    from app.services.notification_templates import format_brl
+
     try:
         items = json.loads(capture.proposal_json or "[]")
     except (TypeError, ValueError):
@@ -460,16 +463,16 @@ def _format_capture_preview(capture) -> str:
         kind = item.get("kind")
         description = str(item.get("description") or "")[:120]
         try:
-            amount = float(item.get("amount", 0))
-        except (TypeError, ValueError):
-            amount = 0.0
+            amount_text = format_brl(Decimal(str(item.get("amount", 0))))
+        except (TypeError, ValueError, ArithmeticError):
+            amount_text = "R$ 0,00"
         if kind == "transaction":
             label = _MOVEMENT_LABELS_PT.get(item.get("movement_type"), "lançamento")
-            lines.append(f"- {label}: R$ {amount:.2f} em {item.get('booked_at')} - {description}")
+            lines.append(f"- {label}: {amount_text} em {item.get('booked_at')} - {description}")
         elif kind == "obligation":
-            lines.append(f"- boleto/obrigação: R$ {amount:.2f}, vence {item.get('due_date')} - {description}")
+            lines.append(f"- boleto/obrigação: {amount_text}, vence {item.get('due_date')} - {description}")
         else:
-            lines.append(f"- holerite: R$ {amount:.2f}, competência {item.get('competence')} - {description}")
+            lines.append(f"- holerite: {amount_text}, competência {item.get('competence')} - {description}")
     suffix = "\n(e mais itens; confira todos no site antes de confirmar)" if len(items) > 5 else ""
     return (
         "Recebi o arquivo e entendi isto:\n"
