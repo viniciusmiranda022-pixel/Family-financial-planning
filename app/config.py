@@ -43,11 +43,17 @@ class Settings(BaseSettings):
     capture_job_max_attempts: int = 3
     capture_job_stale_after_seconds: int = 600
     # MAIL-01 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #68): the
-    # Gmail/SMTP sender credential lives exclusively here (env), never in
-    # the DB or a request/response -- `NotificationSettings`/
-    # `NotificationRecipient` (MAIL-00) have no column for it. `enabled`
-    # defaults `False` so a deployment that never set these vars stays
-    # silent instead of trying to send with an empty host/password.
+    # deployment-wide SMTP sender fallback, read directly from env. Until
+    # MAIL-04 this was the *only* source `SmtpEmailAdapter` ever read;
+    # since MAIL-04 (`app.services.smtp_config.resolve_effective_smtp_settings`)
+    # an enabled, complete `SmtpSenderConfig` row in the DB takes
+    # precedence over these values -- they remain the fallback for an
+    # installation that never configures SMTP through the Settings UI, and
+    # are never merged field-by-field with a DB row (one full source or the
+    # other, never a hybrid credential). `enabled` defaults `False` so a
+    # deployment that never set these vars, and never saved a DB config
+    # either, stays silent instead of trying to send with an empty
+    # host/password.
     alert_email_enabled: bool = False
     alert_smtp_host: str = ""
     alert_smtp_port: int = 587
@@ -56,6 +62,22 @@ class Settings(BaseSettings):
     alert_email_from: str = ""
     alert_email_use_starttls: bool = True
     alert_email_timeout_seconds: int = 15
+    # MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md, issue #110): a
+    # dedicated Fernet key for encrypting the SMTP App Password at rest
+    # when it is configured through the Settings UI
+    # (`app.models.SmtpSenderConfig`, `app.services.smtp_config`) instead
+    # of only via `ALERT_SMTP_*` env vars above. Deliberately optional
+    # (empty default, no `min_length`) -- unlike `mfa_encryption_key` this
+    # feature is opt-in convenience layered onto an existing deployment,
+    # not mandatory security infrastructure from day one, so an
+    # installation that never sets it keeps starting exactly as before
+    # (MAIL-04 acceptance criterion 1) and simply cannot save/enable the
+    # DB-backed SMTP path -- `app.services.smtp_config` fails explicitly,
+    # never falling back to plaintext, the same discipline as every other
+    # dedicated key here. Same non-reuse rule as the rest of this file:
+    # never SECRET_KEY, FILE_ENCRYPTION_KEY, MFA_ENCRYPTION_KEY, or
+    # WHATSAPP_PHONE_ENCRYPTION_KEY.
+    smtp_encryption_key: str = ""
     # Process-local throttle for `POST /notification-settings/test-email`
     # ("rate-limited de forma simples para evitar spam acidental" -- Work
     # Order). `scripts/entrypoint.sh` runs a single `uvicorn` process with
