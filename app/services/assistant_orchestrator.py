@@ -304,16 +304,32 @@ def _format_simulate_purchase(facts: dict[str, Any]) -> str:
     )
     baseline_note = "abaixo" if facts.get("baseline_crosses_safety_floor") else "acima"
     with_note = "abaixo" if facts.get("with_purchase_crosses_safety_floor") else "acima"
+    projection_end_month = facts.get("projection_end_month")
+    horizon_note = (
+        f" (parcelas continuam depois de {projection_end_month}, fora do horizonte configurado -- "
+        "o saldo mínimo abaixo só considera até lá)"
+        if facts.get("schedule_extends_beyond_horizon")
+        else ""
+    )
+    trust_note = (
+        ""
+        if facts.get("trusted_for_projection")
+        else (
+            " Atenção: esta projeção ainda não tem um saldo confirmado/validador íntegro para o período "
+            "-- trate os números abaixo como referência, não como fato consolidado."
+        )
+    )
     return (
         f"Simulação (HIPÓTESE -- nada foi lançado): uma compra de {_format_money(amount)} {payment_note} "
         f"totalizaria {_format_money(facts.get('total_cost'))}. "
         f"Neste mês ({facts.get('current_period')}) você já gastou {_format_money(facts.get('spending_so_far'))} "
         f"de um teto de {_format_money(facts.get('cash_cap'))}, com {_format_money(facts.get('remaining_cap'))} "
         "restantes -- sem considerar esta compra hipotética, já que o mês atual já está fechado no snapshot. "
-        f"Na projeção a partir de {facts.get('projection_start_month')} (cenário conservador com atraso): sem "
-        f"a compra, o saldo mínimo projetado seria {_format_money(facts.get('baseline_minimum_balance'))} "
-        f"({baseline_note} do piso de segurança de {_format_money(facts.get('emergency_floor'))}); com a compra, "
-        f"seria {_format_money(facts.get('with_purchase_minimum_balance'))} ({with_note} do piso)."
+        f"Na projeção de {facts.get('projection_start_month')} a {projection_end_month} (cenário conservador "
+        f"com atraso){horizon_note}: sem a compra, o saldo mínimo projetado seria "
+        f"{_format_money(facts.get('baseline_minimum_balance'))} ({baseline_note} do piso de segurança de "
+        f"{_format_money(facts.get('emergency_floor'))}); com a compra, seria "
+        f"{_format_money(facts.get('with_purchase_minimum_balance'))} ({with_note} do piso).{trust_note}"
     )
 
 

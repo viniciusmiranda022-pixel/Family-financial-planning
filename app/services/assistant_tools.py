@@ -481,8 +481,28 @@ def _tool_simulate_purchase(db: Session, *, user: Any, arguments: dict[str, str]
 
     start_month = add_months(today.replace(day=1), 1)
     end_month = profile.projection_end or date(today.year + 1, 12, 1)
+    if end_month < start_month:
+        # Mirrors `compare_purchase_scenarios`'s own `purchase_month > end`
+        # guard (HTTP 422): a household profile whose configured horizon has
+        # already aged out must never silently run a start>end projection --
+        # `_build_projection_gate_checks` returns zero rows for that range,
+        # and `_scenario_projection_summary`'s `[Decimal("0")] `fallback
+        # then reads as a clean, safe R$ 0,00 projection instead of the
+        # missing/stale configuration it actually is.
+        return ToolOutcome(
+            ok=True,
+            clarifying_question=(
+                "O horizonte de projeção configurado para a família "
+                f"({month_key(end_month)}) já passou do próximo mês "
+                f"({month_key(start_month)}), então não consigo simular essa compra com segurança. "
+                "Peça para alguém com acesso a Configurações atualizar o horizonte de projeção antes."
+            ),
+        )
     schedule, monthly_payment, total_cost = _purchase_scenario_candidate_schedule(
         alternative, purchase_month=start_month
+    )
+    schedule_extends_beyond_horizon = any(
+        datetime.strptime(key, "%Y-%m").date() > end_month for key in schedule
     )
 
     common_kwargs = dict(
@@ -502,6 +522,9 @@ def _tool_simulate_purchase(db: Session, *, user: Any, arguments: dict[str, str]
     )
     baseline_delayed = baseline["scenarios"]["delayed"]
     with_purchase_delayed = with_purchase["scenarios"]["delayed"]
+    trusted_for_projection = bool(
+        baseline["trusted_for_projection"] and with_purchase["trusted_for_projection"]
+    )
 
     return ToolOutcome(
         ok=True,
@@ -517,7 +540,9 @@ def _tool_simulate_purchase(db: Session, *, user: Any, arguments: dict[str, str]
             "remaining_cap": money(publication["remaining_cap"]),
             "projection_start_month": month_key(start_month),
             "projection_end_month": month_key(end_month),
+            "schedule_extends_beyond_horizon": schedule_extends_beyond_horizon,
             "emergency_floor": money(profile.emergency_floor),
+            "trusted_for_projection": trusted_for_projection,
             "baseline_minimum_balance": baseline_delayed["minimum_balance"],
             "baseline_crosses_safety_floor": baseline_delayed["crosses_safety_floor"],
             "with_purchase_minimum_balance": with_purchase_delayed["minimum_balance"],

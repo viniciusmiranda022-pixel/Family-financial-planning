@@ -534,3 +534,148 @@ def test_simulate_purchase_step_is_remembered_as_a_context_hint_for_the_next_tur
     assert second_client.captured_payload["context_hints"] == [
         {"tool": "simulate_purchase", "arguments": {"amount_text": "300"}}
     ]
+
+
+# ---------------------------------------------------------------------------
+# 12. Regression -- Brazilian dot-only thousands ("1.500") is never misread
+#     as a decimal ("1.50") by the shared `parse_amount_text` this tool
+#     reuses. Codex review finding on this PR (assistant_tools.py:444).
+# ---------------------------------------------------------------------------
+
+
+def test_dot_only_brazilian_thousands_amount_is_never_misread_as_a_decimal() -> None:
+    session_factory = _session_factory()
+    household_id = _seed_household(session_factory, username="wa06-dot-thousands")
+    outcome = _run(session_factory, household_id=household_id, arguments={"amount_text": "1.500"})
+    assert outcome.ok is True
+    assert outcome.clarifying_question is None
+    assert outcome.facts["amount"] == Decimal("1500.00")
+
+
+# ---------------------------------------------------------------------------
+# 13. Regression -- a household profile whose configured projection horizon
+#     has already elapsed relative to next month must ask instead of
+#     silently running a start>end projection (zero rows read as a clean
+#     R$ 0,00 baseline). Codex review finding on this PR
+#     (assistant_tools.py:483).
+# ---------------------------------------------------------------------------
+
+
+def test_elapsed_projection_horizon_asks_instead_of_silently_showing_zero() -> None:
+    session_factory = _session_factory()
+    household_id = _seed_household(
+        session_factory,
+        username="wa06-elapsed-horizon",
+        # TODAY is 2026-09-17 -> start_month is 2026-10-01; a horizon that
+        # already ended in September is stale before the simulation even
+        # starts.
+        projection_end=date(2026, 9, 1),
+    )
+    outcome = _run(session_factory, household_id=household_id, arguments={"amount_text": "300"})
+    assert outcome.ok is True
+    assert outcome.facts == {}
+    assert outcome.clarifying_question
+    assert "horizonte" in outcome.clarifying_question.lower()
+    assert "2026-10" in outcome.clarifying_question
+
+
+# ---------------------------------------------------------------------------
+# 14. Regression -- `trusted_for_projection` (balance-evidence sovereignty,
+#     the same fail-closed flag `POST /purchases/scenario-comparison`
+#     already reports) must reach both `facts` and the rendered answer,
+#     never be computed and discarded. Codex review finding on this PR
+#     (assistant_tools.py:525).
+# ---------------------------------------------------------------------------
+
+
+def test_untrusted_balance_evidence_is_surfaced_in_facts_and_answer() -> None:
+    """`_seed_household` never confirms an `AccountBalanceObservation` --
+    the natural, real-world case for a freshly onboarded household -- so
+    `balance_evidence_trusted` is False and the projection must say so."""
+
+    session_factory = _session_factory()
+    household_id = _seed_household(session_factory, username="wa06-untrusted-evidence")
+    outcome = _run(session_factory, household_id=household_id, arguments={"amount_text": "300"})
+    assert outcome.facts["trusted_for_projection"] is False
+    text = _format_step("simulate_purchase", outcome.facts)
+    assert "saldo confirmado" in text.lower()
+
+
+def test_trusted_for_projection_is_the_and_of_baseline_and_with_purchase(monkeypatch) -> None:
+    """`trusted_for_projection` in `facts` must be the AND of the baseline's
+    and the with-purchase scenario's own flags -- each independently
+    computed and already covered end-to-end by `test_purchase_scenario_
+    comparison.py`'s fail-closed trust-gate tests (`_run_purchase_projection_
+    scenario` is not reimplemented here). This pins only that
+    `_tool_simulate_purchase` propagates that combination instead of
+    discarding it, without needing to satisfy every unrelated invariant
+    (e.g. INV-022 lineage) a fully "both trusted" household fixture would
+    otherwise require."""
+
+    import app.api as api_module
+
+    session_factory = _session_factory()
+    household_id = _seed_household(session_factory, username="wa06-trust-combinator")
+
+    original = api_module._run_purchase_projection_scenario
+    seen_suffixes = []
+
+    def fake_run(db, *, extra_installments, entity_suffix, **kwargs):
+        result = dict(
+            original(db, extra_installments=extra_installments, entity_suffix=entity_suffix, **kwargs)
+        )
+        seen_suffixes.append(entity_suffix)
+        result["trusted_for_projection"] = True
+        return result
+
+    monkeypatch.setattr(api_module, "_run_purchase_projection_scenario", fake_run)
+    outcome = _run(session_factory, household_id=household_id, arguments={"amount_text": "300"})
+    assert seen_suffixes == ["assistant_simulate_baseline", "assistant_simulate_purchase"]
+    assert outcome.facts["trusted_for_projection"] is True
+    text = _format_step("simulate_purchase", outcome.facts)
+    assert "saldo confirmado" not in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# 15. Regression -- when the candidate installment schedule extends beyond
+#     the household's configured projection horizon, the answer must
+#     disclose the horizon end and that later installments were not
+#     assessed, never imply the full purchase was evaluated. Codex review
+#     finding on this PR (assistant_orchestrator.py:316).
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_extending_beyond_the_horizon_is_disclosed_in_facts_and_answer() -> None:
+    session_factory = _session_factory()
+    household_id = _seed_household(
+        session_factory,
+        username="wa06-beyond-horizon",
+        # start_month is 2026-10-01; a 2-month-out horizon (2026-11) is far
+        # shorter than a 24-installment purchase starting the same month.
+        projection_end=date(2026, 11, 1),
+    )
+    outcome = _run(
+        session_factory,
+        household_id=household_id,
+        arguments={"amount_text": "2400", "installments_text": "24"},
+    )
+    assert outcome.ok is True
+    facts = outcome.facts
+    assert facts["schedule_extends_beyond_horizon"] is True
+    assert facts["projection_end_month"] == "2026-11"
+    text = _format_step("simulate_purchase", facts)
+    assert "2026-11" in text
+    assert "fora do horizonte" in text.lower()
+
+
+def test_schedule_within_the_horizon_is_not_flagged() -> None:
+    session_factory = _session_factory()
+    household_id = _seed_household(session_factory, username="wa06-within-horizon")
+    outcome = _run(
+        session_factory,
+        household_id=household_id,
+        arguments={"amount_text": "300", "installments_text": "3"},
+    )
+    assert outcome.facts["schedule_extends_beyond_horizon"] is False
+    text = _format_step("simulate_purchase", outcome.facts)
+    assert "fora do horizonte" not in text.lower()
