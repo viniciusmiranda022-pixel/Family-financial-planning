@@ -24,6 +24,7 @@ os.environ.setdefault("DATABASE_URL", f"sqlite:////tmp/ffp-notification-worker-{
 os.environ.setdefault("SECRET_KEY", "notification-worker-test-secret-that-is-long-enough")
 os.environ.setdefault("FILE_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("SMTP_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.cli.notification_worker import run_once  # noqa: E402
 from app.db import Base  # noqa: E402
@@ -34,11 +35,14 @@ from app.models import (  # noqa: E402
     NotificationRecipient,
     NotificationSettings,
     Obligation,
+    SmtpSenderConfig,
     Transaction,
+    User,
 )
 from app.services import notification_scheduler as scheduler  # noqa: E402
 from app.services import notification_worker_status as worker_status  # noqa: E402
-from app.services.email_delivery import EmailDeliveryResult  # noqa: E402
+from app.services import smtp_config as smtp_config_service  # noqa: E402
+from app.services.email_delivery import EmailDeliveryResult, SmtpEmailAdapter  # noqa: E402
 
 TZ = "America/Sao_Paulo"
 
@@ -431,3 +435,65 @@ def test_worker_error_code_from_a_failed_send_surfaces_on_the_heartbeat() -> Non
         assert heartbeat is not None
         assert heartbeat["last_run_ok"] is True
         assert heartbeat["last_error_code"] == "smtp_auth_failed"
+
+
+def test_run_once_without_explicit_adapter_uses_db_smtp_config_saved_before_this_pass(monkeypatch) -> None:
+    """MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md, issue #110): a
+    config saved through the Settings UI must take effect on the very
+    next `run_once()` pass with no process restart -- this test never
+    restarts anything between the save and the pass, only commits a new
+    `SmtpSenderConfig` row, matching what `PUT /smtp-config` does.
+    """
+
+    SessionFactory = _session_factory()
+    today = date(2026, 3, 10)
+    with SessionFactory() as db:
+        household = _household(db)
+        _settings(db, household.id)
+        _recipient(db, household.id)
+        _obligation(db, household.id, due_date=today)
+        user = User(
+            household_id=household.id,
+            name="Admin",
+            username="admin-live-reload",
+            password_hash="x",
+            is_admin=True,
+        )
+        db.add(user)
+        db.flush()
+        smtp_config_service.save_smtp_sender_config(
+            db,
+            user=user,
+            update=smtp_config_service.SmtpSenderConfigUpdate(
+                enabled=True,
+                host="db-configured-host.example.com",
+                port=2525,
+                username="remetente@example.com",
+                from_email="remetente@example.com",
+                use_starttls=True,
+                timeout_seconds=15,
+                app_password="a-live-reloaded-app-password",
+            ),
+        )
+        db.commit()
+
+    captured: dict[str, str] = {}
+
+    def _fake_send(self, message):
+        captured["host"] = self.settings.alert_smtp_host
+        captured["password"] = self.settings.alert_smtp_app_password
+        return EmailDeliveryResult(ok=True, message_id="<live-reload@test>")
+
+    monkeypatch.setattr(SmtpEmailAdapter, "send", _fake_send)
+
+    # `adapter=None` (the default) is the production path -- exercises
+    # `resolve_effective_smtp_settings` exactly like a real deployment,
+    # never the fake adapter the other tests in this file inject.
+    counts = run_once(session_factory=SessionFactory, adapter=None, now_utc=_utc_at(today, 9, 0))
+
+    assert counts["sent"] == 1
+    assert captured["host"] == "db-configured-host.example.com"
+    assert captured["password"] == "a-live-reloaded-app-password"
+
+    with SessionFactory() as db:
+        assert db.query(SmtpSenderConfig).count() == 1
