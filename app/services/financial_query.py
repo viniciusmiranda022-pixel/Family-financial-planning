@@ -8,7 +8,7 @@ total it produces is either (a) plain decimal addition of numbers
 `app.services.financial_snapshots.build_snapshot` already computed and
 `GET /dashboard`/`GET /reports` already publish for a given month
 (`report_month_monetary_publication`, `category_spending_rows`,
-`account_cash_flow_rows` -- exactly the rebaseline's "snapshot canônico"),
+`expense_detail_rows` -- exactly the rebaseline's "snapshot canônico"),
 or (b) a metric (average/count/min/max/share/variation) applied on top of
 those already-canonical per-group amounts. There is no second
 classification of a raw `Transaction` here -- reusing the existing engine,
@@ -16,6 +16,19 @@ never re-deriving what counts as income/expense/transfer/investment, is the
 Work Order's explicit financial invariant (`docs/WORK_ORDER_WA_04.md`
 "Reuse existing canonical classification ... do not create a second
 financial engine").
+
+Every grouping dimension `dimension_rows` exposes (`categoria`/`conta`/
+`cartao`/`mes`/`titular`) is built from `expense_detail_rows` -- the
+canonical per-(category, account, titular) *operating-expense* rows
+`app.services.financial_snapshots._collect` already computes (see that
+module's `expense_detail` accumulator). A card invoice payment, an internal
+transfer and an investment contribution/redemption are never added to
+`expense_detail` there in the first place (PR #107 review round 3), so none
+of them can ever surface as "gasto" here no matter which dimension is asked
+for -- unlike `account_cash_flow_rows`'s per-account `cash_out`, which is
+deliberately the account's *physical bank outflow* (it must include a card
+invoice payment debit for "quanto saiu desta conta?", §16/§17 of the
+rebaseline) and is therefore the wrong source for an *expense* dimension.
 
 Every filter is a free-text hint matched case/accent-insensitively against
 real household labels (comma-separated for multiple values), the same
@@ -38,7 +51,6 @@ from sqlalchemy.orm import Session
 
 from app.services.finance import add_months, money, month_key
 from app.services.financial_snapshots import (
-    account_cash_flow_rows,
     build_snapshot,
     category_spending_rows,
     expense_detail_rows,
@@ -300,9 +312,13 @@ def collect_range_totals(
     Each individual month's figures are exactly what `GET /dashboard`/
     `GET /reports` already publish for that month
     (`report_month_monetary_publication`, `category_spending_rows`,
-    `account_cash_flow_rows`); this function only adds them across months
+    `expense_detail_rows`); this function only adds them across months
     -- plain decimal addition, never a second classification of a raw
-    transaction."""
+    transaction. `account_rows` (PR #107 review round 3) is built from
+    `expense_detail_rows`, not `account_cash_flow_rows` -- see this
+    module's own docstring for why: an account's cash flow legitimately
+    includes its card invoice payment debit, but that debit must never
+    surface as this module's "gasto por conta"."""
 
     income = Decimal("0")
     expenses = Decimal("0")
@@ -326,14 +342,14 @@ def collect_range_totals(
             category_rows[label] = category_rows.get(label, Decimal("0")) + money(
                 Decimal(str(row.get("amount", 0)))
             )
-        for row in account_cash_flow_rows(snapshot):
-            label = str(row.get("account") or "Sem conta identificada")
-            bucket = account_rows.setdefault(
-                label, {"cash_out": Decimal("0"), "account_type": row.get("account_type") or "other"}
-            )
-            bucket["cash_out"] = bucket["cash_out"] + money(Decimal(str(row.get("cash_out", 0))))
         for row in expense_detail_rows(snapshot):
             detail_rows.append({**row, "period": period})
+            account_label = str(row.get("account") or "Sem conta identificada")
+            bucket = account_rows.setdefault(
+                account_label,
+                {"amount": Decimal("0"), "account_type": row.get("account_type") or "other"},
+            )
+            bucket["amount"] = bucket["amount"] + money(Decimal(str(row.get("amount", 0))))
 
     return RangeTotals(
         start_period=start_period,
@@ -367,15 +383,16 @@ def dimension_rows(
     category, so it is dropped whole, same as `label_hint`'s exclusion
     counterpart would be. For `dimension` in `{"conta", "cartao", "mes"}`
     the pre-aggregated `account_rows`/`month_expense_rows` this function
-    reads are NOT per-category -- an account's `cash_out`, in particular,
-    also carries its credit-card-invoice-payment cash-out, which has no
-    category at all -- so re-deriving those rows from `totals.detail_rows`
-    would silently drop that portion. Instead, the excluded category's own
+    reads (both built from `expense_detail_rows`, PR #107 review round 3 --
+    see `collect_range_totals`) are NOT per-category, so a row cannot be
+    re-derived from `totals.detail_rows` by simply dropping it whole the
+    way `categoria` does. Instead, the excluded category's own
     already-canonical per-(account|period) contribution (from
     `totals.detail_rows`, the exact numbers `holder_rows`/
     `filtered_expense_total` already read) is subtracted from each
     existing row's amount, leaving everything else about that row --
-    including any non-categorized cash flow -- untouched."""
+    every other category still billed to that same account/month --
+    untouched."""
 
     if dimension == "mes":
         rows = [{"label": key, "amount": value} for key, value in totals.month_expense_rows.items()]
@@ -384,7 +401,7 @@ def dimension_rows(
     else:
         wants_card = dimension == "cartao"
         rows = [
-            {"label": label, "amount": bucket["cash_out"]}
+            {"label": label, "amount": bucket["amount"]}
             for label, bucket in totals.account_rows.items()
             if (bucket.get("account_type") == "credit_card") == wants_card
         ]

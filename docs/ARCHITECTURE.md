@@ -1676,6 +1676,27 @@ autoridade por memória.
   Testes novos em `tests/test_assistant_wa04_query.py` cobrem `dimension=conta`/`cartao`/`mes`
   com `exclude_category_hint` (isolado e composto com `account_hint`) e paridade do total
   `conta`+`cartao` contra `get_expenses`.
+- **Correção de bug semântico (PR #107, review round 4)**: a correção da rodada 3 acima ainda
+  construía `RangeTotals.account_rows` (a base de `dimension="conta"`/`"cartao"`) a partir de
+  `financial_snapshots.account_cash_flow_rows`'s `cash_out` -- deliberadamente um valor de
+  *fluxo de caixa físico* que inclui o débito do pagamento de fatura de cartão na conta corrente
+  (rebaseline §16/§17, "quanto saiu desta conta?"). Para `dimension="conta"`, isso fazia
+  `financial_aggregate` publicar pagamento de fatura como se fosse um gasto novo, e somar
+  `conta`+`cartao` dava um total maior que `get_expenses.expenses` sempre que uma fatura era paga
+  no período -- dupla contagem exatamente do tipo que o rebaseline proíbe (§17: "a compra já gerou
+  o gasto; pagamento da fatura não gera gasto novamente"). `collect_range_totals` agora constrói
+  `account_rows` a partir de `expense_detail_rows` (a mesma classificação canônica de despesa
+  operacional que `categoria`/`titular` já usam) -- pagamento de fatura, transferência interna e
+  aplicação/resgate patrimonial nunca entram em `expense_detail` (`financial_snapshots._collect`),
+  então nenhuma dimensão de `financial_aggregate` pode mais reportá-los como gasto. A lógica de
+  `exclude_category_hint` por subtração em `totals.detail_rows` (rodada 3) continua igual -- ela já
+  lia a fonte certa, só a base que ela subtraía é que carregava o valor errado. Testes novos em
+  `tests/test_assistant_wa04_query.py` seedam as duas pernas reais de conciliação de pagamento de
+  fatura (`transaction_type="reconciliation"`, categoria "Conciliação", mesmo padrão de
+  `tests/test_financial_snapshots.py`) e verificam: `dimension="conta"` nunca inclui o pagamento;
+  `conta`+`cartao` mantém paridade com `get_expenses` com e sem `exclude_category_hint`; e nenhuma
+  das cinco dimensões (`categoria`/`conta`/`cartao`/`mes`/`titular`) reporta transferência interna,
+  aplicação/resgate patrimonial ou pagamento de fatura como gasto.
 
 ## Evolução
 

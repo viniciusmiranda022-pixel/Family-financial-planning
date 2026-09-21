@@ -1179,6 +1179,314 @@ def test_financial_aggregate_conta_plus_cartao_exclude_category_hint_parity_with
     assert combined == expenses.facts["expenses"]
 
 
+def _seed_card_invoice_payment(
+    session_factory,
+    ids: dict,
+    *,
+    booked_at: date,
+    amount: Decimal,
+) -> str:
+    """Seeds the two reconciliation legs `pay_card_invoice`/`link_card_payment`
+    always create for a real invoice payment (INV-002, same convention as
+    `tests/test_financial_snapshots.py`): a card-side "payment received" leg
+    (+`amount`) and the checking-side cash debit (-`amount`), both under a
+    `Conciliação` category and `transaction_type="reconciliation"`. Only the
+    checking leg counts once, on `card_payments`
+    (`app/services/financial_snapshots.py::_collect`) -- never a second
+    `expense_detail`/`category_spending` contribution."""
+
+    with session_factory() as db:
+        reconciliation = Category(household_id=ids["household_id"], name="Conciliação")
+        db.add(reconciliation)
+        db.commit()
+        reconciliation_id = reconciliation.id
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=reconciliation_id,
+        booked_at=booked_at,
+        amount=amount,
+        transaction_type="reconciliation",
+        description="Pagamento de fatura recebido",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=reconciliation_id,
+        booked_at=booked_at,
+        amount=-amount,
+        transaction_type="reconciliation",
+        description="Pagamento de fatura",
+    )
+    return reconciliation_id
+
+
+def test_financial_aggregate_dimension_conta_never_includes_card_invoice_payment() -> None:
+    """PR #107 review round 3: a card purchase followed by paying that
+    invoice from the checking account must never duplicate the gasto --
+    `dimension="conta"` must report only the checking account's OWN
+    operating expense (here, the R$80 fuel purchase), never the R$150
+    invoice-payment cash debit that also left that same account. Before this
+    fix, `account_rows` was built from `account_cash_flow_rows`'s `cash_out`
+    (a physical-bank-outflow figure that deliberately includes the invoice
+    payment debit for "quanto saiu desta conta?" -- rebaseline §16/§17),
+    so `dimension="conta"` silently reported R$230 for an account with only
+    R$80 of its own spending."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="conta-invoice-payment")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-150.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-80.00"),
+        transaction_type="expense",
+    )
+    _seed_card_invoice_payment(session_factory, ids, booked_at=date(2026, 9, 10), amount=Decimal("150.00"))
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        conta = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "conta", "period_text": "este mês"},
+            message="quanto gastei por conta?",
+            today=TODAY,
+        )
+    with session_factory() as db:
+        cartao = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "cartao", "period_text": "este mês"},
+            message="quanto gastei no cartão?",
+            today=TODAY,
+        )
+    assert {row["label"]: row["amount"] for row in conta.facts["rows"]} == {"Conta Corrente": Decimal("80.00")}
+    assert conta.facts["total"] == Decimal("80.00")
+    assert {row["label"]: row["amount"] for row in cartao.facts["rows"]} == {"Cartão Nubank": Decimal("150.00")}
+
+
+def test_financial_aggregate_conta_plus_cartao_parity_with_get_expenses_when_invoice_paid() -> None:
+    """PR #107 review round 3, regression (3): summing `dimension="conta"`
+    and `dimension="cartao"` must equal `get_expenses`'s own total even in
+    the presence of a paid card invoice -- the invoice payment must not
+    inflate either side, so the two never sum to more than the household's
+    real operating expense."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="conta-cartao-parity-invoice")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-150.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-80.00"),
+        transaction_type="expense",
+    )
+    _seed_card_invoice_payment(session_factory, ids, booked_at=date(2026, 9, 10), amount=Decimal("150.00"))
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        conta = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "conta", "period_text": "este mês"},
+            message="x",
+            today=TODAY,
+        )
+    with session_factory() as db:
+        cartao = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "cartao", "period_text": "este mês"},
+            message="x",
+            today=TODAY,
+        )
+    with session_factory() as db:
+        expenses = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={"period_text": "este mês"},
+            message="x",
+            today=TODAY,
+        )
+    combined = conta.facts["total"] + cartao.facts["total"]
+    assert combined == Decimal("230.00")
+    assert combined == expenses.facts["expenses"]
+
+
+def test_financial_aggregate_conta_plus_cartao_exclude_category_hint_parity_when_invoice_paid() -> None:
+    """PR #107 review round 3, regression (4): `exclude_category_hint` must
+    keep the same conta+cartao == get_expenses parity even when a card
+    invoice was paid in the same period -- excluding Mercado must still only
+    remove the Mercado-categorized rows, never touch the invoice payment
+    (which was never counted as a gasto in the first place)."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="conta-cartao-parity-invoice-exclude")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-150.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-80.00"),
+        transaction_type="expense",
+    )
+    _seed_card_invoice_payment(session_factory, ids, booked_at=date(2026, 9, 10), amount=Decimal("150.00"))
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        conta = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "conta", "period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="x",
+            today=TODAY,
+        )
+    with session_factory() as db:
+        cartao = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "cartao", "period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="x",
+            today=TODAY,
+        )
+    with session_factory() as db:
+        expenses = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={"period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="x",
+            today=TODAY,
+        )
+    combined = conta.facts["total"] + cartao.facts["total"]
+    assert combined == Decimal("80.00")
+    assert combined == expenses.facts["expenses"]
+
+
+def test_financial_aggregate_no_dimension_ever_counts_transfer_investment_or_reconciliation_as_expense() -> None:
+    """PR #107 review round 3, regression (5): an internal transfer, a
+    Privilège application/redemption and a card invoice payment must never
+    surface as "gasto" under ANY `financial_aggregate` dimension
+    (`categoria`, `conta`, `cartao`, `mes`, `titular`) -- only the one real
+    R$80 expense should ever appear, and only under `conta`/`titular`/`mes`;
+    `categoria`/`cartao` legitimately have nothing to show."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="no-dimension-counts-non-operating")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-80.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["internal_transfer_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-1000.00"),
+        transaction_type="transfer",
+        description="Transferência entre contas",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["patrimonial_id"],
+        booked_at=date(2026, 9, 6),
+        amount=Decimal("-2000.00"),
+        transaction_type="transfer",
+        description="Aplicação Privilège",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["patrimonial_id"],
+        booked_at=date(2026, 9, 7),
+        amount=Decimal("500.00"),
+        transaction_type="transfer",
+        description="Resgate Privilège",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 8),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_card_invoice_payment(session_factory, ids, booked_at=date(2026, 9, 10), amount=Decimal("300.00"))
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    for dimension, expected in (
+        ("categoria", {"Combustível": Decimal("80.00"), "Mercado": Decimal("300.00")}),
+        ("conta", {"Conta Corrente": Decimal("80.00")}),
+        ("cartao", {"Cartão Nubank": Decimal("300.00")}),
+        ("mes", {"2026-09": Decimal("380.00")}),
+        ("titular", {"Família": Decimal("380.00")}),
+    ):
+        with session_factory() as db:
+            outcome = run_tool(
+                db,
+                user=user,
+                tool="financial_aggregate",
+                arguments={"dimension": dimension, "period_text": "este mês"},
+                message="x",
+                today=TODAY,
+            )
+        rows = {row["label"]: row["amount"] for row in outcome.facts["rows"]}
+        assert rows == expected, f"dimension={dimension} leaked a non-operating movement: {rows}"
+        assert outcome.facts["total"] == sum(expected.values(), Decimal("0"))
+
+
 # ---------------------------------------------------------------------------
 # 4c. WA-05 (docs/WORK_ORDER_WA_05.md, issue #77) "e se continuar nessa
 #     média até o fim do mês?" -- project_category_pace: deterministic
