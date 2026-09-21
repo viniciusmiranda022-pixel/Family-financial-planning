@@ -68,6 +68,7 @@ from app.schemas import (
     AssistantInterpretRequest,
     AssistantUndoRequest,
     CaptureConfirmRequest,
+    CaptureItemRequest,
     CardCompetenceRepairApplyRequest,
     CardCompetenceRepairRollbackRequest,
     CardInvoiceCloseRequest,
@@ -4399,6 +4400,50 @@ def confirm_capture(
     )
     if not capture:
         raise HTTPException(status_code=404, detail="Captura não encontrada")
+    return _confirm_capture_items(
+        db, user, capture, payload.items, confirmed_large_amount=payload.confirmed_large_amount
+    )
+
+
+def _confirm_capture_items(
+    db: Session,
+    user: User,
+    capture: CaptureDraft,
+    items: list[CaptureItemRequest],
+    *,
+    confirmed_large_amount: bool,
+) -> dict:
+    """The one canonical write path from a `CaptureDraft`'s proposal to real
+    `Transaction`/`Obligation`/`PayrollRecord` rows -- shared by the
+    authenticated web endpoint above (`items` comes from the HTTP request
+    body, letting a household member edit the preview before confirming)
+    and WA-07's WhatsApp media confirmation gate
+    (`app.whatsapp_gateway_app._confirm_pending_capture`, which reads
+    `items` verbatim from the capture's own already-persisted
+    `proposal_json` -- WhatsApp has no editable-preview UI, so a "sim"
+    reply confirms exactly what the preview message already showed, never a
+    client-submitted alternative). Every invariant/guard below (status
+    lifecycle, admin-only, large-amount confirmation, category/account
+    resolution, competence, duplicate detection, Privilège funding) applies
+    identically regardless of caller -- see `docs/WORK_ORDER_WA_07.md`
+    item 1/2 ("reutilizar... não criar segunda implementação").
+
+    `_require_admin` is re-checked here even though `confirm_capture` above
+    already checked it before this function is ever reached from that
+    route -- WA-07's caller has no such wrapper of its own, and calling it
+    twice for the HTTP path is a no-op (same `user`, same outcome). This is
+    also the ADR's own documented least-privilege default for WhatsApp
+    (`docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md` §4.3): a non-admin-linked
+    number can draft/preview a media capture but never confirms it itself.
+
+    Callers must have already verified `capture.household_id ==
+    user.household_id` (both call sites load `capture` through a
+    household-scoped query first). Always commits on success -- this
+    function's `db.commit()` is the one and only commit for the whole
+    confirmation, matching the endpoint's pre-existing contract.
+    """
+
+    _require_admin(user)
     if capture.status == "confirmed":
         raise HTTPException(status_code=409, detail="Esta captura já foi confirmada")
     if capture.status == "cancelled":
@@ -4410,13 +4455,13 @@ def confirm_capture(
             status_code=409,
             detail="O processamento desta captura falhou; use /captures/{id}/retry antes de confirmar",
         )
-    selected = [item for item in payload.items if item.selected]
+    selected = [item for item in items if item.selected]
     if not selected:
         raise HTTPException(status_code=422, detail="Selecione ao menos um item para confirmar")
     profile = profile_for(db, user.household_id)
     large_threshold = _large_entry_threshold(profile)
     if (
-        not payload.confirmed_large_amount
+        not confirmed_large_amount
         and any(item.kind == "transaction" and item.amount >= large_threshold for item in selected)
     ):
         raise HTTPException(
@@ -4676,9 +4721,7 @@ def confirm_capture(
             result["payroll"].append(record.id)
 
     capture.status = "confirmed"
-    capture.proposal_json = json.dumps(
-        [item.model_dump(mode="json") for item in payload.items], ensure_ascii=False
-    )
+    capture.proposal_json = json.dumps([item.model_dump(mode="json") for item in items], ensure_ascii=False)
     capture.result_json = json.dumps(result)
     capture.confirmed_at = datetime.now(UTC)
     if capture.document:
