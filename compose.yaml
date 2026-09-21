@@ -115,15 +115,29 @@ services:
   # profile below) keeps this off by default: `docker compose up` alone
   # never starts it, matching `WHATSAPP_GATEWAY_ENABLED=false`'s
   # ship-disabled default in `app/config.py`. `depends_on: app: condition:
-  # service_healthy` guarantees migration 0024 has already run. `internal`
-  # only (no `lan`): this slice never makes an outbound call (it only
-  # receives webhooks; sending a reply is WA-02+). This is the one
-  # component of the project meant to eventually sit behind a public
+  # service_healthy` guarantees migration 0024 has already run. This is the
+  # one component of the project meant to eventually sit behind a public
   # reverse proxy/TLS terminator (`docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md`
   # §4.2) -- provisioning that public endpoint is explicit OCI/deployment
   # work, out of scope here (Work Order: "Oracle/OCI implementation/
   # deployment is explicitly out of scope"); `WHATSAPP_GATEWAY_PORT` only
   # exposes it on the host for local testing of the webhook contract.
+  #
+  # `networks: [internal, lan]` (WA-07, `docs/WORK_ORDER_WA_07.md`, issue
+  # #79 -- corrects WA-01's original `internal`-only placement, which
+  # predates any outbound call this service makes): WA-03 already added
+  # `MetaCloudApiProvider.send_message` (an authenticated `POST` to
+  # `graph.facebook.com`) and WA-07 adds `fetch_media` (the authenticated
+  # two-step media download, same host) -- both need real internet egress,
+  # which `internal: true` (see this file's `networks:` section) by
+  # definition never provides. `internal` alone was correct for WA-01
+  # (webhook-receive only, confirmed by that slice's own comment above,
+  # left intact for the record) but has been stale since WA-03 first added
+  # an outbound call; this fixes that gap rather than carrying it forward
+  # silently into WA-07. Still no direct DB/document-volume mount and no
+  # other outbound destination than Meta's API -- `lan` here only grants
+  # the same "can reach the internet" reachability `app`'s own `[internal,
+  # lan]` already has, not a wider trust boundary.
   whatsapp-gateway:
     profiles: ["whatsapp-gateway"]
     build: .
@@ -141,7 +155,7 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    networks: [internal]
+    networks: [internal, lan]
 
   advisor:
     profiles: ["container-advisor"]

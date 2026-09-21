@@ -1928,6 +1928,29 @@ class WhatsAppAuthorizedNumber(Base, TimestampMixin):
     deactivated_by: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    # WA-07 (`docs/WORK_ORDER_WA_07.md`, issue #79): at most one media-derived
+    # `CaptureDraft` this number's own next confirm/cancel reply resolves --
+    # never a queue, by design. A second media message while one is still
+    # actionable (`CaptureDraft.status == "preview"`) is rejected up front,
+    # before any fetch/OCR/transcription is even attempted, and this pointer
+    # is never silently replaced -- see
+    # `app.whatsapp_gateway_app._load_actionable_pending_capture` (the
+    # fast-path check) and `_claim_pending_capture_slot` (the `SELECT ...
+    # FOR UPDATE`-guarded claim that also closes the race between two
+    # near-simultaneous media messages from the same number). The household
+    # must explicitly confirm or cancel the pending draft before a new one
+    # can take this slot; a superseded/stale pointer (its draft already
+    # resolved another way, e.g. from the web UI's own `/captures` screen)
+    # is cleared and replaced, never left dangling. `ON DELETE SET NULL`: a
+    # capture draft can outlive this pointer (deleted rows do not exist in
+    # this codebase -- captures are only ever cancelled/expired in place --
+    # but the FK is still SET NULL rather than CASCADE/RESTRICT for the same
+    # reason every other optional back-reference in this file is, so this
+    # table's own row is never blocked/destroyed by unrelated capture-draft
+    # lifecycle).
+    pending_capture_id: Mapped[str | None] = mapped_column(
+        ForeignKey("capture_drafts.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class WhatsAppInboundEvent(Base):

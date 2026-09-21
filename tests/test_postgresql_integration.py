@@ -136,7 +136,7 @@ def test_upgrade_empty_postgresql_database_to_head() -> None:
     }.issubset(tables)
     with engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0026"
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0027"
         )
     engine.dispose()
 
@@ -157,7 +157,7 @@ def test_upgrade_from_legacy_0002_baseline_preserves_existing_rows() -> None:
 
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0026"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0027"
         preserved_name = connection.execute(
             text("SELECT name FROM households WHERE id = :id"), {"id": household_id}
         ).scalar_one()
@@ -1586,7 +1586,7 @@ def test_whatsapp_inbound_event_concurrent_redelivery_is_serialized_to_a_single_
                 thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
                 with Session(thread_engine) as db:
                     barrier.wait(timeout=5.0)
-                    _process_one_message(db, message, settings=get_settings())
+                    asyncio.run(_process_one_message(db, message, settings=get_settings()))
                     db.commit()
                 thread_engine.dispose()
             except BaseException as exc:  # noqa: BLE001
@@ -1697,7 +1697,7 @@ def test_whatsapp_rate_limit_bucket_concurrent_first_hit_is_serialized_to_a_sing
                 thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
                 with Session(thread_engine) as db:
                     barrier.wait(timeout=5.0)
-                    _process_one_message(db, message, settings=get_settings())
+                    asyncio.run(_process_one_message(db, message, settings=get_settings()))
                     db.commit()
                 thread_engine.dispose()
             except BaseException as exc:  # noqa: BLE001
@@ -1868,7 +1868,7 @@ def test_whatsapp_webhook_concurrent_confirm_from_two_messages_serializes_to_one
                 thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
                 with Session(thread_engine) as db:
                     barrier.wait(timeout=5.0)
-                    _process_one_message(db, message, settings=get_settings())
+                    asyncio.run(_process_one_message(db, message, settings=get_settings()))
                 thread_engine.dispose()
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
@@ -2051,7 +2051,7 @@ def test_whatsapp_webhook_concurrent_undo_from_two_messages_reverses_exactly_onc
                 thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
                 with Session(thread_engine) as db:
                     barrier.wait(timeout=5.0)
-                    _process_one_message(db, message, settings=get_settings())
+                    asyncio.run(_process_one_message(db, message, settings=get_settings()))
                 thread_engine.dispose()
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
@@ -2100,6 +2100,204 @@ def test_whatsapp_webhook_concurrent_undo_from_two_messages_reverses_exactly_onc
             # ("Esta ação já foi desfeita") instead of raising or double
             # -reversing.
             assert {event.status for event in events} == {"processed", "needs_clarification"}
+        engine.dispose()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_whatsapp_media_concurrent_capture_never_lets_two_drafts_share_the_pending_pointer(
+    tmp_path, monkeypatch
+) -> None:
+    """WA-07 (`docs/WORK_ORDER_WA_07.md`, issue #79), engineering review
+    finding on PR #109 (2026-09-21): `authorized.pending_capture_id` used to
+    be a plain unconditional assignment in `_run_media_reply`, so a second
+    media message could silently replace the pointer a first, still-
+    actionable `CaptureDraft` was relying on -- orphaning it from a bare
+    "confirmar"/"cancelar" with no trace in the reply. The fix is
+    `app.whatsapp_gateway_app._load_actionable_pending_capture` (a cheap,
+    unlocked pre-check that rejects new media up front while a draft is
+    still `preview`) plus `_claim_pending_capture_slot` (a `SELECT ... FOR
+    UPDATE`-guarded re-check right before the pointer is actually set).
+
+    This test proves the *locked* half under a real two-connection
+    PostgreSQL race the unlocked pre-check alone cannot close: two distinct
+    media messages from the same authorized number, delivered by two
+    threads synchronized with a `threading.Barrier` to maximize the window
+    where both can pass the early pre-check before either commits. Exactly
+    one `CaptureDraft` may end up linked as the pointer; the other must
+    still exist, fully auditable, just unreachable from WhatsApp -- and a
+    later "confirmar" must resolve only the linked one, never the other.
+    """
+
+    import app.whatsapp_gateway_app as gateway_app_module
+    from app.models import (
+        CaptureDraft,
+        Category,
+        FinancialProfile,
+        WhatsAppAuthorizedNumber,
+        WhatsAppInboundEvent,
+    )
+    from app.services import smart_capture as smart_capture_module
+    from app.services import whatsapp_gateway as gateway
+    from app.whatsapp_gateway_app import _process_one_message
+
+    command.upgrade(_alembic_config(), "head")
+    # `_run_media_reply` -> `EncryptedDocumentStore` writes the fetched media
+    # to `settings.documents_dir` (default `/data/documents`, the production
+    # container's mounted volume) -- not writable by the unprivileged CI
+    # runner user, unlike this sandbox's own root user. Same fix
+    # `test_initial_load_documents_are_idempotent_and_resumable_on_real_postgresql`
+    # above already uses for the same reason.
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    get_settings.cache_clear()
+    engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+    try:
+        sender_digits = "5511955554444"
+        phone_hash = gateway.hash_phone(sender_digits)
+        with Session(engine) as setup_db:
+            household = Household(name="Família WhatsApp Mídia Concorrência")
+            setup_db.add(household)
+            setup_db.flush()
+            household_id = household.id
+            setup_db.add(FinancialProfile(household_id=household_id, monthly_cash_cap=Decimal("5000")))
+            setup_db.add(Account(household_id=household_id, name="Conta Corrente", account_type="checking"))
+            setup_db.add(Category(household_id=household_id, name="Mercado"))
+            user = User(
+                household_id=household_id,
+                name="Usuário WhatsApp Mídia Concorrência",
+                username=f"wa-media-concur-{household_id[:8]}",
+                password_hash="not-a-real-password-hash",
+                is_admin=True,
+                active=True,
+            )
+            setup_db.add(user)
+            setup_db.flush()
+            user_id = user.id
+            setup_db.add(
+                WhatsAppAuthorizedNumber(
+                    household_id=household_id,
+                    user_id=user_id,
+                    phone_hash=phone_hash,
+                    phone_encrypted=gateway.encrypt_phone(sender_digits),
+                    phone_last4=gateway.phone_last4(sender_digits),
+                )
+            )
+            setup_db.commit()
+
+        fake_provider = gateway.FakeWhatsAppProvider()
+        fake_provider.register_media("wa-media-race-1", b"fake-jpeg-race-payload-one", "image/jpeg")
+        fake_provider.register_media("wa-media-race-2", b"fake-jpeg-race-payload-two", "image/jpeg")
+        monkeypatch.setattr(gateway_app_module, "_resolve_provider", lambda: fake_provider)
+
+        def _fake_extract(filename, payload, content_type):
+            if payload == b"fake-jpeg-race-payload-one":
+                return ("LOJA CONCORRENCIA UM\nTOTAL R$ 11,00", "ocr_local")
+            return ("LOJA CONCORRENCIA DOIS\nTOTAL R$ 22,00", "ocr_local")
+
+        monkeypatch.setattr(smart_capture_module, "extract_document_text", _fake_extract)
+
+        messages = [
+            gateway.NormalizedInboundMessage(
+                provider_message_id="wa-media-race-msg-1",
+                sender_digits=sender_digits,
+                media_id="wa-media-race-1",
+                media_mime_type="image/jpeg",
+                media_kind="image",
+            ),
+            gateway.NormalizedInboundMessage(
+                provider_message_id="wa-media-race-msg-2",
+                sender_digits=sender_digits,
+                media_id="wa-media-race-2",
+                media_mime_type="image/jpeg",
+                media_kind="image",
+            ),
+        ]
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _deliver(message: gateway.NormalizedInboundMessage) -> None:
+            try:
+                thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
+                with Session(thread_engine) as db:
+                    barrier.wait(timeout=5.0)
+                    asyncio.run(_process_one_message(db, message, settings=get_settings()))
+                thread_engine.dispose()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=_deliver, args=(m,), daemon=True) for m in messages]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10.0)
+
+        assert not errors, f"concurrent media capture must never raise: {errors}"
+        with Session(engine) as verify_db:
+            captures = verify_db.scalars(
+                select(CaptureDraft).where(CaptureDraft.household_id == household_id)
+            ).all()
+            assert len(captures) == 2, "both media messages must still each get their own CaptureDraft/Document"
+            assert {c.status for c in captures} == {"preview"}, "neither draft is confirmed/cancelled by the race itself"
+
+            authorized = verify_db.scalar(
+                select(WhatsAppAuthorizedNumber).where(WhatsAppAuthorizedNumber.household_id == household_id)
+            )
+            assert authorized.pending_capture_id is not None
+            winner_id = authorized.pending_capture_id
+            assert winner_id in {c.id for c in captures}, "the pointer must reference one of the two real drafts"
+
+            events = verify_db.scalars(
+                select(WhatsAppInboundEvent).where(
+                    WhatsAppInboundEvent.provider_message_id.in_([m.provider_message_id for m in messages])
+                )
+            ).all()
+            assert len(events) == 2, "each media message still gets its own inbound event"
+            # The winner's claim succeeds ("processed"); the loser's locked
+            # re-check sees the winner's already-committed pointer and backs
+            # off with a clean "resolve the pending one first" reply
+            # ("needs_clarification"), never silently overwriting it.
+            assert {event.status for event in events} == {"processed", "needs_clarification"}
+
+        # A later "confirmar" must resolve only the winning draft, never the
+        # loser -- proving the pointer race cannot let "confirmar" reach a
+        # draft different from the one the household is actually looking at.
+        confirm_db = Session(engine)
+        try:
+            asyncio.run(
+                _process_one_message(
+                    confirm_db,
+                    gateway.NormalizedInboundMessage(
+                        provider_message_id="wa-media-race-confirm",
+                        sender_digits=sender_digits,
+                        text="confirmar",
+                    ),
+                    settings=get_settings(),
+                )
+            )
+        finally:
+            confirm_db.close()
+
+        with Session(engine) as verify_db:
+            transactions = verify_db.scalars(
+                select(Transaction).where(Transaction.household_id == household_id)
+            ).all()
+            assert len(transactions) == 1, "confirming must produce exactly one financial fact"
+
+            winner = verify_db.get(CaptureDraft, winner_id)
+            assert winner.status == "confirmed"
+            loser = next(c for c in captures if c.id != winner_id)
+            loser_row = verify_db.get(CaptureDraft, loser.id)
+            assert loser_row.status == "preview", (
+                "the draft that lost the pointer race must remain untouched -- still fully "
+                "auditable and recoverable from the web UI's own /captures screen, never "
+                "silently confirmed or discarded"
+            )
+
+            authorized_after = verify_db.scalar(
+                select(WhatsAppAuthorizedNumber).where(WhatsAppAuthorizedNumber.household_id == household_id)
+            )
+            assert authorized_after.pending_capture_id is None
         engine.dispose()
     finally:
         get_settings.cache_clear()

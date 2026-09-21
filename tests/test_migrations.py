@@ -622,6 +622,10 @@ EXPECTED_WHATSAPP_AUTHORIZED_NUMBER_COLUMNS = {
     "deactivated_by",
     "created_at",
     "updated_at",
+    # WA-07 (0027): the single-item "which CaptureDraft does this number's
+    # next confirm/cancel reply resolve" pointer -- see
+    # app.models.WhatsAppAuthorizedNumber.pending_capture_id.
+    "pending_capture_id",
 }
 
 EXPECTED_WHATSAPP_INBOUND_EVENT_COLUMNS = {
@@ -754,6 +758,8 @@ def test_migrations_upgrade_and_downgrade_without_schema_drift(monkeypatch, tmp_
         "ix_whatsapp_authorized_numbers_phone_hash",
         "uq_whatsapp_authorized_numbers_active_user",
         "uq_whatsapp_authorized_numbers_active_phone_hash",
+        # WA-07 (0027)
+        "ix_whatsapp_authorized_numbers_pending_capture_id",
     }
     assert {column["name"] for column in inspector.get_columns("whatsapp_inbound_events")} == (
         EXPECTED_WHATSAPP_INBOUND_EVENT_COLUMNS
@@ -1497,7 +1503,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0026"
+        ).scalar_one() == "0027"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -1523,6 +1529,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0026"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0027"
     engine.dispose()
     get_settings.cache_clear()
