@@ -353,15 +353,29 @@ def dimension_rows(
     dimension: str,
     *,
     label_hint: str | None = None,
-    exclude_label_hint: str | None = None,
+    exclude_category_hint: str | None = None,
 ) -> list[dict[str, Any]]:
     """Per-group `{"label", "amount"}` rows for `dimension`, already
     summed across `totals`'s whole range by `collect_range_totals`, then
     narrowed by `label_hint` (a free-text filter, never a guess -- see
-    `matches_hint`) and, symmetrically, with any row matching
-    `exclude_label_hint` dropped (WA-05, issue #77 "e se tirar mercado?" --
-    both hints compose: `label_hint` narrows, `exclude_label_hint` removes,
-    neither overrides the other)."""
+    `matches_hint`).
+
+    `exclude_category_hint` (WA-05, issue #77 "e se tirar mercado?",
+    PR #107 review round 2) removes that category's own contribution --
+    never a second classification of a raw `Transaction`. For
+    `dimension == "categoria"` the matching row's own label IS the
+    category, so it is dropped whole, same as `label_hint`'s exclusion
+    counterpart would be. For `dimension` in `{"conta", "cartao", "mes"}`
+    the pre-aggregated `account_rows`/`month_expense_rows` this function
+    reads are NOT per-category -- an account's `cash_out`, in particular,
+    also carries its credit-card-invoice-payment cash-out, which has no
+    category at all -- so re-deriving those rows from `totals.detail_rows`
+    would silently drop that portion. Instead, the excluded category's own
+    already-canonical per-(account|period) contribution (from
+    `totals.detail_rows`, the exact numbers `holder_rows`/
+    `filtered_expense_total` already read) is subtracted from each
+    existing row's amount, leaving everything else about that row --
+    including any non-categorized cash flow -- untouched."""
 
     if dimension == "mes":
         rows = [{"label": key, "amount": value} for key, value in totals.month_expense_rows.items()]
@@ -374,11 +388,22 @@ def dimension_rows(
             for label, bucket in totals.account_rows.items()
             if (bucket.get("account_type") == "credit_card") == wants_card
         ]
-    return [
-        row
-        for row in rows
-        if matches_hint(label_hint, row["label"]) and not excludes_hint(exclude_label_hint, row["label"])
-    ]
+
+    if dimension == "categoria":
+        rows = [row for row in rows if not excludes_hint(exclude_category_hint, row["label"])]
+    elif exclude_category_hint:
+        detail_key = "period" if dimension == "mes" else "account"
+        subtract: dict[str, Decimal] = {}
+        for detail in totals.detail_rows:
+            if not excludes_hint(exclude_category_hint, detail.get("category")):
+                continue
+            key = str(detail.get(detail_key))
+            subtract[key] = subtract.get(key, Decimal("0")) + money(Decimal(str(detail.get("amount", 0))))
+        rows = [
+            {**row, "amount": money(row["amount"] - subtract.get(row["label"], Decimal("0")))} for row in rows
+        ]
+
+    return [row for row in rows if matches_hint(label_hint, row["label"])]
 
 
 def _detail_matches(

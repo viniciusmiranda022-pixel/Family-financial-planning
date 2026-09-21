@@ -1658,6 +1658,24 @@ autoridade por memória.
   no backend (os dois itens acima), nunca aritmética no LLM nem um segundo motor. Ambas reaproveitam
   o motor de agregação já existente (`app.services.financial_query`) em vez de reclassificar
   transações; nenhum invariante financeiro foi alterado.
+- **Correção de bug semântico (PR #107, review round 3)**: a implementação da rodada 2 acima
+  encaminhava `exclude_category_hint` para `financial_query.dimension_rows` como se fosse um
+  filtro sobre o próprio label do grupo (`exclude_label_hint`) -- correto apenas quando
+  `dimension == "categoria"` (onde label É a categoria). Para `dimension` em
+  `{"conta", "cartao", "mes"}`, o label é conta/cartão/mês, não categoria, então "tirar mercado"
+  nunca removia de fato o gasto de Mercado dessas linhas (exceto no caso degenerado de uma conta
+  chamada "mercado"). `dimension_rows` agora recebe um `exclude_category_hint` com semântica
+  própria: para `dimension == "categoria"` a linha inteira é removida (igual antes); para
+  `conta`/`cartao`/`mes`, a contribuição já-canônica daquela categoria em `totals.detail_rows`
+  (as mesmas linhas que `holder_rows`/`filtered_expense_total` já leem) é subtraída do valor
+  existente de cada linha, sem recalcular ou substituir o resto dela -- importante porque o
+  `cash_out` de uma conta corrente também carrega o pagamento de fatura de cartão (sem
+  categoria), que a exclusão de categoria nunca deve tocar. `app.services.assistant_tools`'s
+  `_tool_get_expenses`'s `by_account` (antes sem nenhum filtro de exclusão) foi corrigido junto,
+  pela mesma razão -- Dashboard/Relatórios/Assistente nunca podem divergir para a mesma pergunta.
+  Testes novos em `tests/test_assistant_wa04_query.py` cobrem `dimension=conta`/`cartao`/`mes`
+  com `exclude_category_hint` (isolado e composto com `account_hint`) e paridade do total
+  `conta`+`cartao` contra `get_expenses`.
 
 ## Evolução
 

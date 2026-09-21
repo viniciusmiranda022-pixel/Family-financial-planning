@@ -926,6 +926,259 @@ def test_financial_aggregate_titular_dimension_combines_with_exclude_category_hi
     assert rows == {"Vinicius": Decimal("100.00")}
 
 
+def test_financial_aggregate_dimension_conta_exclude_category_hint_subtracts_only_that_category() -> None:
+    """PR #107 review round 2: for `dimension != "categoria"`, `_rows_for`
+    used to forward `exclude_category_hint` straight into `dimension_rows`'s
+    `label_hint`-shaped exclude, which compares against the ROW's own label
+    (an account name for `dimension="conta"`) instead of each transaction's
+    category -- so excluding "mercado" never actually dropped Mercado
+    spending from an account's total unless the account itself happened to
+    be named "mercado". This seeds one checking account with both Mercado
+    and Combustível spend and asserts only the Mercado portion is
+    subtracted, the rest of that same account's total survives untouched."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="aggregate-conta-exclude")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-80.00"),
+        transaction_type="expense",
+    )
+    # Card spend must never leak into `dimension="conta"` rows, excluded or not.
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-999.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "conta", "period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="quanto gastei por conta, tirando mercado?",
+            today=TODAY,
+        )
+    rows = {row["label"]: row["amount"] for row in outcome.facts["rows"]}
+    assert rows == {"Conta Corrente": Decimal("80.00")}
+    assert outcome.facts["total"] == Decimal("80.00")
+
+
+def test_financial_aggregate_dimension_cartao_exclude_category_hint_composes_with_account_hint() -> None:
+    """Same bug class as the `conta` test above, on `dimension="cartao"`,
+    plus composition with `account_hint` (label_hint) narrowing to a single
+    card -- neither filter overrides the other."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="aggregate-cartao-exclude")
+    with session_factory() as db:
+        second_card = Account(household_id=ids["household_id"], name="Cartão Itaú", account_type="credit_card")
+        db.add(second_card)
+        db.commit()
+        second_card_id = second_card.id
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-150.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-200.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=second_card_id,
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-500.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={
+                "dimension": "cartao",
+                "period_text": "este mês",
+                "account_hint": "nubank",
+                "exclude_category_hint": "mercado",
+            },
+            message="quanto gastei no Nubank, tirando mercado?",
+            today=TODAY,
+        )
+    rows = {row["label"]: row["amount"] for row in outcome.facts["rows"]}
+    assert rows == {"Cartão Nubank": Decimal("200.00")}
+
+
+def test_financial_aggregate_dimension_mes_exclude_category_hint_subtracts_per_month() -> None:
+    """`dimension="mes"` groups by period, not by category -- excluding
+    Mercado must subtract only that month's Mercado contribution from each
+    month's row, never the whole row nor another month's figure."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="aggregate-mes-exclude")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 8, 10),
+        amount=Decimal("-100.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 8, 11),
+        amount=Decimal("-40.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-80.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "mes", "period_text": "ultimos 2 meses", "exclude_category_hint": "mercado"},
+            message="quanto gastei por mês, tirando mercado?",
+            today=TODAY,
+        )
+    rows = {row["label"]: row["amount"] for row in outcome.facts["rows"]}
+    assert rows == {"2026-08": Decimal("40.00"), "2026-09": Decimal("80.00")}
+
+
+def test_financial_aggregate_conta_plus_cartao_exclude_category_hint_parity_with_get_expenses() -> None:
+    """Parity requirement (PR #107 review round 2): summing `dimension="conta"`
+    and `dimension="cartao"` rows under the same `exclude_category_hint`
+    must equal `get_expenses`'s own `expenses` total under the identical
+    filter -- both read the exact same `totals.detail_rows`, never a second,
+    independently-computed number."""
+
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="aggregate-parity-exclude")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 3),
+        amount=Decimal("-300.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["checking_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 4),
+        amount=Decimal("-80.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["market_id"],
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-150.00"),
+        transaction_type="expense",
+    )
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=ids["fuel_id"],
+        booked_at=date(2026, 9, 6),
+        amount=Decimal("-200.00"),
+        transaction_type="expense",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        conta = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "conta", "period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="x",
+            today=TODAY,
+        )
+    with session_factory() as db:
+        cartao = run_tool(
+            db,
+            user=user,
+            tool="financial_aggregate",
+            arguments={"dimension": "cartao", "period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="x",
+            today=TODAY,
+        )
+    with session_factory() as db:
+        expenses = run_tool(
+            db,
+            user=user,
+            tool="get_expenses",
+            arguments={"period_text": "este mês", "exclude_category_hint": "mercado"},
+            message="x",
+            today=TODAY,
+        )
+    combined = conta.facts["total"] + cartao.facts["total"]
+    assert combined == Decimal("280.00")
+    assert combined == expenses.facts["expenses"]
+
+
 # ---------------------------------------------------------------------------
 # 4c. WA-05 (docs/WORK_ORDER_WA_05.md, issue #77) "e se continuar nessa
 #     média até o fim do mês?" -- project_category_pace: deterministic

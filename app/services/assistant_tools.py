@@ -604,7 +604,7 @@ def _tool_financial_aggregate(
             )
         label_hint = category_hint or account_hint
         return range_dimension_rows(
-            range_totals, dimension, label_hint=label_hint, exclude_label_hint=exclude_category_hint
+            range_totals, dimension, label_hint=label_hint, exclude_category_hint=exclude_category_hint
         )
 
     rows = _rows_for(totals)
@@ -728,11 +728,11 @@ def _tool_get_expenses(db: Session, *, user: Any, arguments: dict[str, str], tod
     # `filtered_expense_total`.
     exclude_category_hint = arguments.get("exclude_category_hint")
     category_rows = range_dimension_rows(
-        totals, "categoria", label_hint=category_hint, exclude_label_hint=exclude_category_hint
+        totals, "categoria", label_hint=category_hint, exclude_category_hint=exclude_category_hint
     )
-    account_rows = range_dimension_rows(totals, "conta", label_hint=account_hint) + range_dimension_rows(
-        totals, "cartao", label_hint=account_hint
-    )
+    account_rows = range_dimension_rows(
+        totals, "conta", label_hint=account_hint, exclude_category_hint=exclude_category_hint
+    ) + range_dimension_rows(totals, "cartao", label_hint=account_hint, exclude_category_hint=exclude_category_hint)
     # WA-04 PR #106 review round 1: `category_hint`/`account_hint`/
     # `holder_hint` compose simultaneously (AND) via `filtered_expense_total`
     # -- the same per-transaction `expense_detail_rows` contributions
