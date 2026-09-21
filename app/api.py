@@ -4412,6 +4412,8 @@ def _confirm_capture_items(
     items: list[CaptureItemRequest],
     *,
     confirmed_large_amount: bool,
+    audit_source: str = "application",
+    audit_trace_id: str | None = None,
 ) -> dict:
     """The one canonical write path from a `CaptureDraft`'s proposal to real
     `Transaction`/`Obligation`/`PayrollRecord` rows -- shared by the
@@ -4441,6 +4443,14 @@ def _confirm_capture_items(
     household-scoped query first). Always commits on success -- this
     function's `db.commit()` is the one and only commit for the whole
     confirmation, matching the endpoint's pre-existing contract.
+
+    `audit_source`/`audit_trace_id` are narration-only (the `AuditEvent.source`/
+    `trace_id` columns already used by every other caller of `audit()` in
+    this file) -- the web endpoint leaves both at their defaults
+    ("application"/`None`); WA-07's WhatsApp caller passes `"whatsapp"` and
+    this message's own `trace_id` so `capture.confirm` shows up correlated
+    with the rest of that inbound message's sanitized trace, the same way
+    `assistant.orchestrate` already is for the text flow.
     """
 
     _require_admin(user)
@@ -4739,6 +4749,8 @@ def _confirm_capture_items(
             "payroll": len(result["payroll"]),
             "review_items": review_count,
         },
+        trace_id=audit_trace_id,
+        source=audit_source,
     )
     db.commit()
     return {"ok": True, "result": result, "review_items": review_count}

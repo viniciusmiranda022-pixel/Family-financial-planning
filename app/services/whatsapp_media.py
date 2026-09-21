@@ -210,10 +210,35 @@ _CANCEL_WORDS = frozenset(
 )
 
 
-def _normalize_reply(text: str) -> str:
+def normalize_reply(text: str) -> str:
+    """Accent-/case-/punctuation-insensitive normalization shared by
+    `interpret_confirmation_reply` and, for the large-amount override phrase
+    specifically, `app.whatsapp_gateway_app` directly (a second, narrower
+    closed phrase -- "confirmar valor alto" -- gates the same large-amount
+    guard `app.api._confirm_capture_items` already enforces for the web
+    confirmation form, so a household cannot silently skip it by replying
+    "sim" once)."""
+
     stripped = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     stripped = re.sub(r"[^\w\s]", "", stripped.lower()).strip()
     return re.sub(r"\s+", " ", stripped)
+
+
+# A second, narrower closed phrase -- deliberately distinct from
+# `_CONFIRM_WORDS` -- required to override
+# `app.api._confirm_capture_items`'s own large-amount guard from WhatsApp.
+# Mirrors the web confirmation form's own two-step UX (an unchecked
+# "confirmo que este valor está correto" checkbox blocks a large
+# transaction's confirmation) rather than silently passing
+# `confirmed_large_amount=True` on a plain "sim" -- a bare "sim" must never
+# be enough to wave through an unusually large amount site-unseen.
+LARGE_AMOUNT_OVERRIDE_PHRASES = frozenset({"confirmar valor alto", "confirmo valor alto", "confirmar mesmo assim"})
+
+
+def is_large_amount_override(text: str | None) -> bool:
+    if not text:
+        return False
+    return normalize_reply(text) in LARGE_AMOUNT_OVERRIDE_PHRASES
 
 
 @dataclass(frozen=True)
@@ -236,7 +261,7 @@ def interpret_confirmation_reply(text: str | None) -> ConfirmationIntent:
 
     if not text:
         return ConfirmationIntent(action=None)
-    normalized = _normalize_reply(text)
+    normalized = normalize_reply(text)
     if not normalized:
         return ConfirmationIntent(action=None)
     if normalized in _CONFIRM_WORDS:
@@ -252,4 +277,7 @@ __all__ = [
     "guard_media_bytes",
     "ConfirmationIntent",
     "interpret_confirmation_reply",
+    "normalize_reply",
+    "LARGE_AMOUNT_OVERRIDE_PHRASES",
+    "is_large_amount_override",
 ]

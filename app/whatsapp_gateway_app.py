@@ -62,26 +62,47 @@ operator visibility.
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 import uuid
+from datetime import UTC, datetime, timedelta
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
 from app.services import whatsapp_gateway as gateway
+from app.services import whatsapp_media
 
 logger = logging.getLogger(__name__)
 
 _UNSUPPORTED_CONTENT_REPLY = (
-    "Por enquanto só consigo entender mensagens em texto. Pode escrever o que você quer "
-    "registrar ou perguntar?"
+    "Por enquanto só consigo entender mensagens em texto, foto, áudio ou PDF. Pode escrever o que "
+    "você quer registrar ou perguntar?"
 )
 _ORCHESTRATION_FAILURE_REPLY = (
     "Não consegui processar sua mensagem agora. Tente novamente em instantes."
+)
+_MEDIA_UNAVAILABLE_REPLY = (
+    "Não consegui buscar o arquivo enviado agora. Tente reenviar em instantes."
+)
+_MEDIA_NEEDS_INPUT_PREFIX = "Recebi o arquivo, mas "
+_MEDIA_REQUIRES_ACCOUNT_REPLY = (
+    "Recebi o arquivo e entendi o lançamento, mas não consegui identificar a conta ou o cartão. "
+    "Reenvie mencionando o nome do banco/cartão na legenda, ou finalize pelo site."
+)
+_MEDIA_NO_PENDING_CAPTURE_REPLY = "Essa captura não está mais disponível para confirmação."
+_MEDIA_CANCELLED_REPLY = "Combinado, cancelei essa captura. Nada foi lançado."
+_MEDIA_CONFIRMED_REPLY = "Lançamento confirmado com sucesso."
+_MEDIA_CONFIRM_FAILED_PREFIX = "Não consegui confirmar: "
+_MEDIA_DUPLICATE_FILE_REPLY = (
+    "Você já enviou esse mesmo arquivo antes. Confira a captura existente pelo site."
 )
 
 gateway_app = FastAPI(title="Family Finance WhatsApp Gateway", docs_url=None, redoc_url=None)
@@ -102,6 +123,44 @@ def _ready(settings) -> bool:
 def health() -> dict:
     settings = get_settings()
     return {"status": "healthy", "gateway_enabled": _ready(settings)}
+
+
+_METRICS_WINDOW_MINUTES = 60
+
+
+@gateway_app.get("/health/metrics")
+def health_metrics(db: Session = Depends(get_db)) -> dict:
+    """WA-07 (`docs/WORK_ORDER_WA_07.md`, issue #79): operational
+    availability/failure/latency visibility without ever exposing a
+    financial payload, a phone number, a message body or a secret --
+    exactly the same "sanitized observability" contract this module's other
+    logging already follows (see `_finalize_and_log` below).
+
+    Aggregated counts only, grouped by the already-sanitized `status`
+    column of `WhatsAppInboundEvent` (`app.models.WhatsAppInboundEvent`'s
+    own docstring: never message text, never a phone number in recoverable
+    form) over a fixed, short trailing window -- never a per-message
+    listing, which could otherwise let a caller reconstruct traffic timing
+    for one specific household by narrowing the window. `outbound_configured`
+    mirrors `/health`'s own `gateway_enabled` shape: a plain boolean, never
+    the credential itself.
+    """
+
+    from app.models import WhatsAppInboundEvent
+
+    settings = get_settings()
+    cutoff = datetime.now(UTC) - timedelta(minutes=_METRICS_WINDOW_MINUTES)
+    rows = db.execute(
+        select(WhatsAppInboundEvent.status, func.count())
+        .where(WhatsAppInboundEvent.received_at >= cutoff)
+        .group_by(WhatsAppInboundEvent.status)
+    ).all()
+    return {
+        "window_minutes": _METRICS_WINDOW_MINUTES,
+        "inbound_by_status": {status: count for status, count in rows},
+        "outbound_configured": gateway.resolve_provider() is not None,
+        "gateway_enabled": _ready(settings),
+    }
 
 
 @gateway_app.get("/webhooks/whatsapp")
@@ -148,13 +207,13 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
 
     messages = gateway.normalize_inbound_messages(payload if isinstance(payload, dict) else {})
     for message in messages:
-        _process_one_message(db, message, settings=settings)
+        await _process_one_message(db, message, settings=settings)
     if messages:
         db.commit()
     return JSONResponse(content=_UNIFORM_OK)
 
 
-def _process_one_message(
+async def _process_one_message(
     db, message: gateway.NormalizedInboundMessage, *, settings
 ) -> None:
     """`is_duplicate_message` is a cheap pre-check for the common case (a
@@ -235,10 +294,10 @@ def _process_one_message(
         db.rollback()
         return
 
-    _run_assistant_reply(db, message=message, authorized=authorized, trace_id=trace_id, event=event)
+    await _run_assistant_reply(db, message=message, authorized=authorized, trace_id=trace_id, event=event)
 
 
-def _run_assistant_reply(
+async def _run_assistant_reply(
     db,
     *,
     message: gateway.NormalizedInboundMessage,
@@ -246,18 +305,35 @@ def _run_assistant_reply(
     trace_id: str,
     event,
 ) -> None:
-    """WA-03: the one call site that reaches the Tool Layer from WhatsApp --
-    `plan_and_execute` itself already fixes `household_id`/authorization
-    from `user`, never from anything in `message`/the raw webhook payload
-    (Work Order item 11), and already never raises for a planning/tool
-    failure; the `except Exception` below is this module's own outermost
-    safety net (Work Order item 12, "falha parcial") for something
-    genuinely unexpected (e.g. a database error), not the expected
-    fail-closed path.
+    """WA-03/WA-07: the one dispatch point that decides what an authorized,
+    non-duplicate, non-rate-limited inbound message reaches next --
+    `plan_and_execute` (free text, unchanged since WA-03) for a `"text"`
+    message; the media capture pipeline (`_run_media_reply`, new in WA-07)
+    for an `image`/`audio`/`document` message; the pending-capture
+    confirm/cancel gate (`_resolve_pending_capture_reply`, new in WA-07) for
+    a text reply while this number has a `pending_capture_id`; or the
+    unsupported-content reply for anything else. Every branch fixes
+    `household_id`/authorization from `user` (looked up here, from
+    `authorized.user_id`, never from anything in `message`/the raw webhook
+    payload -- Work Order item 11) before doing anything else. `plan_and_execute`
+    already never raises for a planning/tool failure; the `except Exception`
+    around it below is this module's own outermost safety net (Work Order
+    item 12, "falha parcial") for something genuinely unexpected (e.g. a
+    database error), not the expected fail-closed path -- `_run_media_reply`
+    and `_resolve_pending_capture_reply` apply the same discipline for their
+    own new failure modes (guarded/logged below, not re-raised here).
     """
 
     from app.models import User
-    from app.services.assistant_orchestrator import plan_and_execute
+
+    logger.info(
+        "whatsapp_gateway.inbound_accepted",
+        extra={
+            "trace_id": trace_id,
+            "kind": "media" if message.media_id else ("text" if message.text else "unsupported"),
+            "media_kind": message.media_kind,
+        },
+    )
 
     # WA-05 (`docs/WORK_ORDER_WA_05.md`, issue #77): `authorized.id` is the
     # stable `WhatsAppAuthorizedNumber` row id for this one phone-user link
@@ -269,11 +345,6 @@ def _run_assistant_reply(
     # conversational memory never carries over to a different person taking
     # over a number (Work Order "different households are strictly
     # isolated" / separate-per-user state, applied within one household).
-    if not message.text:
-        _send_reply(to_digits=message.sender_digits, body=_UNSUPPORTED_CONTENT_REPLY)
-        gateway.finalize_inbound_event(db, event, status="unsupported_content", trace_id=trace_id)
-        return
-
     user = db.get(User, authorized.user_id)
     if user is None or user.household_id != authorized.household_id:
         # The allowlist row's target user/household no longer matches (e.g.
@@ -282,6 +353,29 @@ def _run_assistant_reply(
         logger.error("whatsapp_gateway.stale_authorized_number", extra={"trace_id": trace_id})
         gateway.finalize_inbound_event(db, event, status="error", trace_id=trace_id)
         return
+
+    if message.media_id:
+        await _run_media_reply(db, message=message, authorized=authorized, user=user, trace_id=trace_id, event=event)
+        return
+
+    if message.text and authorized.pending_capture_id:
+        resolved = _resolve_pending_capture_reply(
+            db, message=message, authorized=authorized, user=user, trace_id=trace_id, event=event
+        )
+        if resolved:
+            return
+        # `resolved=False`: the reply text was not a confirm/cancel/override
+        # match (`whatsapp_media.interpret_confirmation_reply` returned
+        # `None`) -- falls through to the normal text orchestrator below,
+        # exactly like any other message. The pending pointer is left
+        # untouched so a later "sim"/"não" can still resolve it.
+
+    if not message.text:
+        _send_reply(to_digits=message.sender_digits, body=_UNSUPPORTED_CONTENT_REPLY)
+        gateway.finalize_inbound_event(db, event, status="unsupported_content", trace_id=trace_id)
+        return
+
+    from app.services.assistant_orchestrator import plan_and_execute
 
     try:
         result = plan_and_execute(
@@ -301,6 +395,10 @@ def _run_assistant_reply(
     _send_reply(to_digits=message.sender_digits, body=result.answer)
     outcome_status = "needs_clarification" if result.needs_clarification else "processed"
     gateway.finalize_inbound_event(db, event, status=outcome_status, trace_id=trace_id)
+    logger.info(
+        "whatsapp_gateway.orchestration_completed",
+        extra={"trace_id": trace_id, "status": outcome_status},
+    )
 
 
 def _resolve_provider() -> gateway.WhatsAppProvider | None:
@@ -326,3 +424,372 @@ def _send_reply(*, to_digits: str, body: str) -> None:
     result = provider.send_message(gateway.build_outbound_text_message(to_digits=to_digits, body=body))
     if not result.ok:
         logger.error("whatsapp_gateway.send_failed", extra={"error": result.error})
+
+
+# --- WA-07: media capture (image/audio/document) --------------------------
+
+_MOVEMENT_LABELS_PT = {
+    "expense": "despesa",
+    "income": "receita",
+    "investment": "aplicação",
+    "redemption": "resgate",
+    "refund": "reembolso/estorno",
+    "transfer": "transferência interna",
+    "reconciliation": "pagamento/conciliação",
+}
+_LARGE_AMOUNT_DETAIL_PREFIX = "Há um lançamento de valor elevado"
+
+
+def _format_capture_preview(capture) -> str:
+    """Sanitized-for-WhatsApp rendering of a `CaptureDraft`'s stored
+    proposal -- shown so an explicit "confirmar"/"cancelar" reply is an
+    informed one (Work Order item 2: "mesmo fluxo de draft + prévia +
+    confirmação"). Summarizes only what the reply itself needs to decide --
+    kind, amount, date, description -- never the full `extracted_text`
+    (which can hold a document's entire OCR/transcription output, or a
+    bank/card statement's full line-by-line detail)."""
+
+    try:
+        items = json.loads(capture.proposal_json or "[]")
+    except (TypeError, ValueError):
+        items = []
+    if not items:
+        return "Recebi o arquivo, mas não encontrei nenhum lançamento para revisar."
+    lines: list[str] = []
+    for item in items[:5]:
+        kind = item.get("kind")
+        description = str(item.get("description") or "")[:120]
+        try:
+            amount = float(item.get("amount", 0))
+        except (TypeError, ValueError):
+            amount = 0.0
+        if kind == "transaction":
+            label = _MOVEMENT_LABELS_PT.get(item.get("movement_type"), "lançamento")
+            lines.append(f"- {label}: R$ {amount:.2f} em {item.get('booked_at')} - {description}")
+        elif kind == "obligation":
+            lines.append(f"- boleto/obrigação: R$ {amount:.2f}, vence {item.get('due_date')} - {description}")
+        else:
+            lines.append(f"- holerite: R$ {amount:.2f}, competência {item.get('competence')} - {description}")
+    suffix = "\n(e mais itens; confira todos no site antes de confirmar)" if len(items) > 5 else ""
+    return (
+        "Recebi o arquivo e entendi isto:\n"
+        + "\n".join(lines)
+        + suffix
+        + '\n\nResponda "confirmar" para lançar ou "cancelar" para descartar.'
+    )
+
+
+async def _run_media_reply(
+    db,
+    *,
+    message: gateway.NormalizedInboundMessage,
+    authorized,
+    user,
+    trace_id: str,
+    event,
+) -> None:
+    """WA-07 (`docs/WORK_ORDER_WA_07.md`, issue #79): turns an authorized,
+    non-duplicate `image`/`audio`/`document` message into a `CaptureDraft`,
+    reusing the exact same canonical pipeline the authenticated web upload
+    flow uses end to end (`app.api._analyze_and_persist_capture` ->
+    `app.services.smart_capture.preview_capture` ->
+    `extract_document_text`/`transcribe_audio`/`detect_document_type`/
+    `parse_financial_document` -- never a second OCR/transcription/parser).
+    Nothing here computes a financial fact or writes a
+    `Transaction`/`Obligation`/`PayrollRecord`; that only ever happens later,
+    from an explicit "confirmar" reply, via `_resolve_pending_capture_reply`
+    -> `app.api._confirm_capture_items` (the same canonical write path the
+    web confirmation form uses).
+
+    Replay protection for the media fetch itself needs no dedicated
+    mechanism: this function is only ever reached once per
+    `provider_message_id`, because `_process_one_message`'s idempotency
+    claim (`uq_whatsapp_inbound_events_message_id`) already committed before
+    this function is called -- a genuine redelivery of the same
+    `provider_message_id` never reaches past that claim, so
+    `WhatsAppProvider.fetch_media` is never called twice for one inbound
+    event. A *different* message that happens to carry the same underlying
+    file (a household resending the same photo) is instead caught by the
+    `Document.sha256` uniqueness check below, and replied to without
+    creating a second draft.
+    """
+
+    from app.models import Document
+    from app.services.crypto import EncryptedDocumentStore
+    from app.services.importer import file_sha256
+
+    settings = get_settings()
+    provider = _resolve_provider()
+    if provider is None:
+        logger.warning("whatsapp_gateway.media_fetch_not_configured", extra={"trace_id": trace_id})
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_UNAVAILABLE_REPLY)
+        gateway.finalize_inbound_event(db, event, status="error", trace_id=trace_id)
+        return
+
+    fetch_started = time.perf_counter()
+    fetch_result = provider.fetch_media(message.media_id)
+    fetch_duration_ms = round((time.perf_counter() - fetch_started) * 1000)
+    if not fetch_result.ok or not fetch_result.payload:
+        # Never logs `fetch_result.error` for anything but the transport-
+        # level classification `whatsapp_gateway._is_transient_send_error`
+        # already produces (an exception class name or `http_<code>`) --
+        # never a raw response body/URL.
+        logger.warning(
+            "whatsapp_gateway.media_fetch_failed",
+            extra={"trace_id": trace_id, "error": fetch_result.error, "duration_ms": fetch_duration_ms},
+        )
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_UNAVAILABLE_REPLY)
+        gateway.finalize_inbound_event(db, event, status="error", trace_id=trace_id)
+        return
+    logger.info(
+        "whatsapp_gateway.media_fetched",
+        extra={"trace_id": trace_id, "media_kind": message.media_kind, "duration_ms": fetch_duration_ms},
+    )
+
+    mime_type = fetch_result.mime_type or message.media_mime_type
+    media_kind = message.media_kind or "document"
+    try:
+        whatsapp_media.guard_media_bytes(
+            media_kind=media_kind,
+            mime_type=mime_type,
+            payload=fetch_result.payload,
+            max_bytes=settings.whatsapp_media_max_mb * 1024 * 1024,
+        )
+    except whatsapp_media.MediaRejected as exc:
+        logger.warning("whatsapp_gateway.media_rejected", extra={"trace_id": trace_id, "reason": exc.reason})
+        _send_reply(to_digits=message.sender_digits, body=exc.user_message)
+        gateway.finalize_inbound_event(db, event, status="unsupported_content", trace_id=trace_id)
+        return
+
+    filename = whatsapp_media.media_filename(media_kind, mime_type, message.media_filename)
+    digest = file_sha256(fetch_result.payload)
+    existing_document_id = db.scalar(
+        select(Document.id).where(Document.household_id == user.household_id, Document.sha256 == digest)
+    )
+    if existing_document_id is not None:
+        logger.info("whatsapp_gateway.media_duplicate_content", extra={"trace_id": trace_id})
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_DUPLICATE_FILE_REPLY)
+        gateway.finalize_inbound_event(db, event, status="processed", trace_id=trace_id)
+        return
+
+    document = Document(
+        household_id=user.household_id,
+        original_name=filename,
+        document_type="smart_capture",
+        sha256=digest,
+        encrypted_path="pending",
+        status="capture_processing",
+    )
+    db.add(document)
+    db.flush()
+    document.encrypted_path = EncryptedDocumentStore().save(document.id, fetch_result.payload)
+
+    from app.api import _analyze_and_persist_capture
+
+    analysis_started = time.perf_counter()
+    try:
+        capture = await _analyze_and_persist_capture(
+            db,
+            user,
+            document,
+            text=message.media_caption,
+            filename=filename,
+            content_type=mime_type,
+            payload=fetch_result.payload,
+            document_type="auto",
+            account=None,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("whatsapp_gateway.media_capture_failed", extra={"trace_id": trace_id})
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_UNAVAILABLE_REPLY)
+        gateway.finalize_inbound_event(db, event, status="error", trace_id=trace_id)
+        return
+    analysis_duration_ms = round((time.perf_counter() - analysis_started) * 1000)
+    logger.info(
+        "whatsapp_gateway.capture_created",
+        extra={
+            "trace_id": trace_id,
+            "capture_status": capture.status,
+            "detected_type": capture.detected_type,
+            "duration_ms": analysis_duration_ms,
+        },
+    )
+
+    if capture.status == "needs_input":
+        # `capture.notes` here is `str(CaptureParseError(...))` -- a fixed,
+        # already-user-facing Portuguese sentence written by
+        # `app.services.smart_capture` for exactly this situation (e.g. "Não
+        # encontrei um valor...", "O áudio não contém fala reconhecível"),
+        # never raw extracted document text. Zero DB mutation beyond this
+        # non-financial `CaptureDraft`/`Document` pair -- Work Order
+        # acceptance criterion "ambiguidade... deve esclarecer e não deve
+        # escrever".
+        _send_reply(
+            to_digits=message.sender_digits,
+            body=_MEDIA_NEEDS_INPUT_PREFIX + (capture.notes or "não consegui entender o conteúdo."),
+        )
+        gateway.finalize_inbound_event(db, event, status="needs_clarification", trace_id=trace_id)
+        return
+
+    try:
+        items = json.loads(capture.proposal_json or "[]")
+    except (TypeError, ValueError):
+        items = []
+    if any(item.get("requires_account") for item in items):
+        # The same account-resolution pass every capture already goes
+        # through (`app.api._enrich_capture_items`) could not resolve a
+        # unique account/card from the household's accounts, the message
+        # description, or the card's last four digits. WhatsApp has no
+        # editable-preview UI in this slice to let the household pick one
+        # inline, so this stays a clarification, never a write -- the
+        # household finishes it from the web UI's own `/captures` screen,
+        # or resends mentioning the account/card by name.
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_REQUIRES_ACCOUNT_REPLY)
+        gateway.finalize_inbound_event(db, event, status="needs_clarification", trace_id=trace_id)
+        return
+
+    authorized.pending_capture_id = capture.id
+    db.commit()
+    _send_reply(to_digits=message.sender_digits, body=_format_capture_preview(capture))
+    gateway.finalize_inbound_event(db, event, status="processed", trace_id=trace_id)
+
+
+def _resolve_pending_capture_reply(
+    db,
+    *,
+    message: gateway.NormalizedInboundMessage,
+    authorized,
+    user,
+    trace_id: str,
+    event,
+) -> bool:
+    """WA-07: the confirm/cancel gate for a media-derived `CaptureDraft`
+    already previewed to this number (`authorized.pending_capture_id`).
+
+    Returns `True` when this reply was consumed as a confirm/cancel/large-
+    amount-override action (the caller, `_run_assistant_reply`, must not
+    also run the text orchestrator on it) and `False` when the reply did
+    not match any of those closed phrases, in which case the caller falls
+    through to the normal free-text flow unchanged -- see
+    `app.services.whatsapp_media`'s own module docstring for why this is a
+    small, deterministic, non-LLM-routed gate on an already-shown preview,
+    not the "no static question catalog" free-text/financial-command
+    vocabulary that prohibition is actually about.
+
+    The pending pointer is cleared as soon as this function decides to act
+    on it (confirm, cancel, or a stale/missing/already-resolved draft) --
+    never left set after a terminal outcome, so a later stray "sim" cannot
+    resolve a capture that was already resolved another way (e.g. from the
+    web UI's own `/captures` screen). On the large-amount guard
+    specifically, the pointer is deliberately restored (not cleared) so the
+    immediate next "confirmar valor alto" reply still resolves this exact
+    draft -- see `whatsapp_media.LARGE_AMOUNT_OVERRIDE_PHRASES`'s own
+    docstring for why a bare "sim" is never enough on its own to waive that
+    guard, mirroring the web confirmation form's own two-step UX for it.
+    """
+
+    from app.models import CaptureDraft
+
+    large_override = whatsapp_media.is_large_amount_override(message.text)
+    intent = whatsapp_media.interpret_confirmation_reply(message.text)
+    if not large_override and intent.action is None:
+        return False
+
+    capture = db.scalar(
+        select(CaptureDraft).where(
+            CaptureDraft.id == authorized.pending_capture_id,
+            CaptureDraft.household_id == authorized.household_id,
+        )
+    )
+    authorized.pending_capture_id = None
+    if capture is None or capture.status != "preview":
+        db.commit()
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_NO_PENDING_CAPTURE_REPLY)
+        gateway.finalize_inbound_event(db, event, status="processed", trace_id=trace_id)
+        logger.info("whatsapp_gateway.pending_capture_stale", extra={"trace_id": trace_id})
+        return True
+
+    if intent.action == "cancel":
+        from app.api import audit
+
+        capture.status = "cancelled"
+        if capture.document:
+            capture.document.status = "capture_cancelled"
+        audit(
+            db,
+            user,
+            "capture.cancel",
+            "capture_draft",
+            capture.id,
+            {"source": "whatsapp"},
+            trace_id=trace_id,
+            source="whatsapp",
+        )
+        db.commit()
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_CANCELLED_REPLY)
+        gateway.finalize_inbound_event(db, event, status="processed", trace_id=trace_id)
+        logger.info("whatsapp_gateway.capture_cancelled", extra={"trace_id": trace_id})
+        return True
+
+    # `intent.action == "confirm"`, or the message was only the large-amount
+    # override phrase (which itself always implies "confirm" -- a household
+    # would not send it otherwise; `interpret_confirmation_reply` need not
+    # separately recognize it).
+    from app.api import CaptureItemRequest, _confirm_capture_items
+
+    try:
+        items_raw = json.loads(capture.proposal_json or "[]")
+        items = [CaptureItemRequest.model_validate(item) for item in items_raw]
+    except (TypeError, ValueError, PydanticValidationError):
+        db.rollback()
+        logger.exception("whatsapp_gateway.capture_confirm_malformed_proposal", extra={"trace_id": trace_id})
+        _send_reply(
+            to_digits=message.sender_digits,
+            body=_MEDIA_CONFIRM_FAILED_PREFIX + "os dados ficaram inválidos. Tente enviar o arquivo de novo.",
+        )
+        gateway.finalize_inbound_event(db, event, status="error", trace_id=trace_id)
+        return True
+
+    try:
+        _confirm_capture_items(
+            db,
+            user,
+            capture,
+            items,
+            confirmed_large_amount=large_override,
+            audit_source="whatsapp",
+            audit_trace_id=trace_id,
+        )
+    except HTTPException as exc:
+        db.rollback()
+        detail = str(exc.detail)
+        if exc.status_code == 409 and detail.startswith(_LARGE_AMOUNT_DETAIL_PREFIX):
+            authorized.pending_capture_id = capture.id
+            db.commit()
+            _send_reply(
+                to_digits=message.sender_digits,
+                body=f'{detail} Se está correto mesmo assim, responda "confirmar valor alto".',
+            )
+            gateway.finalize_inbound_event(db, event, status="needs_clarification", trace_id=trace_id)
+            logger.info("whatsapp_gateway.capture_large_amount_guard", extra={"trace_id": trace_id})
+            return True
+        logger.warning(
+            "whatsapp_gateway.capture_confirm_rejected",
+            extra={"trace_id": trace_id, "status_code": exc.status_code},
+        )
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_CONFIRM_FAILED_PREFIX + detail)
+        gateway.finalize_inbound_event(db, event, status="error", trace_id=trace_id)
+        return True
+    except Exception:
+        db.rollback()
+        logger.exception("whatsapp_gateway.capture_confirm_failed", extra={"trace_id": trace_id})
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_UNAVAILABLE_REPLY)
+        gateway.finalize_inbound_event(db, event, status="error", trace_id=trace_id)
+        return True
+
+    _send_reply(to_digits=message.sender_digits, body=_MEDIA_CONFIRMED_REPLY)
+    gateway.finalize_inbound_event(db, event, status="processed", trace_id=trace_id)
+    logger.info("whatsapp_gateway.capture_confirmed", extra={"trace_id": trace_id})
+    return True
