@@ -694,7 +694,96 @@ def test_draft_typed_action_materially_incomplete_message_asks_never_guesses() -
         )
     assert outcome.ok is True
     assert outcome.clarifying_question is not None
-    assert outcome.facts == {"can_execute": False}
+    # AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`, issue
+    # #112): `facts` now carries the full `TypedActionProposal.to_dict()`
+    # shape -- not just a bare `can_execute` flag -- even when the proposal
+    # is unresolved, so a caller (e.g. the web chat's `/assistant/ask`) can
+    # build the exact same structured missing-fields/candidate-picker UI
+    # `/assistant/interpret` already exposes, from this tool's outcome too.
+    assert outcome.facts["can_execute"] is False
+    assert outcome.facts["clarifying_question"] == outcome.clarifying_question
+    assert set(outcome.facts["missing_fields"]) == {"description", "account"}
+    assert outcome.facts["candidates"] == []
+    assert outcome.facts["candidate_kind"] is None
+
+
+def test_plan_and_execute_draft_typed_action_surfaces_full_proposal_for_any_channel() -> None:
+    """AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`, issue
+    #112): a plan that resolves to `draft_typed_action` must hand the full
+    `TypedActionProposal.to_dict()` shape back on `OrchestratorResult.
+    proposal` -- not just `proposal_id` -- so a channel (the web chat) can
+    render the same draft/preview/confirm card `POST /assistant/interpret`
+    already builds, without a second resolution path or a second call."""
+
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="orch-draft-proposal"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    plan_response = _valid_plan_response(steps=[{"tool": "draft_typed_action", "arguments": {}}])
+    interpret_client = FakeInterpretClient(response=_create_expense_interpretation_response())
+
+    with session_factory() as db:
+        result = plan_and_execute(
+            db,
+            user=user,
+            message="Gastei 120 de combustível na conta corrente",
+            client=FakePlanClient(response=plan_response),
+            interpret_client=interpret_client,
+        )
+
+    assert result.unavailable is False
+    assert result.reason is None
+    assert result.needs_clarification is False
+    assert result.proposal_id
+    assert result.proposal is not None
+    assert result.proposal["can_execute"] is True
+    assert result.proposal["typed_action"] == "create_expense"
+    assert result.proposal["payload"]["description"] == "Combustível"
+    # `proposal_id` (top-level, the field every channel already reads to
+    # call `POST /assistant/execute`) and `proposal["proposal_id"]` (the
+    # raw tool fact) must never disagree.
+    assert result.proposal["proposal_id"] == result.proposal_id
+    with session_factory() as db:
+        assert db.get(AssistantActionProposal, result.proposal_id) is not None
+
+
+def test_plan_and_execute_draft_typed_action_disambiguation_surfaces_candidates_too() -> None:
+    """Same as above, for the unresolved path: candidates/candidate_kind/
+    missing_fields must reach `OrchestratorResult.proposal` even though the
+    round ends in a clarifying question, not a persisted draft."""
+
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="orch-draft-disambiguation"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    plan_response = _valid_plan_response(steps=[{"tool": "draft_typed_action", "arguments": {}}])
+    incomplete_response = {
+        "schema_version": "1.0.0",
+        "intent": "create_expense",
+        "extracted_fields": {"amount_text": "300"},
+        "missing_fields": ["description", "account_hint"],
+        "clarifying_question": "Em qual conta ou cartão, e o que foi a despesa?",
+        "confidence": 0.4,
+    }
+    interpret_client = FakeInterpretClient(response=incomplete_response)
+
+    with session_factory() as db:
+        result = plan_and_execute(
+            db,
+            user=user,
+            message="Gastei 300",
+            client=FakePlanClient(response=plan_response),
+            interpret_client=interpret_client,
+        )
+
+    assert result.unavailable is False
+    assert result.needs_clarification is True
+    assert result.proposal_id is None
+    assert result.proposal is not None
+    assert result.proposal["can_execute"] is False
+    assert set(result.proposal["missing_fields"]) == {"description", "account"}
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +803,13 @@ def test_plan_and_execute_falls_back_safely_when_plan_is_unavailable() -> None:
         )
     assert result.needs_clarification is False
     assert "não consegui" in result.answer.lower()
+    # AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`, issue
+    # #112): a channel needs an unambiguous, structured signal -- not text
+    # sniffing -- to fail closed instead of falling back to a second,
+    # static engine when the Codex planner itself could not be reached.
+    assert result.unavailable is True
+    assert result.reason == "provider_unreachable"
+    assert result.proposal is None
 
 
 def test_plan_and_execute_needs_clarification_when_plan_says_so() -> None:
@@ -896,6 +992,14 @@ def test_assistant_ask_http_requires_admin_and_degrades_gracefully_without_codex
         body = response.json()
         assert isinstance(body["answer"], str) and body["answer"]
         assert body["needs_clarification"] is False
+        # AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`,
+        # issue #112): the HTTP response carries the same structured
+        # unavailable/reason signal the web chat's fail-closed UX reads --
+        # a real, unconfigured-Codex round through the actual FastAPI route
+        # (not just the Python-level `plan_and_execute` call) must produce it.
+        assert body["unavailable"] is True
+        assert body["reason"] == "codex_disabled"
+        assert body["proposal"] is None
 
 
 # ---------------------------------------------------------------------------

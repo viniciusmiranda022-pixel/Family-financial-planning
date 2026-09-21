@@ -67,8 +67,8 @@ def build_interpret_payload(
     `app.schemas.AdvisorHistoryItem`, or an equivalent mapping) so this
     module never needs to import `app.schemas` (keeping it dependency-free
     like `audit_sanitizer`). Only the last `MAX_HISTORY_ITEMS` entries are
-    forwarded, each truncated -- same cap `/advisor/chat` already applies
-    client-side to `state.advisorHistory`.
+    forwarded, each truncated -- same cap the web Assistant already applies
+    client-side to `state.assistantHistory`.
     """
 
     clean_message = _clean_text(message, max_length=MAX_MESSAGE_LENGTH)

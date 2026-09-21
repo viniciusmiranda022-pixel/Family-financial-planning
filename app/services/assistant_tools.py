@@ -572,7 +572,16 @@ def _tool_draft_typed_action(
             proposal.clarifying_question
             or "Não identifiquei uma ação para executar nessa mensagem."
         )
-        return ToolOutcome(ok=True, clarifying_question=question, facts={"can_execute": False})
+        # AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`,
+        # issue #112): the full `proposal.to_dict()` -- candidates,
+        # candidate_kind, missing_fields included -- travels in `facts` even
+        # when unresolved, not just the bare `can_execute` flag. A caller
+        # that only reads `clarifying_question` (the WA-02..07 text answer)
+        # is unaffected; a channel that wants the same structured
+        # duplicate/candidate-picker UI `/assistant/interpret` already
+        # exposes (e.g. the web chat) can now build it from this tool's
+        # facts too, without a second resolution path.
+        return ToolOutcome(ok=True, clarifying_question=question, facts=proposal.to_dict())
 
     proposal_id = persist_action_proposal(
         db,
@@ -583,15 +592,9 @@ def _tool_draft_typed_action(
         structured_interpretation=interpretation.to_dict(),
         proposal=proposal,
     )
-    return ToolOutcome(
-        ok=True,
-        facts={
-            "can_execute": True,
-            "proposal_id": proposal_id,
-            "typed_action": proposal.typed_action,
-            "payload": dict(proposal.payload or {}),
-        },
-    )
+    facts = proposal.to_dict()
+    facts["proposal_id"] = proposal_id
+    return ToolOutcome(ok=True, facts=facts)
 
 
 def _not_expired(proposal: Any, *, now: datetime) -> bool:
