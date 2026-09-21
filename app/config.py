@@ -153,6 +153,40 @@ class Settings(BaseSettings):
     whatsapp_phone_number_id: str = ""
     whatsapp_api_base_url: str = "https://graph.facebook.com/v21.0"
     whatsapp_send_timeout_seconds: int = 10
+    # WA-07 (docs/WORK_ORDER_WA_07.md, issue #79): bounded retry/backoff for
+    # transient outbound-send failures (timeout/network/5xx) -- never for a
+    # 4xx (a malformed payload/bad token retrying itself is pointless and
+    # would only burn the same rate-limit budget the Work Order asks this
+    # slice to respect). `_send_with_retry` in
+    # `app.services.whatsapp_gateway` is the only reader; kept small (2
+    # retries, short linear backoff) so a webhook POST handler -- which
+    # itself has no async/background dispatch in this slice -- still
+    # returns to Meta well inside its own delivery timeout even in the
+    # worst case (a real send call plus two retries).
+    whatsapp_send_max_attempts: int = 3
+    whatsapp_send_backoff_seconds: float = 0.2
+    # Same bounded retry/backoff, applied to the authenticated two-step
+    # media download (`MetaCloudApiProvider.fetch_media`: GET the media's
+    # temporary CDN URL, then GET the bytes) -- a WhatsApp media message
+    # otherwise has a single inbound webhook delivery as its only chance to
+    # ever fetch the underlying bytes (the URL Meta returns expires), so a
+    # transient failure here should not silently downgrade to "reply asking
+    # the household to resend" more often than necessary.
+    whatsapp_media_fetch_max_attempts: int = 3
+    whatsapp_media_fetch_backoff_seconds: float = 0.2
+    whatsapp_media_fetch_timeout_seconds: int = 20
+    # Resource limits for WA-07 media ingestion (Work Order §"Riscos":
+    # "MIME/size limits, decompression/resource exhaustion"). Deliberately a
+    # dedicated, smaller cap than `max_upload_mb` (the authenticated web
+    # upload limit) -- WhatsApp media arrives from an unauthenticated public
+    # webhook surface (`docs/ADR_WA_00_AI_ASSISTANT_DISCOVERY.md` §4.2) and
+    # Meta's own media API already caps individual message media well below
+    # `max_upload_mb` in practice (documents up to 100MB, images/audio much
+    # smaller), so this is the gateway's own independent, conservative
+    # ceiling -- never trust the provider's `Content-Length`/declared size
+    # alone; `app.services.whatsapp_media.guard_media_bytes` enforces this
+    # against the bytes actually read.
+    whatsapp_media_max_mb: int = 16
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

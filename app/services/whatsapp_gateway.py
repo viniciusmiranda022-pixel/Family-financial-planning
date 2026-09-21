@@ -24,6 +24,7 @@ import hmac
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -150,6 +151,19 @@ def verify_handshake(*, mode: str | None, verify_token: str | None, configured_t
 
 
 _MAX_INBOUND_TEXT_CHARS = 2000
+_MAX_MEDIA_CAPTION_CHARS = 1024
+_MAX_MEDIA_ID_CHARS = 200
+_MAX_MIME_TYPE_CHARS = 200
+_MAX_MEDIA_FILENAME_CHARS = 255
+
+# WA-07 (`docs/WORK_ORDER_WA_07.md`, issue #79): the three WhatsApp Cloud API
+# message types this slice reuses the existing capture/OCR/transcription
+# pipeline for. Deliberately a closed set matching exactly what
+# `app.services.smart_capture.preview_capture` already knows how to route
+# (audio -> `transcribe_audio`, image/document -> `extract_document_text`) --
+# `location`/`contacts`/`interactive`/`sticker`/... stay unsupported, same as
+# every other non-text type WA-01 already tolerated.
+_MEDIA_MESSAGE_TYPES = ("image", "audio", "document")
 
 
 @dataclass(frozen=True)
@@ -161,11 +175,24 @@ class NormalizedInboundMessage:
     # with no/blank `text.body`) -- the caller must treat `None` as
     # "nothing to interpret", never as an empty-but-valid message, exactly
     # the same "hint absent, never guessed" contract the Tool Layer already
-    # uses elsewhere. Only free text is in scope for this slice (no
-    # image/audio/location/interactive-button handling -- that is the
-    # existing OCR/transcription capture pipeline's territory, out of this
-    # Work Order's scope: "não antecipar WA-04+").
+    # uses elsewhere.
     text: str | None = None
+    # WA-07: populated instead of `text` for an `image`/`audio`/`document`
+    # message. `media_id` is Meta's opaque reference -- never the media
+    # bytes themselves, which are fetched separately (and only once, after
+    # this message has already won the idempotency claim -- see
+    # `app.whatsapp_gateway_app._run_media_reply`) via
+    # `WhatsAppProvider.fetch_media`. `media_kind` is one of
+    # `_MEDIA_MESSAGE_TYPES`; `media_caption` is the optional free-text
+    # caption WhatsApp lets an `image`/`document` message carry (never
+    # populated for `audio`, which has no caption field) and is treated
+    # exactly like the `text` field of a text message -- a hint, bounded and
+    # never trusted beyond that.
+    media_id: str | None = None
+    media_mime_type: str | None = None
+    media_kind: str | None = None
+    media_caption: str | None = None
+    media_filename: str | None = None
 
 
 def normalize_inbound_messages(payload: dict) -> list[NormalizedInboundMessage]:
@@ -212,17 +239,49 @@ def normalize_inbound_messages(payload: dict) -> list[NormalizedInboundMessage]:
                 except InvalidPhoneNumberError:
                     continue
                 text: str | None = None
-                if message.get("type") == "text":
+                message_type = message.get("type")
+                media_id: str | None = None
+                media_mime_type: str | None = None
+                media_kind: str | None = None
+                media_caption: str | None = None
+                media_filename: str | None = None
+                if message_type == "text":
                     body = message.get("text")
                     if isinstance(body, dict):
                         raw_text = body.get("body")
                         if isinstance(raw_text, str) and raw_text.strip():
                             text = raw_text.strip()[:_MAX_INBOUND_TEXT_CHARS]
+                elif message_type in _MEDIA_MESSAGE_TYPES:
+                    media = message.get(message_type)
+                    if isinstance(media, dict):
+                        raw_id = media.get("id")
+                        if isinstance(raw_id, str) and raw_id.strip():
+                            media_id = raw_id.strip()[:_MAX_MEDIA_ID_CHARS]
+                            media_kind = message_type
+                            raw_mime = media.get("mime_type")
+                            if isinstance(raw_mime, str) and raw_mime.strip():
+                                media_mime_type = raw_mime.strip()[:_MAX_MIME_TYPE_CHARS]
+                            raw_caption = media.get("caption")
+                            if isinstance(raw_caption, str) and raw_caption.strip():
+                                media_caption = raw_caption.strip()[:_MAX_MEDIA_CAPTION_CHARS]
+                            raw_filename = media.get("filename")
+                            if isinstance(raw_filename, str) and raw_filename.strip():
+                                media_filename = raw_filename.strip()[:_MAX_MEDIA_FILENAME_CHARS]
+                # A media entry whose provider payload was missing/malformed
+                # (no usable `id`) is treated as unsupported content, exactly
+                # like a `"text"` message with no/blank body -- `media_id`
+                # stays `None`, so the caller's existing "nothing to
+                # interpret" branch handles it without a new code path.
                 messages.append(
                     NormalizedInboundMessage(
                         provider_message_id=str(message_id),
                         sender_digits=sender_digits,
                         text=text,
+                        media_id=media_id,
+                        media_mime_type=media_mime_type,
+                        media_kind=media_kind,
+                        media_caption=media_caption,
+                        media_filename=media_filename,
                     )
                 )
     return messages
@@ -252,6 +311,23 @@ class ProviderSendResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class MediaFetchResult:
+    """WA-07: result of `WhatsAppProvider.fetch_media`. `ok=False` covers
+    every failure this module treats as "could not read this media right
+    now" -- unconfigured provider, transient network/timeout after
+    exhausting retries, an unexpected 4xx/5xx, or a media id Meta no longer
+    recognizes (its CDN URLs expire) -- collapsed to one boolean so the
+    caller (`app.whatsapp_gateway_app._run_media_reply`) has a single
+    fail-closed branch, the same shape `ProviderSendResult` already gives
+    outbound sends. `payload`/`mime_type` are only meaningful when `ok`."""
+
+    ok: bool
+    payload: bytes | None = None
+    mime_type: str | None = None
+    error: str | None = None
+
+
 class WhatsAppProvider(Protocol):
     """Adapter boundary a real Meta Cloud API client and the fake test
     provider both implement -- mirrors `advisor/providers/fakeProvider.mjs`'s
@@ -263,6 +339,17 @@ class WhatsAppProvider(Protocol):
 
     def send_message(self, payload: dict) -> ProviderSendResult: ...
 
+    # WA-07: authenticated download of one inbound media attachment's raw
+    # bytes, given the opaque `media_id` Meta's webhook payload carried
+    # (never a media *URL* -- Meta's Cloud API requires a first
+    # metadata/lookup call per media id, since the CDN URL is short-lived
+    # and not itself present in the webhook body). Called at most once per
+    # `provider_message_id` -- see `app.whatsapp_gateway_app._run_media_reply`'s
+    # docstring on why message-level idempotency (already enforced before
+    # this is ever reached) is what makes a redelivered media message never
+    # re-fetch/re-process, not a second dedup mechanism here.
+    def fetch_media(self, media_id: str) -> MediaFetchResult: ...
+
 
 class FakeWhatsAppProvider:
     """In-memory recorder for tests -- never calls any network. Records
@@ -272,10 +359,28 @@ class FakeWhatsAppProvider:
 
     def __init__(self) -> None:
         self.sent: list[dict] = []
+        # media_id -> (payload_bytes, mime_type). A test registers a fixture
+        # via `register_media` before delivering a webhook that references
+        # it; `fetch_media_calls` records every id this provider was asked
+        # to fetch (in order, including repeats) so a test can assert a
+        # redelivered/duplicate message never fetches twice.
+        self._media: dict[str, tuple[bytes, str]] = {}
+        self.fetch_media_calls: list[str] = []
 
     def send_message(self, payload: dict) -> ProviderSendResult:
         self.sent.append(payload)
         return ProviderSendResult(ok=True, provider_message_id=f"fake-{len(self.sent)}")
+
+    def register_media(self, media_id: str, payload: bytes, mime_type: str) -> None:
+        self._media[media_id] = (payload, mime_type)
+
+    def fetch_media(self, media_id: str) -> MediaFetchResult:
+        self.fetch_media_calls.append(media_id)
+        found = self._media.get(media_id)
+        if found is None:
+            return MediaFetchResult(ok=False, error="fake_media_not_registered")
+        payload, mime_type = found
+        return MediaFetchResult(ok=True, payload=payload, mime_type=mime_type)
 
 
 class MetaCloudApiProvider:
@@ -313,24 +418,154 @@ class MetaCloudApiProvider:
             },
             method="POST",
         )
-        try:
-            with urlopen(request, timeout=self.settings.whatsapp_send_timeout_seconds) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
+
+        def _attempt() -> ProviderSendResult:
             try:
-                detail = json.loads(exc.read().decode("utf-8"))
-            except (ValueError, OSError):
-                detail = {}
-            error = (detail.get("error") or {}).get("message") if isinstance(detail, dict) else None
-            return ProviderSendResult(ok=False, error=error or f"http_{exc.code}")
-        except (URLError, TimeoutError, ValueError, OSError) as exc:
-            return ProviderSendResult(ok=False, error=str(exc.__class__.__name__))
-        message_id = None
-        if isinstance(result, dict):
-            messages = result.get("messages")
-            if isinstance(messages, list) and messages and isinstance(messages[0], dict):
-                message_id = messages[0].get("id")
-        return ProviderSendResult(ok=True, provider_message_id=message_id)
+                with urlopen(request, timeout=self.settings.whatsapp_send_timeout_seconds) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                try:
+                    detail = json.loads(exc.read().decode("utf-8"))
+                except (ValueError, OSError):
+                    detail = {}
+                error = (detail.get("error") or {}).get("message") if isinstance(detail, dict) else None
+                return ProviderSendResult(ok=False, error=error or f"http_{exc.code}")
+            except (URLError, TimeoutError, ValueError, OSError) as exc:
+                return ProviderSendResult(ok=False, error=str(exc.__class__.__name__))
+            message_id = None
+            if isinstance(result, dict):
+                messages = result.get("messages")
+                if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+                    message_id = messages[0].get("id")
+            return ProviderSendResult(ok=True, provider_message_id=message_id)
+
+        return _retry_transient(
+            _attempt,
+            is_transient=lambda outcome: not outcome.ok and _is_transient_send_error(outcome.error),
+            max_attempts=self.settings.whatsapp_send_max_attempts,
+            backoff_seconds=self.settings.whatsapp_send_backoff_seconds,
+        )
+
+    def fetch_media(self, media_id: str) -> MediaFetchResult:
+        """Two-step Meta Cloud API media download: `GET /{media_id}` returns
+        JSON metadata including a short-lived `url` + `mime_type` (never the
+        bytes directly), then a second authenticated `GET` on that `url`
+        returns the actual media bytes. Both calls are wrapped by the same
+        bounded retry/backoff as `send_message` -- WA-07 hardening item 2
+        ("timeouts/retries explícitos") -- but only for the transient
+        failure classes `_is_transient_send_error` recognizes; a 4xx (e.g. an
+        expired/invalid `media_id`) fails immediately, never retried, since
+        retrying cannot make an invalid id valid and would only spend more
+        of this sender's own rate-limit budget on the provider side.
+        """
+
+        if not self.configured:
+            return MediaFetchResult(ok=False, error="whatsapp_media_fetch_not_configured")
+        timeout = self.settings.whatsapp_media_fetch_timeout_seconds
+        max_attempts = self.settings.whatsapp_media_fetch_max_attempts
+        backoff = self.settings.whatsapp_media_fetch_backoff_seconds
+        auth_headers = {"Authorization": f"Bearer {self.settings.whatsapp_access_token}"}
+
+        # Internal-only carrier for the metadata step's result: reuses the
+        # same `(ok, error)` shape `_retry_transient` already knows how to
+        # drive, but keeps the short-lived, token-bearing CDN `url` in its
+        # own named field rather than overloading `MediaFetchResult.error`
+        # (which a caller might reasonably assume is always either `None`
+        # or a safe-to-log failure reason).
+        @dataclass(frozen=True)
+        class _MetadataResult:
+            ok: bool
+            url: str | None = None
+            mime_type: str | None = None
+            error: str | None = None
+
+        def _fetch_metadata() -> _MetadataResult:
+            url = f"{self.settings.whatsapp_api_base_url.rstrip('/')}/{media_id}"
+            request = Request(url, headers=auth_headers, method="GET")
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                return _MetadataResult(ok=False, error=f"http_{exc.code}")
+            except (URLError, TimeoutError, ValueError, OSError) as exc:
+                return _MetadataResult(ok=False, error=str(exc.__class__.__name__))
+            if not isinstance(body, dict) or not body.get("url"):
+                return _MetadataResult(ok=False, error="media_metadata_malformed")
+            return _MetadataResult(ok=True, url=body.get("url"), mime_type=body.get("mime_type"))
+
+        metadata = _retry_transient(
+            _fetch_metadata,
+            is_transient=lambda outcome: not outcome.ok and _is_transient_send_error(outcome.error),
+            max_attempts=max_attempts,
+            backoff_seconds=backoff,
+        )
+        if not metadata.ok:
+            return MediaFetchResult(ok=False, error=metadata.error)
+        media_url = metadata.url
+
+        def _fetch_bytes() -> MediaFetchResult:
+            request = Request(media_url, headers=auth_headers, method="GET")
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    data = response.read(self.settings.whatsapp_media_max_mb * 1024 * 1024 + 1)
+            except HTTPError as exc:
+                return MediaFetchResult(ok=False, error=f"http_{exc.code}")
+            except (URLError, TimeoutError, ValueError, OSError) as exc:
+                return MediaFetchResult(ok=False, error=str(exc.__class__.__name__))
+            return MediaFetchResult(ok=True, payload=data, mime_type=metadata.mime_type)
+
+        return _retry_transient(
+            _fetch_bytes,
+            is_transient=lambda outcome: not outcome.ok and _is_transient_send_error(outcome.error),
+            max_attempts=max_attempts,
+            backoff_seconds=backoff,
+        )
+
+
+def _is_transient_send_error(error: str | None) -> bool:
+    """Classifies an outbound-send/media-fetch failure as worth a bounded
+    retry. `URLError`/`TimeoutError`/`OSError` (network-level: DNS, refused
+    connection, timeout) and a `5xx` HTTP status are transient -- the same
+    request might succeed moments later. A `4xx` (bad token, malformed
+    payload, expired/unknown media id, rate-limited -- `429` is
+    deliberately excluded here too: retrying immediately into an active
+    rate limit would make it worse, and this module has no backoff long
+    enough to meaningfully wait one out) is not retried: the exact same
+    request would fail again for the exact same reason, and retrying only
+    spends more of the outbound rate-limit budget for no chance of success.
+    """
+
+    if not error:
+        return False
+    if error in {"URLError", "TimeoutError", "OSError"}:
+        return True
+    if error.startswith("http_"):
+        code = error[len("http_") :]
+        return code.isdigit() and code.startswith("5")
+    return False
+
+
+def _retry_transient(attempt, *, is_transient, max_attempts: int, backoff_seconds: float):
+    """Bounded linear-backoff retry loop shared by `send_message` and
+    `fetch_media` -- WA-07 hardening item 2. `max_attempts` includes the
+    first (non-retry) attempt, so `max_attempts=1` disables retrying
+    entirely (an operator can always dial this down to 1 without special-
+    casing anything). Sleeps between attempts only, never after the last
+    one. `time.sleep` is a deliberate, short, synchronous block: this
+    module has no async call path (the webhook handler that ultimately
+    calls this is itself a synchronous FastAPI route body), and the total
+    worst case (`max_attempts - 1` backoff steps, each a few hundred
+    milliseconds by default) stays comfortably inside Meta's own webhook
+    delivery timeout.
+    """
+
+    outcome = attempt()
+    attempts = 1
+    while attempts < max(1, max_attempts) and is_transient(outcome):
+        time.sleep(max(0.0, backoff_seconds) * attempts)
+        outcome = attempt()
+        attempts += 1
+    return outcome
 
 
 def resolve_provider() -> WhatsAppProvider | None:
