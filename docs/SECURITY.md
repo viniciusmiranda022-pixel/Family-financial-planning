@@ -115,9 +115,11 @@ do repositório em `%LOCALAPPDATA%\FamilyFinancialPlanning\codex`.
 `POST /notification-settings/test-email` administrativo; o scheduler/worker que efetivamente envia
 D-1/D0 automaticamente é a seção "Alertas de e-mail — outbox e worker (MAIL-02)" logo abaixo.
 
-- a credencial SMTP (`ALERT_SMTP_USERNAME`/`ALERT_SMTP_APP_PASSWORD`) só existe em variável de
-  ambiente (`.env`/segredo do orquestrador) -- nunca no banco, nunca na UI, nunca em resposta de API;
-  `NotificationSettings`/`NotificationRecipient` (MAIL-00) não têm coluna para ela;
+- a credencial SMTP de fallback (`ALERT_SMTP_USERNAME`/`ALERT_SMTP_APP_PASSWORD`) vive em variável de
+  ambiente (`.env`/segredo do orquestrador) -- nunca em resposta de API; `NotificationSettings`/
+  `NotificationRecipient` (MAIL-00) não têm coluna para ela. Desde o MAIL-04 (seção própria abaixo) um
+  admin pode alternativamente salvar um remetente pela interface, com a App Password criptografada em
+  repouso -- nunca em texto plano no banco, nunca em resposta de API;
 - gere uma **App Password** do Gmail (exige verificação em duas etapas na conta remetente) em
   https://myaccount.google.com/apppasswords -- nunca use a senha normal de login da conta nesse campo;
 - com `ALERT_EMAIL_ENABLED=false` (padrão) ou qualquer variável `ALERT_SMTP_*`/`ALERT_EMAIL_FROM`
@@ -153,9 +155,10 @@ D-1/D0 automaticamente é a seção "Alertas de e-mail — outbox e worker (MAIL
 `docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`, issue #69. Cobre o envio automático de D-1/D0 em si
 (`app.services.notification_scheduler`, `app.cli.notification_worker`).
 
-- a credencial SMTP continua exclusivamente em variável de ambiente (nada muda aqui em relação ao
-  MAIL-01) -- o worker reusa o mesmo `SmtpEmailAdapter`, nunca lê/grava a credencial em
-  `notification_deliveries`;
+- a credencial SMTP é resolvida por `app.services.smtp_config.resolve_effective_smtp_settings` a cada
+  passada -- banco (se habilitado/completo) ou `ALERT_SMTP_*` (MAIL-04, seção própria abaixo) -- e
+  entregue a uma instância de `SmtpEmailAdapter`, o mesmo e único motor de envio do MAIL-01; o worker
+  nunca lê/grava a credencial em `notification_deliveries`;
 - `AuditEvent` gravado pelo worker (`source="notification_worker"`) tem `user_id=None` (processo de
   sistema) e `details` restrito a ids/`alert_kind`/código de erro sanitizado -- nunca o endereço de
   e-mail do destinatário, nunca o corpo do e-mail, nunca texto bruto de exceção SMTP;
@@ -176,9 +179,10 @@ D-1/D0 automaticamente é a seção "Alertas de e-mail — outbox e worker (MAIL
 `GET /notification-settings/status`. Ver `docs/RUNBOOK_MAIL_ALERTS.md` para operação/troubleshooting
 completos.
 
-- a credencial SMTP continua exclusivamente em `.env`/segredo do orquestrador -- o serviço
-  `notification-worker` usa `env_file: .env`, os mesmos `ALERT_SMTP_*` que `app` já usava, nunca uma
-  cópia ou uma segunda fonte de configuração;
+- o serviço `notification-worker` usa `env_file: .env` -- os mesmos `ALERT_SMTP_*` que `app` já usava
+  continuam disponíveis como fallback -- e lê a mesma tabela `smtp_sender_configs` que `app` (MAIL-04)
+  através da mesma `resolve_effective_smtp_settings`, nunca uma cópia ou uma segunda fonte de
+  configuração;
 - `GET /notification-settings/status` não é `_require_admin`-gated (qualquer membro autenticado do
   household lê, mesma fronteira de `GET /notification-settings`) porque nada na resposta é segredo
   ou endereço de destinatário: `sender_configured` é um booleano, `worker` traz apenas timestamps/
@@ -201,6 +205,44 @@ completos.
   exceção (`tests/test_notification_worker.py::test_run_once_records_a_failed_heartbeat_and_still_raises_when_a_pass_crashes`),
   e a mesma passada nunca deixa uma `notification_delivery`/`Transaction` órfã ou parcial (a
   transação da sessão correspondente é revertida pelo `with Session(...)` do SQLAlchemy).
+
+## Alertas de e-mail — remetente SMTP configurável pela interface (MAIL-04)
+
+`docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md`, issue #110. Cobre `smtp_sender_configs` (migração `0028`),
+`app.services.smtp_config` e `GET`/`PUT /smtp-config`. Nunca introduz um segundo motor de envio --
+`app.services.email_delivery.SmtpEmailAdapter` continua sendo o único transporte, apenas recebendo uma
+configuração já resolvida.
+
+- a App Password é criptografada em repouso com `cryptography.fernet.Fernet` e uma chave dedicada,
+  `SMTP_ENCRYPTION_KEY` -- nunca `SECRET_KEY`, `FILE_ENCRYPTION_KEY`, `MFA_ENCRYPTION_KEY`, ou
+  `WHATSAPP_PHONE_ENCRYPTION_KEY` (mesma disciplina de "uma chave por domínio" já usada por essas
+  quatro), e a criptografia/descriptografia falha explicitamente (`SmtpConfigurationError`) quando a
+  chave está ausente/inválida -- nunca cai para texto plano;
+- `GET`/`PUT /smtp-config` são `_require_admin`-gated -- diferente de `GET /notification-settings`,
+  aqui a leitura também é admin-only, porque a resposta descreve o remetente do deployment inteiro, não
+  uma preferência do household do chamador
+  (`tests/test_role_based_authorization.py::test_consulta_reads_household_data`,
+  `tests/test_smtp_config_api.py`);
+- nenhuma resposta de `GET`/`PUT /smtp-config` inclui a App Password em qualquer forma (texto plano ou
+  cifrada) -- apenas `app_password_configured` (booleano) e os campos não sensíveis (host/porta/
+  usuário/remetente/STARTTLS/timeout) (`tests/test_smtp_config_api.py::test_put_then_get_reflects_saved_config_without_leaking_password`);
+- `AuditEvent` de `smtp_config.update` também nunca carrega a senha -- `details` só tem
+  `app_password_changed` (booleano), e `before_state`/`after_state` são a mesma projeção sanitizada
+  devolvida pela API (`tests/test_smtp_config_api.py::test_put_audits_change_without_leaking_password_in_before_after_or_details`);
+- editar a configuração com o campo de senha vazio preserva a senha já salva; substituição e remoção
+  (`remove_app_password`) são ações explícitas e mutuamente exclusivas com o envio de uma senha nova na
+  mesma chamada (`tests/test_smtp_config.py`);
+- a precedência banco-vs-`ALERT_SMTP_*` é tudo-ou-nada: uma linha habilitada e completa no banco é
+  usada inteiramente; caso contrário `ALERT_SMTP_*` é usado inteiramente -- nunca uma mistura de host
+  de uma fonte com senha de outra (`tests/test_smtp_config.py::test_disabled_db_row_falls_back_to_env_entirely_not_partially`);
+- `resolve_effective_smtp_settings` é chamada sem cache tanto por `POST /notification-settings/
+  test-email` quanto por cada passada de `app.cli.notification_worker.run_once` -- uma configuração
+  salva pela interface vale a partir da própria chamada/passada seguinte, sem restart de processo
+  (`tests/test_notification_worker.py::test_run_once_without_explicit_adapter_uses_db_smtp_config_saved_before_this_pass`);
+- `SMTP_ENCRYPTION_KEY` é opcional (diferente de `MFA_ENCRYPTION_KEY`, que é obrigatória desde o
+  primeiro boot): uma instalação que nunca a define continua subindo normalmente e simplesmente não
+  consegue habilitar/salvar o remetente pela interface -- o fallback `ALERT_SMTP_*` continua
+  funcionando sem qualquer mudança (MAIL-04, critério de aceite 1).
 
 ## CI (PR 8)
 

@@ -1338,8 +1338,11 @@ D-1/D0 automaticamente é a seção "MAIL-02" logo abaixo.
 - **UI**: botão "Testar" por linha em `#notification-recipients-table`
   (`app/static/app.js:renderNotificationRecipients`), admin-only, mostra a mensagem sanitizada da API
   via toast em caso de falha.
-- **Segredo**: `ALERT_SMTP_APP_PASSWORD` só existe em `.env`/segredo do orquestrador (ver
+- **Segredo**: `ALERT_SMTP_APP_PASSWORD` (`.env`/segredo do orquestrador) é o fallback (ver
   `docs/SECURITY.md#alertas-de-e-mail--smtp-e-gmail-mail-01`); `.env.example` só tem placeholders.
+  Desde o MAIL-04 (seção própria mais abaixo) um admin pode alternativamente salvar um remetente pela
+  interface, com a App Password criptografada em repouso -- `resolve_effective_smtp_settings` decide
+  qual das duas fontes está efetiva, nunca uma mistura das duas.
 
 ## Alertas de vencimento por e-mail — MAIL-02 (outbox, scheduler, idempotência e retry)
 
@@ -1421,8 +1424,9 @@ exclusivamente em `app.services.notification_scheduler`).
   `household_id`).
 - **`GET /notification-settings/status`** (`app.api`): qualquer membro autenticado do household lê
   (mesma fronteira de `GET /notification-settings`) -- nada na resposta é segredo ou endereço de
-  destinatário. Combina `enabled`/`sender_configured` (`SmtpEmailAdapter().configured`, já existente
-  desde MAIL-01) + `worker` (o heartbeat, `null` se nenhuma passada terminou ainda) + `deliveries`
+  destinatário. Combina `enabled`/`sender_configured` (`SmtpEmailAdapter(settings=
+  resolve_effective_smtp_settings(db)).configured` desde o MAIL-04 -- banco ou `ALERT_SMTP_*`, o que
+  estiver efetivo) + `worker` (o heartbeat, `null` se nenhuma passada terminou ainda) + `deliveries`
   (contagens `pending`/`sending`/`sent`/`failed`/`canceled` só deste household) -- exatamente o
   checklist "Observabilidade" do Work Order.
 - **`app/cli/notification_worker_healthcheck.py`**: o `HEALTHCHECK` Docker do serviço
@@ -1435,6 +1439,58 @@ exclusivamente em `app.services.notification_scheduler`).
   catch-up após reboot, nota de compatibilidade OCI/ARM64 (mesma imagem/dependências já validadas
   no backlog Oracle/OCI, nenhuma nova) e rollback (nunca destrutivo para
   `notification_deliveries`/pagamentos/obrigações).
+
+## Alertas de vencimento por e-mail — MAIL-04 (remetente SMTP pela interface)
+
+`docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md`, issue #110. Estende MAIL-00..03 com uma segunda fonte,
+opcional, para a credencial SMTP -- nunca um segundo motor de envio, nunca uma segunda cópia do
+`SmtpEmailAdapter`.
+
+- **`smtp_sender_configs`** (migração `0028`, `app.models.SmtpSenderConfig`): linha única, global (não
+  por household -- um único `notification-worker` envia para todos os households, mesma razão de
+  `NotificationWorkerHeartbeat` ser global). `app_password_encrypted` é `Text` nullable; `NULL`
+  significa "nenhuma senha salva ainda", nunca "senha vazia". Primary key fixa
+  (`app.services.smtp_config._SINGLETON_ID`), mesmo idioma de concorrência de
+  `notification_worker_status._SINGLETON_ID` (a PK, não disciplina de aplicação, impede duas linhas
+  concorrentes na primeira gravação).
+- **`app.services.smtp_config`**: dono de duas decisões, e só duas --
+  - criptografia: `Fernet(settings.smtp_encryption_key)`, uma chave dedicada e opcional (`str = ""`,
+    diferente de `mfa_encryption_key`, que é obrigatória desde o primeiro boot) -- uma instalação que
+    nunca a define continua subindo normalmente (critério de aceite 1 do Work Order) e só não consegue
+    habilitar/salvar o remetente pela interface, com erro explícito
+    (`SmtpConfigurationError`), nunca um fallback silencioso para texto plano;
+  - precedência: `resolve_effective_smtp_settings(db)` -- uma linha habilitada e completa (host,
+    username, from_email, App Password) vence por inteiro; caso contrário `ALERT_SMTP_*` (MAIL-01)
+    vence por inteiro. Nunca um campo do banco combinado com um campo do `.env` na mesma configuração
+    efetiva.
+- **`app.services.email_delivery.SmtpSettingsLike`** (`Protocol`): a única mudança em MAIL-01 que o
+  MAIL-04 exigiu -- `SmtpEmailAdapter.__init__` passa a aceitar qualquer objeto com os 8 atributos
+  `alert_*` que já lia de `Settings`, estruturalmente. `EffectiveSmtpSettings`
+  (`app.services.smtp_config`) satisfaz o Protocol; a lógica de `send()`/mapeamento de erro do MAIL-01
+  não muda uma linha.
+- **`GET`/`PUT /smtp-config`** (`app.api`, admin-only para leitura *e* escrita -- diferente de
+  `GET /notification-settings`, que qualquer membro do household lê): `PUT` nunca aceita nem devolve a
+  senha em texto plano; devolve `app_password_configured` (booleano). Editar com o campo de senha
+  vazio preserva o segredo salvo; `remove_app_password` é a única forma explícita de apagá-lo, e é
+  mutuamente exclusivo com enviar uma senha nova na mesma chamada. Habilitar (`enabled=true`) exige
+  host/username/from_email e uma App Password (nova ou já salva) -- nunca fica "habilitado" enquanto
+  `resolve_effective_smtp_settings` na verdade cairia para o `.env` por baixo.
+- **Reuso, não duplicação, do teste e do worker**: `POST /notification-settings/test-email` (MAIL-01) e
+  cada passada de `app.cli.notification_worker.run_once` (MAIL-02) passam a construir
+  `SmtpEmailAdapter(settings=resolve_effective_smtp_settings(db))` em vez de `SmtpEmailAdapter()` --
+  mesma chamada, resolvida sem cache a cada vez, então uma configuração salva pela interface vale a
+  partir da própria chamada/passada seguinte, sem restart de `app`/`notification-worker`
+  (`tests/test_notification_worker.py::test_run_once_without_explicit_adapter_uses_db_smtp_config_saved_before_this_pass`).
+- **Auditoria**: `smtp_config.update` grava apenas `app_password_changed` (booleano) em `details`, e
+  `before_state`/`after_state` são a mesma projeção sanitizada da API -- nunca a senha, cifrada ou não.
+- **UI**: painel "Remetente SMTP" em Configurações (`#smtp-config-settings`,
+  `app/templates/index.html`), oculto inteiramente para não-admin (`app/static/app.js:showApp`) --
+  proteção de UX, a fronteira real é `_require_admin` na API. O campo de senha sempre inicia vazio; o
+  placeholder indica se já existe uma senha salva, nunca a senha em si.
+- **Compatibilidade**: uma instalação existente que nunca configura `SMTP_ENCRYPTION_KEY` nem usa este
+  painel continua funcionando exatamente como antes do MAIL-04 -- `resolve_effective_smtp_settings`
+  não encontra linha usável em `smtp_sender_configs` e cai para `ALERT_SMTP_*` por inteiro, o mesmo
+  caminho que já existia.
 
 ## Valorização diária do Privilège DI via CVM (issue #85)
 
