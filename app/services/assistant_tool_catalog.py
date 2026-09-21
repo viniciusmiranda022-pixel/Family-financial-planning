@@ -179,6 +179,26 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
         ),
         arguments=(("merchant_hint", "nome/descrição da compra parcelada (obrigatório)"),),
     ),
+    # WA-06 (docs/WORK_ORDER_WA_06.md, issue #78) -- "posso gastar R$ X?":
+    # a purely hypothetical, read-only cash-impact scenario, never a
+    # typed-action draft and never persisted (see
+    # `app.services.assistant_tools._tool_simulate_purchase`).
+    ToolSpec(
+        name="simulate_purchase",
+        description=(
+            "Simula o impacto de uma compra hipotética no teto do mês e na projeção de liquidez, sem "
+            "lançar nada -- 'posso gastar R$ X?', 'dá pra comprar algo de R$ X em Nx?'. Nunca cria um "
+            "rascunho de lançamento; é somente leitura/simulação."
+        ),
+        arguments=(
+            ("amount_text", "valor da compra em texto livre (ex.: '300', 'R$ 1.500,00') -- obrigatório"),
+            ("installments_text", "quantidade de parcelas, opcional (padrão: 1 = à vista)"),
+            (
+                "monthly_interest_rate_text",
+                "taxa de juros mensal do parcelamento em %, opcional (padrão: 0 = sem juros)",
+            ),
+        ),
+    ),
     ToolSpec(
         name="search_transactions",
         description=(

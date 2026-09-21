@@ -46,6 +46,7 @@ from app.services.assistant_actions import (
     build_typed_action_proposal,
     cancel_action_proposal,
     execute_typed_action,
+    parse_amount_text,
     persist_action_proposal,
     undo_assistant_action,
 )
@@ -367,6 +368,186 @@ def _tool_project_category_pace(db: Session, *, user: Any, arguments: dict[str, 
             "days_in_month": days_in_month,
             "amount_so_far": amount_so_far,
             "projected_total": projected_total,
+        },
+    )
+
+
+_MAX_SIMULATED_INSTALLMENTS = 120
+_MAX_SIMULATED_MONTHLY_RATE = Decimal("0.30")
+
+
+def _parse_installments_hint(value: str | None) -> int:
+    """Free-text installment-count hint -> a valid `1..120` count, or `1`
+    (à vista) for anything absent/unparsable/out of range -- an optional
+    field's own documented default, never a reason to block the simulation
+    on a clarifying question (mirrors `_normalize_type_hint`'s "unrecognized
+    soft hint is silently ignored" idiom)."""
+
+    if not value:
+        return 1
+    match = re.search(r"\d{1,3}", value)
+    if not match:
+        return 1
+    count = int(match.group(0))
+    return count if 1 <= count <= _MAX_SIMULATED_INSTALLMENTS else 1
+
+
+def _parse_monthly_rate_hint(value: str | None) -> Decimal:
+    """Free-text monthly-interest-rate hint (percent, e.g. `"2"`/`"2%"`) ->
+    a `Decimal` fraction, or `0` (interest-free) for anything absent/
+    unparsable/implausibly high -- same "optional field, documented default,
+    never blocks on a clarifying question" idiom as `_parse_installments_hint`.
+    """
+
+    if not value:
+        return Decimal("0")
+    parsed = parse_amount_text(value.replace("%", ""))
+    if parsed is None:
+        return Decimal("0")
+    rate = parsed / Decimal("100")
+    return rate if rate <= _MAX_SIMULATED_MONTHLY_RATE else Decimal("0")
+
+
+def _tool_simulate_purchase(db: Session, *, user: Any, arguments: dict[str, str], today: date) -> ToolOutcome:
+    """WA-06 (`docs/WORK_ORDER_WA_06.md`, issue #78) "posso gastar R$ X?" --
+    a purely hypothetical, read-only purchase/cash-impact scenario. Never
+    persists anything and never drafts a typed action: this tool answers
+    "what would happen if", `draft_typed_action` is the only path that can
+    ever turn a purchase into a real pending proposal.
+
+    Reuses, rather than reimplements: `app.services.assistant_actions.
+    parse_amount_text` for the amount (the exact "hint, never a guess"
+    parser the typed-action WRITE pipeline already uses for the same kind of
+    free-text amount), `app.schemas.PurchaseScenarioAlternativeRequest` +
+    `app.api._purchase_scenario_candidate_schedule` for the amortized
+    monthly payment/total cost and installment schedule (the same amortized
+    Price/Gauss formula `_advisor_payment` and `POST /purchases/scenario-
+    comparison` already use -- see `app.services.finance.
+    amortized_installment_payment`'s own docstring), and `app.api.
+    _run_purchase_projection_scenario` -- the exact canonical Projection
+    Engine/Validator path `POST /purchases/scenario-comparison` runs,
+    factored out of that endpoint specifically so this tool can share it
+    instead of becoming a second projection engine.
+
+    Deliberately does NOT net the simulated monthly payment against the
+    CURRENT month's remaining cap: the canonical projection only ever
+    starts from next month onward (the current month's snapshot is already
+    closed -- see `_purchase_scenario_candidate_schedule`'s own docstring on
+    why it refuses to invent a placement convention), so blending "this
+    month's already-closed cap" with "a schedule that can only begin next
+    month" would itself be exactly the kind of invented calendar semantics
+    that function's docstring documents an engineering review rejecting.
+    The current month's cap/spending are reported side by side, as
+    unrelated context, never netted against this hypothetical.
+    """
+
+    amount = parse_amount_text(arguments.get("amount_text"))
+    if amount is None:
+        return ToolOutcome(
+            ok=True, clarifying_question="Qual o valor da compra que você quer simular?"
+        )
+
+    installments = _parse_installments_hint(arguments.get("installments_text"))
+    monthly_rate = _parse_monthly_rate_hint(arguments.get("monthly_interest_rate_text"))
+
+    from app.api import (  # deferred: avoids app.api <-> services circular import
+        _purchase_scenario_candidate_schedule,
+        _run_purchase_projection_scenario,
+        profile_for,
+    )
+    from app.schemas import PurchaseScenarioAlternativeRequest
+
+    try:
+        alternative = PurchaseScenarioAlternativeRequest(
+            label="Simulação do Assistente",
+            price=amount,
+            installment_count=installments,
+            monthly_interest_rate=monthly_rate,
+        )
+    except ValueError:
+        return ToolOutcome(
+            ok=True,
+            clarifying_question=(
+                "Não consegui simular essa compra com esses valores. Pode confirmar o valor, a "
+                "quantidade de parcelas e a taxa de juros?"
+            ),
+        )
+
+    profile = profile_for(db, user.household_id)
+    current_period = month_key(today.replace(day=1))
+    snapshot = build_snapshot(db, household_id=user.household_id, period=current_period, generated_by=user.id)
+    publication = dashboard_monetary_publication(snapshot, profile=profile)
+    balance_evidence_trusted = bool(snapshot.payload.get("balance_evidence_trusted", False))
+
+    start_month = add_months(today.replace(day=1), 1)
+    end_month = profile.projection_end or date(today.year + 1, 12, 1)
+    if end_month < start_month:
+        # Mirrors `compare_purchase_scenarios`'s own `purchase_month > end`
+        # guard (HTTP 422): a household profile whose configured horizon has
+        # already aged out must never silently run a start>end projection --
+        # `_build_projection_gate_checks` returns zero rows for that range,
+        # and `_scenario_projection_summary`'s `[Decimal("0")] `fallback
+        # then reads as a clean, safe R$ 0,00 projection instead of the
+        # missing/stale configuration it actually is.
+        return ToolOutcome(
+            ok=True,
+            clarifying_question=(
+                "O horizonte de projeção configurado para a família "
+                f"({month_key(end_month)}) já passou do próximo mês "
+                f"({month_key(start_month)}), então não consigo simular essa compra com segurança. "
+                "Peça para alguém com acesso a Configurações atualizar o horizonte de projeção antes."
+            ),
+        )
+    schedule, monthly_payment, total_cost = _purchase_scenario_candidate_schedule(
+        alternative, purchase_month=start_month
+    )
+    schedule_extends_beyond_horizon = any(
+        datetime.strptime(key, "%Y-%m").date() > end_month for key in schedule
+    )
+
+    common_kwargs = dict(
+        household_id=user.household_id,
+        profile=profile,
+        snapshot=snapshot,
+        start_month=start_month,
+        end_month=end_month,
+        current_period=current_period,
+        balance_evidence_trusted=balance_evidence_trusted,
+    )
+    baseline = _run_purchase_projection_scenario(
+        db, extra_installments=None, entity_suffix="assistant_simulate_baseline", **common_kwargs
+    )
+    with_purchase = _run_purchase_projection_scenario(
+        db, extra_installments=schedule, entity_suffix="assistant_simulate_purchase", **common_kwargs
+    )
+    baseline_delayed = baseline["scenarios"]["delayed"]
+    with_purchase_delayed = with_purchase["scenarios"]["delayed"]
+    trusted_for_projection = bool(
+        baseline["trusted_for_projection"] and with_purchase["trusted_for_projection"]
+    )
+
+    return ToolOutcome(
+        ok=True,
+        facts={
+            "amount": amount,
+            "installments": installments,
+            "monthly_interest_rate": monthly_rate,
+            "monthly_payment": monthly_payment,
+            "total_cost": total_cost,
+            "current_period": current_period,
+            "cash_cap": money(publication["cash_cap"]),
+            "spending_so_far": money(publication["spending"]),
+            "remaining_cap": money(publication["remaining_cap"]),
+            "projection_start_month": month_key(start_month),
+            "projection_end_month": month_key(end_month),
+            "schedule_extends_beyond_horizon": schedule_extends_beyond_horizon,
+            "emergency_floor": money(profile.emergency_floor),
+            "trusted_for_projection": trusted_for_projection,
+            "baseline_minimum_balance": baseline_delayed["minimum_balance"],
+            "baseline_crosses_safety_floor": baseline_delayed["crosses_safety_floor"],
+            "with_purchase_minimum_balance": with_purchase_delayed["minimum_balance"],
+            "with_purchase_final_balance": with_purchase_delayed["final_balance"],
+            "with_purchase_crosses_safety_floor": with_purchase_delayed["crosses_safety_floor"],
         },
     )
 
@@ -1034,6 +1215,8 @@ def run_tool(
         return _tool_project_horizon(db, user=user, arguments=clean_arguments)
     if tool == "project_category_pace":
         return _tool_project_category_pace(db, user=user, arguments=clean_arguments, today=resolved_today)
+    if tool == "simulate_purchase":
+        return _tool_simulate_purchase(db, user=user, arguments=clean_arguments, today=resolved_today)
     if tool == "draft_typed_action":
         return _tool_draft_typed_action(
             db,

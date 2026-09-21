@@ -189,6 +189,28 @@ def parse_amount_text(text: str | None) -> Decimal | None:
     elif "," in cleaned:
         # Only a comma: treat it as the decimal separator ("300,50").
         cleaned = cleaned.replace(",", ".")
+    elif "." in cleaned:
+        # Only dot(s), no comma -- Brazilian thousands grouping ("1.500",
+        # "1.234.567") reads as a *smaller* amount if a lone "." is assumed
+        # to be a decimal point ("1.500" -> Decimal("1.5")), so it is never
+        # treated as decimal by default. Disambiguate by shape instead of
+        # guessing: a final group of 1-2 digits can only be a decimal
+        # remainder ("1.5" euro-style typo, "1.50" comma-for-dot typo); a
+        # final group of exactly 3 digits, with every other group a valid
+        # thousands group (leading group 1-3 digits, every middle group
+        # exactly 3 digits), can only be Brazilian grouping. Anything else
+        # (e.g. "1.2345", "1234.567") is genuinely ambiguous and rejected
+        # rather than guessed.
+        groups = cleaned.split(".")
+        last_group = groups[-1]
+        if len(last_group) in (1, 2):
+            cleaned = "".join(groups[:-1]) + "." + last_group
+        elif len(last_group) == 3 and 1 <= len(groups[0]) <= 3 and all(
+            len(group) == 3 for group in groups[1:-1]
+        ):
+            cleaned = "".join(groups)
+        else:
+            return None
     try:
         value = Decimal(cleaned)
     except InvalidOperation:

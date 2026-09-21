@@ -114,6 +114,31 @@ def test_parse_amount_text_handles_brazilian_and_plain_formats() -> None:
     assert parse_amount_text("-50") is None
 
 
+def test_parse_amount_text_disambiguates_a_dot_with_no_comma_by_shape() -> None:
+    """A lone "." with no "," is never assumed to be a decimal point by
+    default -- "1.500" read that way silently becomes R$ 1,50 (Codex review
+    finding on PR #108, `assistant_tools.py:444`). Disambiguate by shape
+    instead of guessing: a 3-digit final group with valid thousands
+    grouping throughout can only be Brazilian grouping; a 1-2 digit final
+    group can only be a decimal remainder; anything else is genuinely
+    ambiguous and rejected rather than guessed."""
+
+    # Unambiguous Brazilian thousands grouping -- no comma at all.
+    assert parse_amount_text("1.500") == Decimal("1500")
+    assert parse_amount_text("8.500") == Decimal("8500")
+    assert parse_amount_text("R$ 1.500") == Decimal("1500")
+    assert parse_amount_text("12.500") == Decimal("12500")
+    assert parse_amount_text("100.000") == Decimal("100000")
+    assert parse_amount_text("1.234.567") == Decimal("1234567")
+    # Unambiguous decimal remainder -- a final group too short to be a
+    # thousands group.
+    assert parse_amount_text("1.5") == Decimal("1.5")
+    assert parse_amount_text("1.50") == Decimal("1.50")
+    # Genuinely ambiguous shapes are rejected, never guessed.
+    assert parse_amount_text("1.2345") is None
+    assert parse_amount_text("1234.567") is None
+
+
 @given(cents=st.integers(min_value=1, max_value=999_999_999))
 @settings(max_examples=100)
 def test_parse_amount_text_property_round_trips_every_brazilian_formatted_value(cents: int) -> None:
