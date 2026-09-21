@@ -992,6 +992,14 @@ def test_assistant_ask_http_requires_admin_and_degrades_gracefully_without_codex
         body = response.json()
         assert isinstance(body["answer"], str) and body["answer"]
         assert body["needs_clarification"] is False
+        # AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`,
+        # issue #112): the HTTP response carries the same structured
+        # unavailable/reason signal the web chat's fail-closed UX reads --
+        # a real, unconfigured-Codex round through the actual FastAPI route
+        # (not just the Python-level `plan_and_execute` call) must produce it.
+        assert body["unavailable"] is True
+        assert body["reason"] == "codex_disabled"
+        assert body["proposal"] is None
 
 
 # ---------------------------------------------------------------------------

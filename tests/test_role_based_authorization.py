@@ -621,6 +621,18 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             {"json": {"message": "Gastei 300 de combustível no Nubank"}},
         ),
         (
+            # AI-CHAT-01 (docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md,
+            # issue #112): the web chat's only interpreter now. Same
+            # `_require_admin` gate as every other `/assistant/*`/
+            # `/advisor/*` route -- a read-only question through the Tool
+            # Layer is not a lower-privilege operation than the typed-action
+            # interpreter it replaced.
+            "assistant ask",
+            "post",
+            "/api/assistant/ask",
+            {"json": {"message": "Qual meu saldo agora?"}},
+        ),
+        (
             "assistant execute",
             "post",
             "/api/assistant/execute",
