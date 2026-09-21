@@ -1928,6 +1928,26 @@ class WhatsAppAuthorizedNumber(Base, TimestampMixin):
     deactivated_by: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    # WA-07 (`docs/WORK_ORDER_WA_07.md`, issue #79): at most one media-derived
+    # `CaptureDraft` this number's own next confirm/cancel reply resolves --
+    # never a queue, by design. A second media message while one is already
+    # pending simply replaces this pointer (see
+    # `app.whatsapp_gateway_app._run_media_reply`): the *draft row* the old
+    # value pointed at is left exactly as it was (still `preview`/
+    # `needs_input`, still fully auditable, still confirmable later straight
+    # from the web UI's own `/captures` screen) -- only this channel's own
+    # "what does the next yes/no reply resolve" pointer moves, so a
+    # superseded draft is never silently confirmed or destroyed, only no
+    # longer reachable through a bare WhatsApp "sim"/"não". `ON DELETE
+    # SET NULL`: a capture draft can outlive this pointer (deleted rows do
+    # not exist in this codebase -- captures are only ever cancelled/expired
+    # in place -- but the FK is still SET NULL rather than CASCADE/RESTRICT
+    # for the same reason every other optional back-reference in this file
+    # is, so this table's own row is never blocked/destroyed by unrelated
+    # capture-draft lifecycle).
+    pending_capture_id: Mapped[str | None] = mapped_column(
+        ForeignKey("capture_drafts.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class WhatsAppInboundEvent(Base):
