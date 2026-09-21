@@ -57,6 +57,23 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
         description="Projeção determinística de liquidez para os próximos 30, 60 ou 90 dias.",
         arguments=(("horizon_days", "um de: 30, 60, 90"),),
     ),
+    # WA-05 (docs/WORK_ORDER_WA_05.md, issue #77) -- "e se continuar nessa
+    # média até o fim do mês?". Deterministic linear pace estimate for the
+    # CURRENT, still in-progress month only (never a past/future month --
+    # there is no "pace" for a month that already closed or has not
+    # started); see `app.services.assistant_tools._tool_project_category_pace`.
+    ToolSpec(
+        name="project_category_pace",
+        description=(
+            "Projeção determinística de ritmo de gasto até o fim do mês ATUAL (ainda em andamento), "
+            "extrapolando linearmente o gasto já realizado (total ou de uma categoria) pelos dias já "
+            "decorridos do mês. Não se aplica a um mês passado ou futuro -- apenas ao mês corrente."
+        ),
+        arguments=(
+            ("category_hint", "nome de categoria para projetar, opcional (ausente = gasto total)"),
+            ("period_text", "período em texto livre, opcional -- deve ser o mês atual (ex.: 'este mês')"),
+        ),
+    ),
     ToolSpec(
         name="draft_typed_action",
         description=(
@@ -95,7 +112,8 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
             "Agrega o gasto operacional de um período por categoria, conta, cartão, mês ou titular, com "
             "métrica (total, média, contagem, mínimo, máximo, participação percentual, variação absoluta "
             "ou percentual) e, opcionalmente, apenas os top N resultados. category_hint/account_hint/"
-            "holder_hint combinam-se simultaneamente quando mais de um for informado."
+            "holder_hint combinam-se simultaneamente quando mais de um for informado. Com metric=total, "
+            "a resposta inclui também um total consolidado somando todas as linhas retornadas."
         ),
         arguments=(
             ("dimension", "um de: categoria, conta, cartao, mes, titular"),
@@ -109,6 +127,11 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
             ("category_hint", "nome (ou nomes, separados por vírgula) de categoria para filtrar"),
             ("account_hint", "nome de conta/cartão para filtrar"),
             ("holder_hint", "titular/responsável para filtrar"),
+            (
+                "exclude_category_hint",
+                "nome (ou nomes, separados por vírgula) de categoria para EXCLUIR do resultado/total "
+                "(ex.: 'e se tirar mercado?') -- combina-se com os demais filtros, nunca os substitui",
+            ),
             ("top_n", "quantidade máxima de resultados a devolver, já ordenados"),
         ),
     ),
@@ -129,6 +152,11 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
             ("category_hint", "nome (ou nomes, separados por vírgula) de categoria para filtrar"),
             ("account_hint", "nome de conta/cartão para filtrar"),
             ("holder_hint", "titular/responsável para filtrar"),
+            (
+                "exclude_category_hint",
+                "nome (ou nomes, separados por vírgula) de categoria para EXCLUIR do total "
+                "(ex.: 'e se tirar mercado?') -- combina-se com os demais filtros, nunca os substitui",
+            ),
         ),
     ),
     ToolSpec(

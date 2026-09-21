@@ -663,6 +663,69 @@ class AssistantActionProposal(Base):
     )
 
 
+class AssistantConversationState(Base):
+    """WA-05 (`docs/WORK_ORDER_WA_05.md`, issue #77): short, structured,
+    server-side conversational continuity for the Tool Layer -- one row per
+    `(household_id, user_id, conversation_id)`, never per household or per
+    household+conversation alone (Work Order acceptance criterion
+    "Vinicius/Kelly may have separate conversation state inside the same
+    household").
+
+    This table is deliberately *not* a second audit trail and *not* a
+    financial record: `app.services.assistant_conversation_context` is the
+    only writer, everything it stores is either already-sanitized plain
+    chat text (`turns`, the same shape/bounds as the existing
+    `AdvisorHistoryItem` the web Assistant already lets a client resupply
+    every call -- see `app.services.assistant_tool_sanitizer`) or an
+    already-validated read-only tool call
+    (`turns`/`last_steps` -- `tool` drawn from
+    `app.services.assistant_tool_catalog.ALLOWED_TOOLS`, `arguments` from
+    that tool's own `TOOL_ARGUMENT_KEYS`, the exact same allowlist
+    `app.services.assistant_tools.run_tool` re-validates independently).
+    `last_steps` never records `draft_typed_action`/`confirm_typed_action`/
+    `cancel_typed_action`/`undo_typed_action` -- Work Order prohibition "No
+    authority/household/write-confirmation derived from conversation
+    memory": the write flow's own idempotency/authorization
+    (`AssistantActionProposal`/`AssistantActionEvent`) is always resolved
+    fresh from the database, never from this table.
+
+    `expires_at` is a sliding TTL, refreshed on every
+    `app.services.assistant_conversation_context.record_turn` call --  a
+    conversation goes quiet and is treated as gone (never resurrected) once
+    it has been silent past `CONVERSATION_STATE_TTL_MINUTES`; the same
+    module lazily deletes an expired row the next time its key is touched,
+    rather than requiring a separate scheduled sweep (this is a single-family
+    deployment, no external cache/broker -- same architectural constraint
+    `app.services.notification_scheduler`/`app.services.capture_worker`
+    already document).
+    """
+
+    __tablename__ = "assistant_conversation_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "household_id",
+            "user_id",
+            "conversation_id",
+            name="uq_assistant_conversation_states_identity",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    household_id: Mapped[str] = mapped_column(
+        ForeignKey("households.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    conversation_id: Mapped[str] = mapped_column(String(128))
+    channel: Mapped[str] = mapped_column(String(16))
+    turns: Mapped[list[Any]] = mapped_column(JSON_DOCUMENT, default=list)
+    last_steps: Mapped[list[Any]] = mapped_column(JSON_DOCUMENT, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class IntegrityRun(Base):
     __tablename__ = "integrity_runs"
     __table_args__ = (

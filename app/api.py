@@ -12056,11 +12056,18 @@ def assistant_ask(
     db: Session = Depends(get_db),
 ) -> dict:
     _require_admin(user)
+    # WA-05: an explicit `conversation_id` lets a client keep its own
+    # separate thread (e.g. distinct browser tabs); omitting it defaults to
+    # one persistent conversation per user, so a plain client that never
+    # sends one still gets follow-up continuity across requests without any
+    # opt-in step.
     result = plan_and_execute(
         db,
         user=user,
         message=payload.message,
         history=payload.history,
+        conversation_id=payload.conversation_id or f"web:{user.id}",
+        channel="web",
         trace_id=payload.trace_id,
     )
     return result.to_dict()

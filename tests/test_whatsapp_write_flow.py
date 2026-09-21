@@ -502,6 +502,95 @@ def test_two_households_never_cross_reference_pending_proposals(monkeypatch) -> 
 
 
 # ---------------------------------------------------------------------------
+# WA-05 (`docs/WORK_ORDER_WA_05.md`, issue #77): conversational context is
+# wired end to end through the real WhatsApp webhook, keyed by the stable
+# `WhatsAppAuthorizedNumber.id` (see `app.whatsapp_gateway_app._run_assistant_reply`).
+# ---------------------------------------------------------------------------
+
+
+def test_whatsapp_conversation_context_forwards_previous_read_only_step_as_a_hint(monkeypatch) -> None:
+    fake_provider = _install_fake_provider(monkeypatch)
+    client, session_factory = _client(fake_provider)
+    household_id, user_id = _seed_household(
+        session_factory, sender_digits="5511999997777", username="wa05-context"
+    )
+
+    captured_payloads: list[dict] = []
+    plans = [
+        {
+            "schema_version": "1.0.0",
+            "needs_clarification": False,
+            "clarifying_question": None,
+            "steps": [
+                {
+                    "tool": "financial_aggregate",
+                    "arguments": {
+                        "dimension": "categoria",
+                        "category_hint": "Mercado",
+                        "period_text": "setembro",
+                    },
+                }
+            ],
+            "model": "modelo-de-teste",
+        },
+        {
+            "schema_version": "1.0.0",
+            "needs_clarification": False,
+            "clarifying_question": None,
+            "steps": [
+                {
+                    "tool": "financial_aggregate",
+                    "arguments": {
+                        "dimension": "categoria",
+                        "category_hint": "Mercado",
+                        "period_text": "agosto",
+                    },
+                }
+            ],
+            "model": "modelo-de-teste",
+        },
+    ]
+
+    def _plan(_self, payload: dict) -> CodexResult:
+        captured_payloads.append(payload)
+        return CodexResult(plans.pop(0))
+
+    monkeypatch.setattr(CodexAdvisorClient, "configured", property(lambda _self: True))
+    monkeypatch.setattr(CodexAdvisorClient, "plan", _plan)
+
+    _signed_post(
+        client,
+        _text_payload(
+            message_id="wa-ctx-1", sender_digits="5511999997777", text="quanto gastei em Mercado esse mês?"
+        ),
+    )
+    assert captured_payloads[0]["context_hints"] == []
+
+    _signed_post(
+        client, _text_payload(message_id="wa-ctx-2", sender_digits="5511999997777", text="e mês passado?")
+    )
+    assert captured_payloads[1]["context_hints"] == [
+        {
+            "tool": "financial_aggregate",
+            "arguments": {"dimension": "categoria", "category_hint": "Mercado", "period_text": "setembro"},
+        }
+    ]
+
+    with session_factory() as db:
+        authorized = db.scalar(
+            select(WhatsAppAuthorizedNumber).where(WhatsAppAuthorizedNumber.household_id == household_id)
+        )
+        from app.models import AssistantConversationState
+
+        rows = db.scalars(select(AssistantConversationState)).all()
+        assert len(rows) == 1
+        assert rows[0].household_id == household_id
+        assert rows[0].user_id == user_id
+        assert rows[0].conversation_id == f"whatsapp:{authorized.id}"
+        assert rows[0].channel == "whatsapp"
+
+
+# ---------------------------------------------------------------------------
 # Fail-closed: a malformed/hostile Codex plan never partially executes.
 # ---------------------------------------------------------------------------
 

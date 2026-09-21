@@ -1594,6 +1594,110 @@ WhatsApp, nenhuma escrita SQL/ORM vinda do LLM.
   (falha sem a correção: duas `AuditEvent` de reversão e um `DELETE` sem linha correspondente na
   segunda tentativa).
 
+### Contexto conversacional (WA-05, `docs/WORK_ORDER_WA_05.md`, issue #77)
+
+Continuidade curta e estruturada entre mensagens de um mesmo `(household_id, user_id,
+conversation_id)`, para perguntas de acompanhamento ("e mês passado?", "e a Kelly?", "mostra por
+mês", "qual a diferença?") sem virar uma segunda fonte de verdade financeira nem conceder
+autoridade por memória.
+
+- **Armazenamento**: `AssistantConversationState` (uma linha por `household_id`+`user_id`+
+  `conversation_id`, `app.services.assistant_conversation_context`), guardando só (a) até 8 turnos
+  de texto já saneado (`turns`, o mesmo formato/limite que `POST /assistant/ask` já aceita do
+  cliente como `history`) e (b) até 3 chamadas de ferramenta *somente leitura* já resolvidas
+  (`last_steps` -- `tool` restrito a um subconjunto de `assistant_tool_catalog.ALLOWED_TOOLS`,
+  `arguments` filtrado pelo `TOOL_ARGUMENT_KEYS` daquele tool, a mesma validação independente que
+  `assistant_tools.run_tool` já aplica). `draft_typed_action`/`confirm_typed_action`/
+  `cancel_typed_action`/`undo_typed_action` nunca viram `last_steps` -- o fluxo de escrita continua
+  resolvendo sua própria autoridade/idempotência sempre a partir do banco
+  (`AssistantActionProposal`/`AssistantActionEvent`), nunca da memória conversacional.
+- **TTL deslizante** (`CONVERSATION_STATE_TTL_MINUTES = 30`), renovado a cada turno; uma
+  conversa expirada nunca é ressuscitada -- `load_context` a trata como inexistente, e o próximo
+  toque na mesma chave a apaga (limpeza preguiçosa, sem scheduler dedicado; ver docstring do
+  módulo sobre por que este é um deployment single-family sem Redis).
+- **Concorrência**: mesmo idioma de `app.services.whatsapp_gateway.check_rate_limit` --
+  `SELECT ... FOR UPDATE` mais `begin_nested()`/`IntegrityError` para o primeiro turno de uma
+  chave nova, porque `FOR UPDATE` não trava uma linha que ainda não existe.
+- **Isolamento**: chave sempre inclui `user_id`, nunca só `household_id` -- Vinicius e Kelly têm
+  memória separada mesmo reutilizando o mesmo `conversation_id` literal (ex.: duas abas). No
+  WhatsApp, `conversation_id = f"whatsapp:{WhatsAppAuthorizedNumber.id}"` (um número autorizado por
+  pessoa); no Assistente web, `AssistantAskRequest.conversation_id` é opcional e usa
+  `f"web:{user.id}"` como padrão quando omitido.
+- **Sidecar (`advisor/server.mjs`, `planPrompt`)**: `context_hints` é um campo aditivo ao payload
+  de `/v1/plan` (schema de saída do `/v1/plan` não muda) com as últimas chamadas de leitura já
+  resolvidas -- o modelo usa isso só para preencher, na pergunta atual, um argumento que ela não
+  repete (ex.: manter `category_hint` ao trocar só o período); informação nova na mensagem atual
+  substitui apenas a dimensão correspondente. Continua vedado: LLM calcular um valor financeiro,
+  `context_hints` autorizar confirmar/cancelar/desfazer/trocar household, ou inventar um argumento
+  que nem a mensagem nem o próprio contexto contêm -- ambiguidade cai em `needs_clarification`,
+  nunca em uma combinação de ferramentas inédita.
+- **`exclude_category_hint`** ("e se tirar mercado?"): argumento aditivo de `financial_aggregate`/
+  `get_expenses`, simétrico a `category_hint` mas removendo em vez de restringir -- combina-se com
+  todo outro filtro já existente (AND, nunca sobrepõe), lido de `app.services.financial_query.
+  excludes_hint`/`dimension_rows`/`filtered_expense_total`/`holder_rows`. `financial_aggregate` com
+  `metric=total` passa a devolver também um fato `total` (soma simples, já-decimal, de toda linha
+  retornada) -- mesmo motor determinístico de sempre, nenhum cálculo novo, só uma segunda forma de
+  ler o mesmo número já publicado por `RangeTotals`/`category_spending_rows`.
+- **`project_category_pace`** ("e se continuar nessa média até o fim do mês?"): nova tool somente
+  leitura (`app.services.assistant_tools._tool_project_category_pace`), projeção linear
+  determinística `gasto_até_hoje * dias_no_mês / dias_decorridos`, exclusiva do mês ATUAL ainda em
+  andamento -- um período resolvido para qualquer outro mês (passado ou futuro) sempre cai em
+  `needs_clarification`, nunca numa extrapolação sem base. `gasto_até_hoje` é exatamente o mesmo
+  total canônico do mês corrente que `get_expenses`/`financial_aggregate` já publicam
+  (`collect_range_totals`/`filtered_expense_total` para `start_period == end_period == mês atual`)
+  -- não uma nova consulta a `Transaction` por `booked_at`, para nunca divergir do Dashboard/
+  Relatórios na mesma categoria/período. `dias_decorridos` é `today.day` (nunca `0`; dia 1 é o
+  próprio dia decorrido 1) e `dias_no_mês` vem de `calendar.monthrange` (28/29/30/31). Resposta
+  sempre rotulada "estimativa (PREVISTO)", nunca um fato realizado.
+- **Technical Challenge resolvido (PR #107, review round 2)**: a primeira submissão deste slice
+  havia deixado as duas capacidades acima como `needs_clarification` deliberado, por não existir
+  ainda nenhuma primitiva determinística equivalente e o Work Order pedir "reuse WA-04 tools, no
+  second engine". O engenheiro responsável rejeitou essa resolução porque o Work Order/issue #77
+  listam "e se tirar mercado?" e o 4º turno "e se continuar nessa média..." como critério de
+  aceite obrigatório, não opcional -- a saída correta é adicionar a primitiva determinística mínima
+  no backend (os dois itens acima), nunca aritmética no LLM nem um segundo motor. Ambas reaproveitam
+  o motor de agregação já existente (`app.services.financial_query`) em vez de reclassificar
+  transações; nenhum invariante financeiro foi alterado.
+- **Correção de bug semântico (PR #107, review round 3)**: a implementação da rodada 2 acima
+  encaminhava `exclude_category_hint` para `financial_query.dimension_rows` como se fosse um
+  filtro sobre o próprio label do grupo (`exclude_label_hint`) -- correto apenas quando
+  `dimension == "categoria"` (onde label É a categoria). Para `dimension` em
+  `{"conta", "cartao", "mes"}`, o label é conta/cartão/mês, não categoria, então "tirar mercado"
+  nunca removia de fato o gasto de Mercado dessas linhas (exceto no caso degenerado de uma conta
+  chamada "mercado"). `dimension_rows` agora recebe um `exclude_category_hint` com semântica
+  própria: para `dimension == "categoria"` a linha inteira é removida (igual antes); para
+  `conta`/`cartao`/`mes`, a contribuição já-canônica daquela categoria em `totals.detail_rows`
+  (as mesmas linhas que `holder_rows`/`filtered_expense_total` já leem) é subtraída do valor
+  existente de cada linha, sem recalcular ou substituir o resto dela -- importante porque o
+  `cash_out` de uma conta corrente também carrega o pagamento de fatura de cartão (sem
+  categoria), que a exclusão de categoria nunca deve tocar. `app.services.assistant_tools`'s
+  `_tool_get_expenses`'s `by_account` (antes sem nenhum filtro de exclusão) foi corrigido junto,
+  pela mesma razão -- Dashboard/Relatórios/Assistente nunca podem divergir para a mesma pergunta.
+  Testes novos em `tests/test_assistant_wa04_query.py` cobrem `dimension=conta`/`cartao`/`mes`
+  com `exclude_category_hint` (isolado e composto com `account_hint`) e paridade do total
+  `conta`+`cartao` contra `get_expenses`.
+- **Correção de bug semântico (PR #107, review round 4)**: a correção da rodada 3 acima ainda
+  construía `RangeTotals.account_rows` (a base de `dimension="conta"`/`"cartao"`) a partir de
+  `financial_snapshots.account_cash_flow_rows`'s `cash_out` -- deliberadamente um valor de
+  *fluxo de caixa físico* que inclui o débito do pagamento de fatura de cartão na conta corrente
+  (rebaseline §16/§17, "quanto saiu desta conta?"). Para `dimension="conta"`, isso fazia
+  `financial_aggregate` publicar pagamento de fatura como se fosse um gasto novo, e somar
+  `conta`+`cartao` dava um total maior que `get_expenses.expenses` sempre que uma fatura era paga
+  no período -- dupla contagem exatamente do tipo que o rebaseline proíbe (§17: "a compra já gerou
+  o gasto; pagamento da fatura não gera gasto novamente"). `collect_range_totals` agora constrói
+  `account_rows` a partir de `expense_detail_rows` (a mesma classificação canônica de despesa
+  operacional que `categoria`/`titular` já usam) -- pagamento de fatura, transferência interna e
+  aplicação/resgate patrimonial nunca entram em `expense_detail` (`financial_snapshots._collect`),
+  então nenhuma dimensão de `financial_aggregate` pode mais reportá-los como gasto. A lógica de
+  `exclude_category_hint` por subtração em `totals.detail_rows` (rodada 3) continua igual -- ela já
+  lia a fonte certa, só a base que ela subtraía é que carregava o valor errado. Testes novos em
+  `tests/test_assistant_wa04_query.py` seedam as duas pernas reais de conciliação de pagamento de
+  fatura (`transaction_type="reconciliation"`, categoria "Conciliação", mesmo padrão de
+  `tests/test_financial_snapshots.py`) e verificam: `dimension="conta"` nunca inclui o pagamento;
+  `conta`+`cartao` mantém paridade com `get_expenses` com e sem `exclude_category_hint`; e nenhuma
+  das cinco dimensões (`categoria`/`conta`/`cartao`/`mes`/`titular`) reporta transferência interna,
+  aplicação/resgate patrimonial ou pagamento de fatura como gasto.
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila

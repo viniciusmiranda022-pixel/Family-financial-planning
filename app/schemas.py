@@ -192,6 +192,16 @@ class AssistantAskRequest(BaseModel):
     message: str = Field(min_length=1, max_length=1000)
     history: list[AdvisorHistoryItem] = Field(default_factory=list, max_length=8)
     trace_id: str | None = Field(default=None, max_length=64)
+    conversation_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "WA-05: opts this request into short, structured, server-side "
+            "conversational continuity for follow-up questions (e.g. 'e mês "
+            "passado?'). Optional and stable per browser/client if supplied; "
+            "when omitted, defaults to one persistent conversation per user."
+        ),
+    )
 
 
 class EntryTypeTemplateDeactivateRequest(BaseModel):

@@ -8,7 +8,7 @@ total it produces is either (a) plain decimal addition of numbers
 `app.services.financial_snapshots.build_snapshot` already computed and
 `GET /dashboard`/`GET /reports` already publish for a given month
 (`report_month_monetary_publication`, `category_spending_rows`,
-`account_cash_flow_rows` -- exactly the rebaseline's "snapshot canônico"),
+`expense_detail_rows` -- exactly the rebaseline's "snapshot canônico"),
 or (b) a metric (average/count/min/max/share/variation) applied on top of
 those already-canonical per-group amounts. There is no second
 classification of a raw `Transaction` here -- reusing the existing engine,
@@ -16,6 +16,19 @@ never re-deriving what counts as income/expense/transfer/investment, is the
 Work Order's explicit financial invariant (`docs/WORK_ORDER_WA_04.md`
 "Reuse existing canonical classification ... do not create a second
 financial engine").
+
+Every grouping dimension `dimension_rows` exposes (`categoria`/`conta`/
+`cartao`/`mes`/`titular`) is built from `expense_detail_rows` -- the
+canonical per-(category, account, titular) *operating-expense* rows
+`app.services.financial_snapshots._collect` already computes (see that
+module's `expense_detail` accumulator). A card invoice payment, an internal
+transfer and an investment contribution/redemption are never added to
+`expense_detail` there in the first place (PR #107 review round 3), so none
+of them can ever surface as "gasto" here no matter which dimension is asked
+for -- unlike `account_cash_flow_rows`'s per-account `cash_out`, which is
+deliberately the account's *physical bank outflow* (it must include a card
+invoice payment debit for "quanto saiu desta conta?", §16/§17 of the
+rebaseline) and is therefore the wrong source for an *expense* dimension.
 
 Every filter is a free-text hint matched case/accent-insensitively against
 real household labels (comma-separated for multiple values), the same
@@ -38,7 +51,6 @@ from sqlalchemy.orm import Session
 
 from app.services.finance import add_months, money, month_key
 from app.services.financial_snapshots import (
-    account_cash_flow_rows,
     build_snapshot,
     category_spending_rows,
     expense_detail_rows,
@@ -116,6 +128,19 @@ def matches_hint(hint: str | None, label: str | None) -> bool:
     if not needles:
         return True
     return any(_norm(needle) in haystack for needle in needles)
+
+
+def excludes_hint(hint: str | None, label: str | None) -> bool:
+    """True when `hint` is present and matches `label` -- the exclusion
+    counterpart to `matches_hint`, with the opposite empty-hint default: an
+    empty/`None` exclude-hint excludes nothing (WA-05, issue #77 "e se tirar
+    mercado?" -- callers pass an exclude-hint only when the caller actually
+    asked to drop something; it must never silently drop every row when
+    absent, unlike `matches_hint`'s own "empty hint matches everything")."""
+
+    if not hint or not hint.strip():
+        return False
+    return matches_hint(hint, label)
 
 
 def resolve_period(text: str | None, *, today: date) -> str | None:
@@ -287,9 +312,13 @@ def collect_range_totals(
     Each individual month's figures are exactly what `GET /dashboard`/
     `GET /reports` already publish for that month
     (`report_month_monetary_publication`, `category_spending_rows`,
-    `account_cash_flow_rows`); this function only adds them across months
+    `expense_detail_rows`); this function only adds them across months
     -- plain decimal addition, never a second classification of a raw
-    transaction."""
+    transaction. `account_rows` (PR #107 review round 3) is built from
+    `expense_detail_rows`, not `account_cash_flow_rows` -- see this
+    module's own docstring for why: an account's cash flow legitimately
+    includes its card invoice payment debit, but that debit must never
+    surface as this module's "gasto por conta"."""
 
     income = Decimal("0")
     expenses = Decimal("0")
@@ -313,14 +342,14 @@ def collect_range_totals(
             category_rows[label] = category_rows.get(label, Decimal("0")) + money(
                 Decimal(str(row.get("amount", 0)))
             )
-        for row in account_cash_flow_rows(snapshot):
-            label = str(row.get("account") or "Sem conta identificada")
-            bucket = account_rows.setdefault(
-                label, {"cash_out": Decimal("0"), "account_type": row.get("account_type") or "other"}
-            )
-            bucket["cash_out"] = bucket["cash_out"] + money(Decimal(str(row.get("cash_out", 0))))
         for row in expense_detail_rows(snapshot):
             detail_rows.append({**row, "period": period})
+            account_label = str(row.get("account") or "Sem conta identificada")
+            bucket = account_rows.setdefault(
+                account_label,
+                {"amount": Decimal("0"), "account_type": row.get("account_type") or "other"},
+            )
+            bucket["amount"] = bucket["amount"] + money(Decimal(str(row.get("amount", 0))))
 
     return RangeTotals(
         start_period=start_period,
@@ -335,11 +364,35 @@ def collect_range_totals(
     )
 
 
-def dimension_rows(totals: RangeTotals, dimension: str, *, label_hint: str | None = None) -> list[dict[str, Any]]:
+def dimension_rows(
+    totals: RangeTotals,
+    dimension: str,
+    *,
+    label_hint: str | None = None,
+    exclude_category_hint: str | None = None,
+) -> list[dict[str, Any]]:
     """Per-group `{"label", "amount"}` rows for `dimension`, already
     summed across `totals`'s whole range by `collect_range_totals`, then
     narrowed by `label_hint` (a free-text filter, never a guess -- see
-    `matches_hint`)."""
+    `matches_hint`).
+
+    `exclude_category_hint` (WA-05, issue #77 "e se tirar mercado?",
+    PR #107 review round 2) removes that category's own contribution --
+    never a second classification of a raw `Transaction`. For
+    `dimension == "categoria"` the matching row's own label IS the
+    category, so it is dropped whole, same as `label_hint`'s exclusion
+    counterpart would be. For `dimension` in `{"conta", "cartao", "mes"}`
+    the pre-aggregated `account_rows`/`month_expense_rows` this function
+    reads (both built from `expense_detail_rows`, PR #107 review round 3 --
+    see `collect_range_totals`) are NOT per-category, so a row cannot be
+    re-derived from `totals.detail_rows` by simply dropping it whole the
+    way `categoria` does. Instead, the excluded category's own
+    already-canonical per-(account|period) contribution (from
+    `totals.detail_rows`, the exact numbers `holder_rows`/
+    `filtered_expense_total` already read) is subtracted from each
+    existing row's amount, leaving everything else about that row --
+    every other category still billed to that same account/month --
+    untouched."""
 
     if dimension == "mes":
         rows = [{"label": key, "amount": value} for key, value in totals.month_expense_rows.items()]
@@ -348,24 +401,49 @@ def dimension_rows(totals: RangeTotals, dimension: str, *, label_hint: str | Non
     else:
         wants_card = dimension == "cartao"
         rows = [
-            {"label": label, "amount": bucket["cash_out"]}
+            {"label": label, "amount": bucket["amount"]}
             for label, bucket in totals.account_rows.items()
             if (bucket.get("account_type") == "credit_card") == wants_card
         ]
+
+    if dimension == "categoria":
+        rows = [row for row in rows if not excludes_hint(exclude_category_hint, row["label"])]
+    elif exclude_category_hint:
+        detail_key = "period" if dimension == "mes" else "account"
+        subtract: dict[str, Decimal] = {}
+        for detail in totals.detail_rows:
+            if not excludes_hint(exclude_category_hint, detail.get("category")):
+                continue
+            key = str(detail.get(detail_key))
+            subtract[key] = subtract.get(key, Decimal("0")) + money(Decimal(str(detail.get("amount", 0))))
+        rows = [
+            {**row, "amount": money(row["amount"] - subtract.get(row["label"], Decimal("0")))} for row in rows
+        ]
+
     return [row for row in rows if matches_hint(label_hint, row["label"])]
 
 
 def _detail_matches(
-    row: dict[str, Any], *, category_hint: str | None, account_hint: str | None, holder_hint: str | None
+    row: dict[str, Any],
+    *,
+    category_hint: str | None,
+    account_hint: str | None,
+    holder_hint: str | None,
+    exclude_category_hint: str | None = None,
 ) -> bool:
     """True when `row` (one of `RangeTotals.detail_rows`) satisfies every
     provided hint at once (AND, never "last one wins") -- a hint left
-    absent/`None` matches everything, same contract as `matches_hint`."""
+    absent/`None` matches everything, same contract as `matches_hint`.
+    `exclude_category_hint` is the one exception: it *removes* a row whose
+    category matches it, symmetric to `category_hint` narrowing one in (WA-05,
+    issue #77 "e se tirar mercado?" -- composes with every other filter here,
+    never a second classification of a raw transaction)."""
 
     return (
         matches_hint(category_hint, row.get("category"))
         and matches_hint(account_hint, row.get("account"))
         and matches_hint(holder_hint, row.get("holder"))
+        and not excludes_hint(exclude_category_hint, row.get("category"))
     )
 
 
@@ -375,6 +453,7 @@ def filtered_expense_total(
     category_hint: str | None = None,
     account_hint: str | None = None,
     holder_hint: str | None = None,
+    exclude_category_hint: str | None = None,
 ) -> Decimal:
     """Operating-expense total narrowed by every provided hint at once.
 
@@ -392,7 +471,13 @@ def filtered_expense_total(
     matched = [
         row
         for row in totals.detail_rows
-        if _detail_matches(row, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint)
+        if _detail_matches(
+            row,
+            category_hint=category_hint,
+            account_hint=account_hint,
+            holder_hint=holder_hint,
+            exclude_category_hint=exclude_category_hint,
+        )
     ]
     return money(sum((Decimal(str(row.get("amount", 0))) for row in matched), Decimal("0")))
 
@@ -403,6 +488,7 @@ def holder_rows(
     category_hint: str | None = None,
     account_hint: str | None = None,
     holder_hint: str | None = None,
+    exclude_category_hint: str | None = None,
 ) -> list[dict[str, Any]]:
     """Per-holder `{"label", "amount"}` rows for `financial_aggregate`'s
     `titular` dimension -- grouped from `totals.detail_rows`, narrowed by
@@ -413,7 +499,13 @@ def holder_rows(
 
     grouped: dict[str, Decimal] = {}
     for row in totals.detail_rows:
-        if not _detail_matches(row, category_hint=category_hint, account_hint=account_hint, holder_hint=holder_hint):
+        if not _detail_matches(
+            row,
+            category_hint=category_hint,
+            account_hint=account_hint,
+            holder_hint=holder_hint,
+            exclude_category_hint=exclude_category_hint,
+        ):
             continue
         label = str(row.get("holder") or "Não informado")
         grouped[label] = grouped.get(label, Decimal("0")) + money(Decimal(str(row.get("amount", 0))))
