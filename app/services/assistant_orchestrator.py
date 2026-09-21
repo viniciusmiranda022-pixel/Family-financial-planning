@@ -517,6 +517,23 @@ class OrchestratorResult:
     proposal_id: str | None
     trace_id: str
     trace: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    # AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`, issue
+    # #112): `unavailable`/`reason` distinguish "the Codex planner itself
+    # could not be reached" from every other outcome (a normal answer, a
+    # clarifying question, a tool failure). A channel needs this to fail
+    # closed -- show that the interpreter is down and stop, never fall back
+    # to a second, static engine -- without parsing `trace`/`answer` text.
+    # `False`/`None` for every path except the `not plan.available` one.
+    unavailable: bool = False
+    reason: str | None = None
+    # `proposal` mirrors `app.services.assistant_actions.TypedActionProposal.
+    # to_dict()` (can_execute/typed_action/payload/candidates/candidate_kind/
+    # missing_fields) whenever the resolved step was `draft_typed_action` --
+    # the same shape `POST /assistant/interpret` already returns, so any
+    # caller can render the identical draft/duplicate/candidate-picker UI
+    # regardless of which entry point produced it. `None` for every other
+    # tool or outcome.
+    proposal: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -526,6 +543,9 @@ class OrchestratorResult:
             "proposal_id": self.proposal_id,
             "trace_id": self.trace_id,
             "trace": list(self.trace),
+            "unavailable": self.unavailable,
+            "reason": self.reason,
+            "proposal": self.proposal,
         }
 
 
@@ -571,6 +591,9 @@ def _finish(
     conversation_id: str | None = None,
     channel: str = "web",
     resolved_step: tuple[str, dict[str, Any]] | None = None,
+    unavailable: bool = False,
+    reason: str | None = None,
+    proposal: dict[str, Any] | None = None,
 ) -> OrchestratorResult:
     """WA-05: every return path of `plan_and_execute` funnels through here,
     so conversational memory is updated exactly once per round, atomically
@@ -603,6 +626,9 @@ def _finish(
         proposal_id=proposal_id,
         trace_id=trace_id,
         trace=trace,
+        unavailable=unavailable,
+        reason=reason,
+        proposal=proposal,
     )
 
 
@@ -677,6 +703,8 @@ def plan_and_execute(
             trace=({"stage": "plan", "ok": False, "reason": plan.reason},),
             conversation_id=conversation_id,
             channel=channel,
+            unavailable=True,
+            reason=plan.reason,
         )
 
     if plan.needs_clarification or not plan.steps:
@@ -701,6 +729,7 @@ def plan_and_execute(
     answers: list[str] = []
     proposal_id: str | None = None
     resolved_step: tuple[str, dict[str, Any]] | None = None
+    proposal_facts: dict[str, Any] | None = None
 
     for index, step in enumerate(plan.steps):
         outcome: ToolOutcome = run_tool(
@@ -737,6 +766,7 @@ def plan_and_execute(
                 conversation_id=conversation_id,
                 channel=channel,
                 resolved_step=resolved_step,
+                proposal=dict(outcome.facts) if step.tool == "draft_typed_action" else None,
             )
         if not outcome.ok:
             step_trace["failed"] = True
@@ -758,8 +788,14 @@ def plan_and_execute(
 
         step_trace["fact_keys"] = sorted(outcome.facts.keys())
         trace.append(step_trace)
-        if step.tool == "draft_typed_action" and outcome.facts.get("can_execute"):
-            proposal_id = outcome.facts.get("proposal_id")
+        if step.tool == "draft_typed_action":
+            # Sticky, like `proposal_id` right below: a later step in the
+            # same round (e.g. a plan composing `draft_typed_action` with a
+            # read-only tool) must never blank out the draft this round
+            # already produced.
+            proposal_facts = dict(outcome.facts)
+            if outcome.facts.get("can_execute"):
+                proposal_id = outcome.facts.get("proposal_id")
         if step.tool in _CONTEXT_ELIGIBLE_TOOLS:
             resolved_step = (step.tool, dict(step.arguments))
         answers.append(_format_step(step.tool, outcome.facts))
@@ -778,4 +814,5 @@ def plan_and_execute(
         conversation_id=conversation_id,
         channel=channel,
         resolved_step=resolved_step,
+        proposal=proposal_facts,
     )

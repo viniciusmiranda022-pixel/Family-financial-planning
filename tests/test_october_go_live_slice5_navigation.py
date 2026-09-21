@@ -207,29 +207,56 @@ def test_assistant_execute_never_sends_typed_action_or_payload() -> None:
         )
 
 
-def test_assistant_interpret_request_only_ever_sends_the_known_contract_fields() -> None:
+def test_assistant_ask_request_only_ever_sends_the_known_contract_fields() -> None:
+    """AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`, issue
+    #112): every free-text chat message is planned by the Tool Layer
+    (`POST /assistant/ask` -> `app.services.assistant_orchestrator.
+    plan_and_execute`), never sent with a client-supplied typed_action/
+    payload/amount/account -- the server resolves everything from `message`
+    alone."""
     source = _app_js()
     send_body = _function_body(source, "sendAssistantMessage")
+    assert '"/assistant/ask"' in send_body
+    assert '"/assistant/interpret"' not in send_body
+    for forbidden in ("typed_action", "payload:", "amount:", "account_id:"):
+        assert forbidden not in send_body
+
+
+def test_assistant_duplicate_resolution_request_only_ever_sends_the_known_contract_fields() -> None:
+    """Duplicate resolution (Pular/Importar mesmo assim/Ver existente) is a
+    deterministic replay of an already-interpreted message with an explicit
+    decision, not new free-text planning -- it stays on `/assistant/
+    interpret`, still Codex-backed (`interpret_message`), still without a
+    client-supplied typed_action/payload."""
+    source = _app_js()
     resolve_body = _function_body(source, "resolveAssistantDuplicate")
-    for body in (send_body, resolve_body):
-        assert '"/assistant/interpret"' in body
-        for forbidden in ("typed_action", "payload:", "amount:", "account_id:"):
-            assert forbidden not in body
+    assert '"/assistant/interpret"' in resolve_body
+    for forbidden in ("typed_action", "payload:", "amount:", "account_id:"):
+        assert forbidden not in resolve_body
 
 
 def test_assistant_confirm_button_only_created_when_proposal_can_execute() -> None:
     source = _app_js()
-    handler_body = _function_body(source, "handleAssistantInterpretResult")
-    # renderAssistantProposal() is the only place a "Confirmar e registrar"
-    # button is wired to executeAssistantProposal() -- assert it is reached
-    # exclusively through the `proposal.can_execute` branch.
-    match = re.search(r"if\s*\(proposal\.can_execute\)\s*\{\s*renderAssistantProposal\(", handler_body)
+    # `renderProposalOutcome()` is the one place shared by a fresh
+    # `/assistant/ask` round (`handleAssistantAskResult`) and the duplicate-
+    # resolution retry (`resolveAssistantDuplicate`) that turns a resolved
+    # `proposal` into UI -- assert `renderAssistantProposal()` (which
+    # creates the Confirmar/execute button) is reached exclusively through
+    # the `proposal.can_execute` branch there.
+    outcome_body = _function_body(source, "renderProposalOutcome")
+    match = re.search(r"if\s*\(proposal\.can_execute\)\s*\{\s*renderAssistantProposal\(", outcome_body)
     assert match, (
         "renderAssistantProposal() (which creates the Confirmar/execute button) must "
         "only be called when proposal.can_execute is true"
     )
     proposal_render_body = _function_body(source, "renderAssistantProposal")
     assert "executeAssistantProposal(proposalId" in proposal_render_body
+    # And both callers must reach it only through renderProposalOutcome --
+    # neither builds its own can_execute branch.
+    for caller_name in ("handleAssistantAskResult", "resolveAssistantDuplicate"):
+        caller_body = _function_body(source, caller_name)
+        assert "renderAssistantProposal(" not in caller_body
+        assert "renderProposalOutcome(" in caller_body
 
 
 def test_assistant_possible_duplicate_offers_exactly_three_choices_and_never_writes() -> None:
@@ -260,14 +287,31 @@ def test_assistant_undo_is_gated_by_the_servers_own_undoable_flag() -> None:
     )
 
 
-def test_assistant_intent_fallback_uses_existing_advisor_chat_not_a_new_engine() -> None:
-    """A message that is not a recognized typed-action intent (a plain
-    question) must fall back to the pre-existing read-only `/advisor/chat`
-    consultant, never a second, ad-hoc answer engine in the frontend."""
+def test_assistant_chat_has_no_static_engine_fallback_and_fails_closed() -> None:
+    """AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`, issue
+    #112) supersedes the old Slice 4 behavior this test used to pin: a
+    message the typed-action interpreter did not recognize no longer falls
+    back to `/advisor/chat`'s static/regex engine. Every free-text message
+    -- question or actionable request -- is planned by the Tool Layer
+    (`POST /assistant/ask`) exclusively, and when the Codex planner itself
+    is unreachable (`result.unavailable`) the chat says so and stops --
+    fail closed, never a second engine answering in its place ("Codex
+    indisponível deve significar exatamente isso")."""
     source = _app_js()
-    handler_body = _function_body(source, "handleAssistantInterpretResult")
-    assert "answerAdvisorQuestion(originalMessage, bubble)" in handler_body
-    assert '"/advisor/chat"' not in handler_body  # delegated, not duplicated inline
+    assert "function answerAdvisorQuestion(" not in source, (
+        "the static /advisor/chat fallback function must not exist in the chat frontend anymore"
+    )
+    handler_body = _function_body(source, "handleAssistantAskResult")
+    assert '"/advisor/chat"' not in handler_body
+    assert "answerAdvisorQuestion(" not in handler_body
+    # `unavailable` is checked, and returns, before any proposal/answer
+    # rendering -- an unavailable round never falls through to a normal
+    # answer path.
+    match = re.search(r"if\s*\(result\.unavailable\)\s*\{.*?return;\s*\}", handler_body, re.S)
+    assert match, "handleAssistantAskResult must return immediately when result.unavailable is true"
+    assert match.start() < handler_body.index("if (result.proposal)"), (
+        "the unavailable check must run before the proposal/answer branches, not after"
+    )
 
 
 def test_entry_type_template_chips_only_prefill_never_auto_submit() -> None:

@@ -10,13 +10,13 @@ const state = {
   captureDraft: null,
   captureAudio: null,
   captureRecorder: null,
-  advisorHistory: [],
-  // October Go-Live Slice 5: Assistente Financeiro typed-action thread
-  // state, entirely separate from advisorHistory above (a different
-  // backend contract/conversation -- POST /assistant/interpret never
-  // shares history with POST /advisor/chat). Reset by resetAssistantThread()
-  // once a proposal executes, is cancelled, or the message turns out not to
-  // be an actionable request at all.
+  // AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`, issue
+  // #112): every free-text chat turn -- question or actionable request --
+  // goes through `POST /assistant/ask` and this one thread. There is no
+  // second, `/advisor/chat`-backed history anymore: that static engine is
+  // no longer reachable from the chat UI. Reset by resetAssistantThread()
+  // once a proposal executes, is cancelled, or a round finishes with a
+  // plain answer (nothing left pending to disambiguate).
   assistantHistory: [],
   assistantTraceId: null,
   assistantDisambiguationQa: [],
@@ -3284,44 +3284,20 @@ function advisorElement(tag, className = "", text = "") {
   return element;
 }
 
-function advisorDecisionLabel(intent, status) {
-  if (intent === "purchase") {
-    if (status === "not_recommended") return "Compra não recomendada agora";
-    if (status === "caution") return "Compra possível, mas exige cautela";
-    if (status === "favorable") return "Compra compatível com o cenário";
-    if (status === "insufficient_data") return "Precisamos de mais informações";
-  }
-  const labels = {
-    obligations: "Próximos compromissos",
-    cuts: "Oportunidades de economia",
-    cash_in: "Entradas do mês",
-    cash_out: "Saídas do mês",
-    spending: "Gastos do mês",
-  };
-  return labels[intent] || "Análise financeira";
-}
-
-function advisorAnswerSections(answer) {
-  const text = String(answer || "").trim();
-  const markers = [
-    { key: "reflection", label: "Compra consciente:" },
-    { key: "schedule", label: "Cronograma dos próximos meses já considerado no cálculo:" },
-  ];
-  const found = markers
-    .map((marker) => ({ ...marker, index: text.indexOf(marker.label) }))
-    .filter((marker) => marker.index >= 0)
-    .sort((left, right) => left.index - right.index);
-  if (!found.length) return { main: text, reflection: "", schedule: "" };
-
-  const sections = { main: text.slice(0, found[0].index).trim(), reflection: "", schedule: "" };
-  found.forEach((marker, index) => {
-    const start = marker.index + marker.label.length;
-    const end = found[index + 1]?.index ?? text.length;
-    sections[marker.key] = text.slice(start, end).trim();
-  });
-  return sections;
-}
-
+// AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`, issue
+// #112): `advisorDecisionLabel`/`advisorAnswerSections`/`renderAdvisorAnswer`
+// and the purchase-metrics/reflection/schedule renderers that used to sit
+// here rendered `/advisor/chat`'s bespoke "purchase advisor" response
+// shape. That endpoint is no longer reachable from the chat UI (see
+// `sendAssistantMessage`/`handleAssistantAskResult` below); this file kept
+// no other caller for any of them, so they were removed rather than left
+// as dead code. The detailed, richly-formatted purchase-scenario analysis
+// they rendered still exists on its own screen -- `POST /purchases/
+// scenario-comparison` (`state.scenarioAlternatives`) -- unaffected by this
+// change; a chat question like "posso comprar um carro de R$ 50.000?" is
+// now answered as plain grounded text via the `simulate_purchase` tool
+// (`app.services.assistant_tools`/`assistant_orchestrator._format_
+// simulate_purchase`) instead of that bespoke card.
 function appendAdvisorText(parent, text) {
   const lines = String(text || "").split("\n").map((line) => line.trim()).filter(Boolean);
   let list = null;
@@ -3337,153 +3313,6 @@ function appendAdvisorText(parent, text) {
     list = null;
     parent.appendChild(advisorElement("p", "advisor-answer-paragraph", line));
   });
-}
-
-function appendAdvisorPurchaseMetrics(parent, metrics) {
-  if (!metrics?.purchase_amount || !metrics?.payment) return;
-  const quick = metrics.purchase_context?.analysis_depth === "quick";
-  const values = quick
-    ? [
-      ["Valor da compra", metrics.purchase_amount],
-      ["Teto após a compra", metrics.remaining_after],
-    ]
-    : [
-      ["Valor da compra", metrics.purchase_amount],
-      [Number(metrics.payment.installments) > 1 ? "Parcela mensal" : "Impacto à vista", metrics.payment.monthly_payment],
-      ["Teto após a compra", metrics.remaining_after],
-      ["Margem acima do piso", metrics.projection_margin_after],
-    ];
-  const grid = advisorElement("div", "advisor-metric-grid");
-  values.forEach(([label, value]) => {
-    if (value === undefined || value === null) return;
-    const card = advisorElement("div", `advisor-metric${Number(value) < 0 ? " negative" : ""}`);
-    card.append(
-      advisorElement("span", "", label),
-      advisorElement("strong", "", money.format(Number(value))),
-    );
-    grid.appendChild(card);
-  });
-  if (grid.children.length) parent.appendChild(grid);
-}
-
-function appendAdvisorReflection(parent, reflection, purchaseContext = null) {
-  if (!reflection) return;
-  const section = advisorElement("section", "advisor-reflection");
-  const heading = advisorElement("div", "advisor-section-heading");
-  const quick = purchaseContext?.analysis_depth === "quick";
-  heading.append(
-    advisorElement("span", `advisor-section-icon${quick ? " proportional" : ""}`, quick ? "✓" : "?"),
-    advisorElement("h4", "", quick ? "Leitura proporcional" : "Antes de decidir"),
-  );
-  section.appendChild(heading);
-
-  const lines = reflection.split("\n").map((line) => line.trim()).filter(Boolean);
-  const opening = [];
-  const closing = [];
-  const questions = [];
-  let foundQuestion = false;
-  lines.forEach((line) => {
-    if (line.startsWith("- ")) {
-      foundQuestion = true;
-      questions.push(line.slice(2));
-    } else if (foundQuestion) {
-      closing.push(line);
-    } else {
-      opening.push(line);
-    }
-  });
-  if (opening.length) section.appendChild(advisorElement("p", "advisor-reflection-intro", opening.join(" ")));
-  if (questions.length) {
-    const list = advisorElement("div", "advisor-question-list");
-    questions.forEach((question) => {
-      const separator = question.indexOf(":");
-      const item = advisorElement("div", "advisor-question");
-      item.appendChild(advisorElement("span", "advisor-question-dot", ""));
-      const content = advisorElement("p");
-      if (separator > 0) {
-        content.append(
-          advisorElement("strong", "", `${question.slice(0, separator)}: `),
-          document.createTextNode(question.slice(separator + 1).trim()),
-        );
-      } else {
-        content.textContent = question;
-      }
-      item.appendChild(content);
-      list.appendChild(item);
-    });
-    section.appendChild(list);
-  }
-  if (closing.length) section.appendChild(advisorElement("p", "advisor-reflection-close", closing.join(" ")));
-  parent.appendChild(section);
-}
-
-function advisorMonthLabel(value) {
-  const match = /^(\d{4})-(\d{2})$/.exec(String(value || ""));
-  if (!match) return String(value || "");
-  const label = monthFormat.format(new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, 1)));
-  return label.charAt(0).toUpperCase() + label.slice(1);
-}
-
-function appendAdvisorSchedule(parent, schedule) {
-  if (!Array.isArray(schedule) || !schedule.length) return;
-  const section = advisorElement("section", "advisor-schedule");
-  const heading = advisorElement("div", "advisor-section-heading");
-  heading.append(
-    advisorElement("span", "advisor-section-icon calendar", "▦"),
-    advisorElement("div", ""),
-  );
-  heading.lastChild.append(
-    advisorElement("h4", "", "Compromissos dos próximos meses"),
-    advisorElement("small", "", "Parcelas dos cartões e obrigações já consideradas na análise"),
-  );
-  section.appendChild(heading);
-
-  const wrapper = advisorElement("div", "advisor-schedule-scroll");
-  const table = advisorElement("table", "advisor-schedule-table");
-  const head = advisorElement("thead");
-  const headRow = advisorElement("tr");
-  ["Mês", "Cartões", "Obrigações", "Total"].forEach((label) => headRow.appendChild(advisorElement("th", "", label)));
-  head.appendChild(headRow);
-  table.appendChild(head);
-  const body = advisorElement("tbody");
-  schedule.forEach((row) => {
-    const tr = advisorElement("tr");
-    tr.append(
-      advisorElement("td", "advisor-schedule-month", advisorMonthLabel(row.month)),
-      advisorElement("td", "", money.format(Number(row.card_installments || 0))),
-      advisorElement("td", "", money.format(Number(row.obligations || 0))),
-      advisorElement("td", "advisor-schedule-total", money.format(Number(row.total || 0))),
-    );
-    body.appendChild(tr);
-  });
-  table.appendChild(body);
-  wrapper.appendChild(table);
-  section.appendChild(wrapper);
-  parent.appendChild(section);
-}
-
-function renderAdvisorAnswer(bubble, result) {
-  bubble.replaceChildren();
-  bubble.className = `advisor-message assistant ${result.status}`;
-  bubble.dataset.source = result.provider === "codex" ? "Explicado pelo Codex" : "Motor financeiro local";
-
-  const header = advisorElement("div", "advisor-answer-header");
-  const statusIcon = result.status === "not_recommended" ? "!" : result.status === "favorable" ? "✓" : result.status === "caution" ? "!" : "i";
-  header.append(
-    advisorElement("span", "advisor-answer-icon", statusIcon),
-    advisorElement("strong", "", advisorDecisionLabel(result.intent, result.status)),
-  );
-  bubble.appendChild(header);
-
-  const sections = advisorAnswerSections(result.answer);
-  const summary = advisorElement("div", "advisor-answer-summary");
-  appendAdvisorText(summary, sections.main);
-  bubble.appendChild(summary);
-  appendAdvisorPurchaseMetrics(bubble, result.metrics);
-  appendAdvisorReflection(bubble, sections.reflection, result.metrics?.purchase_context);
-  if (result.metrics?.show_commitment_schedule !== false) {
-    appendAdvisorSchedule(bubble, result.metrics?.commitment_schedule);
-  }
 }
 
 async function loadAdvisor() {
@@ -3522,44 +3351,15 @@ async function loadAdvisor() {
   }
 }
 
-// `bubble` already exists (appended by the caller) -- this only ever fills
-// it in, it never appends the user's own message a second time. Kept
-// separate from the typed-action flow below: `/advisor/chat` is the
-// pre-existing read-only financial consultant (explains numbers the
-// deterministic engine already computed) and keeps its own conversation
-// history, never mixed with the Assistente's `/assistant/interpret` thread.
-async function answerAdvisorQuestion(message, bubble) {
-  try {
-    const result = await api("/advisor/chat", {
-      method: "POST",
-      body: JSON.stringify({ message, history: state.advisorHistory.slice(-8) }),
-    });
-    renderAdvisorAnswer(bubble, result);
-    state.advisorHistory.push(
-      { role: "user", content: message },
-      { role: "assistant", content: result.answer.slice(0, 8000) },
-    );
-    state.advisorHistory = state.advisorHistory.slice(-8);
-  } catch (error) {
-    bubble.textContent = error.message;
-    bubble.className = "advisor-message assistant error";
-  }
-  bubble.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-// October Go-Live Slice 5 (docs/WORK_ORDER_OCTOBER_GO_LIVE_SLICE_5.md):
-// Assistente Financeiro typed-action UI. This is the ONLY frontend surface
-// that calls `/assistant/interpret` and `/assistant/execute`
-// (`app.services.assistant_actions`, Slice 4 contract) -- it never sends a
-// `typed_action`/`payload` directly, only ever the `proposal_id` the
-// server already resolved and persisted server-side
+// AI-CHAT-01 (`docs/WORK_ORDER_AI_CHAT_01_CODEX_ORCHESTRATOR.md`, issue
+// #112): the web chat's single typed-action UI. `/assistant/ask` (the
+// WA-02..07 Tool Layer, `app.services.assistant_orchestrator.
+// plan_and_execute`) is now the only interpreter for free text -- it never
+// sends a `typed_action`/`payload` directly, only ever the `proposal_id`
+// the server already resolved and persisted server-side
 // (`persist_action_proposal`), matching the engineering-review contract in
 // PR #92/#93: the client cannot forge or edit a proposal, only confirm or
 // cancel the one the server built.
-const ASSISTANT_TYPED_ACTION_INTENTS = new Set([
-  "create_expense", "create_income", "create_internal_transfer",
-  "pay_obligation", "pay_card_invoice", "register_refund",
-]);
 const ASSISTANT_TYPED_ACTION_LABELS = {
   create_expense: "Registrar saída",
   create_income: "Registrar entrada",
@@ -3805,13 +3605,12 @@ function renderAssistantExecutionResult(bubble, result) {
   loadAssistantActionsPanel();
 }
 
-// The one place that turns a `/assistant/interpret` response into UI. Used
-// both by a fresh message and by the duplicate-resolution retry below, so
-// the branching (proposal ready / possible duplicate / pick a candidate /
-// missing fields / not a typed action at all) only exists once.
-async function handleAssistantInterpretResult(bubble, result, originalMessage) {
-  state.assistantTraceId = result.trace_id;
-  const { interpretation, proposal, proposal_id: proposalId } = result;
+// AI-CHAT-01: the one place that turns a resolved typed-action `proposal`
+// (`app.services.assistant_actions.TypedActionProposal.to_dict()` shape)
+// into UI -- shared by a fresh `/assistant/ask` round and by the
+// duplicate-resolution retry below, so the branching (proposal ready /
+// possible duplicate / pick a candidate / missing fields) only exists once.
+function renderProposalOutcome(bubble, proposal, proposalId, originalMessage) {
   if (proposal.can_execute) {
     renderAssistantProposal(bubble, proposal, proposalId);
     state.assistantHistory = [];
@@ -3824,7 +3623,7 @@ async function handleAssistantInterpretResult(bubble, result, originalMessage) {
     state.assistantHistory = state.assistantHistory.slice(-8);
     state.assistantPendingQuestion = proposal.clarifying_question || null;
     renderAssistantCandidates(bubble, proposal, originalMessage);
-  } else if (interpretation.available && ASSISTANT_TYPED_ACTION_INTENTS.has(interpretation.intent)) {
+  } else {
     // Actionable intent, but the resolution is still incomplete
     // (`proposal.missing_fields`) -- keep the thread open so the next
     // message can fill in what's missing instead of starting over.
@@ -3833,14 +3632,45 @@ async function handleAssistantInterpretResult(bubble, result, originalMessage) {
     state.assistantHistory = state.assistantHistory.slice(-8);
     state.assistantPendingQuestion = question;
     renderAssistantClarifyingQuestion(bubble, question);
-  } else {
-    // Not a typed-action request at all (intent null/query/unknown, or the
-    // Codex sidecar was unavailable) -- this is a question, not something
-    // to register; answer it with the existing read-only consultant.
+  }
+  bubble.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// The one place that turns a `POST /assistant/ask` response
+// (`app.services.assistant_orchestrator.OrchestratorResult.to_dict()`) into
+// UI. `result.unavailable` -- the Codex planner itself could not be reached
+// -- is checked first and returns immediately: fail closed, exactly the
+// Work Order's "Codex indisponível deve significar exatamente isso", never
+// a second, static engine answering in its place.
+async function handleAssistantAskResult(bubble, result, originalMessage) {
+  state.assistantTraceId = result.trace_id;
+  if (result.unavailable) {
     resetAssistantThread();
-    await answerAdvisorQuestion(originalMessage, bubble);
+    bubble.replaceChildren();
+    bubble.className = "advisor-message assistant error";
+    bubble.textContent = "O Assistente Financeiro (Codex) está indisponível agora. "
+      + "Não vou responder por um mecanismo alternativo -- tente novamente em instantes.";
+    bubble.scrollIntoView({ behavior: "smooth", block: "start" });
     return;
   }
+  if (result.proposal) {
+    renderProposalOutcome(bubble, result.proposal, result.proposal_id, originalMessage);
+    return;
+  }
+  if (result.needs_clarification) {
+    state.assistantHistory.push({ role: "user", content: originalMessage }, { role: "assistant", content: result.answer });
+    state.assistantHistory = state.assistantHistory.slice(-8);
+    state.assistantPendingQuestion = result.clarifying_question || result.answer;
+    renderAssistantClarifyingQuestion(bubble, result.answer);
+    return;
+  }
+  // A plain, grounded answer -- QUERY/aggregate/compare/project/ADVISOR
+  // tool output already phrased by the backend (`_format_step`), never
+  // recomputed or rephrased client-side.
+  resetAssistantThread();
+  bubble.replaceChildren();
+  bubble.className = "advisor-message assistant";
+  appendAdvisorText(bubble, result.answer);
   bubble.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -3853,7 +3683,7 @@ async function sendAssistantMessage(message) {
   appendAdvisorMessage("user", message);
   const loading = appendAdvisorMessage("assistant", "Pensando...");
   try {
-    const result = await api("/assistant/interpret", {
+    const result = await api("/assistant/ask", {
       method: "POST",
       body: JSON.stringify({
         message,
@@ -3861,13 +3691,21 @@ async function sendAssistantMessage(message) {
         trace_id: state.assistantTraceId,
       }),
     });
-    await handleAssistantInterpretResult(loading, result, message);
+    await handleAssistantAskResult(loading, result, message);
   } catch (error) {
     loading.textContent = error.message;
     loading.className = "advisor-message assistant error";
   }
 }
 
+// Duplicate resolution (Pular/Importar mesmo assim/Ver existente) is a
+// deterministic replay of an already-interpreted message with an explicit,
+// button-driven decision -- not new free-text interpretation, so it is not
+// re-planned by the Tool Layer. It still goes through Codex
+// (`interpret_message`, the same `/v1/interpret` call `draft_typed_action`
+// itself makes) and fails closed the same way; it simply is not the
+// multi-tool orchestrator, because there is no ambiguity left for a
+// planner to resolve.
 async function resolveAssistantDuplicate(originalMessage, decision, transactionId, bubble) {
   bubble.replaceChildren();
   bubble.className = "advisor-message assistant";
@@ -3882,7 +3720,8 @@ async function resolveAssistantDuplicate(originalMessage, decision, transactionI
         duplicate_resolution: { decision, transaction_id: transactionId },
       }),
     });
-    await handleAssistantInterpretResult(bubble, result, originalMessage);
+    state.assistantTraceId = result.trace_id;
+    renderProposalOutcome(bubble, result.proposal, result.proposal_id, originalMessage);
   } catch (error) {
     bubble.textContent = error.message;
     bubble.className = "advisor-message assistant error";
