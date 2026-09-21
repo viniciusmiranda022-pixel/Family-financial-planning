@@ -136,7 +136,7 @@ def test_upgrade_empty_postgresql_database_to_head() -> None:
     }.issubset(tables)
     with engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0026"
+            connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0027"
         )
     engine.dispose()
 
@@ -157,7 +157,7 @@ def test_upgrade_from_legacy_0002_baseline_preserves_existing_rows() -> None:
 
     engine = create_engine(POSTGRES_TEST_DATABASE_URL)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0026"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0027"
         preserved_name = connection.execute(
             text("SELECT name FROM households WHERE id = :id"), {"id": household_id}
         ).scalar_one()
@@ -1586,7 +1586,7 @@ def test_whatsapp_inbound_event_concurrent_redelivery_is_serialized_to_a_single_
                 thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
                 with Session(thread_engine) as db:
                     barrier.wait(timeout=5.0)
-                    _process_one_message(db, message, settings=get_settings())
+                    asyncio.run(_process_one_message(db, message, settings=get_settings()))
                     db.commit()
                 thread_engine.dispose()
             except BaseException as exc:  # noqa: BLE001
@@ -1697,7 +1697,7 @@ def test_whatsapp_rate_limit_bucket_concurrent_first_hit_is_serialized_to_a_sing
                 thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
                 with Session(thread_engine) as db:
                     barrier.wait(timeout=5.0)
-                    _process_one_message(db, message, settings=get_settings())
+                    asyncio.run(_process_one_message(db, message, settings=get_settings()))
                     db.commit()
                 thread_engine.dispose()
             except BaseException as exc:  # noqa: BLE001
@@ -1868,7 +1868,7 @@ def test_whatsapp_webhook_concurrent_confirm_from_two_messages_serializes_to_one
                 thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
                 with Session(thread_engine) as db:
                     barrier.wait(timeout=5.0)
-                    _process_one_message(db, message, settings=get_settings())
+                    asyncio.run(_process_one_message(db, message, settings=get_settings()))
                 thread_engine.dispose()
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
@@ -2051,7 +2051,7 @@ def test_whatsapp_webhook_concurrent_undo_from_two_messages_reverses_exactly_onc
                 thread_engine = create_engine(POSTGRES_TEST_DATABASE_URL)
                 with Session(thread_engine) as db:
                     barrier.wait(timeout=5.0)
-                    _process_one_message(db, message, settings=get_settings())
+                    asyncio.run(_process_one_message(db, message, settings=get_settings()))
                 thread_engine.dispose()
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
