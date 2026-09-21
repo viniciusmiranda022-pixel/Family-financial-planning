@@ -1698,6 +1698,53 @@ autoridade por memória.
   das cinco dimensões (`categoria`/`conta`/`cartao`/`mes`/`titular`) reporta transferência interna,
   aplicação/resgate patrimonial ou pagamento de fatura como gasto.
 
+### Simulação de compra hipotética (WA-06, `docs/WORK_ORDER_WA_06.md`, issue #78)
+
+Nova tool somente leitura `simulate_purchase` (`app.services.assistant_tools._tool_simulate_purchase`)
+para "posso gastar/comprar R$ X (em Nx)?" -- nunca persiste nada e nunca cria um rascunho de ação
+tipada; só `draft_typed_action` pode virar uma proposta real. Diagnósticos abertos ("por que meu
+dinheiro está acabando mais rápido?") não ganharam tool própria: continuam resolvidos por composição
+de tools já existentes (`get_income`/`get_expenses`/`get_commitments`/`financial_aggregate` com
+`dimension=mes` para tendência e `metric=participacao` para concentração) dentro do mesmo limite de
+5 passos por plano que o WA-02 já impõe -- `planPrompt` (`advisor/server.mjs`) ganhou apenas
+orientação textual de composição, nenhum contrato/backend novo.
+
+- **Reaproveitamento, não um segundo motor**: `parse_amount_text` (o mesmo parser "hint, nunca
+  chute" que a WRITE pipeline de ações tipadas já usa) para o valor; `amortized_installment_payment`
+  (Price/Gauss, `app.services.finance`) via `app.schemas.PurchaseScenarioAlternativeRequest` +
+  `app.api._purchase_scenario_candidate_schedule` para parcela mensal/custo total; e o próprio motor
+  canônico de Projeção/Validador que `POST /purchases/scenario-comparison` já usa. Este último foi
+  extraído do que era um closure interno daquele endpoint (`_run_scenario`) para a função de módulo
+  `app.api._run_purchase_projection_scenario`, exatamente para que este segundo chamador pudesse
+  reaproveitá-lo sem passar pelo contrato HTTP `PurchaseScenarioComparisonRequest` (que exige 2+
+  alternativas nomeadas -- uma restrição do caso de uso "comparar duas compras", sem relação com a
+  matemática em si). Comportamento de `compare_purchase_scenarios` é idêntico ao de antes da extração
+  (`tests/test_purchase_scenario_comparison.py` inalterado e verde).
+- **Nunca sintetiza um veredito**: assim como `app.api._scenario_projection_summary` parou de
+  colapsar `crosses_safety_floor`/`has_uncovered_deficit` num único "viable" (ver o comentário de
+  engenharia citado naquela função), `_tool_simulate_purchase`/seu formatador
+  (`app.services.assistant_orchestrator._format_simulate_purchase`) só expõem baseline vs.
+  com-a-compra lado a lado -- nunca um "favorável"/"não recomendado" fabricado pelo Assistente.
+  Regra de propriedade coberta em teste: o mínimo projetado com a compra nunca é maior que o
+  baseline.
+- **Nunca mistura o teto do mês corrente com o cronograma da projeção**: como o snapshot do mês
+  atual já está fechado, o motor de projeção só admite uma parcela hipotética a partir do mês
+  seguinte (`purchase_month`, ver docstring de `_purchase_scenario_candidate_schedule` sobre por que
+  inventar outra convenção de calendário já foi rejeitado em revisão anterior). O teto/gasto do mês
+  corrente e a projeção a partir do mês seguinte são reportados como fatos paralelos, nunca somados
+  ou subtraídos um do outro.
+- **`amount_text`/`installments_text`/`monthly_interest_rate_text`**: só `amount_text` é obrigatório
+  (ausente/zero/negativo/não numérico sempre cai em `clarifying_question`, nunca um chute). Parcelas
+  e juros ausentes ou não numéricos usam o próprio padrão documentado da tool (1x à vista, sem
+  juros) em vez de bloquear com uma pergunta -- mesmo idioma de tolerância que `_normalize_type_hint`
+  já usa para um hint secundário não reconhecido.
+- **`plan-schema.json`**: `simulate_purchase` e seus três argumentos precisaram ser adicionados ao
+  enum/allowlist de saída do `/v1/plan` (schema fechado, `additionalProperties: false`) -- sem essa
+  atualização, o sidecar rejeitaria qualquer plano do modelo que tentasse chamar a tool nova, mesmo
+  com o catálogo Python já a expondo. Nenhum outro arquivo do sidecar precisou mudar:
+  `catalog_for_prompt()` já é dado, não código, então o texto/descrição da tool chega ao prompt do
+  `/v1/plan` automaticamente.
+
 ## Evolução
 
 OCR e transcrição já rodam de forma assíncrona (fila `capture_processing_jobs`, ver "Fila

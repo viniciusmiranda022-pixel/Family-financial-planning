@@ -288,6 +288,35 @@ def _format_project_category_pace(facts: dict[str, Any]) -> str:
     )
 
 
+def _format_simulate_purchase(facts: dict[str, Any]) -> str:
+    """WA-06 (`docs/WORK_ORDER_WA_06.md`, issue #78): renders `_tool_simulate_purchase`'s
+    facts as plain text -- baseline vs with-purchase, never a synthesized
+    favorable/caution/not_recommended verdict (see that tool's own docstring
+    and `app.api._scenario_projection_summary`'s docstring on why this
+    codebase deliberately stopped collapsing a multi-scenario projection
+    into one authoritative verdict)."""
+
+    amount = facts.get("amount")
+    installments = facts.get("installments") or 1
+    monthly_payment = facts.get("monthly_payment")
+    payment_note = (
+        "à vista" if installments == 1 else f"em {installments}x de {_format_money(monthly_payment)}"
+    )
+    baseline_note = "abaixo" if facts.get("baseline_crosses_safety_floor") else "acima"
+    with_note = "abaixo" if facts.get("with_purchase_crosses_safety_floor") else "acima"
+    return (
+        f"Simulação (HIPÓTESE -- nada foi lançado): uma compra de {_format_money(amount)} {payment_note} "
+        f"totalizaria {_format_money(facts.get('total_cost'))}. "
+        f"Neste mês ({facts.get('current_period')}) você já gastou {_format_money(facts.get('spending_so_far'))} "
+        f"de um teto de {_format_money(facts.get('cash_cap'))}, com {_format_money(facts.get('remaining_cap'))} "
+        "restantes -- sem considerar esta compra hipotética, já que o mês atual já está fechado no snapshot. "
+        f"Na projeção a partir de {facts.get('projection_start_month')} (cenário conservador com atraso): sem "
+        f"a compra, o saldo mínimo projetado seria {_format_money(facts.get('baseline_minimum_balance'))} "
+        f"({baseline_note} do piso de segurança de {_format_money(facts.get('emergency_floor'))}); com a compra, "
+        f"seria {_format_money(facts.get('with_purchase_minimum_balance'))} ({with_note} do piso)."
+    )
+
+
 def _format_dimension_label(dimension: str | None) -> str:
     return {
         "categoria": "categoria",
@@ -439,6 +468,8 @@ def _format_step(tool: str, facts: dict[str, Any]) -> str:
         return _format_project_horizon(facts)
     if tool == "project_category_pace":
         return _format_project_category_pace(facts)
+    if tool == "simulate_purchase":
+        return _format_simulate_purchase(facts)
     if tool == "draft_typed_action":
         return _format_draft_typed_action(facts)
     if tool == "confirm_typed_action":

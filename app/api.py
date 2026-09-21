@@ -9622,6 +9622,72 @@ def _purchase_scenario_candidate_schedule(
     return schedule, monthly_payment, total_financed_cost
 
 
+def _run_purchase_projection_scenario(
+    db: Session,
+    *,
+    household_id: str,
+    profile: FinancialProfile,
+    snapshot: FinancialSnapshot,
+    start_month: date,
+    end_month: date,
+    current_period: str,
+    balance_evidence_trusted: bool,
+    extra_installments: dict[str, Decimal] | None,
+    entity_suffix: str,
+) -> dict:
+    """Run exactly one hypothetical-or-baseline schedule through the
+    canonical Projection Engine/Validator + invariant assessment, in memory
+    only (`evaluate_invariant`/`assess_integrity`, no `execute_integrity_run`,
+    no commit -- see `compare_purchase_scenarios`'s own docstring).
+
+    Extracted from what used to be `compare_purchase_scenarios`' own nested
+    `_run_scenario` closure (`docs/WORK_ORDER_PURCHASE_SCENARIO_COMPARISON.md`)
+    so a second caller -- the WA-06 `simulate_purchase` conversational tool
+    (`docs/WORK_ORDER_WA_06.md`, issue #78,
+    `app.services.assistant_tools._tool_simulate_purchase`) -- can run the
+    exact same canonical single-purchase-vs-baseline comparison without going
+    through `PurchaseScenarioComparisonRequest`'s HTTP-level "compare 2+ named
+    alternatives" contract (`min_length=2`), which has no bearing on this
+    function's own math. Behavior for `compare_purchase_scenarios` itself is
+    unchanged -- same inputs, same computation, only moved out of the request
+    handler's local scope.
+    """
+
+    checks, rows, validation = _build_projection_gate_checks(
+        db,
+        household_id=household_id,
+        profile=profile,
+        snapshot=snapshot,
+        start_month=start_month,
+        end_month=end_month,
+        check_period=current_period,
+        entity_type="projection_scenario_comparison",
+        entity_id=(f"projection_scenario_comparison:{household_id}:{current_period}:{entity_suffix}"),
+        extra_installments=extra_installments,
+    )
+    results = tuple(evaluate_invariant(check.invariant_id, check.context) for check in checks)
+    assessment = assess_integrity(results)
+    inv018_result = next(result for result in results if result.invariant_id == "INV-018")
+    projection_gate_trusted = assessment.trusted_for_projection
+    trusted_for_projection = bool(balance_evidence_trusted and validation.valid and projection_gate_trusted)
+    serialized_rows = [
+        {key: decimal_value(value) if isinstance(value, Decimal) else value for key, value in row.items()}
+        for row in rows
+    ]
+    return {
+        "scenarios": {
+            scenario: _scenario_projection_summary(rows, scenario)
+            for scenario in ("no_commission", "delayed", "expected")
+        },
+        "trusted_for_projection": trusted_for_projection,
+        "projection_formula_trusted": validation.valid,
+        "projection_invariant_gate_trusted": projection_gate_trusted,
+        "integrity_status": inv018_result.status.value,
+        "validator_mismatches": len(validation.mismatches),
+        "commitment_schedule": _advisor_commitment_schedule({"rows": serialized_rows}),
+    }
+
+
 @router.post("/purchases/scenario-comparison")
 def compare_purchase_scenarios(
     payload: PurchaseScenarioComparisonRequest,
@@ -9664,47 +9730,18 @@ def compare_purchase_scenarios(
     balance_evidence_trusted = bool(current_snapshot.payload.get("balance_evidence_trusted", False))
 
     def _run_scenario(*, extra_installments: dict[str, Decimal] | None, entity_suffix: str) -> dict:
-        checks, rows, validation = _build_projection_gate_checks(
+        return _run_purchase_projection_scenario(
             db,
             household_id=user.household_id,
             profile=profile,
             snapshot=current_snapshot,
             start_month=start_month,
             end_month=end,
-            check_period=current_period,
-            entity_type="projection_scenario_comparison",
-            entity_id=(
-                f"projection_scenario_comparison:{user.household_id}:"
-                f"{current_period}:{entity_suffix}"
-            ),
+            current_period=current_period,
+            balance_evidence_trusted=balance_evidence_trusted,
             extra_installments=extra_installments,
+            entity_suffix=entity_suffix,
         )
-        results = tuple(evaluate_invariant(check.invariant_id, check.context) for check in checks)
-        assessment = assess_integrity(results)
-        inv018_result = next(result for result in results if result.invariant_id == "INV-018")
-        projection_gate_trusted = assessment.trusted_for_projection
-        trusted_for_projection = bool(
-            balance_evidence_trusted and validation.valid and projection_gate_trusted
-        )
-        serialized_rows = [
-            {
-                key: decimal_value(value) if isinstance(value, Decimal) else value
-                for key, value in row.items()
-            }
-            for row in rows
-        ]
-        return {
-            "scenarios": {
-                scenario: _scenario_projection_summary(rows, scenario)
-                for scenario in ("no_commission", "delayed", "expected")
-            },
-            "trusted_for_projection": trusted_for_projection,
-            "projection_formula_trusted": validation.valid,
-            "projection_invariant_gate_trusted": projection_gate_trusted,
-            "integrity_status": inv018_result.status.value,
-            "validator_mismatches": len(validation.mismatches),
-            "commitment_schedule": _advisor_commitment_schedule({"rows": serialized_rows}),
-        }
 
     baseline = _run_scenario(extra_installments=None, entity_suffix="baseline")
 
