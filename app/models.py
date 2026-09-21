@@ -1868,6 +1868,53 @@ class NotificationWorkerHeartbeat(Base, TimestampMixin):
     last_error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
 
+class SmtpSenderConfig(Base, TimestampMixin):
+    """Singleton row: the SMTP sender configured through the Settings UI
+    (MAIL-04, `docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md`, issue #110).
+
+    Global, not household-scoped: exactly like `NotificationWorkerHeartbeat`,
+    there is one `notification-worker` process sending for every household,
+    so there is one sender configuration, not one per household. Any
+    household admin may read/write it (`_require_admin` in `app.api`) --
+    this codebase has no separate "deployment admin" role distinct from a
+    household admin, a decision recorded as a residual risk in the MAIL-04
+    PR rather than invented here.
+
+    `app_password_encrypted` is the App Password Fernet-encrypted with a key
+    derived from `settings.file_encryption_key` via HKDF
+    (`app.services.smtp_config._derive_fernet_key`) -- never plaintext,
+    never `file_encryption_key`/`SECRET_KEY`/`MFA_ENCRYPTION_KEY`/
+    `WHATSAPP_PHONE_ENCRYPTION_KEY` reused directly. `NULL` means "no
+    App Password saved yet", not "empty password" -- `app.services
+    .smtp_config.save_smtp_sender_config` only ever overwrites it on an
+    explicit non-empty value or an explicit removal request, so a caller
+    that submits an empty field on edit (leaving the password unchanged)
+    cannot accidentally erase it.
+
+    This row is never read directly by `app.services.email_delivery
+    .SmtpEmailAdapter`, which only knows how to read attributes off a
+    `Settings`-shaped object -- `app.services.smtp_config
+    .resolve_effective_smtp_settings` is the only place that decrypts
+    `app_password_encrypted` and the only place allowed to decide DB vs
+    `ALERT_*` env precedence, so that decision is never duplicated.
+    """
+
+    __tablename__ = "smtp_sender_configs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    host: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    port: Mapped[int] = mapped_column(Integer, default=587, server_default="587")
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    app_password_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    from_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    use_starttls: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=15, server_default="15")
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 class WhatsAppAuthorizedNumber(Base, TimestampMixin):
     """WA-01 (`docs/WORK_ORDER_WA_01.md`, issue #73): the allowlist mapping
     one authorized phone number to exactly one `User`/`household`.

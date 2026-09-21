@@ -975,13 +975,41 @@
             <button id="due-notifications-disable" class="secondary hidden" type="button">Desativar neste navegador</button>
           </div>
         </article>
+        <!-- MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md, issue
+             #110): the SMTP sender itself, admin-only. The App Password
+             field is always submitted empty unless the admin is
+             explicitly typing a new one -- leaving it empty on save
+             preserves whatever secret is already stored; "Remover senha"
+             is the only way to clear it. This panel is hidden entirely
+             for a non-admin user (showApp() in app.js); the real
+             boundary is `app.api._require_admin` on GET/PUT /smtp-config. -->
+        <article class="panel settings-panel" id="smtp-config-settings">
+          <div class="panel-heading"><div><span class="step-label">ALERTAS POR E-MAIL</span><h2>Remetente SMTP</h2></div></div>
+          <p class="muted-copy">Configure aqui o remetente usado para enviar os alertas de vencimento (abaixo). Sem editar arquivos do servidor, sem reiniciar containers -- a próxima passada do worker e o próximo teste já usam a configuração salva. Se nada for salvo aqui, o sistema usa a configuração de ambiente (<code>ALERT_SMTP_*</code>), quando existir.</p>
+          <div id="smtp-config-status" class="security-note"></div>
+          <form id="smtp-config-form" class="form-grid three">
+            <label>Envio pelo remetente configurado aqui<select name="enabled"><option value="false">Não</option><option value="true">Sim</option></select></label>
+            <label>Servidor SMTP<input name="host" placeholder="smtp.gmail.com" autocomplete="off"></label>
+            <label>Porta<input type="number" name="port" min="1" max="65535" value="587"></label>
+            <label>Usuário/e-mail de autenticação<input name="username" placeholder="remetente@gmail.com" autocomplete="off"></label>
+            <label>E-mail remetente (De:)<input name="from_email" placeholder="remetente@gmail.com" autocomplete="off"></label>
+            <label>STARTTLS<select name="use_starttls"><option value="true">Sim</option><option value="false">Não</option></select></label>
+            <label>Timeout (segundos)<input type="number" name="timeout_seconds" min="1" max="120" value="15"></label>
+            <label>App Password<input type="password" name="app_password" autocomplete="new-password" placeholder="Deixe em branco para manter a senha atual"></label>
+            <label>Remover senha salva<input type="checkbox" name="remove_app_password"></label>
+            <div class="form-action"><button class="primary" type="submit">Salvar remetente SMTP</button></div>
+          </form>
+        </article>
         <!-- MAIL-00/MAIL-01 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md,
              issues #67/#68): destinatários/preferências (MAIL-00) plus a
              manual "Testar" send through the real SMTP adapter (MAIL-01).
              No scheduler runs yet (MAIL-02) -- D-1/D0 are not sent
-             automatically. The Gmail sender credential never appears here
-             or anywhere in the UI, only destinatários/preferências, per
-             Work Order "Decisão de produto solicitada". -->
+             automatically. The Gmail sender credential never appears in
+             this specific panel, only destinatários/preferências, per
+             Work Order "Decisão de produto solicitada" -- since MAIL-04
+             the credential itself lives in #smtp-config-settings above,
+             and "Testar" (below) sends through whichever configuration
+             `resolve_effective_smtp_settings` currently resolves. -->
         <article class="panel settings-panel" id="notification-settings-panel">
           <div class="panel-heading"><div><span class="step-label">ALERTAS POR E-MAIL</span><h2>Alertas de vencimento por e-mail</h2></div></div>
           <p class="muted-copy">Avisa por e-mail um dia antes (D-1) e no dia do vencimento (D0) de contas/obrigações cadastradas. O envio automático roda em segundo plano, sem depender do navegador aberto — aqui você configura destinatários/preferências e acompanha o status do envio.</p>
@@ -1028,6 +1056,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/app.js?v={{ asset_version }}-mail-03-worker-status" defer></script>
+  <script src="/static/app.js?v={{ asset_version }}-mail-04-smtp-config" defer></script>
 </body>
 </html>

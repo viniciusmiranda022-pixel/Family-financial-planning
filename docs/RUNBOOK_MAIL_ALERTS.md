@@ -1,11 +1,12 @@
-# Runbook — alertas de vencimento por e-mail (MAIL-00..03)
+# Runbook — alertas de vencimento por e-mail (MAIL-00..04)
 
 Este runbook cobre a operação completa dos alertas de vencimento por e-mail
-(`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`): configuração segura do Gmail,
-o serviço `notification-worker` em Docker Compose, seu health check,
-troubleshooting por código de erro sanitizado e rollback. Não altera nenhuma
-regra de elegibilidade D-1/D0 -- essas continuam exclusivamente em
-`app/services/notification_scheduler.py`.
+(`docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md`,
+`docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md`): configuração do remetente SMTP
+(pela interface ou por `.env`), o serviço `notification-worker` em Docker
+Compose, seu health check, troubleshooting por código de erro sanitizado e
+rollback. Não altera nenhuma regra de elegibilidade D-1/D0 -- essas
+continuam exclusivamente em `app/services/notification_scheduler.py`.
 
 ## 1. Visão geral dos componentes
 
@@ -14,22 +15,79 @@ regra de elegibilidade D-1/D0 -- essas continuam exclusivamente em
 | `notification_settings` / `notification_recipients` | Postgres (migração `0020`) | Configuração por household: ativo, horário, fuso, destinatários e preferências D-1/D0 (MAIL-00). |
 | `notification_deliveries` | Postgres (migração `0021`) | Outbox/trilha de entrega -- uma linha por evento lógico `(household, obrigação, destinatário, vencimento, tipo)` (MAIL-02). |
 | `notification_worker_heartbeats` | Postgres (migração `0022`) | Linha única com a última execução do worker: início, fim, sucesso/falha, contagens, último erro sanitizado (MAIL-03). |
-| `app.services.email_delivery.SmtpEmailAdapter` | Código | Transporte SMTP/STARTTLS. Nunca decide elegibilidade, nunca persiste (MAIL-01). |
-| `app.cli.notification_worker` | Código + serviço `notification-worker` no `compose.yaml` | Descobre, reivindica, renderiza, envia e finaliza cada entrega, em loop (MAIL-02/03). |
+| `smtp_sender_configs` | Postgres (migração `0028`) | Linha única, global, com o remetente SMTP configurado pela interface -- App Password criptografada em repouso (MAIL-04). |
+| `app.services.email_delivery.SmtpEmailAdapter` | Código | Transporte SMTP/STARTTLS. Nunca decide elegibilidade, nunca persiste, nunca decide de onde vem sua própria credencial (MAIL-01). |
+| `app.services.smtp_config` | Código | Criptografia da App Password e resolução da configuração SMTP *efetiva* (banco vs. `ALERT_SMTP_*`) -- a única fonte dessa decisão (MAIL-04). |
+| `app.cli.notification_worker` | Código + serviço `notification-worker` no `compose.yaml` | Descobre, reivindica, renderiza, envia e finaliza cada entrega, em loop (MAIL-02/03). Resolve a configuração SMTP efetiva a cada passada -- sem cache, sem restart (MAIL-04). |
 | `GET /notification-settings/status` | API | Leitura operacional: alertas ativos, sender configurado, última execução do worker, contagens de entrega por status (MAIL-03). |
+| `GET`/`PUT /smtp-config` | API (admin apenas) | Lê metadados sanitizados (nunca a senha) e salva o remetente SMTP (MAIL-04). |
 
-## 2. Configuração segura do Gmail
+## 2. Configurando o remetente SMTP
 
-A credencial do Gmail **nunca** é digitada na UI nem gravada no banco --
-somente em `.env`/segredo do orquestrador, lido por
-`app.config.Settings` (`ALERT_SMTP_*`).
+Duas formas coexistem, com precedência explícita: uma configuração salva
+pela interface, **habilitada e completa**, tem prioridade total sobre as
+variáveis `ALERT_SMTP_*` -- nunca uma mistura de campos das duas fontes
+(`app.services.smtp_config.resolve_effective_smtp_settings`). Se nenhuma
+configuração foi salva pela interface, ou ela está desabilitada/incompleta,
+o sistema usa `ALERT_SMTP_*` inteiramente, como antes do MAIL-04.
 
-1. Ative a verificação em duas etapas na conta Gmail remetente (obrigatório
-   para gerar uma App Password).
-2. Gere uma **App Password** em
+### 2.1 Pela interface (recomendado -- sem editar arquivos, sem restart)
+
+1. Nenhuma chave nova para gerar ou adicionar a `.env`: a App Password
+   salva pela interface é criptografada em repouso com uma chave *derivada*
+   de `FILE_ENCRYPTION_KEY` (HKDF-SHA256, domain separation, nunca
+   `FILE_ENCRYPTION_KEY` reutilizada diretamente --
+   `app.services.smtp_config._derive_fernet_key`) -- toda instalação já tem
+   `FILE_ENCRYPTION_KEY` configurada desde antes do MAIL-04 existir
+   (obrigatória para subir o `app`), então o painel de SMTP da interface
+   funciona no primeiro acesso, sem editar `.env` e sem `docker compose
+   ... --force-recreate`.
+2. Ative a verificação em duas etapas na conta Gmail remetente (obrigatório
+   para gerar uma App Password) e gere uma **App Password** em
    <https://myaccount.google.com/apppasswords> (nunca use a senha normal de
    login).
-3. Preencha em `.env` (nunca em `.env.example`, nunca versionado):
+3. Em **Configurações → Remetente SMTP** (admin apenas), preencha
+   servidor/porta/usuário/remetente/STARTTLS/timeout e a App Password, e
+   marque "Sim" em "Envio pelo remetente configurado aqui". Salvar não
+   exige restart nem edição de `.env` -- a próxima passada do worker e o
+   próximo teste já usam essa configuração.
+4. Deixar a App Password em branco ao editar preserva a senha já salva;
+   "Remover senha salva" é a única forma explícita de apagá-la.
+5. Cadastre destinatários na tela **Configurações → Alertas de vencimento
+   por e-mail** e use o botão **Testar** de um destinatário já cadastrado --
+   isso chama `POST /notification-settings/test-email`, que sempre usa a
+   configuração SMTP efetiva (banco, se habilitada e completa; senão
+   `ALERT_SMTP_*`), nunca um host/usuário/senha vindo do navegador.
+
+### 2.3 Rotação de `FILE_ENCRYPTION_KEY`
+
+Como a chave de criptografia da App Password SMTP é derivada de
+`FILE_ENCRYPTION_KEY` (seção 2.1), rotacionar `FILE_ENCRYPTION_KEY` (ex.:
+resposta a um incidente de segurança) também rotaciona essa chave derivada
+-- qualquer App Password salva antes da rotação se torna indecifrável.
+Isso nunca vira fallback silencioso para texto plano nem um envio
+malsucedido silencioso: `resolve_effective_smtp_settings` levanta
+`SmtpConfigurationError` explicitamente (o worker registra a passada como
+`worker_pass_exception` no heartbeat, seção 5; `POST
+/notification-settings/test-email` retorna erro).
+
+Procedimento após rotacionar `FILE_ENCRYPTION_KEY`:
+
+1. Em **Configurações → Remetente SMTP**, reinsira a App Password (mesmo
+   valor de antes ou uma nova) e salve -- isso a recriptografa com a chave
+   derivada da nova `FILE_ENCRYPTION_KEY`.
+2. Use o botão **Testar** (seção 2.1, passo 5) para confirmar antes de
+   considerar a rotação concluída.
+
+Isso não é específico deste worker: qualquer segredo criptografado com uma
+chave derivada de `FILE_ENCRYPTION_KEY` precisa do mesmo passo de
+re-gravação após uma rotação -- documentado aqui porque a App Password SMTP
+é, por ora, o único.
+
+### 2.2 Por `.env` (fallback, compatível com instalações anteriores ao MAIL-04)
+
+1. Ative a verificação em duas etapas e gere uma App Password (igual acima).
+2. Preencha em `.env` (nunca em `.env.example`, nunca versionado):
    ```bash
    ALERT_EMAIL_ENABLED=true
    ALERT_SMTP_HOST=smtp.gmail.com
@@ -39,18 +97,19 @@ somente em `.env`/segredo do orquestrador, lido por
    ALERT_EMAIL_FROM=seu-remetente@gmail.com
    ALERT_EMAIL_USE_STARTTLS=true
    ```
-4. Reinicie `app` e `notification-worker` para carregar o novo `.env`:
+3. Reinicie `app` e `notification-worker` para carregar o novo `.env`:
    ```bash
    docker compose up -d --force-recreate app notification-worker
    ```
-5. Cadastre destinatários na tela **Configurações → Alertas de vencimento
-   por e-mail** (admin apenas) e use o botão **Testar** de um destinatário
-   já cadastrado -- isso chama `POST /notification-settings/test-email`, que
-   nunca aceita host/usuário/senha vindos do navegador.
+   Essa via continua funcionando exatamente como antes do MAIL-04, desde
+   que nenhuma configuração habilitada/completa tenha sido salva pela
+   interface (seção 2.1) -- nesse caso ela é ignorada por inteiro, nunca
+   combinada campo a campo com a configuração do banco.
 
-`ALERT_SMTP_APP_PASSWORD` nunca aparece em log, exceção serializada, evento
-de auditoria, response da API ou screenshot desta documentação -- apenas os
-códigos sanitizados da seção 5 abaixo.
+Em nenhum dos dois caminhos a App Password aparece em log, exceção
+serializada, evento de auditoria, response da API/UI ou screenshot desta
+documentação -- apenas os códigos sanitizados da seção 5 abaixo, e, no
+caminho da interface, apenas o booleano "senha configurada".
 
 ## 3. Subindo o worker
 
@@ -129,14 +188,14 @@ específicos do worker/heartbeat -- nunca o texto bruto de exceção do
 
 | Código | Significado | Ação |
 |---|---|---|
-| `not_configured` | `ALERT_EMAIL_ENABLED=false` ou uma variável `ALERT_SMTP_*`/`ALERT_EMAIL_FROM` vazia | Complete a seção 2 e recrie `app`/`notification-worker`. Falha permanente -- não entra em retry. |
-| `smtp_auth_failed` | Usuário/App Password incorretos ou revogados | Gere uma nova App Password (a antiga pode ter sido revogada ao trocar a senha da conta Google). Falha permanente. |
-| `smtp_connection_failed` | Não conseguiu conectar ao host/porta SMTP | Verifique egress de rede do container (`lan` em `compose.yaml`) e se `ALERT_SMTP_HOST`/`ALERT_SMTP_PORT` estão corretos. Transitório -- entra em retry com backoff. |
+| `not_configured` | Nenhuma configuração SMTP efetiva: nem uma configuração habilitada/completa salva pela interface, nem `ALERT_SMTP_*`/`ALERT_EMAIL_FROM` preenchidos | Complete a seção 2.1 (interface, sem restart) ou 2.2 (`.env`, recria `app`/`notification-worker`). Falha permanente -- não entra em retry. |
+| `smtp_auth_failed` | Usuário/App Password incorretos ou revogados | Gere uma nova App Password (a antiga pode ter sido revogada ao trocar a senha da conta Google) e salve-a em Configurações → Remetente SMTP (ou em `ALERT_SMTP_APP_PASSWORD`, conforme qual fonte está efetiva). Falha permanente. |
+| `smtp_connection_failed` | Não conseguiu conectar ao host/porta SMTP | Verifique egress de rede do container (`lan` em `compose.yaml`) e se o host/porta efetivos (interface ou `ALERT_SMTP_HOST`/`ALERT_SMTP_PORT`) estão corretos. Transitório -- entra em retry com backoff. |
 | `smtp_timeout` | Servidor SMTP não respondeu dentro de `ALERT_EMAIL_TIMEOUT_SECONDS` | Normalmente transitório (rede lenta); se persistente, aumente o timeout. Transitório -- entra em retry. |
 | `smtp_recipient_refused` | Servidor rejeitou o endereço do destinatário | Confirme o e-mail cadastrado em Configurações. Falha permanente. |
 | `smtp_send_failed` | Outra falha SMTP não classificada acima | Verifique `docker compose logs notification-worker` (nunca inclui a senha). Transitório -- entra em retry. |
 | `worker_timeout_exhausted` | Uma entrega ficou `sending` além de `NOTIFICATION_DELIVERY_STALE_AFTER_SECONDS` e já sem tentativas | O worker provavelmente crashou no meio do envio; verifique se o e-mail chegou de fato (SMTP não tem transação distribuída com o banco -- ver "Limite técnico" no Work Order) antes de qualquer ação manual. |
-| `worker_pass_exception` | A própria passada (`run_once`) lançou uma exceção não tratada (ex.: banco indisponível) | Verifique `docker compose logs notification-worker` e a saúde de `db`. O heartbeat registra `ok=false` para esta passada; a próxima passada tenta de novo automaticamente. |
+| `worker_pass_exception` | A própria passada (`run_once`) lançou uma exceção não tratada (ex.: banco indisponível, ou `SmtpConfigurationError` -- App Password SMTP salva antes de uma rotação de `FILE_ENCRYPTION_KEY`, seção 2.3) | Verifique `docker compose logs notification-worker` e a saúde de `db`. Se o log mostrar `SmtpConfigurationError`, siga o procedimento de rotação da seção 2.3 (reinserir a App Password). O heartbeat registra `ok=false` para esta passada; a próxima passada tenta de novo automaticamente. |
 | `never_run` (healthcheck) | Nenhuma passada terminou ainda | Normal logo após subir; persistente além de `start_period` indica processo travado antes do primeiro `run_once` completar -- veja logs. |
 | `stale` (healthcheck) | Última passada terminou há mais tempo que a janela de frescor | Worker travado ou reiniciando em loop; `docker compose logs notification-worker` e `docker compose ps` para o estado de restart. |
 

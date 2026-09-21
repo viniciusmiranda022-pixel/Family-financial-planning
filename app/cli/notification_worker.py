@@ -52,6 +52,7 @@ from app.services import notification_scheduler as scheduler
 from app.services import notification_worker_status as worker_status
 from app.services.email_delivery import EmailDeliveryResult, OutboundEmail, SmtpEmailAdapter
 from app.services.notification_templates import render_due_date_alert
+from app.services.smtp_config import resolve_effective_smtp_settings
 
 logger = logging.getLogger(__name__)
 
@@ -310,7 +311,16 @@ def run_once(
                 db, limit=limit, stale_after_seconds=stale_after_seconds, now_utc=now_utc
             )
 
-        active_adapter = adapter or SmtpEmailAdapter()
+        if adapter is not None:
+            active_adapter = adapter
+        else:
+            # MAIL-04: resolved fresh every pass (no caching) so a config
+            # saved through the Settings UI mid-run takes effect on the
+            # very next pass without a process restart -- the DB-vs-env
+            # precedence decision itself lives in `resolve_effective_smtp_settings`,
+            # never duplicated here.
+            with session_factory() as db:
+                active_adapter = SmtpEmailAdapter(settings=resolve_effective_smtp_settings(db))
         for delivery_id in claimable_ids:
             with session_factory() as db:
                 delivery = scheduler.claim_delivery(

@@ -4,9 +4,14 @@
 This module only knows how to *transport* an already-rendered message
 (`app.services.notification_templates`). It never decides who gets
 alerted or when -- that is MAIL-02's outbox/scheduler -- and it never
-persists anything. The Gmail/SMTP credential comes exclusively from
-`app.config.Settings` (`ALERT_SMTP_*` env vars); it is never accepted from
-a request body, read from the database, or returned in a response.
+persists anything, and it never decides *where its own credential comes
+from*: MAIL-04 (`app.services.smtp_config.resolve_effective_smtp_settings`)
+owns the DB-vs-`ALERT_SMTP_*` precedence decision and hands this module an
+already-resolved `SmtpSettingsLike` object -- either `app.config.Settings`
+itself (env-only, `get_settings()` default) or MAIL-04's
+`EffectiveSmtpSettings` (DB-backed, already decrypted). Nothing in this
+module reads the database or accepts a credential from a request body or
+a response.
 
 Errors are collapsed to a small, fixed set of sanitized codes
 (`EmailErrorCode`). The raw `smtplib`/socket exception text is deliberately
@@ -25,9 +30,28 @@ import time
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import make_msgid
+from typing import Protocol, runtime_checkable
 
-from app.config import Settings, get_settings
+from app.config import get_settings
 from app.services.notification_templates import RenderedEmail
+
+
+@runtime_checkable
+class SmtpSettingsLike(Protocol):
+    """The exact surface `SmtpEmailAdapter` reads off a config object --
+    `app.config.Settings` and MAIL-04's `EffectiveSmtpSettings` both
+    satisfy this structurally, so the adapter (the one and only send
+    engine, MAIL-04 Work Order: "Não criar segundo motor de envio") never
+    needs to know or care which source resolved the credential."""
+
+    alert_email_enabled: bool
+    alert_smtp_host: str
+    alert_smtp_port: int
+    alert_smtp_username: str
+    alert_smtp_app_password: str
+    alert_email_from: str
+    alert_email_use_starttls: bool
+    alert_email_timeout_seconds: int
 
 
 class EmailErrorCode:
@@ -70,7 +94,7 @@ class SmtpEmailAdapter:
     """Thin SMTP/STARTTLS transport. No template knowledge, no persistence,
     no retry (MAIL-02 owns retry/backoff over repeated `send` calls)."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: SmtpSettingsLike | None = None) -> None:
         self.settings = settings or get_settings()
 
     @property

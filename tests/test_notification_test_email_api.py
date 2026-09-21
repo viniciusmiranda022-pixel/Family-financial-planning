@@ -120,7 +120,9 @@ def test_test_email_success_returns_ok_and_audits_without_leaking_email(
     assert event.entity_type == "notification_recipient"
     assert event.entity_id == recipient_id
     details = json.loads(event.details)
-    assert details == {"result": "sent", "error_code": None}
+    # MAIL-04: `source` records which config `resolve_effective_smtp_settings`
+    # resolved (no DB config saved in this test -> "env").
+    assert details == {"result": "sent", "error_code": None, "source": "env"}
     # The recipient's e-mail address is personal data; the audit trail must
     # reference it only by id (Work Order "Privacidade e logs").
     assert "destino-secreto@exemplo.com" not in event.details
@@ -146,7 +148,7 @@ def test_test_email_adapter_failure_returns_502_and_audits_sanitized_error_code(
 
     event = _last_test_email_event(session_factory)
     details = json.loads(event.details)
-    assert details == {"result": "failed", "error_code": EmailErrorCode.AUTH_FAILED}
+    assert details == {"result": "failed", "error_code": EmailErrorCode.AUTH_FAILED, "source": "env"}
 
 
 def test_test_email_second_call_within_window_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:

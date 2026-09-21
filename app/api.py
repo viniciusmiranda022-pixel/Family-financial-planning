@@ -113,6 +113,7 @@ from app.schemas import (
     RefundUnlinkRequest,
     SemanticAuditRequest,
     SetupRequest,
+    SmtpSenderConfigUpdateRequest,
     TransactionUpdate,
     TransferRequest,
     UserCreateRequest,
@@ -321,6 +322,15 @@ from app.services.report_export import (
     report_export_filename,
 )
 from app.services.smart_capture import CaptureParseError, preview_capture
+from app.services.smtp_config import (
+    SmtpConfigurationError,
+    SmtpSenderConfigUpdate,
+    SmtpSenderConfigValidationError,
+    get_smtp_sender_config,
+    resolve_effective_smtp_settings,
+    save_smtp_sender_config,
+    serialize_smtp_sender_config,
+)
 from app.services.transfers import TransferError, create_internal_transfer
 
 router = APIRouter(prefix="/api")
@@ -12451,7 +12461,12 @@ def notification_recipients_delete(
 # the real SMTP adapter. Admin-only, never accepts host/username/password
 # from the caller, never creates/alters a financial fact, and is
 # rate-limited per household to avoid accidental spam (see
-# `app.services.email_delivery.EmailSendThrottle`).
+# `app.services.email_delivery.EmailSendThrottle`). MAIL-04: uses
+# `resolve_effective_smtp_settings` -- exactly the same DB-vs-env
+# precedence the notification-worker uses -- so this button always tests
+# "the configuration that would actually be used to send", never a config
+# the browser supplied (Work Order: "Botão de teste deve usar exatamente
+# a configuração efetiva salva").
 @router.post("/notification-settings/test-email")
 def notification_settings_test_email(
     payload: NotificationTestEmailRequest,
@@ -12466,7 +12481,8 @@ def notification_settings_test_email(
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="Destinatário não encontrado") from exc
 
-    adapter = SmtpEmailAdapter()
+    effective = resolve_effective_smtp_settings(db)
+    adapter = SmtpEmailAdapter(settings=effective)
     if not adapter.configured:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -12489,7 +12505,7 @@ def notification_settings_test_email(
         "notification_settings.test_email",
         "notification_recipient",
         recipient.id,
-        {"result": "sent" if result.ok else "failed", "error_code": result.error_code},
+        {"result": "sent" if result.ok else "failed", "error_code": result.error_code, "source": effective.source},
         source="notification_settings",
     )
     db.commit()
@@ -12498,6 +12514,79 @@ def notification_settings_test_email(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=email_error_message(result.error_code)
         )
     return {"ok": True}
+
+
+# MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md, issue #110): admin-only
+# read/write of the SMTP sender configured through the Settings UI. Never
+# returns the App Password in any form (plaintext or ciphertext) -- only
+# `app_password_configured`, a boolean. Global/process-wide resource (one
+# `notification-worker` sends for every household); any household admin
+# may read or change it, the same `_require_admin` boundary used
+# throughout this codebase, since there is no separate "deployment admin"
+# role (documented residual risk in the MAIL-04 PR).
+@router.get("/smtp-config")
+def smtp_config_get(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    return serialize_smtp_sender_config(get_smtp_sender_config(db))
+
+
+@router.put("/smtp-config")
+def smtp_config_update(
+    payload: SmtpSenderConfigUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_admin(user)
+    existing = get_smtp_sender_config(db)
+    before = serialize_smtp_sender_config(existing)
+    # Snapshot the raw ciphertext (never logged/audited itself, just compared)
+    # *before* calling save -- `existing` and the row `save_smtp_sender_config`
+    # returns are the same SQLAlchemy-identity-mapped object for this `db`
+    # session, mutated in place, so this has to be read into a local `str`
+    # (immutable, unaffected by that later mutation) now, not derived from
+    # `before`/`after` afterwards. `before["app_password_configured"]` is a
+    # boolean and cannot distinguish "kept the same secret" from "replaced it
+    # with a different one" -- see engineering review on the PR for issue #110
+    # (2026-09-21) and `tests/test_smtp_config_api.py
+    # ::test_replacing_an_existing_app_password_audits_changed_true`.
+    before_app_password_ciphertext = existing.app_password_encrypted if existing is not None else None
+    try:
+        row = save_smtp_sender_config(
+            db,
+            user=user,
+            update=SmtpSenderConfigUpdate(
+                enabled=payload.enabled,
+                host=payload.host.strip(),
+                port=payload.port,
+                username=payload.username.strip(),
+                from_email=payload.from_email.strip(),
+                use_starttls=payload.use_starttls,
+                timeout_seconds=payload.timeout_seconds,
+                app_password=payload.app_password or None,
+                remove_app_password=payload.remove_app_password,
+            ),
+        )
+    except SmtpSenderConfigValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SmtpConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    after = serialize_smtp_sender_config(row)
+    audit(
+        db,
+        user,
+        "smtp_config.update",
+        "smtp_sender_config",
+        row.id,
+        {"app_password_changed": row.app_password_encrypted != before_app_password_ciphertext},
+        before_state=before,
+        after_state=after,
+        source="smtp_config",
+    )
+    db.commit()
+    return after
 
 
 # MAIL-03 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #70): the Work
@@ -12518,7 +12607,7 @@ def notification_settings_status(
     db.commit()
     return {
         "enabled": settings_row.enabled,
-        "sender_configured": SmtpEmailAdapter().configured,
+        "sender_configured": SmtpEmailAdapter(settings=resolve_effective_smtp_settings(db)).configured,
         "worker": heartbeat_snapshot(db),
         "deliveries": delivery_status_counts(db, household_id=user.household_id),
     }

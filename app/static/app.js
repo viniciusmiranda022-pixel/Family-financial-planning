@@ -301,6 +301,12 @@ async function showApp() {
   // Configurações (#settings-integrity-link, toggled here).
   const settingsIntegrityLink = document.querySelector("#settings-integrity-link");
   if (settingsIntegrityLink) settingsIntegrityLink.classList.toggle("hidden", !(state.user.is_admin && integrityUiEnabled()));
+  // MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md): GET/PUT
+  // /smtp-config are admin-only server-side (`_require_admin`) -- hiding
+  // the whole panel for a non-admin is UX only, same convention as
+  // #nav-users/#settings-integrity-link above.
+  const smtpConfigPanel = document.querySelector("#smtp-config-settings");
+  if (smtpConfigPanel) smtpConfigPanel.classList.toggle("hidden", !state.user.is_admin);
   // `.admin-only` static forms/controls (see index.html) are only ever a UX
   // convenience -- `app/api.py::_require_admin` is what actually rejects a
   // consulta user's request, regardless of this class.
@@ -2339,7 +2345,42 @@ async function loadProfile() {
   form.querySelector('button[type="submit"]').classList.toggle("hidden", !isAdmin());
   renderDueNotificationsSettings();
   await renderMfaSettings();
+  if (isAdmin()) await loadSmtpConfig();
   await loadNotificationSettings();
+}
+
+// MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md, issue #110): reads/
+// renders `GET /smtp-config`. Never receives the App Password back --
+// only `app_password_configured`, which drives the status chip and the
+// field's placeholder; the field itself always starts empty so a save
+// with it left blank cannot possibly resubmit a value that was never
+// there. `PUT /smtp-config` already 403s server-side for a non-admin
+// (`_require_admin`); this whole panel is additionally hidden for a
+// non-admin in `showApp()`.
+async function loadSmtpConfig() {
+  const data = await api("/smtp-config");
+  const form = document.querySelector("#smtp-config-form");
+  form.elements.enabled.value = String(Boolean(data.enabled));
+  form.elements.host.value = data.host || "";
+  form.elements.port.value = data.port || 587;
+  form.elements.username.value = data.username || "";
+  form.elements.from_email.value = data.from_email || "";
+  form.elements.use_starttls.value = String(Boolean(data.use_starttls));
+  form.elements.timeout_seconds.value = data.timeout_seconds || 15;
+  form.elements.app_password.value = "";
+  form.elements.app_password.placeholder = data.app_password_configured
+    ? "Senha salva -- deixe em branco para manter"
+    : "Nenhuma senha salva ainda";
+  form.elements.remove_app_password.checked = false;
+
+  const statusPanel = document.querySelector("#smtp-config-status");
+  const passwordChip = data.app_password_configured
+    ? '<span class="status-chip ok">Senha salva</span>'
+    : '<span class="status-chip warn">Sem senha salva</span>';
+  const updated = data.updated_at
+    ? `<small>Última alteração: ${new Date(data.updated_at).toLocaleString("pt-BR")}</small>`
+    : "<small>Nunca configurado -- usando ALERT_SMTP_* de ambiente, se existir</small>";
+  statusPanel.innerHTML = `<p>${passwordChip} ${updated}</p>`;
 }
 
 // MAIL-00 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #67): reads/
@@ -4767,6 +4808,32 @@ document.querySelector("#profile-form").addEventListener("submit", async (event)
   const numeric = ["monthly_salary_net", "monthly_cash_cap", "emergency_floor", "food_allowance", "meal_allowance_daily", "workdays_month", "investment_balance", "investment_gross_annual_rate", "investment_income_tax_rate"];
   try { await api("/profile", { method: "PUT", body: JSON.stringify(formJson(event.target, numeric)) }); toast("Premissas salvas"); await loadDashboard(); }
   catch (error) { toast(error.message, true); }
+});
+// MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md, issue #110): built
+// field-by-field rather than through `formJson` because that helper turns
+// every empty string into `null` -- fine for `app_password` (that IS the
+// "leave the saved secret unchanged" signal, `app.services.smtp_config
+// .save_smtp_sender_config`'s "keep" branch) but wrong for `host`/
+// `username`/`from_email`, which the API expects as strings, never null.
+document.querySelector("#smtp-config-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const payload = {
+    enabled: form.elements.enabled.value === "true",
+    host: form.elements.host.value.trim(),
+    port: Number(form.elements.port.value || 587),
+    username: form.elements.username.value.trim(),
+    from_email: form.elements.from_email.value.trim(),
+    use_starttls: form.elements.use_starttls.value === "true",
+    timeout_seconds: Number(form.elements.timeout_seconds.value || 15),
+    app_password: form.elements.app_password.value || null,
+    remove_app_password: form.elements.remove_app_password.checked,
+  };
+  try {
+    await api("/smtp-config", { method: "PUT", body: JSON.stringify(payload) });
+    toast("Remetente SMTP salvo");
+    await loadSmtpConfig();
+  } catch (error) { toast(error.message, true); }
 });
 document.querySelector("#notification-settings-form").addEventListener("submit", async (event) => {
   event.preventDefault();

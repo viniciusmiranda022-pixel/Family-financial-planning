@@ -393,6 +393,25 @@ class NotificationTestEmailRequest(BaseModel):
     recipient_id: str = Field(min_length=1, max_length=36)
 
 
+class SmtpSenderConfigUpdateRequest(BaseModel):
+    """MAIL-04 (`docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md`). `app_password`
+    left empty/omitted preserves the previously saved secret --
+    `remove_app_password=True` is the only explicit way to clear it, and
+    the two are mutually exclusive (enforced in
+    `app.services.smtp_config.save_smtp_sender_config`, not here, since it
+    needs the row's current state to validate `enabled` completeness)."""
+
+    enabled: bool
+    host: str = Field(default="", max_length=255)
+    port: int = Field(default=587, ge=1, le=65535)
+    username: str = Field(default="", max_length=255)
+    from_email: str = Field(default="", max_length=255)
+    use_starttls: bool = True
+    timeout_seconds: int = Field(default=15, ge=1, le=120)
+    app_password: str | None = Field(default=None, max_length=255)
+    remove_app_password: bool = False
+
+
 class IntegrityRunRequest(BaseModel):
     scope: str = Field(pattern="^(entity|period|global)$")
     period: str | None = Field(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")

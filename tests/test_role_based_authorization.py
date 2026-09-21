@@ -233,6 +233,11 @@ def test_consulta_reads_household_data(roles: RoleFixture) -> None:
     # Pre-existing behavior (unchanged by this Work Order): user management
     # is admin-only reading too, not only writing.
     assert roles.consulta.get("/api/users").status_code == 403
+    # MAIL-04 (docs/WORK_ORDER_MAIL_04_UI_SMTP_CONFIG.md, issue #110): unlike
+    # `/api/notification-settings` above, the SMTP sender config is
+    # admin-only reading too -- it is never a household-scoped preference,
+    # it is the deployment's own sender credential metadata.
+    assert roles.consulta.get("/api/smtp-config").status_code == 403
 
 
 def test_consulta_rejected_from_semantic_audit_and_advisor_chat_without_side_effect(
@@ -705,6 +710,12 @@ def _mutations() -> list[tuple[str, str, str, dict]]:
             "post",
             "/api/notification-settings/test-email",
             {"json": {"recipient_id": "missing"}},
+        ),
+        (
+            "smtp config update",
+            "put",
+            "/api/smtp-config",
+            {"json": {"enabled": False, "host": "", "port": 587, "username": "", "from_email": ""}},
         ),
     ]
 
