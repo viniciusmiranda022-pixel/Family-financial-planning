@@ -99,6 +99,10 @@ _MEDIA_REQUIRES_ACCOUNT_REPLY = (
     "Reenvie mencionando o nome do banco/cartão na legenda, ou finalize pelo site."
 )
 _MEDIA_NO_PENDING_CAPTURE_REPLY = "Essa captura não está mais disponível para confirmação."
+_MEDIA_PENDING_CAPTURE_REPLY = (
+    'Você já tem um lançamento aguardando confirmação. Responda "confirmar" ou "cancelar" '
+    "para essa captura antes de enviar um novo arquivo."
+)
 _MEDIA_CANCELLED_REPLY = "Combinado, cancelei essa captura. Nada foi lançado."
 _MEDIA_CONFIRMED_REPLY = "Lançamento confirmado com sucesso."
 _MEDIA_CONFIRM_FAILED_PREFIX = "Não consegui confirmar: "
@@ -482,6 +486,81 @@ def _format_capture_preview(capture) -> str:
     )
 
 
+def _load_actionable_pending_capture(db, authorized):
+    """WA-07 fix (engineering review finding on PR #109, 2026-09-21): the
+    fast-path half of the "no silent pointer overwrite" guard. Returns the
+    `CaptureDraft` `authorized.pending_capture_id` still points at, but only
+    when it is still actionable (`status == "preview"`) -- `None` when there
+    is no pointer, or the pointer is stale (the draft was already resolved
+    another way, e.g. confirmed/cancelled from the web UI's own `/captures`
+    screen). Never mutates `authorized.pending_capture_id` itself: a stale
+    pointer is left for whichever caller is about to replace it to clear
+    explicitly, so this helper stays a pure read usable from a cheap
+    pre-check before any fetch/OCR/transcription is attempted."""
+
+    if not authorized.pending_capture_id:
+        return None
+    from app.models import CaptureDraft
+
+    return db.scalar(
+        select(CaptureDraft).where(
+            CaptureDraft.id == authorized.pending_capture_id,
+            CaptureDraft.household_id == authorized.household_id,
+            CaptureDraft.status == "preview",
+        )
+    )
+
+
+def _claim_pending_capture_slot(db, authorized, capture_id: str) -> bool:
+    """WA-07 fix (engineering review finding on PR #109, 2026-09-21): the
+    locked half of the "no silent pointer overwrite" guard -- the actual
+    correctness barrier for two near-simultaneous media messages from the
+    same number, which `_load_actionable_pending_capture`'s earlier,
+    unlocked pre-check cannot by itself close (two racers can both pass that
+    check before either commits).
+
+    Takes a row lock on the `WhatsAppAuthorizedNumber` row itself
+    (`SELECT ... FOR UPDATE`) and re-reads `pending_capture_id` under that
+    lock before deciding whether to claim it for `capture_id`. On
+    PostgreSQL this genuinely serializes two concurrent requests: whichever
+    one acquires the lock second sees the first's already-claimed pointer
+    and backs off instead of overwriting it. On SQLite (unit tests) `FOR
+    UPDATE` is a no-op, but SQLite tests never exercise real thread
+    concurrency for this path anyway -- the dedicated race coverage runs
+    against real PostgreSQL with real threads
+    (`tests/test_postgresql_integration.py`).
+
+    Returns `True` when the claim succeeded (`capture_id` is now this
+    number's pending pointer) and `False` when another still-actionable
+    draft already holds the slot. On `False`, `capture_id`'s own
+    `CaptureDraft` is left exactly as `_analyze_and_persist_capture` already
+    committed it (still a fully valid, auditable, non-financial `preview`
+    row) -- just not reachable from a bare WhatsApp "confirmar"/"cancelar"
+    on this channel; the caller is expected to tell the household to finish
+    it from the web UI's own `/captures` screen instead, same as any other
+    capture this channel's pointer does not currently reach."""
+
+    from app.models import CaptureDraft, WhatsAppAuthorizedNumber
+
+    locked = db.execute(
+        select(WhatsAppAuthorizedNumber).where(WhatsAppAuthorizedNumber.id == authorized.id).with_for_update()
+    ).scalar_one()
+    if locked.pending_capture_id:
+        still_actionable = db.scalar(
+            select(CaptureDraft.id).where(
+                CaptureDraft.id == locked.pending_capture_id,
+                CaptureDraft.household_id == authorized.household_id,
+                CaptureDraft.status == "preview",
+            )
+        )
+        if still_actionable is not None:
+            db.commit()
+            return False
+    locked.pending_capture_id = capture_id
+    db.commit()
+    return True
+
+
 async def _run_media_reply(
     db,
     *,
@@ -515,7 +594,25 @@ async def _run_media_reply(
     file (a household resending the same photo) is instead caught by the
     `Document.sha256` uniqueness check below, and replied to without
     creating a second draft.
+
+    WA-07 fix (engineering review finding on PR #109, 2026-09-21): new media
+    is rejected up front, before any fetch/OCR/transcription, while this
+    number already has a still-actionable pending capture
+    (`_load_actionable_pending_capture`) -- a second media message can no
+    longer silently replace `authorized.pending_capture_id` and orphan the
+    draft the household's next "confirmar"/"cancelar" was actually meant to
+    resolve. `_claim_pending_capture_slot` is the corresponding locked
+    re-check right before the pointer is actually set, closing the race
+    between two near-simultaneous media messages that both pass this
+    earlier, unlocked check.
     """
+
+    pending = _load_actionable_pending_capture(db, authorized)
+    if pending is not None:
+        logger.info("whatsapp_gateway.media_rejected_pending_capture", extra={"trace_id": trace_id})
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_PENDING_CAPTURE_REPLY)
+        gateway.finalize_inbound_event(db, event, status="needs_clarification", trace_id=trace_id)
+        return
 
     from app.models import Document
     from app.services.crypto import EncryptedDocumentStore
@@ -653,8 +750,19 @@ async def _run_media_reply(
         gateway.finalize_inbound_event(db, event, status="needs_clarification", trace_id=trace_id)
         return
 
-    authorized.pending_capture_id = capture.id
-    db.commit()
+    if not _claim_pending_capture_slot(db, authorized, capture.id):
+        # Lost the race: another message (media processed concurrently, or
+        # a confirm/cancel that resolved a *different* draft and then a
+        # third message claimed the slot first) already holds a still-
+        # actionable pending capture under the lock. `capture` itself stays
+        # a fully committed, auditable `preview` draft -- just not this
+        # channel's pointer -- so nothing financial is lost, only WhatsApp
+        # reachability for this one draft.
+        logger.info("whatsapp_gateway.media_pending_capture_race_lost", extra={"trace_id": trace_id})
+        _send_reply(to_digits=message.sender_digits, body=_MEDIA_PENDING_CAPTURE_REPLY)
+        gateway.finalize_inbound_event(db, event, status="needs_clarification", trace_id=trace_id)
+        return
+
     _send_reply(to_digits=message.sender_digits, body=_format_capture_preview(capture))
     gateway.finalize_inbound_event(db, event, status="processed", trace_id=trace_id)
 

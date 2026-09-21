@@ -682,3 +682,138 @@ def test_media_capture_works_with_codex_entirely_unconfigured(monkeypatch) -> No
         capture = db.scalar(select(CaptureDraft))
         assert capture is not None
         assert capture.status == "preview"
+
+
+# --- second media while one is still pending: no silent pointer overwrite --
+# Engineering review finding on PR #109 (2026-09-21): a second media message
+# used to silently replace `authorized.pending_capture_id`, orphaning
+# whichever draft the household's next "confirmar"/"cancelar" was actually
+# meant to resolve. These tests lock in the fix: new media is rejected
+# up front (no fetch, no second draft's pointer wins) while a draft is
+# still actionable, and normal single-pending behavior is unaffected once
+# the household explicitly resolves it.
+
+
+def test_second_media_while_one_pending_is_rejected_without_replacing_the_pointer(monkeypatch) -> None:
+    fake_provider = _install_fake_provider(monkeypatch)
+    _stub_extraction(monkeypatch, document_text="LOJA UM\nTOTAL R$ 10,00")
+    client, session_factory = _client()
+    household_id, _user_id = _seed_household(
+        session_factory, sender_digits="5511711112222", username="vinicius-second-media"
+    )
+    fake_provider.register_media("wamid-media-first", b"fake-bytes-first", "image/jpeg")
+    fake_provider.register_media("wamid-media-second", b"fake-bytes-second", "image/jpeg")
+
+    first = _signed_post(
+        client,
+        _media_payload(
+            message_id="wamid-img-first",
+            sender_digits="5511711112222",
+            media_type="image",
+            media_id="wamid-media-first",
+            mime_type="image/jpeg",
+        ),
+    )
+    assert first.status_code == 200
+
+    authorized = _authorized_row(session_factory, household_id)
+    first_pending_id = authorized.pending_capture_id
+    assert first_pending_id is not None
+
+    # Different extraction stub would not even matter: the second media must
+    # be rejected before any extraction/fetch is attempted.
+    _stub_extraction(monkeypatch, document_text="LOJA DOIS\nTOTAL R$ 20,00")
+    second = _signed_post(
+        client,
+        _media_payload(
+            message_id="wamid-img-second",
+            sender_digits="5511711112222",
+            media_type="image",
+            media_id="wamid-media-second",
+            mime_type="image/jpeg",
+        ),
+    )
+    assert second.status_code == 200
+
+    # The second media was never even fetched -- rejected purely from the
+    # existing still-actionable pointer, before `WhatsAppProvider.fetch_media`
+    # is ever called for it.
+    assert fake_provider.fetch_media_calls == ["wamid-media-first"]
+
+    rejection_reply = fake_provider.sent[-1]["text"]["body"]
+    assert "confirmar" in rejection_reply.lower()
+    assert "cancelar" in rejection_reply.lower()
+
+    with session_factory() as db:
+        captures = db.scalars(select(CaptureDraft)).all()
+        assert len(captures) == 1  # no second draft, no second document
+        assert captures[0].id == first_pending_id
+        assert captures[0].status == "preview"
+        assert len(db.scalars(select(Document)).all()) == 1
+
+    authorized_after = _authorized_row(session_factory, household_id)
+    assert authorized_after.pending_capture_id == first_pending_id  # untouched
+
+    # The original draft is still exactly what "confirmar" resolves.
+    confirm_response = _signed_post(
+        client,
+        _text_payload(message_id="wamid-confirm-first", sender_digits="5511711112222", text="confirmar"),
+    )
+    assert confirm_response.status_code == 200
+    with session_factory() as db:
+        transactions = db.scalars(select(Transaction)).all()
+        assert len(transactions) == 1
+        capture = db.get(CaptureDraft, first_pending_id)
+        assert capture.status == "confirmed"
+
+
+def test_media_after_cancelling_pending_capture_proceeds_normally(monkeypatch) -> None:
+    fake_provider = _install_fake_provider(monkeypatch)
+    _stub_extraction(monkeypatch, document_text="LOJA A\nTOTAL R$ 15,00")
+    client, session_factory = _client()
+    household_id, _user_id = _seed_household(
+        session_factory, sender_digits="5511700001111", username="vinicius-cancel-then-media"
+    )
+    fake_provider.register_media("wamid-media-a", b"fake-bytes-a", "image/jpeg")
+    fake_provider.register_media("wamid-media-b", b"fake-bytes-b", "image/jpeg")
+
+    _signed_post(
+        client,
+        _media_payload(
+            message_id="wamid-img-a",
+            sender_digits="5511700001111",
+            media_type="image",
+            media_id="wamid-media-a",
+            mime_type="image/jpeg",
+        ),
+    )
+    cancel_response = _signed_post(
+        client,
+        _text_payload(message_id="wamid-cancel-a", sender_digits="5511700001111", text="cancelar"),
+    )
+    assert cancel_response.status_code == 200
+    authorized_after_cancel = _authorized_row(session_factory, household_id)
+    assert authorized_after_cancel.pending_capture_id is None
+
+    _stub_extraction(monkeypatch, document_text="LOJA B\nTOTAL R$ 25,00")
+    second = _signed_post(
+        client,
+        _media_payload(
+            message_id="wamid-img-b",
+            sender_digits="5511700001111",
+            media_type="image",
+            media_id="wamid-media-b",
+            mime_type="image/jpeg",
+        ),
+    )
+    assert second.status_code == 200
+    assert fake_provider.fetch_media_calls == ["wamid-media-a", "wamid-media-b"]
+
+    with session_factory() as db:
+        captures = db.scalars(select(CaptureDraft)).all()
+        assert len(captures) == 2
+        assert {c.status for c in captures} == {"cancelled", "preview"}
+
+    authorized_after_second = _authorized_row(session_factory, household_id)
+    assert authorized_after_second.pending_capture_id is not None
+    assert authorized_after_second.pending_capture_id != authorized_after_cancel.pending_capture_id
