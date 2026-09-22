@@ -168,6 +168,54 @@ def test_test_email_second_call_within_window_is_rate_limited(monkeypatch: pytes
         assert second.status_code == 429, second.text
 
 
+# UX-01 (docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md, issue #114):
+# reproduced real-world regression -- the throttle used to be keyed only by
+# household, so testing recipient A blocked an immediate test of recipient
+# B in the same household.
+def test_test_email_different_recipients_are_not_cross_throttled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_module.SmtpEmailAdapter, "configured", property(lambda self: True))
+    monkeypatch.setattr(
+        api_module.SmtpEmailAdapter,
+        "send",
+        lambda self, message: EmailDeliveryResult(ok=True, message_id="<test-message@family-finance.local>"),
+    )
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        recipient_a = _create_recipient(client, email="destino-a@exemplo.com")
+        recipient_b = _create_recipient(client, email="destino-b@exemplo.com")
+        first = client.post("/api/notification-settings/test-email", json={"recipient_id": recipient_a})
+        assert first.status_code == 200, first.text
+        second = client.post("/api/notification-settings/test-email", json={"recipient_id": recipient_b})
+        assert second.status_code == 200, second.text
+        # The same recipient A, right after, is still protected (double-click guard).
+        third = client.post("/api/notification-settings/test-email", json={"recipient_id": recipient_a})
+        assert third.status_code == 429, third.text
+
+
+def test_test_email_rate_limited_response_reports_remaining_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_module.SmtpEmailAdapter, "configured", property(lambda self: True))
+    monkeypatch.setattr(
+        api_module.SmtpEmailAdapter,
+        "send",
+        lambda self, message: EmailDeliveryResult(ok=True, message_id="<test-message@family-finance.local>"),
+    )
+    client, _ = _client()
+    with client:
+        _setup_household(client)
+        recipient_id = _create_recipient(client)
+        first = client.post("/api/notification-settings/test-email", json={"recipient_id": recipient_id})
+        assert first.status_code == 200, first.text
+        second = client.post("/api/notification-settings/test-email", json={"recipient_id": recipient_id})
+        assert second.status_code == 429, second.text
+        # UI must be able to show the wait time (Work Order "UI deve mostrar
+        # tempo restante quando throttled"), and a standard `Retry-After` is
+        # also present for any non-browser caller.
+        assert "s" in second.json()["detail"]
+        assert any(char.isdigit() for char in second.json()["detail"])
+        assert second.headers.get("retry-after", "").isdigit()
+
+
 def test_test_email_rejects_arbitrary_host_username_password_fields() -> None:
     """The Work Order is explicit: this endpoint "não aceita host/username/
     password arbitrários enviados pelo navegador". `NotificationTestEmailRequest`

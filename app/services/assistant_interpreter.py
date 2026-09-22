@@ -39,6 +39,11 @@ _ALLOWED_EXTRACTED_FIELD_KEYS = frozenset(
         "funding_source_hint",
         "target_hint",
         "asset_value_kind_hint",
+        # UX-01 (`docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md`, issue #114):
+        # only ever meaningful for `create_expense` -- see
+        # `app.services.assistant_actions._propose_create_transaction`.
+        "installments_text",
+        "monthly_interest_rate_text",
     }
 )
 _ALLOWED_FUNDING_SOURCE_HINTS = frozenset({"account", "privilege", "unspecified"})

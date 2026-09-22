@@ -1322,16 +1322,23 @@ D-1/D0 automaticamente é a seção "MAIL-02" logo abaixo.
   `CONNECTION_FAILED`/`TIMEOUT`/`RECIPIENT_REFUSED`/`SEND_FAILED`) -- o texto bruto da exceção nunca
   chega à resposta HTTP, ao `AuditEvent` ou a um log.
 - **`app.services.email_delivery.EmailSendThrottle`** (instância módulo-level `test_email_throttle`):
-  contador em memória por `household_id`, mínimo `ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS` (padrão 60s)
-  entre chamadas de teste. Deliberadamente não persistido -- `scripts/entrypoint.sh` roda um único
-  processo `uvicorn` sem `--workers`, então o controle por processo já é efetivo, e uma coluna nova só
-  para isso não teria nenhum outro leitor.
+  contador em memória por `(household_id, recipient_id)` -- não mais por `household_id` sozinho (UX-01,
+  `docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md`, issue #114: testar o destinatário A bloqueava um
+  teste imediato do destinatário B na mesma família, uma regressão real reproduzida em produção),
+  mínimo `ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS` (padrão 5s -- reduzido de 60s agora que a chave é por
+  destinatário, então isto só protege contra duplo clique/retry rápido no *mesmo* destinatário) entre
+  chamadas de teste. `seconds_remaining` expõe, sem mutar nada, quantos segundos faltam para a próxima
+  chamada permitida. Deliberadamente não persistido -- `scripts/entrypoint.sh` roda um único processo
+  `uvicorn` sem `--workers`, então o controle por processo já é efetivo, e uma coluna nova só para isso
+  não teria nenhum outro leitor.
 - **`POST /notification-settings/test-email`** (`app.api.notification_settings_test_email`):
   `_require_admin`; recebe somente `recipient_id` (`NotificationTestEmailRequest`), nunca host/
   username/password; `404` se o destinatário não existir no household do chamador; `503` se o adapter
-  não estiver configurado; `429` se o throttle recusar; `502` com a mensagem sanitizada
-  (`email_error_message`) se o SMTP falhar; `200 {"ok": true}` em sucesso. Grava exatamente um
-  `AuditEvent` (`notification_settings.test_email`, `entity_type="notification_recipient"`,
+  não estiver configurado; `429` se o throttle recusar (`detail` inclui os segundos restantes e o
+  header `Retry-After` também os carrega, para a UI mostrar o tempo de espera -- Work Order "UI deve
+  mostrar tempo restante quando throttled"); `502` com a mensagem sanitizada (`email_error_message`) se
+  o SMTP falhar; `200 {"ok": true}` em sucesso. Grava exatamente um `AuditEvent`
+  (`notification_settings.test_email`, `entity_type="notification_recipient"`,
   `entity_id=<recipient_id>`, `details={"result": "sent"|"failed", "error_code": ...}`) -- nunca o
   endereço de e-mail do destinatário, que já está disponível via `entity_id` para quem tiver
   permissão de leitura.
@@ -1815,6 +1822,89 @@ orientação textual de composição, nenhum contrato/backend novo.
   com o catálogo Python já a expondo. Nenhum outro arquivo do sidecar precisou mudar:
   `catalog_for_prompt()` já é dado, não código, então o texto/descrição da tool chega ao prompt do
   `/v1/plan` automaticamente.
+
+### Regressões reais de chat WRITE/e-mail de teste (UX-01, `docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md`, issue #114)
+
+Duas regressões reproduzidas em uso real, corrigidas sem alterar semântica financeira nem introduzir
+um segundo motor.
+
+**Compra parcelada pela WRITE pipeline.** Até esta fatia, `create_expense` só sabia propor um
+pagamento único -- "fiz uma compra de 2459 parcelada no cartão nubank" nunca tinha como virar uma
+proposta de parcelamento, mesmo a fatia WA-06 já sabendo *simular* uma compra parcelada
+hipotética. Correção aditiva, reaproveitando exatamente essa mesma infraestrutura:
+
+- `extracted_fields` ganhou `installments_text`/`monthly_interest_rate_text` (mesmo par que
+  `simulate_purchase` já usa) em `assistant_interpreter._ALLOWED_EXTRACTED_FIELD_KEYS` e em
+  `advisor/interpret-schema.json`. Diferente de `simulate_purchase` -- onde parcelas/juros ausentes
+  ou não numéricos caem no padrão documentado da tool (1x à vista) -- aqui `installments_text`
+  *presente mas não numérico* nunca vira 1x silenciosamente: `interpretPrompt` só preenche esse campo
+  quando a mensagem (ou o histórico, pela regra de continuação abaixo) já indica que o pagamento é
+  parcelado, então um valor não numérico é sempre uma parcela ainda não dita, e
+  `app.services.assistant_actions._propose_create_transaction` pergunta "Em quantas parcelas?" em vez
+  de assumir pagamento único -- registrar um fato diferente do que a pessoa descreveu seria pior que
+  perguntar de novo.
+- `amount_text` continua sendo o valor contratado/total ("2459" = preço total, não parcela) --
+  `app.services.finance.amortized_installment_payment` (a mesma função Price/Gauss que
+  `simulate_purchase`/`POST /purchases/scenario-comparison` já usam) deriva a parcela mensal. O
+  payload final grava `installment_current=1`/`installment_total=N` -- os mesmos dois campos que
+  `ManualTransactionRequest`/`create_manual_transaction` já aceitam do formulário manual, então a
+  projeção de "parcelas futuras" (`app.api._installment_remaining_schedule`) trata um lançamento
+  vindo do chat exatamente como um do formulário, sem caminho paralelo. Só se aplica a
+  `create_expense` (`ManualTransactionRequest.validate_movement_fields`: parcelamento nunca se aplica
+  a renda/transferência) -- `installments_text` em `create_income` é ignorado.
+- **Revisão de engenharia do PR #115 (MERGE BLOCKED) -- juros nunca vira 0 por silêncio.** Uma
+  primeira versão desta fatia reaproveitou o mesmo idioma "ausente/não numérico -> 0" de
+  `simulate_purchase` para `monthly_interest_rate_text` na pipeline WRITE, inclusive instruindo
+  `interpretPrompt` a deixar o campo ausente quando a mensagem não menciona juros "(parcelamento sem
+  juros)". Isso transformava o silêncio do usuário num fato financeiro (taxa 0) nunca afirmado por
+  ele -- viola o mesmo princípio que já protege `installments_text` (hipótese nunca vira fato
+  silenciosamente) e distorce o valor da parcela persistida sempre que a compra real tinha juros.
+  Corrigido para uma resolução de três estados
+  (`app.services.assistant_actions._resolve_installment_rate_text`), chamada somente depois que
+  `installment_total` já foi resolvido: (a) texto explícito com taxa válida (incluindo uma negação
+  explícita como "sem juros"/"0%", que é um fato dito pelo usuário, nunca uma omissão preenchida) ->
+  usa essa taxa; (b) campo ausente -> `clarifying_question` perguntando se há juros, nunca grava nada;
+  (c) texto presente mas não numérico, negativo ou acima de `_MAX_INTERPRETED_MONTHLY_RATE` ->
+  `clarifying_question` pedindo a correção, nunca vira 0. `interpretPrompt` foi ajustado para nunca
+  escrever "0"/"sem juros" em `monthly_interest_rate_text` por conta própria -- só quando a própria
+  mensagem afirma explicitamente um valor ou a ausência de juros.
+- A verificação de possível duplicidade (`_check_possible_duplicate`) passou a comparar contra o
+  valor *da parcela* já derivado, não o total contratado -- é o valor da parcela que efetivamente vai
+  virar `Transaction.amount`, o mesmo que uma reimportação duplicada compararia.
+
+**Continuidade de rascunho entre turnos.** `planPrompt`/`interpretPrompt` (`advisor/server.mjs`)
+ganharam instruções explícitas para dois casos que já eram tecnicamente suportados pelo histórico
+enviado (`app.services.assistant_sanitizer.build_interpret_payload`/
+`assistant_tool_sanitizer.build_plan_payload` já forwardavam `history`), mas que o texto do prompt
+não amarrava o suficiente: (1) um relato no passado ("gastei", "paguei", "recebi", "coloquei mais X
+em") é, em si, um pedido de registro -- nunca deve ser tratado como consulta só por não estar no
+imperativo; (2) quando o turno anterior do Assistente já era uma pergunta sobre um rascunho de
+lançamento ainda não confirmado, a mensagem seguinte (só um número de parcelas, só um nome de conta)
+deve continuar esse mesmo rascunho -- `/v1/plan` continua chamando `draft_typed_action`, e
+`/v1/interpret` reaproveita os campos já extraídos nos turnos anteriores do histórico. Nenhum
+contrato/schema mudou para isso -- é orientação textual, como a composição de diagnóstico aberto que
+o WA-06 já tinha adicionado ao `planPrompt`.
+
+**Status de um rascunho/ação ("você conseguiu lançar o que eu gastei?").** Nova tool somente leitura
+`get_action_status` (`app.services.assistant_tools._tool_get_action_status`), sem argumentos: olha a
+`AssistantActionProposal` mais recente deste `(household_id, user_id)` -- mesmo escopo "sem
+referência explícita -> a mais recente deste usuário" que `_find_pending_proposal`/
+`_find_undoable_action` já usam para `confirm_typed_action`/`undo_typed_action` -- e devolve um de
+`pending_confirmation`/`executed`/`cancelled`/`undone`/`expired`/"nada encontrado", nunca um valor
+gasto (o bug real reproduzido: essa pergunta caía em `get_expenses`/`query_facts`, respondendo
+"quanto gastei" em vez de "o que aconteceu com aquele lançamento"). Somente leitura -- nunca muta
+`AssistantActionProposal`/`AssistantActionEvent`; `planPrompt` ganhou orientação para não confundir
+essa pergunta com uma de valor gasto.
+
+**Throttle do e-mail de teste por destinatário.** `EmailSendThrottle` (`app.services.email_delivery`)
+era indexado só por `household_id` -- testar o destinatário A bloqueava um teste imediato do
+destinatário B na mesma família por até 60s, também reproduzido em uso real. Agora indexado por
+`(household_id, recipient_id)`, com o intervalo mínimo (`ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS`,
+ainda configurável) reduzido do padrão de 60s para 5s, já que agora só protege duplo
+clique/retry no mesmo destinatário, não uma sequência legítima de testes de destinatários diferentes.
+`POST /notification-settings/test-email` devolve os segundos restantes tanto no `detail` do `429`
+quanto no header `Retry-After`, para a UI mostrar o tempo de espera em vez de um "aguarde" genérico.
+Nenhuma mudança no scheduler/worker D-1/D0 (`app.services.notification_scheduler`).
 
 ## Evolução
 

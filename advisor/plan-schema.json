@@ -24,6 +24,7 @@
               "confirm_typed_action",
               "undo_typed_action",
               "cancel_typed_action",
+              "get_action_status",
               "financial_aggregate",
               "get_income",
               "get_expenses",

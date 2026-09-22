@@ -219,6 +219,173 @@ def test_create_expense_cash_without_funding_source_asks_and_then_resolves() -> 
     assert proposal.payload["funding_source"] == "account"
 
 
+# UX-01 (docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md, issue #114): a
+# parcelada purchase -- "fiz uma compra de 2459 parcelada no cartão nubank"
+# -- must ask for the installment count when it cannot be resolved, and
+# only then propose, with `amount_text` treated as the total contracted
+# price (per-installment payment derived via the same amortized formula
+# `simulate_purchase`/scenario-comparison already use).
+def test_create_expense_installments_text_present_but_unresolvable_asks_for_count() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="parcelada",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is False
+    assert "parcelas" in proposal.clarifying_question.lower()
+    assert proposal.missing_fields == ("installments",)
+
+
+# Engineering review of PR #115 (MERGE BLOCKED): an installment purchase
+# whose count is known but whose interest was never mentioned must ask,
+# never silently book rate 0 -- silence is not the same fact as an explicit
+# "sem juros".
+def test_create_expense_installments_without_interest_mention_asks_about_rate() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is False
+    assert "juros" in proposal.clarifying_question.lower()
+    assert proposal.missing_fields == ("monthly_interest_rate",)
+
+
+def test_create_expense_installments_explicit_zero_interest_text_resolves() -> None:
+    """An explicit "sem juros" is a stated fact, not a filled-in absence --
+    it must resolve exactly like a numeric "0" would."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="sem juros",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is True
+    assert proposal.payload["amount"] == "245.90"
+    assert proposal.payload["installment_current"] == 1
+    assert proposal.payload["installment_total"] == 10
+
+
+def test_create_expense_installments_resolves_to_equal_interest_free_split() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="0",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is True
+    assert proposal.payload["amount"] == "245.90"
+    assert proposal.payload["installment_current"] == 1
+    assert proposal.payload["installment_total"] == 10
+
+
+def test_create_expense_installments_invalid_rate_asks_for_correction() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="um monte",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is False
+    assert "juros" in proposal.clarifying_question.lower()
+    assert proposal.missing_fields == ("monthly_interest_rate",)
+
+    interpretation_too_high = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="99",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(
+            db, household_id=household_id, interpretation=interpretation_too_high
+        )
+    assert proposal.can_execute is False
+    assert proposal.missing_fields == ("monthly_interest_rate",)
+
+
+def test_create_expense_installments_with_interest_uses_amortized_payment() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="1000",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="2",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is True
+    from app.services.finance import amortized_installment_payment
+
+    expected_payment, _ = amortized_installment_payment(Decimal("1000"), 10, Decimal("0.02"))
+    assert proposal.payload["amount"] == str(expected_payment)
+    assert proposal.payload["installment_total"] == 10
+
+
+def test_create_income_ignores_installments_text_never_parcels_income() -> None:
+    """Parcelamento só se aplica a despesas (`ManualTransactionRequest.
+    validate_movement_fields`) -- `installments_text` on a `create_income`
+    interpretation must never reach the payload, never block the proposal."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Conta Corrente", account_type="checking")
+    interpretation = _interpretation(
+        "create_income",
+        amount_text="1000",
+        description="Salário",
+        account_hint="Conta Corrente",
+        installments_text="10",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is True
+    assert "installment_total" not in proposal.payload
+    assert proposal.payload["amount"] == "1000"
+
+
 def test_internal_transfer_proposal_never_asks_about_category_or_funding() -> None:
     session_factory = _session_factory()
     household_id = _household(session_factory)
@@ -460,6 +627,52 @@ def test_execute_create_expense_writes_exactly_once_and_is_fully_audited() -> No
                 db.scalars(select(Transaction).where(Transaction.transaction_type == "expense"))
             )
             assert len(expenses) == 1
+
+
+def test_execute_create_expense_installment_persists_current_and_total() -> None:
+    """UX-01: the executed `Transaction` must carry `installment_current`/
+    `installment_total` exactly like the manual-entry form's own
+    `ManualTransactionRequest` -- the canonical "parcelas futuras"
+    projection (`app.api._installment_remaining_schedule`) reads these same
+    two columns, so a chat-drafted installment purchase must feed it
+    identically to a manually-entered one."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        account = client.post(
+            "/api/accounts",
+            json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17},
+        )
+        assert account.status_code == 201, account.text
+
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "create_expense",
+            amount_text="2459",
+            description="Televisão",
+            account_hint="Nubank",
+            category_hint="Casa",
+            installments_text="10",
+            monthly_interest_rate_text="sem juros",
+        )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="fiz uma compra de 2459 parcelada no cartão nubank",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+
+        execute = client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
+        assert execute.status_code == 201, execute.text
+        transaction_id = execute.json()["response"]["id"]
+
+        with session_factory() as db:
+            transaction = db.get(Transaction, transaction_id)
+            assert transaction.installment_current == 1
+            assert transaction.installment_total == 10
+            assert transaction.amount == Decimal("-245.90")
 
 
 def test_execute_internal_transfer_creates_zero_income_or_expense() -> None:

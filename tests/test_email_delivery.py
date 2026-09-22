@@ -200,14 +200,25 @@ def test_email_error_message_never_returns_none_for_unknown_code() -> None:
 
 def test_throttle_blocks_second_call_within_window() -> None:
     throttle = EmailSendThrottle()
-    assert throttle.allow("household-a", min_interval_seconds=60) is True
-    assert throttle.allow("household-a", min_interval_seconds=60) is False
+    assert throttle.allow("household-a", "recipient-1", min_interval_seconds=60) is True
+    assert throttle.allow("household-a", "recipient-1", min_interval_seconds=60) is False
 
 
 def test_throttle_is_independent_per_household() -> None:
     throttle = EmailSendThrottle()
-    assert throttle.allow("household-a", min_interval_seconds=60) is True
-    assert throttle.allow("household-b", min_interval_seconds=60) is True
+    assert throttle.allow("household-a", "recipient-1", min_interval_seconds=60) is True
+    assert throttle.allow("household-b", "recipient-1", min_interval_seconds=60) is True
+
+
+# UX-01 (docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md, issue #114):
+# reproduced real-world regression -- testing recipient A must never block
+# an immediate test of recipient B in the same household.
+def test_throttle_is_independent_per_recipient_within_the_same_household() -> None:
+    throttle = EmailSendThrottle()
+    assert throttle.allow("household-a", "recipient-a", min_interval_seconds=60) is True
+    assert throttle.allow("household-a", "recipient-b", min_interval_seconds=60) is True
+    # The same recipient, right after, is still protected (double-click guard).
+    assert throttle.allow("household-a", "recipient-a", min_interval_seconds=60) is False
 
 
 def test_throttle_allows_again_after_interval_elapses(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -217,8 +228,28 @@ def test_throttle_allows_again_after_interval_elapses(monkeypatch: pytest.Monkey
     monkeypatch.setattr(module.time, "monotonic", lambda: current_time[0])
 
     throttle = EmailSendThrottle()
-    assert throttle.allow("household-a", min_interval_seconds=60) is True
-    assert throttle.allow("household-a", min_interval_seconds=60) is False
+    assert throttle.allow("household-a", "recipient-1", min_interval_seconds=60) is True
+    assert throttle.allow("household-a", "recipient-1", min_interval_seconds=60) is False
 
     current_time[0] += 61
-    assert throttle.allow("household-a", min_interval_seconds=60) is True
+    assert throttle.allow("household-a", "recipient-1", min_interval_seconds=60) is True
+
+
+def test_throttle_seconds_remaining_reports_time_left_without_mutating_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.email_delivery as module
+
+    current_time = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: current_time[0])
+
+    throttle = EmailSendThrottle()
+    assert throttle.seconds_remaining("household-a", "recipient-1", min_interval_seconds=60) == 0.0
+    assert throttle.allow("household-a", "recipient-1", min_interval_seconds=60) is True
+
+    current_time[0] += 22
+    assert throttle.seconds_remaining("household-a", "recipient-1", min_interval_seconds=60) == 38.0
+    # Probing `seconds_remaining` repeatedly never itself starts/refreshes
+    # the window -- the window is still 38 seconds later, not reset.
+    assert throttle.seconds_remaining("household-a", "recipient-1", min_interval_seconds=60) == 38.0
+    assert throttle.allow("household-a", "recipient-1", min_interval_seconds=60) is False

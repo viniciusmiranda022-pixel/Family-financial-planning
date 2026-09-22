@@ -103,6 +103,22 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
         ),
         arguments=(("reference_text", "trecho/identificador da proposta a cancelar, se houver"),),
     ),
+    # UX-01 (docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md, issue #114) --
+    # "você conseguiu lançar o que eu gastei?": a status question about this
+    # user's own most recent draft/action, never a spending total. Distinct
+    # from confirm/undo/cancel (this tool never mutates anything) and from
+    # query_facts/get_expenses (it never reports how much was spent).
+    ToolSpec(
+        name="get_action_status",
+        description=(
+            "Consulta o status da última proposta ou ação de lançamento deste usuário no Assistente: "
+            "pendente de confirmação, executada, cancelada, desfeita ou expirada. Use para perguntas "
+            "como 'você conseguiu lançar isso?', 'já confirmou aquele pagamento?', 'o que aconteceu "
+            "com a proposta anterior?' -- nunca para 'quanto eu gastei', que é gasto do período, não "
+            "status de uma ação do Assistente."
+        ),
+        arguments=(),
+    ),
     # WA-04 (docs/WORK_ORDER_WA_04.md, issue #76) -- generic, composable
     # read/query tools, additive to the WA-02 set above (nothing here
     # replaces query_facts/aggregate_spending/compare_periods).

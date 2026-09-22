@@ -131,7 +131,9 @@ D-1/D0 automaticamente é a seção "Alertas de e-mail — outbox e worker (MAIL
   ou qualquer log -- o texto bruto da exceção/resposta do servidor SMTP nunca é propagado;
 - `test-email` é `_require_admin`-gated, envia somente para um `NotificationRecipient` já cadastrado do
   household do chamador (nunca aceita host/username/password do navegador) e é limitado a uma chamada
-  por `ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS` (padrão 60s) por household
+  por `ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS` (padrão 5s) por `(household, destinatário)` -- não mais
+  por household sozinho, para que testar um destinatário nunca bloqueie um teste imediato de outro
+  (UX-01, `docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md`, issue #114)
   (`app.services.email_delivery.EmailSendThrottle`, em memória -- `scripts/entrypoint.sh` roda um único
   processo `uvicorn` sem `--workers`, então o limite é efetivo, não apenas best-effort);
 - o e-mail é sempre HTML com alternativa texto puro (`app.services.notification_templates`), nunca
