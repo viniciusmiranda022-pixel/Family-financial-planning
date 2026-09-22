@@ -35,7 +35,9 @@
         "asset_value_kind_hint": {
           "type": "string",
           "enum": ["current_value", "expected_receivable_value", "unspecified"]
-        }
+        },
+        "installments_text": { "type": "string", "maxLength": 20 },
+        "monthly_interest_rate_text": { "type": "string", "maxLength": 20 }
       },
       "additionalProperties": false
     },

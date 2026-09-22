@@ -466,11 +466,60 @@ def _format_draft_typed_action(facts: dict[str, Any]) -> str:
     amount = payload.get("amount")
     if amount is not None:
         details.append(_format_money(amount))
+    installment_total = payload.get("installment_total")
+    if installment_total:
+        details.append(f"{installment_total}x")
     description = payload.get("description") or payload.get("category_name")
     if description:
         details.append(str(description))
     detail_text = f" ({', '.join(details)})" if details else ""
-    return f"Entendi {label}{detail_text}. Confirma?"
+    installment_note = ""
+    if amount is not None and installment_total:
+        # rebaseline §6.7 "Compra parcelada": compra contratada/impacto no
+        # mês/parcelas futuras must all be shown, never collapsed into just
+        # the per-installment payment -- pure display arithmetic over the
+        # exact `amount`/`installment_total` this proposal will persist
+        # (`installment_current=1`, so "parcelas futuras" is the remaining
+        # `installment_total - 1`), never a second amortization formula.
+        try:
+            per_installment = Decimal(str(amount))
+            contracted_total = per_installment * installment_total
+            future_remaining = per_installment * (installment_total - 1)
+            installment_note = (
+                f" Compra contratada {_format_money(contracted_total)}, impacto neste mês "
+                f"{_format_money(per_installment)}, parcelas futuras {_format_money(future_remaining)}."
+            )
+        except (InvalidOperation, TypeError):
+            installment_note = ""
+    return f"Entendi {label}{detail_text}.{installment_note} Confirma?"
+
+
+_ACTION_STATUS_LABELS = {
+    "pending_confirmation": "ainda está aguardando sua confirmação",
+    "executed": "já foi confirmada e lançada",
+    "cancelled": "foi cancelada antes de ser confirmada",
+    "undone": "foi confirmada e depois desfeita",
+    "expired": "expirou sem confirmação -- pode repetir o pedido",
+}
+
+
+def _format_get_action_status(facts: dict[str, Any]) -> str:
+    if not facts.get("found"):
+        return "Não encontrei nenhuma proposta ou ação recente do Assistente para você."
+    typed_action = facts.get("typed_action")
+    label = _TYPED_ACTION_LABELS.get(typed_action, "uma ação")
+    payload = facts.get("payload") or {}
+    details = []
+    amount = payload.get("amount")
+    if amount is not None:
+        details.append(_format_money(amount))
+    description = payload.get("description") or payload.get("category_name")
+    if description:
+        details.append(str(description))
+    detail_text = f" ({', '.join(details)})" if details else ""
+    status = facts.get("status")
+    status_text = _ACTION_STATUS_LABELS.get(status, "está em um estado que não consegui determinar")
+    return f"A última proposta -- {label}{detail_text} -- {status_text}."
 
 
 def _format_step(tool: str, facts: dict[str, Any]) -> str:
@@ -494,6 +543,8 @@ def _format_step(tool: str, facts: dict[str, Any]) -> str:
         return "Ação desfeita -- o histórico original foi preservado."
     if tool == "cancel_typed_action":
         return "Combinado, cancelei essa proposta. Nada foi lançado."
+    if tool == "get_action_status":
+        return _format_get_action_status(facts)
     if tool == "financial_aggregate":
         return _format_financial_aggregate(facts)
     if tool == "get_income":

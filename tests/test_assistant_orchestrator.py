@@ -17,7 +17,7 @@ import calendar
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -656,6 +656,183 @@ def test_draft_then_confirm_then_undo_full_cycle() -> None:
     assert undone.facts["result"]["action_id"] == action_id
 
 
+# UX-01 (docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md, issue #114):
+# "você conseguiu lançar o que eu gastei?" -- status of the last draft/
+# action, never a spending total.
+def test_get_action_status_reports_not_found_before_any_draft() -> None:
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="status-nothing-yet"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    with session_factory() as db:
+        outcome = run_tool(
+            db, user=user, tool="get_action_status", arguments={}, message="voce conseguiu lancar o que eu gastei?"
+        )
+    assert outcome.ok is True
+    assert outcome.clarifying_question is None
+    assert outcome.facts == {"found": False}
+
+
+def test_get_action_status_reports_pending_then_executed_then_undone() -> None:
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="status-cycle"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    interpret_client = FakeInterpretClient(response=_create_expense_interpretation_response())
+
+    with session_factory() as db:
+        draft = run_tool(
+            db,
+            user=user,
+            tool="draft_typed_action",
+            arguments={},
+            message="Gastei 120 de combustível na conta corrente",
+            trace_id="trace-status-1",
+            interpret_client=interpret_client,
+        )
+    assert draft.facts["can_execute"] is True
+
+    with session_factory() as db:
+        pending = run_tool(db, user=user, tool="get_action_status", arguments={}, message="conseguiu lancar?")
+    assert pending.facts["found"] is True
+    assert pending.facts["status"] == "pending_confirmation"
+    assert pending.facts["typed_action"] == "create_expense"
+
+    with session_factory() as db:
+        confirmed = run_tool(db, user=user, tool="confirm_typed_action", arguments={}, message="confirmo")
+    assert confirmed.facts["executed"] is True
+
+    with session_factory() as db:
+        executed = run_tool(db, user=user, tool="get_action_status", arguments={}, message="conseguiu lancar?")
+    assert executed.facts["status"] == "executed"
+    assert executed.facts["executed_at"] is not None
+
+    with session_factory() as db:
+        undone = run_tool(db, user=user, tool="undo_typed_action", arguments={}, message="desfaz essa ultima acao")
+    assert undone.facts["undone"] is True
+
+    with session_factory() as db:
+        after_undo = run_tool(db, user=user, tool="get_action_status", arguments={}, message="conseguiu lancar?")
+    assert after_undo.facts["status"] == "undone"
+
+
+def test_get_action_status_reports_cancelled() -> None:
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="status-cancelled"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    interpret_client = FakeInterpretClient(response=_create_expense_interpretation_response())
+
+    with session_factory() as db:
+        draft = run_tool(
+            db,
+            user=user,
+            tool="draft_typed_action",
+            arguments={},
+            message="Gastei 120 de combustível na conta corrente",
+            interpret_client=interpret_client,
+        )
+    assert draft.facts["can_execute"] is True
+
+    with session_factory() as db:
+        cancelled = run_tool(db, user=user, tool="cancel_typed_action", arguments={}, message="cancela")
+    assert cancelled.facts["cancelled"] is True
+
+    with session_factory() as db:
+        status = run_tool(db, user=user, tool="get_action_status", arguments={}, message="conseguiu lancar?")
+    assert status.facts["status"] == "cancelled"
+
+
+def test_get_action_status_reports_expired_without_ever_being_confirmed() -> None:
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="status-expired"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    with session_factory() as db:
+        row = AssistantActionProposal(
+            household_id=household_id,
+            user_id=user.id,
+            trace_id=str(uuid.uuid4()),
+            original_message="Gastei 120",
+            typed_action="create_expense",
+            payload={"amount": "120"},
+            path_params={},
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+        db.add(row)
+        db.commit()
+
+    with session_factory() as db:
+        status = run_tool(db, user=user, tool="get_action_status", arguments={}, message="conseguiu lancar?")
+    assert status.facts["status"] == "expired"
+
+
+def test_get_action_status_is_isolated_between_households_and_users() -> None:
+    session_factory = _session_factory()
+    household_a, _account_a, _category_a = _seed_household_with_spending(
+        session_factory, username="status-isolation-a"
+    )
+    household_b, _account_b, _category_b = _seed_household_with_spending(
+        session_factory, username="status-isolation-b"
+    )
+    user_a = _admin_user(session_factory, household_id=household_a)
+    user_b = _admin_user(session_factory, household_id=household_b)
+    interpret_client = FakeInterpretClient(response=_create_expense_interpretation_response())
+
+    with session_factory() as db:
+        draft = run_tool(
+            db,
+            user=user_a,
+            tool="draft_typed_action",
+            arguments={},
+            message="Gastei 120 de combustível na conta corrente",
+            interpret_client=interpret_client,
+        )
+    assert draft.facts["can_execute"] is True
+
+    # Household A's own admin sees the pending draft...
+    with session_factory() as db:
+        status_a = run_tool(db, user=user_a, tool="get_action_status", arguments={}, message="conseguiu lancar?")
+    assert status_a.facts["status"] == "pending_confirmation"
+
+    # ...but household B's admin, who never drafted anything, never sees it.
+    with session_factory() as db:
+        status_b = run_tool(db, user=user_b, tool="get_action_status", arguments={}, message="conseguiu lancar?")
+    assert status_b.facts == {"found": False}
+
+
+def test_get_action_status_orchestrator_answer_never_reports_a_spending_total() -> None:
+    """Guards the exact bug reported in issue #114: a status question must
+    never be answered as if it were `get_expenses`/`financial_aggregate`."""
+
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="status-answer-shape"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    plan_response = {
+        "schema_version": "1.0.0",
+        "needs_clarification": False,
+        "clarifying_question": None,
+        "steps": [{"tool": "get_action_status", "arguments": {}}],
+    }
+    with session_factory() as db:
+        result = plan_and_execute(
+            db,
+            user=user,
+            message="voce conseguiu lancar o que eu gastei?",
+            client=FakePlanClient(response=plan_response),
+        )
+    assert result.needs_clarification is False
+    assert "gastou" not in result.answer.lower()
+    assert "gasto" not in result.answer.lower()
+    assert "proposta ou ação recente" in result.answer.lower()
+
+
 def test_confirm_typed_action_without_a_pending_proposal_asks_never_guesses() -> None:
     session_factory = _session_factory()
     household_id, _account_id, _category_id = _seed_household_with_spending(
@@ -746,6 +923,52 @@ def test_plan_and_execute_draft_typed_action_surfaces_full_proposal_for_any_chan
     assert result.proposal["proposal_id"] == result.proposal_id
     with session_factory() as db:
         assert db.get(AssistantActionProposal, result.proposal_id) is not None
+
+
+# UX-01 (docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md, issue #114) +
+# rebaseline §6.7 "Compra parcelada": the confirmation text for an
+# installment draft must show compra contratada/impacto no mês/parcelas
+# futuras side by side, never only the per-installment payment.
+def test_plan_and_execute_draft_typed_action_installment_answer_shows_full_breakdown() -> None:
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="orch-draft-installments"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    with session_factory() as db:
+        db.add(Account(household_id=household_id, name="Nubank", account_type="credit_card"))
+        db.commit()
+    plan_response = _valid_plan_response(steps=[{"tool": "draft_typed_action", "arguments": {}}])
+    installment_response = {
+        "schema_version": "1.0.0",
+        "intent": "create_expense",
+        "extracted_fields": {
+            "amount_text": "2459",
+            "description": "Televisão",
+            "account_hint": "Nubank",
+            "installments_text": "10",
+        },
+        "missing_fields": [],
+        "clarifying_question": None,
+        "confidence": 0.9,
+    }
+    interpret_client = FakeInterpretClient(response=installment_response)
+
+    with session_factory() as db:
+        result = plan_and_execute(
+            db,
+            user=user,
+            message="fiz uma compra de 2459 parcelada em 10x no cartão nubank",
+            client=FakePlanClient(response=plan_response),
+            interpret_client=interpret_client,
+        )
+
+    assert result.proposal["can_execute"] is True
+    assert result.proposal["payload"]["amount"] == "245.90"
+    assert result.proposal["payload"]["installment_total"] == 10
+    assert "Compra contratada R$ 2.459,00" in result.answer
+    assert "impacto neste mês R$ 245,90" in result.answer
+    assert "parcelas futuras R$ 2.213,10" in result.answer
 
 
 def test_plan_and_execute_draft_typed_action_disambiguation_surfaces_candidates_too() -> None:

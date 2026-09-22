@@ -81,6 +81,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.services.assistant_interpreter import StructuredInterpretation
+from app.services.finance import amortized_installment_payment
 
 # Typed actions the Assistant may propose/execute. Deliberately a closed
 # list matching `app.services.assistant_sanitizer.KNOWN_INTENTS` minus the
@@ -682,6 +683,60 @@ def build_typed_action_proposal(
     return _needs_disambiguation("Não sei executar esse tipo de ação ainda pelo Assistente.")
 
 
+# UX-01 (`docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md`, issue #114):
+# installment purchases were previously invisible to the typed-action WRITE
+# pipeline -- `create_expense` only ever proposed a single, non-installment
+# payment (rebaseline §19 requires distinguishing "compra contratada" from
+# "impacto neste mês"/"parcelas futuras" for any parcelada purchase, chat
+# included). `_MAX_INTERPRETED_INSTALLMENTS` mirrors
+# `ManualTransactionRequest.installment_total`'s own `le=999` bound, capped
+# further to the same practical ceiling `assistant_tools._MAX_SIMULATED_INSTALLMENTS`
+# already uses for the read-only purchase simulator, so a chat-drafted
+# installment purchase can never exceed what a human could enter in the
+# manual-entry form either.
+_MAX_INTERPRETED_INSTALLMENTS = 120
+_MAX_INTERPRETED_MONTHLY_RATE = Decimal("0.30")
+
+
+def _parse_installment_count_text(value: str | None) -> int | None:
+    """A materially different contract from
+    `assistant_tools._parse_installments_hint`: that function is for
+    `simulate_purchase`, an optional argument where "absent/unparsable"
+    safely defaults to 1 (a hypothetical simulation the user can always
+    re-ask). Here, `installments_text` is only ever populated by Codex when
+    the message itself already says the purchase is parcelada (see
+    `advisor/server.mjs`'s `interpretPrompt`) -- so "present but
+    unparsable" must never silently fall back to a single, non-installment
+    payment (that would record a different financial fact than the one the
+    user described); it is always a missing field the human must resolve,
+    hence `None` here, never a default count."""
+
+    if not value:
+        return None
+    match = re.search(r"\d{1,3}", value)
+    if not match:
+        return None
+    count = int(match.group(0))
+    return count if 2 <= count <= _MAX_INTERPRETED_INSTALLMENTS else None
+
+
+def _parse_installment_rate_text(value: str | None) -> Decimal:
+    """Optional financing rate for an installment purchase -- absent/
+    unparsable/implausibly high means interest-free (rate `0`), never a
+    reason to block on a clarifying question by itself (mirrors
+    `assistant_tools._parse_monthly_rate_hint`'s same "optional, documented
+    default" idiom); only the installment *count* is ever material enough
+    to ask about."""
+
+    if not value:
+        return Decimal("0")
+    parsed = parse_amount_text(value.replace("%", ""))
+    if parsed is None:
+        return Decimal("0")
+    rate = parsed / Decimal("100")
+    return rate if rate <= _MAX_INTERPRETED_MONTHLY_RATE else Decimal("0")
+
+
 def _propose_create_transaction(
     db: Session,
     *,
@@ -738,6 +793,37 @@ def _propose_create_transaction(
             "Preciso de mais informação: valor, conta/cartão e o que foi.", missing_fields=tuple(missing)
         )
 
+    # UX-01 installment purchase: `installments_text` is only ever set by
+    # Codex when the message itself already indicates a parcelada payment
+    # (see `advisor/server.mjs`'s `interpretPrompt`), so its presence alone
+    # -- regardless of whether a count could be parsed from it -- means the
+    # user described an installment purchase, never a single payment
+    # `amount_text` happens to also satisfy. `ManualTransactionRequest`
+    # only allows `installment_current`/`installment_total` on an expense
+    # (rebaseline: parcelamento não se aplica a renda/transferência), so
+    # `create_income` never reaches this branch.
+    installment_total: int | None = None
+    if typed_action == "create_expense" and fields.get("installments_text"):
+        installment_total = _parse_installment_count_text(fields["installments_text"])
+        if installment_total is None:
+            return _needs_disambiguation(
+                "Em quantas parcelas? Preciso do número para calcular o valor de cada parcela.",
+                missing_fields=("installments",),
+            )
+
+    # `amount` is always the contracted/total price as the user stated it
+    # ("compra de 2459 parcelada em 10x" -> 2459 total); the per-installment
+    # payment actually booked this month is derived from it via the exact
+    # same amortized Price/Gauss formula `simulate_purchase`/`POST
+    # /purchases/scenario-comparison` already use (`app.services.finance.
+    # amortized_installment_payment`) -- interest-free (rate 0) when the
+    # message never mentions one, an equal split of `amount` across
+    # `installment_total`. Never a second, ad-hoc division here.
+    booked_amount = amount
+    if installment_total is not None:
+        monthly_rate = _parse_installment_rate_text(fields.get("monthly_interest_rate_text"))
+        booked_amount, _total_cost = amortized_installment_payment(amount, installment_total, monthly_rate)
+
     booked_at = parse_date_text(fields.get("date_text")) or date.today()
 
     # Pre-flight probable-duplicate check (Work Order "deduplicação
@@ -750,7 +836,7 @@ def _propose_create_transaction(
     # `pay_card_invoice`'s exact-match idempotent-replay short-circuit, and
     # `register_refund`'s own linkage invariants (INV-027) -- so this pass
     # is not duplicated there.
-    signed_amount = -amount if typed_action == "create_expense" else amount
+    signed_amount = -booked_amount if typed_action == "create_expense" else booked_amount
     duplicate = _check_possible_duplicate(
         db,
         household_id=household_id,
@@ -796,7 +882,7 @@ def _propose_create_transaction(
     payload: dict[str, Any] = {
         "booked_at": booked_at.isoformat(),
         "description": description[:500],
-        "amount": str(amount),
+        "amount": str(booked_amount),
         "movement_type": "expense" if typed_action == "create_expense" else "income",
         "account_id": accounts[0].id,
     }
@@ -805,6 +891,9 @@ def _propose_create_transaction(
         if category_hint:
             payload["category_name"] = category_hint[:100]
         payload["funding_source"] = funding_source
+        if installment_total is not None:
+            payload["installment_current"] = 1
+            payload["installment_total"] = installment_total
     return TypedActionProposal(can_execute=True, typed_action=typed_action, payload=payload, path_params={})
 
 

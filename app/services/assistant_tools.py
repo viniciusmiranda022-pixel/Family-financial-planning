@@ -725,6 +725,52 @@ def _tool_undo_typed_action(db: Session, *, user: Any, arguments: dict[str, str]
     return ToolOutcome(ok=True, facts={"undone": True, "result": result})
 
 
+def _tool_get_action_status(db: Session, *, user: Any) -> ToolOutcome:
+    """UX-01 (`docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md`, issue #114):
+    "você conseguiu lançar o que eu gastei?" -- read-only, never mutates
+    anything. Looks at this user's own single most recent
+    `AssistantActionProposal` (household + user scoped, same "no reference
+    given -> most recent" default `_find_pending_proposal`/
+    `_find_undoable_action` already use), regardless of its current state,
+    and reports what happened to it: still pending confirmation, executed,
+    cancelled, undone after being executed, or expired without ever being
+    confirmed. `found=False` when this user has never drafted anything --
+    never guessed from someone else's household action."""
+
+    from app.models import AssistantActionEvent, AssistantActionProposal  # deferred, same reason as above
+
+    proposal = db.scalar(
+        select(AssistantActionProposal)
+        .where(
+            AssistantActionProposal.household_id == user.household_id,
+            AssistantActionProposal.user_id == user.id,
+        )
+        .order_by(AssistantActionProposal.created_at.desc())
+        .limit(1)
+    )
+    if proposal is None:
+        return ToolOutcome(ok=True, facts={"found": False})
+
+    facts: dict[str, Any] = {
+        "found": True,
+        "typed_action": proposal.typed_action,
+        "payload": proposal.payload,
+        "created_at": proposal.created_at.isoformat(),
+    }
+    if proposal.consumed_at is None:
+        facts["status"] = "pending_confirmation" if _not_expired(proposal, now=datetime.now(UTC)) else "expired"
+        return ToolOutcome(ok=True, facts=facts)
+    if proposal.consumed_action_event_id is None:
+        facts["status"] = "cancelled"
+        return ToolOutcome(ok=True, facts=facts)
+
+    action_event = db.get(AssistantActionEvent, proposal.consumed_action_event_id)
+    facts["status"] = "undone" if action_event and action_event.undone_at else "executed"
+    if action_event is not None:
+        facts["executed_at"] = action_event.created_at.isoformat()
+    return ToolOutcome(ok=True, facts=facts)
+
+
 def _tool_financial_aggregate(
     db: Session, *, user: Any, arguments: dict[str, str], today: date
 ) -> ToolOutcome:
@@ -1235,6 +1281,8 @@ def run_tool(
         return _tool_undo_typed_action(db, user=user, arguments=clean_arguments)
     if tool == "cancel_typed_action":
         return _tool_cancel_typed_action(db, user=user, arguments=clean_arguments)
+    if tool == "get_action_status":
+        return _tool_get_action_status(db, user=user)
     if tool == "financial_aggregate":
         return _tool_financial_aggregate(db, user=user, arguments=clean_arguments, today=resolved_today)
     if tool == "get_income":
