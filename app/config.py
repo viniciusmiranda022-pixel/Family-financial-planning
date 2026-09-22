@@ -89,8 +89,16 @@ class Settings(BaseSettings):
     # Order). `scripts/entrypoint.sh` runs a single `uvicorn` process with
     # no `--workers`, so an in-memory-per-process counter (see
     # `app.services.email_delivery._EmailSendThrottle`) is an effective
-    # control here, not just a best-effort one.
-    alert_test_email_min_interval_seconds: int = 60
+    # control here, not just a best-effort one. UX-01
+    # (`docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md`, issue #114): keyed
+    # per-recipient now (see `EmailSendThrottle`), so this only ever guards
+    # a double-click/rapid-retry on the *same* recipient -- 5s is enough for
+    # that without being a reproduced real-world regression against
+    # legitimate consecutive admin tests of different recipients. Still
+    # configurable via `ALERT_TEST_EMAIL_MIN_INTERVAL_SECONDS` for an
+    # operator who wants it stricter; never changes the D-1/D0
+    # scheduler/worker cadence below.
+    alert_test_email_min_interval_seconds: int = 5
     # MAIL-02 (docs/WORK_ORDER_DUE_DATE_EMAIL_ALERTS.md, issue #69): the
     # outbox/scheduler worker's own tuning. `notification_worker_poll_seconds`
     # is how often `python -m app.cli.notification_worker` sweeps for newly

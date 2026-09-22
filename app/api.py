@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -12490,12 +12491,23 @@ def notification_settings_test_email(
         )
 
     settings = get_settings()
-    if not test_email_throttle.allow(
-        user.household_id, min_interval_seconds=settings.alert_test_email_min_interval_seconds
-    ):
+    # UX-01 (docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md, issue #114):
+    # keyed by recipient, not just household -- testing recipient A no
+    # longer blocks an immediate test of recipient B. `seconds_remaining` is
+    # read *after* a failed `allow` (never before -- `allow` is the one call
+    # that may start/refresh the window) so the UI can show exactly how long
+    # is left, not just that it must wait.
+    min_interval_seconds = settings.alert_test_email_min_interval_seconds
+    if not test_email_throttle.allow(user.household_id, recipient.id, min_interval_seconds=min_interval_seconds):
+        remaining_seconds = math.ceil(
+            test_email_throttle.seconds_remaining(
+                user.household_id, recipient.id, min_interval_seconds=min_interval_seconds
+            )
+        )
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Aguarde antes de enviar outro e-mail de teste.",
+            detail=f"Aguarde {max(1, remaining_seconds)}s antes de testar este destinatário de novo.",
+            headers={"Retry-After": str(max(1, remaining_seconds))},
         )
 
     result = adapter.send(OutboundEmail(to_email=recipient.email, rendered=render_test_email()))

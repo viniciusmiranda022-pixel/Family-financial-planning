@@ -155,6 +155,15 @@ class EmailSendThrottle:
     """Process-local minimum-interval guard for the administrative
     test-email endpoint ("rate-limited de forma simples" -- Work Order).
 
+    UX-01 (`docs/WORK_ORDER_UX_01_MAIL_TEST_CHAT_WRITE.md`, issue #114):
+    keyed by `(household_id, recipient_id)`, not `household_id` alone --
+    the original single-key throttle meant testing recipient A blocked an
+    immediate test of recipient B in the same household, a reproduced
+    real-world regression the Work Order requires fixed ("Throttle deve ser
+    granular por household + destinatário"). Double-click/rapid-retry
+    protection on the *same* recipient is unchanged; a different recipient
+    was never the thing this guard was protecting against.
+
     Deliberately in-memory, not a DB column: `scripts/entrypoint.sh` runs a
     single `uvicorn` process with no `--workers`, so a per-process counter
     is an effective control for this deployment, and it avoids adding a
@@ -165,15 +174,32 @@ class EmailSendThrottle:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._last_sent_at: dict[str, float] = {}
+        self._last_sent_at: dict[tuple[str, str], float] = {}
 
-    def allow(self, household_id: str, *, min_interval_seconds: float) -> bool:
+    def seconds_remaining(
+        self, household_id: str, recipient_id: str, *, min_interval_seconds: float
+    ) -> float:
+        """Read-only: how many seconds until `allow` would next succeed for
+        this exact `(household_id, recipient_id)` -- `0` if it would
+        succeed right now. Never mutates state, so probing this never
+        itself counts as a send."""
+
         now = time.monotonic()
         with self._lock:
-            last = self._last_sent_at.get(household_id)
+            last = self._last_sent_at.get((household_id, recipient_id))
+        if last is None:
+            return 0.0
+        remaining = min_interval_seconds - (now - last)
+        return max(0.0, remaining)
+
+    def allow(self, household_id: str, recipient_id: str, *, min_interval_seconds: float) -> bool:
+        now = time.monotonic()
+        key = (household_id, recipient_id)
+        with self._lock:
+            last = self._last_sent_at.get(key)
             if last is not None and (now - last) < min_interval_seconds:
                 return False
-            self._last_sent_at[household_id] = now
+            self._last_sent_at[key] = now
             return True
 
 
