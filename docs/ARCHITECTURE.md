@@ -1845,14 +1845,29 @@ hipotética. Correção aditiva, reaproveitando exatamente essa mesma infraestru
   perguntar de novo.
 - `amount_text` continua sendo o valor contratado/total ("2459" = preço total, não parcela) --
   `app.services.finance.amortized_installment_payment` (a mesma função Price/Gauss que
-  `simulate_purchase`/`POST /purchases/scenario-comparison` já usam) deriva a parcela mensal
-  igualmente dividida (sem juros quando a mensagem não menciona taxa). O payload final grava
-  `installment_current=1`/`installment_total=N` -- os mesmos dois campos que
+  `simulate_purchase`/`POST /purchases/scenario-comparison` já usam) deriva a parcela mensal. O
+  payload final grava `installment_current=1`/`installment_total=N` -- os mesmos dois campos que
   `ManualTransactionRequest`/`create_manual_transaction` já aceitam do formulário manual, então a
   projeção de "parcelas futuras" (`app.api._installment_remaining_schedule`) trata um lançamento
   vindo do chat exatamente como um do formulário, sem caminho paralelo. Só se aplica a
   `create_expense` (`ManualTransactionRequest.validate_movement_fields`: parcelamento nunca se aplica
   a renda/transferência) -- `installments_text` em `create_income` é ignorado.
+- **Revisão de engenharia do PR #115 (MERGE BLOCKED) -- juros nunca vira 0 por silêncio.** Uma
+  primeira versão desta fatia reaproveitou o mesmo idioma "ausente/não numérico -> 0" de
+  `simulate_purchase` para `monthly_interest_rate_text` na pipeline WRITE, inclusive instruindo
+  `interpretPrompt` a deixar o campo ausente quando a mensagem não menciona juros "(parcelamento sem
+  juros)". Isso transformava o silêncio do usuário num fato financeiro (taxa 0) nunca afirmado por
+  ele -- viola o mesmo princípio que já protege `installments_text` (hipótese nunca vira fato
+  silenciosamente) e distorce o valor da parcela persistida sempre que a compra real tinha juros.
+  Corrigido para uma resolução de três estados
+  (`app.services.assistant_actions._resolve_installment_rate_text`), chamada somente depois que
+  `installment_total` já foi resolvido: (a) texto explícito com taxa válida (incluindo uma negação
+  explícita como "sem juros"/"0%", que é um fato dito pelo usuário, nunca uma omissão preenchida) ->
+  usa essa taxa; (b) campo ausente -> `clarifying_question` perguntando se há juros, nunca grava nada;
+  (c) texto presente mas não numérico, negativo ou acima de `_MAX_INTERPRETED_MONTHLY_RATE` ->
+  `clarifying_question` pedindo a correção, nunca vira 0. `interpretPrompt` foi ajustado para nunca
+  escrever "0"/"sem juros" em `monthly_interest_rate_text` por conta própria -- só quando a própria
+  mensagem afirma explicitamente um valor ou a ausência de juros.
 - A verificação de possível duplicidade (`_check_possible_duplicate`) passou a comparar contra o
   valor *da parcela* já derivado, não o total contratado -- é o valor da parcela que efetivamente vai
   virar `Transaction.amount`, o mesmo que uma reimportação duplicada compararia.

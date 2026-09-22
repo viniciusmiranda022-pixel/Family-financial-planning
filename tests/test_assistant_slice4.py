@@ -243,7 +243,11 @@ def test_create_expense_installments_text_present_but_unresolvable_asks_for_coun
     assert proposal.missing_fields == ("installments",)
 
 
-def test_create_expense_installments_resolves_to_equal_interest_free_split() -> None:
+# Engineering review of PR #115 (MERGE BLOCKED): an installment purchase
+# whose count is known but whose interest was never mentioned must ask,
+# never silently book rate 0 -- silence is not the same fact as an explicit
+# "sem juros".
+def test_create_expense_installments_without_interest_mention_asks_about_rate() -> None:
     session_factory = _session_factory()
     household_id = _household(session_factory)
     _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
@@ -256,10 +260,86 @@ def test_create_expense_installments_resolves_to_equal_interest_free_split() -> 
     )
     with session_factory() as db:
         proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is False
+    assert "juros" in proposal.clarifying_question.lower()
+    assert proposal.missing_fields == ("monthly_interest_rate",)
+
+
+def test_create_expense_installments_explicit_zero_interest_text_resolves() -> None:
+    """An explicit "sem juros" is a stated fact, not a filled-in absence --
+    it must resolve exactly like a numeric "0" would."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="sem juros",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
     assert proposal.can_execute is True
     assert proposal.payload["amount"] == "245.90"
     assert proposal.payload["installment_current"] == 1
     assert proposal.payload["installment_total"] == 10
+
+
+def test_create_expense_installments_resolves_to_equal_interest_free_split() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="0",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is True
+    assert proposal.payload["amount"] == "245.90"
+    assert proposal.payload["installment_current"] == 1
+    assert proposal.payload["installment_total"] == 10
+
+
+def test_create_expense_installments_invalid_rate_asks_for_correction() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="um monte",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is False
+    assert "juros" in proposal.clarifying_question.lower()
+    assert proposal.missing_fields == ("monthly_interest_rate",)
+
+    interpretation_too_high = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="99",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(
+            db, household_id=household_id, interpretation=interpretation_too_high
+        )
+    assert proposal.can_execute is False
+    assert proposal.missing_fields == ("monthly_interest_rate",)
 
 
 def test_create_expense_installments_with_interest_uses_amortized_payment() -> None:
@@ -574,6 +654,7 @@ def test_execute_create_expense_installment_persists_current_and_total() -> None
             account_hint="Nubank",
             category_hint="Casa",
             installments_text="10",
+            monthly_interest_rate_text="sem juros",
         )
         proposal_id, proposal, _ = _propose_and_persist(
             session_factory,

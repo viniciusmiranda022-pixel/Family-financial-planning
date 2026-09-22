@@ -720,21 +720,63 @@ def _parse_installment_count_text(value: str | None) -> int | None:
     return count if 2 <= count <= _MAX_INTERPRETED_INSTALLMENTS else None
 
 
-def _parse_installment_rate_text(value: str | None) -> Decimal:
-    """Optional financing rate for an installment purchase -- absent/
-    unparsable/implausibly high means interest-free (rate `0`), never a
-    reason to block on a clarifying question by itself (mirrors
-    `assistant_tools._parse_monthly_rate_hint`'s same "optional, documented
-    default" idiom); only the installment *count* is ever material enough
-    to ask about."""
+# Engineering review of PR #115 (MERGE BLOCKED): unlike
+# `assistant_tools._parse_monthly_rate_hint` (an optional simulation
+# argument that safely defaults absent/unparsable to interest-free), a rate
+# this module resolves is about to be *persisted* as the per-installment
+# amount of a real WRITE. Coercing "the message never mentioned interest"
+# into a booked rate of `0` turns Codex's silence into a financial fact the
+# user never stated -- forbidden by the Assistant contract (hipótese nunca
+# vira fato silenciosamente). A monthly rate materially changes the booked
+# installment payment (`amortized_installment_payment`), so it is exactly as
+# material as the installment count itself once a purchase is known to be
+# parcelada: the caller must always land on one of three explicit outcomes,
+# never a silent default.
+_ZERO_INTEREST_PHRASES = (
+    "sem juros",
+    "sem juro",
+    "0 juros",
+    "0 juro",
+    "zero juros",
+    "zero juro",
+    "juros zero",
+    "nao tem juros",
+    "nao tem juro",
+    "nao possui juros",
+    "nenhum juro",
+    "isento de juros",
+    "isenta de juros",
+)
 
-    if not value:
-        return Decimal("0")
+
+def _resolve_installment_rate_text(value: str | None) -> tuple[Decimal, str | None]:
+    """Resolve the monthly interest rate for an installment purchase whose
+    `installment_total` is already known. Returns `(rate, issue)`:
+
+    - `(Decimal, None)`: an explicit rate the message actually stated --
+      including an explicit zero ("sem juros"/"0%"), which is a stated fact,
+      never a filled-in absence.
+    - `(Decimal("0"), "missing")`: `monthly_interest_rate_text` was never
+      populated -- the message never mentioned interest at all. The rate is
+      a placeholder only; the caller must treat this as a clarifying
+      question, never book it.
+    - `(Decimal("0"), "invalid")`: the field was populated but is
+      unparsable, negative, or above `_MAX_INTERPRETED_MONTHLY_RATE` -- the
+      caller must ask for a correction, never silently coerce to `0`.
+    """
+
+    if not value or not value.strip():
+        return Decimal("0"), "missing"
+    normalized = _strip_accents(value).strip().lower()
+    if normalized in ("0", "0%") or any(phrase in normalized for phrase in _ZERO_INTEREST_PHRASES):
+        return Decimal("0"), None
     parsed = parse_amount_text(value.replace("%", ""))
     if parsed is None:
-        return Decimal("0")
+        return Decimal("0"), "invalid"
     rate = parsed / Decimal("100")
-    return rate if rate <= _MAX_INTERPRETED_MONTHLY_RATE else Decimal("0")
+    if rate < 0 or rate > _MAX_INTERPRETED_MONTHLY_RATE:
+        return Decimal("0"), "invalid"
+    return rate, None
 
 
 def _propose_create_transaction(
@@ -816,12 +858,28 @@ def _propose_create_transaction(
     # payment actually booked this month is derived from it via the exact
     # same amortized Price/Gauss formula `simulate_purchase`/`POST
     # /purchases/scenario-comparison` already use (`app.services.finance.
-    # amortized_installment_payment`) -- interest-free (rate 0) when the
-    # message never mentions one, an equal split of `amount` across
-    # `installment_total`. Never a second, ad-hoc division here.
+    # amortized_installment_payment`) -- equal split of `amount` across
+    # `installment_total` when the rate is a stated zero, amortized
+    # otherwise. Never a second, ad-hoc division here.
     booked_amount = amount
     if installment_total is not None:
-        monthly_rate = _parse_installment_rate_text(fields.get("monthly_interest_rate_text"))
+        # Engineering review of PR #115: a materially known count with an
+        # unknown rate is still an incomplete purchase -- ask, exactly like
+        # an unresolved installment count already does, rather than booking
+        # a rate nobody stated.
+        monthly_rate, rate_issue = _resolve_installment_rate_text(fields.get("monthly_interest_rate_text"))
+        if rate_issue == "missing":
+            return _needs_disambiguation(
+                "Esse parcelamento tem juros? Se tiver, me diga a taxa mensal; se não tiver, "
+                "é só responder \"sem juros\".",
+                missing_fields=("monthly_interest_rate",),
+            )
+        if rate_issue == "invalid":
+            return _needs_disambiguation(
+                "Não entendi a taxa de juros informada. Qual é a taxa mensal do parcelamento "
+                "(ou \"sem juros\")?",
+                missing_fields=("monthly_interest_rate",),
+            )
         booked_amount, _total_cost = amortized_installment_payment(amount, installment_total, monthly_rate)
 
     booked_at = parse_date_text(fields.get("date_text")) or date.today()

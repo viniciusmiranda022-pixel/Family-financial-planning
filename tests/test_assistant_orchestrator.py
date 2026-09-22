@@ -947,6 +947,7 @@ def test_plan_and_execute_draft_typed_action_installment_answer_shows_full_break
             "description": "Televisão",
             "account_hint": "Nubank",
             "installments_text": "10",
+            "monthly_interest_rate_text": "sem juros",
         },
         "missing_fields": [],
         "clarifying_question": None,
