@@ -171,6 +171,7 @@ def _purchase(
     description: str = "Compra",
     installment_current: int | None = None,
     installment_total: int | None = None,
+    installment_contracted_total: str | None = None,
 ) -> str:
     with session_factory() as db:
         signed_amount = Decimal(amount) if transaction_type == "refund" else -abs(Decimal(amount))
@@ -191,6 +192,9 @@ def _purchase(
             reviewed=True,
             installment_current=installment_current,
             installment_total=installment_total,
+            installment_contracted_total=(
+                Decimal(installment_contracted_total) if installment_contracted_total is not None else None
+            ),
         )
         db.add(txn)
         db.commit()
@@ -339,6 +343,85 @@ def test_invoice_purchase_lines_expose_contracted_impact_and_future_installments
     assert plain_line["monthly_impact"] == "80.00"
     assert plain_line["contracted_total"] == "80.00"
     assert plain_line["future_installments_total"] == "0"
+
+
+def test_invoice_purchase_lines_preserve_contracted_total_with_rounding() -> None:
+    """Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md, item 3):
+    a R$100 purchase in 3 interest-free installments cannot be split into
+    three equal cent-rounded payments (`money(100 / 3) * 3 == 99.99`), so
+    the chat/typed-action WRITE path (`app.services.assistant_actions
+    ._propose_create_transaction`) persists the user-stated
+    `installment_contracted_total` fact alongside the R$33.33 booked this
+    cycle. This line must show the stated `100.00`, never the lossy
+    `99.99` reconstruction, and the three rebaseline §6.7 figures must
+    still reconcile exactly (33.33 + 66.67 == 100.00)."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    card_id = _account(
+        session_factory, household_id=household_id, name="Cartão", account_type="credit_card", closing_day=10, due_day=17
+    )
+    category_id = _category(session_factory, household_id=household_id)
+    installment_id = _purchase(
+        session_factory, household_id=household_id, account_id=card_id, amount="33.33",
+        booked_at=date(2026, 9, 3), competence="2026-09", category_id=category_id,
+        description="Compra 100 em 3x sem juros", installment_current=1, installment_total=3,
+        installment_contracted_total="100.00",
+    )
+
+    with session_factory() as db:
+        account = db.get(Account, card_id)
+        invoice = get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-09", as_of=date(2026, 9, 5))
+        db.commit()
+        invoice_id = invoice.id
+
+    with session_factory() as db:
+        lines = {
+            line.id: serialize_invoice_purchase_line(line)
+            for line in invoice_purchase_lines(db, household_id=household_id, invoice_id=invoice_id)
+        }
+
+    line = lines[installment_id]
+    assert line["monthly_impact"] == "33.33"
+    assert line["contracted_total"] == "100.00"
+    assert line["future_installments_total"] == "66.67"
+
+
+def test_invoice_purchase_lines_fall_back_to_derived_total_for_legacy_rows() -> None:
+    """A row with no `installment_contracted_total` (every row written
+    before this column existed, and every row from a write path that never
+    captures a stated total -- manual entry, document capture/import)
+    keeps the pre-existing `amount * installment_total` derivation exactly
+    as before: existing data is never reinterpreted."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    card_id = _account(
+        session_factory, household_id=household_id, name="Cartão", account_type="credit_card", closing_day=10, due_day=17
+    )
+    category_id = _category(session_factory, household_id=household_id)
+    installment_id = _purchase(
+        session_factory, household_id=household_id, account_id=card_id, amount="33.33",
+        booked_at=date(2026, 9, 3), competence="2026-09", category_id=category_id,
+        description="Compra legada 3x", installment_current=1, installment_total=3,
+    )
+
+    with session_factory() as db:
+        account = db.get(Account, card_id)
+        invoice = get_or_sync_invoice(db, household_id=household_id, account=account, competence="2026-09", as_of=date(2026, 9, 5))
+        db.commit()
+        invoice_id = invoice.id
+
+    with session_factory() as db:
+        lines = {
+            line.id: serialize_invoice_purchase_line(line)
+            for line in invoice_purchase_lines(db, household_id=household_id, invoice_id=invoice_id)
+        }
+
+    line = lines[installment_id]
+    assert line["monthly_impact"] == "33.33"
+    assert line["contracted_total"] == "99.99"
+    assert line["future_installments_total"] == "66.66"
 
 
 def test_close_invoice_fails_closed_before_closing_date() -> None:

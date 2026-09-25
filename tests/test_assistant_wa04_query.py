@@ -141,6 +141,7 @@ def _seed_transaction(
     owner_label: str = "Família",
     installment_current: int | None = None,
     installment_total: int | None = None,
+    installment_contracted_total: Decimal | None = None,
     competence: str | None = None,
 ) -> str:
     with session_factory() as db:
@@ -162,6 +163,7 @@ def _seed_transaction(
             reviewed=True,
             installment_current=installment_current,
             installment_total=installment_total,
+            installment_contracted_total=installment_contracted_total,
         )
         db.add(transaction)
         db.commit()
@@ -1812,6 +1814,45 @@ def test_get_installments_reports_contracted_impact_and_future_remaining() -> No
     assert purchase["impact_this_month"] == Decimal("500.00")
     assert purchase["installment_current"] == 2
     assert purchase["installment_total"] == 10
+
+
+# Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md, item 3/4):
+# `get_installments` must report the stated R$100,00 contracted total, not
+# the lossy `money(100 / 3) * 3 == 99.99` reconstruction, keeping this tool
+# consistent with the chat WRITE preview and `serialize_invoice_purchase_line`.
+def test_get_installments_preserves_contracted_total_with_rounding() -> None:
+    session_factory = _session_factory()
+    ids = _seed_household(session_factory, username="installments-rounding")
+    _seed_transaction(
+        session_factory,
+        household_id=ids["household_id"],
+        account_id=ids["card_id"],
+        category_id=None,
+        booked_at=date(2026, 9, 5),
+        amount=Decimal("-33.33"),
+        transaction_type="expense",
+        description="Loja Rounding Parcela 1/3",
+        installment_current=1,
+        installment_total=3,
+        installment_contracted_total=Decimal("100.00"),
+        competence="2026-09",
+    )
+    user = _admin_user(session_factory, household_id=ids["household_id"])
+
+    with session_factory() as db:
+        outcome = run_tool(
+            db,
+            user=user,
+            tool="get_installments",
+            arguments={"merchant_hint": "Loja Rounding"},
+            message="como está a parcela da loja rounding?",
+            today=TODAY,
+        )
+    assert outcome.ok is True
+    purchase = outcome.facts["purchases"][0]
+    assert purchase["contracted_total"] == Decimal("100.00")
+    assert purchase["already_paid"] == Decimal("33.33")
+    assert purchase["future_remaining"] == Decimal("66.67")
 
 
 def test_get_installments_no_match_asks_never_guesses() -> None:

@@ -194,6 +194,13 @@ def test_installments_with_interest_use_the_canonical_amortization_formula() -> 
 
 
 def test_installments_without_interest_split_evenly_with_half_up_rounding() -> None:
+    """Engineering review of PR #115 (`docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md`,
+    item 3): interest-free financing costs nothing beyond the stated
+    principal -- `total_cost` must stay the contracted `100.00` the user
+    stated, never the rounded-per-installment reconstruction
+    `money(100 / 3) * 3 == 99.99` (a cent silently vanishing from the
+    stated total)."""
+
     session_factory = _session_factory()
     household_id = _seed_household(session_factory, username="wa06-rounding")
     outcome = _run(
@@ -203,7 +210,7 @@ def test_installments_without_interest_split_evenly_with_half_up_rounding() -> N
     )
     facts = outcome.facts
     assert facts["monthly_payment"] == Decimal("33.33")
-    assert facts["total_cost"] == Decimal("99.99")
+    assert facts["total_cost"] == Decimal("100.00")
 
 
 def test_out_of_range_or_garbled_installments_and_rate_fall_back_to_documented_defaults() -> None:

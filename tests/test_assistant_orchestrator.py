@@ -972,6 +972,51 @@ def test_plan_and_execute_draft_typed_action_installment_answer_shows_full_break
     assert "parcelas futuras R$ 2.213,10" in result.answer
 
 
+# Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md, item 3): the
+# preview must show the stated R$100,00 contracted total, never the
+# rounded-per-installment reconstruction R$99,99 (`money(100 / 3) * 3`).
+def test_plan_and_execute_draft_typed_action_installment_answer_preserves_rounded_total() -> None:
+    session_factory = _session_factory()
+    household_id, _account_id, _category_id = _seed_household_with_spending(
+        session_factory, username="orch-draft-rounding"
+    )
+    user = _admin_user(session_factory, household_id=household_id)
+    with session_factory() as db:
+        db.add(Account(household_id=household_id, name="Nubank", account_type="credit_card"))
+        db.commit()
+    plan_response = _valid_plan_response(steps=[{"tool": "draft_typed_action", "arguments": {}}])
+    installment_response = {
+        "schema_version": "1.0.0",
+        "intent": "create_expense",
+        "extracted_fields": {
+            "amount_text": "100",
+            "description": "Compra",
+            "account_hint": "Nubank",
+            "installments_text": "3",
+            "monthly_interest_rate_text": "sem juros",
+        },
+        "missing_fields": [],
+        "clarifying_question": None,
+        "confidence": 0.9,
+    }
+    interpret_client = FakeInterpretClient(response=installment_response)
+
+    with session_factory() as db:
+        result = plan_and_execute(
+            db,
+            user=user,
+            message="fiz uma compra de 100 em 3x sem juros no cartão nubank",
+            client=FakePlanClient(response=plan_response),
+            interpret_client=interpret_client,
+        )
+
+    assert result.proposal["can_execute"] is True
+    assert result.proposal["payload"]["amount"] == "33.33"
+    assert "Compra contratada R$ 100,00" in result.answer
+    assert "impacto neste mês R$ 33,33" in result.answer
+    assert "parcelas futuras R$ 66,67" in result.answer
+
+
 def test_plan_and_execute_draft_typed_action_disambiguation_surfaces_candidates_too() -> None:
     """Same as above, for the unresolved path: candidates/candidate_kind/
     missing_fields must reach `OrchestratorResult.proposal` even though the
