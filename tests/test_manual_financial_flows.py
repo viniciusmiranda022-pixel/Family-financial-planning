@@ -26,6 +26,7 @@ import json
 import os
 import re
 import uuid
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
@@ -41,7 +42,7 @@ os.environ.setdefault("MFA_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.api import _future_installments  # noqa: E402
+from app.api import _future_installments, _installment_remaining_schedule  # noqa: E402
 from app.db import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import AuditEvent, Household, Transaction, User  # noqa: E402
@@ -998,6 +999,48 @@ def test_manual_transaction_requires_authentication():
             },
         )
         assert response.status_code == 401
+
+
+# Codex review (PR #116, docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md
+# item 3): `_installment_remaining_schedule`'s `contracted_total` parameter
+# must redistribute a cent-rounding remainder onto the last remaining
+# installment instead of silently letting the schedule's own total drift
+# from the stated fact.
+def test_installment_remaining_schedule_without_contracted_total_stays_uniform():
+    """Manual entry (and every row from before this parameter existed)
+    never passes `contracted_total` -- the schedule must stay exactly the
+    prior uniform-per-installment behavior."""
+    schedule = _installment_remaining_schedule(
+        amount=Decimal("33.33"),
+        installment_current=1,
+        installment_total=3,
+        anchor_month=date(2026, 9, 1),
+    )
+    assert schedule == [("2026-10", Decimal("33.33")), ("2026-11", Decimal("33.33"))]
+
+
+def test_installment_remaining_schedule_allocates_remainder_to_last_installment():
+    schedule = _installment_remaining_schedule(
+        amount=Decimal("33.33"),
+        installment_current=1,
+        installment_total=3,
+        anchor_month=date(2026, 9, 1),
+        contracted_total=Decimal("100.00"),
+    )
+    assert schedule == [("2026-10", Decimal("33.33")), ("2026-11", Decimal("33.34"))]
+    assert sum(value for _month, value in schedule) == Decimal("66.67")
+
+
+def test_installment_remaining_schedule_with_contracted_total_stays_exact_when_evenly_divisible():
+    schedule = _installment_remaining_schedule(
+        amount=Decimal("245.90"),
+        installment_current=1,
+        installment_total=10,
+        anchor_month=date(2026, 9, 1),
+        contracted_total=Decimal("2459.00"),
+    )
+    assert all(value == Decimal("245.90") for _month, value in schedule)
+    assert len(schedule) == 9
 
 
 def test_installment_preview_exposes_canonical_schedule_before_confirmation():

@@ -1036,7 +1036,19 @@ def test_downgrade_from_0015_refuses_to_discard_confirmed_refund_lineage(monkeyp
     assert "card_invoices" in inspector.get_table_names()
     session_factory = sessionmaker(bind=engine)
     with session_factory() as db:
-        assert db.get(Transaction, refund_id).refund_of_transaction_id == purchase_id
+        # A targeted column `select`, not `db.get(Transaction, ...)`: this
+        # downgrade only ran (and only needed to run) down to the revision
+        # right above 0015's guard, which can sit below whatever `head`
+        # migrations after 0015 have additively added to `transactions`
+        # since (e.g. `installment_contracted_total`, migration 0029) --
+        # `app.models.Transaction` always declares every column `head`
+        # knows about, so loading the full mapped entity here would query a
+        # column this intentionally-partial downgrade already dropped on
+        # its way down from `head`, unrelated to the one guard this test
+        # actually exercises.
+        assert db.execute(
+            select(Transaction.refund_of_transaction_id).where(Transaction.id == refund_id)
+        ).scalar_one() == purchase_id
     engine.dispose()
 
     # The documented export-then-clear path: once no link remains, the
@@ -1524,7 +1536,7 @@ def test_integrity_core_upgrade_preserves_existing_financial_and_audit_rows(
         assert audit_row == ('{"preserved": true}', None, None, None, None)
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar_one() == "0028"
+        ).scalar_one() == "0029"
     engine.dispose()
     get_settings.cache_clear()
 
@@ -1550,6 +1562,6 @@ def test_upgrade_preserves_database_created_by_former_dynamic_0001(monkeypatch, 
     assert "capture_drafts" in inspector.get_table_names()
     with engine.connect() as connection:
         assert connection.scalar(select(Household.name)) == "Família legada"
-        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0028"
+        assert connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one() == "0029"
     engine.dispose()
     get_settings.cache_clear()

@@ -364,6 +364,165 @@ def test_create_expense_installments_with_interest_uses_amortized_payment() -> N
     assert proposal.payload["installment_total"] == 10
 
 
+# Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md), item 1:
+# "12% ao ano" (or any explicit non-monthly period) must never be booked as
+# if it were that same percentage per month.
+def test_create_expense_installments_annual_rate_never_applied_as_monthly() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="12% ao ano",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is False
+    assert "mensal" in proposal.clarifying_question.lower()
+    assert proposal.missing_fields == ("monthly_interest_rate",)
+
+
+def test_create_expense_installments_pa_rate_never_applied_as_monthly() -> None:
+    """Codex review (PR #116): "p.a." (per annum) is a standard annual-rate
+    spelling distinct from "a.a." and must fail closed the same way as
+    "ao ano"."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="12% p.a.",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is False
+    assert proposal.missing_fields == ("monthly_interest_rate",)
+
+
+def test_create_expense_installments_daily_rate_never_applied_as_monthly() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="2459",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="0,5% ao dia",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is False
+    assert proposal.missing_fields == ("monthly_interest_rate",)
+
+
+def test_create_expense_installments_bare_rate_without_period_stays_monthly() -> None:
+    """Rebaseline "existing simple WRITE behavior remains compatible": a
+    bare number with no period mentioned at all -- Codex's own extraction
+    contract already names the field `monthly_interest_rate_text` -- must
+    keep resolving as monthly, exactly like every pre-existing WRITE test
+    (`test_create_expense_installments_with_interest_uses_amortized_payment`)
+    already relies on."""
+
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="1000",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="2",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is True
+
+
+# Work Order, item 2: "0% ao mês"/"taxa de 0%" must resolve as an explicit
+# zero, exactly like "sem juros" already does
+# (`test_create_expense_installments_explicit_zero_interest_text_resolves`).
+def test_create_expense_installments_zero_rate_phrase_variants_resolve_as_zero() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    for index, phrasing in enumerate(("taxa de 0%", "0% ao mês", "0% ao mes")):
+        account_name = f"Nubank{index}"
+        _account(session_factory, household_id=household_id, name=account_name, account_type="credit_card")
+        interpretation = _interpretation(
+            "create_expense",
+            amount_text="2459",
+            description="Compra",
+            account_hint=account_name,
+            installments_text="10",
+            monthly_interest_rate_text=phrasing,
+        )
+        with session_factory() as db:
+            proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+        assert proposal.can_execute is True, phrasing
+        assert proposal.payload["amount"] == "245.90", phrasing
+
+
+# Work Order, item 3: the user-stated contracted total ("100 in 3
+# interest-free installments") must survive cent rounding intact.
+def test_create_expense_installments_preserves_contracted_total_with_rounding() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="100",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="3",
+        monthly_interest_rate_text="sem juros",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is True
+    assert proposal.payload["amount"] == "33.33"
+    assert proposal.payload["installment_total"] == 3
+    assert Decimal(proposal.payload["installment_contracted_total"]) == Decimal("100")
+
+
+# Codex review (PR #116): an interest-bearing split's contracted total must
+# be the financed total `amortized_installment_payment` computes (principal
+# + interest), never the raw stated principal -- interest is a real added
+# cost (rebaseline §6.5), not something the contracted-total fix should
+# make disappear from what the purchase will actually cost.
+def test_create_expense_installments_with_interest_persists_financed_total() -> None:
+    session_factory = _session_factory()
+    household_id = _household(session_factory)
+    _account(session_factory, household_id=household_id, name="Nubank", account_type="credit_card")
+    interpretation = _interpretation(
+        "create_expense",
+        amount_text="1000",
+        description="Compra",
+        account_hint="Nubank",
+        installments_text="10",
+        monthly_interest_rate_text="2",
+    )
+    with session_factory() as db:
+        proposal = build_typed_action_proposal(db, household_id=household_id, interpretation=interpretation)
+    assert proposal.can_execute is True
+    from app.services.finance import amortized_installment_payment
+
+    expected_payment, expected_total = amortized_installment_payment(Decimal("1000"), 10, Decimal("0.02"))
+    assert proposal.payload["amount"] == str(expected_payment)
+    assert Decimal(proposal.payload["installment_contracted_total"]) == expected_total
+    assert expected_total > Decimal("1000")
+
+
 def test_create_income_ignores_installments_text_never_parcels_income() -> None:
     """Parcelamento só se aplica a despesas (`ManualTransactionRequest.
     validate_movement_fields`) -- `installments_text` on a `create_income`
@@ -673,6 +832,112 @@ def test_execute_create_expense_installment_persists_current_and_total() -> None
             assert transaction.installment_current == 1
             assert transaction.installment_total == 10
             assert transaction.amount == Decimal("-245.90")
+
+
+def test_execute_create_expense_installment_persists_contracted_total() -> None:
+    """Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md), item
+    3/4: the R$100/3x interest-free proposal's preserved contracted total
+    must actually reach the persisted `Transaction`, not just the
+    pre-confirmation proposal payload -- preview and persistence must
+    agree."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        account = client.post(
+            "/api/accounts",
+            json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17},
+        )
+        assert account.status_code == 201, account.text
+
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "create_expense",
+            amount_text="100",
+            description="Compra",
+            account_hint="Nubank",
+            category_hint="Casa",
+            installments_text="3",
+            monthly_interest_rate_text="sem juros",
+        )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="fiz uma compra de 100 em 3x sem juros no cartão nubank",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+        assert Decimal(proposal.payload["installment_contracted_total"]) == Decimal("100")
+
+        execute = client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
+        assert execute.status_code == 201, execute.text
+        transaction_id = execute.json()["response"]["id"]
+
+        with session_factory() as db:
+            transaction = db.get(Transaction, transaction_id)
+            assert transaction.installment_current == 1
+            assert transaction.installment_total == 3
+            assert transaction.amount == Decimal("-33.33")
+            assert transaction.installment_contracted_total == Decimal("100.00")
+
+        # Codex review (PR #116): the future-installment projection must
+        # reconcile exactly with the preserved contracted total instead of
+        # drifting by the rounding lost to two uniform R$33.33 payments
+        # (R$66.66, not the stated R$66.67 remaining) -- the remainder is
+        # deterministically allocated to the last remaining installment.
+        from app.api import _future_installments
+
+        with session_factory() as db:
+            projection = _future_installments(db, household_id)
+        assert sum(projection.values()) == Decimal("66.67")
+        assert sorted(projection.values()) == [Decimal("33.33"), Decimal("33.34")]
+
+
+def test_execute_create_expense_installment_with_interest_persists_financed_total() -> None:
+    """Codex review (PR #116): the persisted `installment_contracted_total`
+    for an interest-bearing purchase must be the financed total (principal
+    + interest), not the raw principal -- otherwise every downstream
+    reader understates what the purchase will actually cost."""
+
+    client, session_factory = _client()
+    with client:
+        _setup_household(client)
+        account = client.post(
+            "/api/accounts",
+            json={"name": "Nubank", "account_type": "credit_card", "card_closing_day": 10, "card_due_day": 17},
+        )
+        assert account.status_code == 201, account.text
+
+        household_id = _household_id(session_factory)
+        interpretation = _interpretation(
+            "create_expense",
+            amount_text="1000",
+            description="Compra",
+            account_hint="Nubank",
+            category_hint="Casa",
+            installments_text="10",
+            monthly_interest_rate_text="2",
+        )
+        proposal_id, proposal, _ = _propose_and_persist(
+            session_factory,
+            household_id=household_id,
+            message="fiz uma compra de 1000 em 10x com juros de 2% ao mês no cartão nubank",
+            interpretation=interpretation,
+        )
+        assert proposal.can_execute is True
+        from app.services.finance import amortized_installment_payment
+
+        expected_payment, expected_total = amortized_installment_payment(Decimal("1000"), 10, Decimal("0.02"))
+
+        execute = client.post("/api/assistant/execute", json={"proposal_id": proposal_id})
+        assert execute.status_code == 201, execute.text
+        transaction_id = execute.json()["response"]["id"]
+
+        with session_factory() as db:
+            transaction = db.get(Transaction, transaction_id)
+            assert transaction.amount == -expected_payment
+            assert transaction.installment_contracted_total == expected_total
+            assert transaction.installment_contracted_total > Decimal("1000.00")
 
 
 def test_execute_internal_transfer_creates_zero_income_or_expense() -> None:

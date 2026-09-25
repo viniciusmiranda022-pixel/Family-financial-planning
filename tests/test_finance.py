@@ -1,11 +1,16 @@
 from datetime import date
 from decimal import Decimal
 
+from hypothesis import given
+from hypothesis import strategies as st
+
 from app.services.finance import (
     ForecastCommission,
     ForecastInput,
+    amortized_installment_payment,
     build_forecast,
     commission_net,
+    money,
     monthly_net_rate,
 )
 from app.services.projection_validator import validate_projection
@@ -15,6 +20,48 @@ def test_commission_tax_is_rounded_per_receivable() -> None:
     tax, net = commission_net(Decimal("1234.56"), Decimal("0.06"))
     assert tax == Decimal("74.07")
     assert net == Decimal("1160.49")
+
+
+# Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md, item 3):
+# interest-free financing costs nothing beyond the stated principal -- the
+# contracted total must never be silently replaced by the rounded-per-
+# installment reconstruction `money(100 / 3) * 3 == 99.99`.
+def test_amortized_installment_payment_interest_free_preserves_contracted_total() -> None:
+    monthly_payment, total_cost = amortized_installment_payment(Decimal("100"), 3, Decimal("0"))
+    assert monthly_payment == Decimal("33.33")
+    assert total_cost == Decimal("100.00")
+
+
+def test_amortized_installment_payment_single_installment_preserves_contracted_total() -> None:
+    monthly_payment, total_cost = amortized_installment_payment(Decimal("245.90"), 1, Decimal("0"))
+    assert monthly_payment == Decimal("245.90")
+    assert total_cost == Decimal("245.90")
+
+
+@given(
+    principal=st.decimals(min_value="0.01", max_value="999999.99", places=2),
+    installments=st.integers(min_value=1, max_value=120),
+)
+def test_amortized_installment_payment_interest_free_total_always_equals_principal(
+    principal: Decimal, installments: int
+) -> None:
+    """Property: for any interest-free split, `total_cost` is always
+    exactly the stated `principal` -- never a lossy `monthly_payment *
+    installments` reconstruction -- regardless of whether `principal`
+    divides evenly by `installments`."""
+
+    _monthly_payment, total_cost = amortized_installment_payment(principal, installments, Decimal("0"))
+    assert total_cost == money(principal)
+
+
+def test_amortized_installment_payment_with_interest_total_still_exceeds_principal() -> None:
+    """Interest-bearing financing is unaffected by the item-3 fix: its
+    `total_cost` is a genuinely derived quantity (principal + interest),
+    never a user-stated fact to preserve verbatim."""
+
+    monthly_payment, total_cost = amortized_installment_payment(Decimal("1000"), 10, Decimal("0.02"))
+    assert total_cost == money(monthly_payment * 10)
+    assert total_cost > Decimal("1000")
 
 
 def test_commissions_keep_their_calendar_year() -> None:

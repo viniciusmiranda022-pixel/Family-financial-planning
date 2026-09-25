@@ -53,6 +53,16 @@ class ManualTransactionRequest(BaseModel):
     category_name: str | None = Field(default=None, min_length=2, max_length=100)
     installment_current: int | None = Field(default=None, ge=1, le=999)
     installment_total: int | None = Field(default=None, ge=1, le=999)
+    # Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md, item 3):
+    # the user-stated contracted total, preserved verbatim instead of being
+    # reconstructed later as `amount * installment_total` (which can lose
+    # cents to rounding). Only the chat/typed-action WRITE path
+    # (`app.services.assistant_actions._propose_create_transaction`) ever
+    # populates this today -- the manual-entry form has no "total" concept
+    # distinct from the per-installment `amount` it already asks for, so it
+    # never sends this field, and `Transaction.installment_contracted_total`
+    # simply stays `NULL` for those rows exactly as before.
+    installment_contracted_total: Decimal | None = Field(default=None, gt=0)
     # Explicit month (`YYYY-MM`) the user confirms this expense belongs to.
     # Only meaningful for `expense`: INV-017 requires a card purchase to keep
     # the canonical invoice competence, which this app has no invoice entity
@@ -73,6 +83,8 @@ class ManualTransactionRequest(BaseModel):
                 raise ValueError("Informe a parcela atual e o total de parcelas juntos")
             if self.installment_current > self.installment_total:
                 raise ValueError("A parcela atual não pode ser maior que o total de parcelas")
+        elif self.installment_contracted_total is not None:
+            raise ValueError("Valor contratado só se aplica a uma compra parcelada")
         if self.competence is not None and self.movement_type != "expense":
             raise ValueError("Competência explícita só se aplica a despesas")
         if self.funding_source == "privilege" and self.movement_type != "expense":

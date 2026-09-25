@@ -275,6 +275,23 @@ class Transaction(Base, TimestampMixin):
     card_last_four: Mapped[str | None] = mapped_column(String(4), nullable=True)
     installment_current: Mapped[int | None] = mapped_column(Integer, nullable=True)
     installment_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md, item 3):
+    # the user-stated contracted total of an installment purchase, as a fact
+    # -- e.g. "compra de 100 em 3x sem juros" states a contracted total of
+    # 100.00, which `money(100 / 3) * 3 == 99.99` would otherwise silently
+    # replace with a rounded-and-reconstructed figure. Set only by the
+    # chat/typed-action WRITE path (`app.services.assistant_actions
+    # ._propose_create_transaction`) when a total was actually stated and an
+    # installment count is known; every other write path (manual entry,
+    # document capture/import) leaves this `NULL` -- those never capture a
+    # "total" distinct from the per-installment `amount` in the first place,
+    # so there is no fact to preserve, and existing/legacy rows are never
+    # reinterpreted. Every reader that would otherwise derive "compra
+    # contratada" as `amount * installment_total` (`card_invoice_lifecycle
+    # .serialize_invoice_purchase_line`, `assistant_tools._tool_get_installments`)
+    # must prefer this column when it is not `NULL`, falling back to that
+    # same derivation otherwise -- never a second, competing total.
+    installment_contracted_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
     fingerprint: Mapped[str] = mapped_column(String(64))
     source_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
     occurred_at: Mapped[date | None] = mapped_column(Date, nullable=True)

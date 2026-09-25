@@ -43,6 +43,7 @@ from sqlalchemy.orm import Session
 
 from app.services.assistant_actions import (
     AssistantActionError,
+    _has_non_monthly_rate_period,
     build_typed_action_proposal,
     cancel_action_proposal,
     execute_typed_action,
@@ -397,9 +398,22 @@ def _parse_monthly_rate_hint(value: str | None) -> Decimal:
     a `Decimal` fraction, or `0` (interest-free) for anything absent/
     unparsable/implausibly high -- same "optional field, documented default,
     never blocks on a clarifying question" idiom as `_parse_installments_hint`.
+
+    Engineering review (`docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md`,
+    item 1): a hint stating an explicit non-monthly (or self-contradictory)
+    period -- "12% ao ano" -- is exactly as unparsable *as a monthly rate*
+    as free text with no number at all; this is a hypothetical, read-only
+    simulation (never persisted, the user can always re-ask), so the
+    existing "unparsable -> 0" default already documented above is the
+    right fallback here -- unlike `assistant_actions._resolve_installment_rate_text`
+    (a real WRITE about to be persisted), which must fail closed with a
+    clarifying question instead of ever defaulting silently.
     """
 
     if not value:
+        return Decimal("0")
+    normalized = _strip_accents(value).strip().lower()
+    if _has_non_monthly_rate_period(normalized):
         return Decimal("0")
     parsed = parse_amount_text(value.replace("%", ""))
     if parsed is None:
@@ -1117,7 +1131,15 @@ def _tool_get_installments(
         total = row.installment_total or 0
         anchor = _installment_anchor_month(competence=row.competence, booked_at=row.booked_at)
         per_installment = money(abs(row.amount))
-        contracted_total = money(per_installment * total)
+        # Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md, item
+        # 3): prefer the user-stated fact over the `per_installment * total`
+        # reconstruction, which can lose cents to rounding -- same fallback
+        # pattern as `card_invoice_lifecycle.serialize_invoice_purchase_line`.
+        contracted_total = (
+            money(row.installment_contracted_total)
+            if row.installment_contracted_total is not None
+            else money(per_installment * total)
+        )
         already_paid = money(per_installment * min(current, total))
         future_remaining = money(contracted_total - already_paid)
         anchor_key = f"{anchor.year:04d}-{anchor.month:02d}"
@@ -1130,6 +1152,12 @@ def _tool_get_installments(
                     installment_current=current,
                     installment_total=total,
                     anchor_month=anchor,
+                    # The raw stored fact (possibly `None`), never the
+                    # fallback-derived `contracted_total` above -- passing
+                    # the fallback would force the remainder-adjusted
+                    # schedule onto a legacy row that never stated a total,
+                    # silently reinterpreting it.
+                    contracted_total=row.installment_contracted_total,
                 )
             )
             impact_this_month = schedule.get(target_key, Decimal("0"))

@@ -33,12 +33,27 @@ def amortized_installment_payment(
     scenario comparison (`POST /purchases/scenario-comparison`) both call
     this exact function so a financed purchase's monthly payment can never be
     computed two different ways.
+
+    Engineering review (`docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md`,
+    item 3): interest-free financing costs nothing beyond the principal --
+    `total_cost` for `monthly_rate == 0` is always exactly `principal`
+    (`money(principal)`), never `monthly_payment * installments`. Splitting
+    `principal` into `installments` equal cent-rounded payments can lose up
+    to a few cents to rounding (`money(100 / 3) * 3 == 99.99`, not the
+    stated `100.00`); reporting that reconstruction as `total_cost` would
+    silently replace the user-stated contracted total with a lossy
+    recomputation. `monthly_payment` (the *per-installment* figure) is
+    unaffected and still carries whatever rounding is unavoidable for a
+    single equal installment -- callers that need the exact contracted
+    total preserved (not just each installment's individual payment) must
+    keep it from its own source (e.g. `amount_text`), never re-derive it
+    from `monthly_payment`.
     """
     if installments <= 0:
         return Decimal("0"), Decimal("0")
     if installments == 1 or monthly_rate == 0:
         monthly_payment = money(principal / installments)
-        return monthly_payment, money(monthly_payment * installments)
+        return monthly_payment, money(principal)
     factor = Decimal("1") - (Decimal("1") + monthly_rate) ** (-installments)
     monthly_payment = money(principal * monthly_rate / factor)
     return monthly_payment, money(monthly_payment * installments)

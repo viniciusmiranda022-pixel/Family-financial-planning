@@ -481,10 +481,25 @@ def _format_draft_typed_action(facts: dict[str, Any]) -> str:
         # exact `amount`/`installment_total` this proposal will persist
         # (`installment_current=1`, so "parcelas futuras" is the remaining
         # `installment_total - 1`), never a second amortization formula.
+        #
+        # Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md, item
+        # 3): `contracted_total` prefers `payload["installment_contracted_total"]`
+        # -- the user-stated fact `_propose_create_transaction` already
+        # carries in the proposal -- over `per_installment * installment_total`,
+        # which can lose cents to rounding (`money(100 / 3) * 3 == 99.99`,
+        # not the stated `100.00`). `future_remaining` is always derived from
+        # whichever total was used, so the preview and the persisted
+        # `serialize_invoice_purchase_line`/`_tool_get_installments` figures
+        # (item 4: preview/persistence/projection consistency) never drift.
         try:
             per_installment = Decimal(str(amount))
-            contracted_total = per_installment * installment_total
-            future_remaining = per_installment * (installment_total - 1)
+            contracted_total_text = payload.get("installment_contracted_total")
+            contracted_total = (
+                Decimal(str(contracted_total_text))
+                if contracted_total_text is not None
+                else per_installment * installment_total
+            )
+            future_remaining = contracted_total - per_installment
             installment_note = (
                 f" Compra contratada {_format_money(contracted_total)}, impacto neste mês "
                 f"{_format_money(per_installment)}, parcelas futuras {_format_money(future_remaining)}."
