@@ -786,6 +786,10 @@ _NON_MONTHLY_RATE_PERIOD_PATTERNS = tuple(
         r"\banual(?:mente)?\b",
         r"\bpor\s*ano\b",
         r"\ba\.a\.?\b",
+        # Codex review (PR #116): "p.a." (per annum) is a standard annual-rate
+        # spelling in Brazilian financial text too, distinct from "a.a." --
+        # both must fail closed the same way.
+        r"\bp\.a\.?\b",
         r"\bao\s*dia\b",
         r"\bdi[aá]ria(?:mente)?\b",
         r"\bdiario\b",
@@ -923,6 +927,7 @@ def _propose_create_transaction(
     # `installment_total` when the rate is a stated zero, amortized
     # otherwise. Never a second, ad-hoc division here.
     booked_amount = amount
+    contracted_total = amount
     if installment_total is not None:
         # Engineering review of PR #115: a materially known count with an
         # unknown rate is still an incomplete purchase -- ask, exactly like
@@ -947,7 +952,15 @@ def _propose_create_transaction(
                 "(ou \"sem juros\")?",
                 missing_fields=("monthly_interest_rate",),
             )
-        booked_amount, _total_cost = amortized_installment_payment(amount, installment_total, monthly_rate)
+        # Codex review (PR #116): for an interest-bearing split, the
+        # financed total genuinely exceeds the stated principal (interest
+        # is a real added cost, rebaseline §6.5) -- `amortized_installment_
+        # payment`'s own `total_cost` is already the single source of truth
+        # for that amount, exactly `principal` when `monthly_rate == 0`
+        # (Work Order item 3) and the amortized total otherwise, so it is
+        # what gets preserved here, never the raw stated `amount` for every
+        # rate alike.
+        booked_amount, contracted_total = amortized_installment_payment(amount, installment_total, monthly_rate)
 
     booked_at = parse_date_text(fields.get("date_text")) or date.today()
 
@@ -1020,13 +1033,17 @@ def _propose_create_transaction(
             payload["installment_current"] = 1
             payload["installment_total"] = installment_total
             # Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md,
-            # item 3): `amount` here is still the user-stated total (never
-            # reassigned -- only `booked_amount` was), a fact preserved
-            # verbatim so downstream readers never have to reconstruct it as
-            # `booked_amount * installment_total`, which can lose cents to
-            # rounding (`money(100 / 3) * 3 == 99.99`, not the stated
-            # `100.00`).
-            payload["installment_contracted_total"] = str(amount)
+            # item 3) + Codex review (PR #116): `contracted_total` is the
+            # stated principal for an interest-free split (exactly `amount`,
+            # since `amortized_installment_payment` now returns `money(
+            # principal)` for `monthly_rate == 0`) and the correctly
+            # amortized financed total for an interest-bearing one --
+            # preserved verbatim so downstream readers never have to
+            # reconstruct it as `booked_amount * installment_total`, which
+            # can lose cents to rounding (`money(100 / 3) * 3 == 99.99`, not
+            # the stated `100.00`) and, for a financed purchase, would
+            # additionally drop the interest itself from the total.
+            payload["installment_contracted_total"] = str(contracted_total)
     return TypedActionProposal(can_execute=True, typed_action=typed_action, payload=payload, path_params={})
 
 

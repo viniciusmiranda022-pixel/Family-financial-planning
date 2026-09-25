@@ -1152,6 +1152,12 @@ def _tool_get_installments(
                     installment_current=current,
                     installment_total=total,
                     anchor_month=anchor,
+                    # The raw stored fact (possibly `None`), never the
+                    # fallback-derived `contracted_total` above -- passing
+                    # the fallback would force the remainder-adjusted
+                    # schedule onto a legacy row that never stated a total,
+                    # silently reinterpreting it.
+                    contracted_total=row.installment_contracted_total,
                 )
             )
             impact_this_month = schedule.get(target_key, Decimal("0"))

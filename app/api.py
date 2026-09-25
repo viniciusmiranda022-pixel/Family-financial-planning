@@ -5561,6 +5561,11 @@ def preview_manual_installment(
         amount=money(abs(amount)),
         installment_current=installment_current,
         installment_total=installment_total,
+        # Manual entry has no "contracted total" concept distinct from the
+        # per-installment `amount` it already asks for -- unlike the chat
+        # WRITE path, so this candidate never carries one (`_project_installments`
+        # keeps its prior uniform-schedule behavior for it).
+        installment_contracted_total=None,
         competence=resolved_competence,
         booked_at=booked_at,
     )
@@ -9069,7 +9074,12 @@ def _installment_anchor_month(*, competence: str | None, booked_at: date) -> dat
 
 
 def _installment_remaining_schedule(
-    *, amount: Decimal, installment_current: int, installment_total: int, anchor_month: date
+    *,
+    amount: Decimal,
+    installment_current: int,
+    installment_total: int,
+    anchor_month: date,
+    contracted_total: Decimal | None = None,
 ) -> list[tuple[str, Decimal]]:
     """Canonical month -> amount schedule for the installments that remain
     *after* `installment_current`, given the confirmed per-installment
@@ -9086,13 +9096,41 @@ def _installment_remaining_schedule(
     engine uses afterwards -- the UI is never allowed to compute this on its
     own (no parallel formula in JS), and there is no second formula here
     either for the competence-vs-booked_at distinction.
+
+    Codex review (PR #116, Work Order item 3): `contracted_total`, when
+    known (`Transaction.installment_contracted_total`, chat/typed-action
+    WRITE purchases only), is the stated fact every remaining month's
+    payment must sum to exactly, alongside the already-booked
+    `amount * installment_current`. Splitting it into `remaining` equal
+    cent-rounded payments can lose a cent or more (`money(100 / 3) * 3 ==
+    99.99`, not the stated `100.00`), so every month but the *last*
+    remaining one gets the plain per-installment `amount`, and the last one
+    absorbs whatever is actually left -- deterministic, and the one
+    placement that makes this schedule's own total reconcile exactly with
+    `contracted_total` (rather than, say, spreading the remainder evenly
+    and still risking a residual cent). `contracted_total is None` (every
+    manual-entry/document-capture/legacy row, which never captured a
+    "total" distinct from `amount`) keeps the prior uniform behavior
+    unchanged.
     """
     remaining = max(0, installment_total - installment_current)
     value = money(abs(amount))
-    return [
-        (month_key(add_months(anchor_month.replace(day=1), offset)), value)
-        for offset in range(1, remaining + 1)
-    ]
+    months = [month_key(add_months(anchor_month.replace(day=1), offset)) for offset in range(1, remaining + 1)]
+    if not months:
+        return []
+    if contracted_total is None:
+        return [(month, value) for month in months]
+    already_booked = money(value * installment_current)
+    total_remaining = money(abs(contracted_total)) - already_booked
+    schedule: list[tuple[str, Decimal]] = []
+    running = Decimal("0")
+    for index, month in enumerate(months):
+        if index == len(months) - 1:
+            schedule.append((month, total_remaining - running))
+        else:
+            schedule.append((month, value))
+            running += value
+    return schedule
 
 
 def _installment_series_key(
@@ -9126,8 +9164,8 @@ def _project_installments(items) -> dict[str, Decimal]:
     `items` may mix persisted `Transaction` rows with a single in-memory,
     not-yet-persisted candidate (a `SimpleNamespace` carrying the same
     `account_id`/`card_last_four`/`description`/`amount`/
-    `installment_current`/`installment_total`/`competence`/`booked_at`
-    attributes) -- this is the one place that groups observations into a
+    `installment_current`/`installment_total`/`installment_contracted_total`/
+    `competence`/`booked_at` attributes) -- this is the one place that groups observations into a
     series (`_installment_series_key`) and keeps only the latest one by
     `(booked_at, installment_current)`, so a later observation of an
     existing series *replaces* the earlier one's projected schedule instead
@@ -9167,6 +9205,7 @@ def _project_installments(items) -> dict[str, Decimal]:
             installment_current=item.installment_current or 0,
             installment_total=item.installment_total or 0,
             anchor_month=anchor,
+            contracted_total=item.installment_contracted_total,
         ):
             values[key] = values.get(key, Decimal("0")) + value
     return values
