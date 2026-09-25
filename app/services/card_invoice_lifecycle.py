@@ -733,6 +733,25 @@ def serialize_invoice_purchase_line(transaction: Any) -> dict[str, Any]:
     installment_total = transaction.installment_total
     monthly_impact = money(abs(transaction.amount))
     is_installment = installment_current is not None and installment_total is not None
+    # Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md, item 3):
+    # `Transaction.installment_contracted_total` is the user-stated fact
+    # (chat/typed-action WRITE) when present; only fall back to the
+    # `monthly_impact * installment_total` reconstruction -- which can lose
+    # cents to rounding (`money(100 / 3) * 3 == 99.99`, not the stated
+    # `100.00`) -- for rows that never captured that fact (manual entry,
+    # document capture/import, or any row that predates this column).
+    # `future_installments_total` is always derived from whichever
+    # `contracted_total` was used, so the three rebaseline §6.7 figures
+    # (impacto neste mês + parcelas futuras = compra contratada) reconcile
+    # exactly either way.
+    contracted_total = (
+        money(transaction.installment_contracted_total)
+        if is_installment and getattr(transaction, "installment_contracted_total", None) is not None
+        else (money(monthly_impact * installment_total) if is_installment else monthly_impact)
+    )
+    future_installments_total = (
+        money(contracted_total - money(monthly_impact * installment_current)) if is_installment else Decimal("0")
+    )
     return {
         "transaction_id": transaction.id,
         "description": transaction.description,
@@ -744,10 +763,8 @@ def serialize_invoice_purchase_line(transaction: Any) -> dict[str, Any]:
         # installments, the whole amount already *is* the month's impact,
         # nothing is contracted beyond it and nothing remains COMPROMETIDO.
         "monthly_impact": str(monthly_impact),
-        "contracted_total": str(money(monthly_impact * installment_total) if is_installment else monthly_impact),
-        "future_installments_total": str(
-            money(monthly_impact * (installment_total - installment_current)) if is_installment else Decimal("0")
-        ),
+        "contracted_total": str(contracted_total),
+        "future_installments_total": str(future_installments_total),
     }
 
 

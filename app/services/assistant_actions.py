@@ -172,12 +172,13 @@ class DuplicateResolution:
 # ---------------------------------------------------------------------------
 
 
-def parse_amount_text(text: str | None) -> Decimal | None:
-    """Parse a free-text amount hint (`"300"`, `"R$ 300,50"`, `"8.500"`)
-    into a positive `Decimal`, or `None` if it cannot be parsed
-    unambiguously. Never guesses a value from context -- an unparsable
-    amount is always treated as a missing field, never defaulted to zero or
-    to a previous value."""
+def _parse_decimal_text(text: str | None) -> Decimal | None:
+    """Core free-text decimal parser shared by `parse_amount_text` (money
+    amounts, which reject zero -- a $0 transaction is a parsing failure,
+    never a stated fact) and `_resolve_installment_rate_text` (an
+    installment rate, where an explicit `0` is a meaningful stated fact:
+    "sem juros"). Returns a non-negative `Decimal`, or `None` if the text
+    cannot be parsed unambiguously; never guesses a value from context."""
 
     if not text:
         return None
@@ -216,7 +217,22 @@ def parse_amount_text(text: str | None) -> Decimal | None:
         value = Decimal(cleaned)
     except InvalidOperation:
         return None
-    if value <= 0:
+    if value < 0:
+        return None
+    return value
+
+
+def parse_amount_text(text: str | None) -> Decimal | None:
+    """Parse a free-text amount hint (`"300"`, `"R$ 300,50"`, `"8.500"`)
+    into a positive `Decimal`, or `None` if it cannot be parsed
+    unambiguously. Never guesses a value from context -- an unparsable
+    amount is always treated as a missing field, never defaulted to zero or
+    to a previous value. A money amount is never legitimately zero (that is
+    always a parsing failure, unlike an installment rate -- see
+    `_parse_decimal_text`)."""
+
+    value = _parse_decimal_text(text)
+    if value is None or value <= 0:
         return None
     return value
 
@@ -748,18 +764,57 @@ _ZERO_INTEREST_PHRASES = (
     "isenta de juros",
 )
 
+# Engineering review of `docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md`
+# (item 1): `monthly_interest_rate_text` feeds `amortized_installment_payment`
+# as a *monthly* rate -- a message that explicitly names a different period
+# ("12% ao ano") must never have its bare number booked as if it were that
+# same percentage per month instead (12x too high, silently). No
+# deterministic period-conversion is implemented here (annual-to-monthly
+# compounding is a product decision, not something to default silently), so
+# an explicitly non-monthly -- or self-contradictory ("12% ao mês ao ano")
+# -- period always fails closed with a clarification asking specifically
+# for the monthly rate. A bare number with *no* period mentioned at all
+# still means "monthly": Codex's own extraction contract already names the
+# field `monthly_interest_rate_text`, and every existing WRITE test passes
+# bare numbers ("2", "99") expecting exactly that -- so that case is
+# deliberately left alone (rebaseline "existing simple WRITE behavior
+# remains compatible").
+_NON_MONTHLY_RATE_PERIOD_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bao\s*ano\b",
+        r"\banual(?:mente)?\b",
+        r"\bpor\s*ano\b",
+        r"\ba\.a\.?\b",
+        r"\bao\s*dia\b",
+        r"\bdi[aá]ria(?:mente)?\b",
+        r"\bdiario\b",
+        r"\bpor\s*dia\b",
+        r"\bsemanal(?:mente)?\b",
+        r"\bpor\s*semana\b",
+    )
+)
+
+
+def _has_non_monthly_rate_period(normalized: str) -> bool:
+    return any(pattern.search(normalized) for pattern in _NON_MONTHLY_RATE_PERIOD_PATTERNS)
+
 
 def _resolve_installment_rate_text(value: str | None) -> tuple[Decimal, str | None]:
     """Resolve the monthly interest rate for an installment purchase whose
     `installment_total` is already known. Returns `(rate, issue)`:
 
     - `(Decimal, None)`: an explicit rate the message actually stated --
-      including an explicit zero ("sem juros"/"0%"), which is a stated fact,
-      never a filled-in absence.
+      including an explicit zero ("sem juros", "0%", "taxa de 0%", "0% ao
+      mês"), which is a stated fact, never a filled-in absence.
     - `(Decimal("0"), "missing")`: `monthly_interest_rate_text` was never
       populated -- the message never mentioned interest at all. The rate is
       a placeholder only; the caller must treat this as a clarifying
       question, never book it.
+    - `(Decimal("0"), "period")`: the message stated a rate with an explicit
+      non-monthly (or self-contradictory) period -- annual, daily, weekly --
+      never reinterpreted as monthly; the caller must ask specifically for
+      the monthly rate.
     - `(Decimal("0"), "invalid")`: the field was populated but is
       unparsable, negative, or above `_MAX_INTERPRETED_MONTHLY_RATE` -- the
       caller must ask for a correction, never silently coerce to `0`.
@@ -770,11 +825,17 @@ def _resolve_installment_rate_text(value: str | None) -> tuple[Decimal, str | No
     normalized = _strip_accents(value).strip().lower()
     if normalized in ("0", "0%") or any(phrase in normalized for phrase in _ZERO_INTEREST_PHRASES):
         return Decimal("0"), None
-    parsed = parse_amount_text(value.replace("%", ""))
+    if _has_non_monthly_rate_period(normalized):
+        return Decimal("0"), "period"
+    # `_parse_decimal_text` (not `parse_amount_text`) deliberately: an
+    # installment rate of exactly `0` is a meaningful stated fact ("taxa de
+    # 0%", "0% ao mês"), unlike a money amount, where `0` is always a
+    # parsing failure.
+    parsed = _parse_decimal_text(value.replace("%", ""))
     if parsed is None:
         return Decimal("0"), "invalid"
     rate = parsed / Decimal("100")
-    if rate < 0 or rate > _MAX_INTERPRETED_MONTHLY_RATE:
+    if rate > _MAX_INTERPRETED_MONTHLY_RATE:
         return Decimal("0"), "invalid"
     return rate, None
 
@@ -874,6 +935,12 @@ def _propose_create_transaction(
                 "é só responder \"sem juros\".",
                 missing_fields=("monthly_interest_rate",),
             )
+        if rate_issue == "period":
+            return _needs_disambiguation(
+                "Entendi uma taxa anual, diária ou semanal, mas preciso da taxa "
+                'mensal do parcelamento. Qual é a taxa ao mês (ou "sem juros")?',
+                missing_fields=("monthly_interest_rate",),
+            )
         if rate_issue == "invalid":
             return _needs_disambiguation(
                 "Não entendi a taxa de juros informada. Qual é a taxa mensal do parcelamento "
@@ -952,6 +1019,14 @@ def _propose_create_transaction(
         if installment_total is not None:
             payload["installment_current"] = 1
             payload["installment_total"] = installment_total
+            # Work Order (docs/WORK_ORDER_INSTALLMENT_REGRESSIONS_PR115.md,
+            # item 3): `amount` here is still the user-stated total (never
+            # reassigned -- only `booked_amount` was), a fact preserved
+            # verbatim so downstream readers never have to reconstruct it as
+            # `booked_amount * installment_total`, which can lose cents to
+            # rounding (`money(100 / 3) * 3 == 99.99`, not the stated
+            # `100.00`).
+            payload["installment_contracted_total"] = str(amount)
     return TypedActionProposal(can_execute=True, typed_action=typed_action, payload=payload, path_params={})
 
 

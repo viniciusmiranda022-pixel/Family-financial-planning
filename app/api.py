@@ -5281,6 +5281,7 @@ def _create_manual_transaction_impl(
         card_last_four=account.last_four,
         installment_current=payload.installment_current,
         installment_total=payload.installment_total,
+        installment_contracted_total=payload.installment_contracted_total,
         fingerprint=transaction_fingerprint(account.id, parsed, account.owner_label),
         occurred_at=payload.booked_at,
         competence=competence,
@@ -5347,6 +5348,11 @@ def _create_manual_transaction_impl(
             "competence": transaction.competence,
             "competence_explicitly_confirmed": payload.competence is not None,
             "funding_source": payload.funding_source,
+            "installment_contracted_total": (
+                str(transaction.installment_contracted_total)
+                if transaction.installment_contracted_total is not None
+                else None
+            ),
             "privilege_balance_after": (
                 str(funding_balance_after) if funding_balance_after is not None else None
             ),
